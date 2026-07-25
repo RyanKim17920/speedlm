@@ -55,6 +55,8 @@ class ModelProfile:
     target_layer_ids: tuple[int, ...] | None
     chat_template_kind: ChatTemplateKind
     max_seq_len: int
+    tool_call_parser: str | None = None
+    reasoning_parser: str | None = None
     trainable: bool = field(init=False)
 
     def __post_init__(self) -> None:
@@ -70,6 +72,10 @@ class ModelProfile:
             )
         _positive_int(self.num_speculative_tokens, "num_speculative_tokens")
         _positive_int(self.max_seq_len, "max_seq_len")
+        if self.tool_call_parser is not None:
+            _non_empty_string(self.tool_call_parser, "tool_call_parser")
+        if self.reasoning_parser is not None:
+            _non_empty_string(self.reasoning_parser, "reasoning_parser")
         if self.chat_template_kind not in CHAT_TEMPLATE_KINDS:
             allowed = ", ".join(sorted(CHAT_TEMPLATE_KINDS))
             raise ProfileError(
@@ -124,6 +130,8 @@ class ModelProfile:
             ),
             "chat_template_kind": self.chat_template_kind,
             "max_seq_len": self.max_seq_len,
+            "tool_call_parser": self.tool_call_parser,
+            "reasoning_parser": self.reasoning_parser,
             "trainable": self.trainable,
         }
 
@@ -163,7 +171,12 @@ class ModelProfile:
             "chat_template_kind",
             "max_seq_len",
         }
-        allowed = required | {"target_layer_ids", "trainable"}
+        allowed = required | {
+            "target_layer_ids",
+            "tool_call_parser",
+            "reasoning_parser",
+            "trainable",
+        }
         missing = required - set(data)
         if missing:
             raise ProfileError(f"{source}: missing required keys: {', '.join(sorted(missing))}")
@@ -200,6 +213,18 @@ class ModelProfile:
         else:
             raise ProfileError(f"{source}: target_layer_ids must be an array or null")
 
+        tool_call_parser_value = data.get("tool_call_parser")
+        if tool_call_parser_value is not None:
+            tool_call_parser_value = _non_empty_string(
+                tool_call_parser_value, "tool_call_parser"
+            )
+
+        reasoning_parser_value = data.get("reasoning_parser")
+        if reasoning_parser_value is not None:
+            reasoning_parser_value = _non_empty_string(
+                reasoning_parser_value, "reasoning_parser"
+            )
+
         try:
             profile = cls(
                 name=_non_empty_string(data["name"], "name"),
@@ -214,6 +239,8 @@ class ModelProfile:
                 target_layer_ids=target_layer_ids,
                 chat_template_kind=cast(ChatTemplateKind, template_value),
                 max_seq_len=_positive_int(data["max_seq_len"], "max_seq_len"),
+                tool_call_parser=cast(str | None, tool_call_parser_value),
+                reasoning_parser=cast(str | None, reasoning_parser_value),
             )
         except ProfileError as exc:
             raise ProfileError(f"{source}: {exc}") from exc
@@ -239,6 +266,8 @@ GPT_OSS_EAGLE3_PROFILE: Final = ModelProfile(
     target_layer_ids=(2, 12, 21),
     chat_template_kind="harmony",
     max_seq_len=131_072,
+    tool_call_parser="openai",
+    reasoning_parser="openai_gptoss",
 )
 
 LLAMA_31_8B_EAGLE3_PROFILE: Final = ModelProfile(
@@ -261,6 +290,7 @@ QWEN_35_9B_MTP_PROFILE: Final = ModelProfile(
     target_layer_ids=None,
     chat_template_kind="chatml",
     max_seq_len=262_144,
+    tool_call_parser="hermes",
 )
 
 BUILTIN_PROFILES: Final[Mapping[str, ModelProfile]] = MappingProxyType(

@@ -140,6 +140,47 @@ def test_vllm_serve_passthrough(
     ]
 
 
+def test_gpt_oss_profile_injects_parser_flags() -> None:
+    passthrough = cli._profiled_vllm_passthrough("openai/gpt-oss-20b", [])
+
+    assert passthrough == [
+        "--tool-call-parser",
+        "openai",
+        "--reasoning-parser",
+        "openai_gptoss",
+    ]
+
+
+@pytest.mark.parametrize(
+    "user_flag",
+    [
+        ["--tool-call-parser", "custom"],
+        ["--tool-call-parser=custom"],
+    ],
+)
+def test_user_supplied_tool_call_parser_wins(user_flag: list[str]) -> None:
+    passthrough = cli._profiled_vllm_passthrough(
+        "openai/gpt-oss-20b",
+        user_flag,
+    )
+
+    assert passthrough[: len(user_flag)] == user_flag
+    assert "openai" not in passthrough
+    assert passthrough[-2:] == ["--reasoning-parser", "openai_gptoss"]
+
+
+def test_unprofiled_model_injects_no_parser_flags() -> None:
+    passthrough = ["--tensor-parallel-size", "2"]
+
+    assert cli._profiled_vllm_passthrough("acme/unprofiled", passthrough) == passthrough
+
+
+def test_qwen_profile_injects_tool_call_parser() -> None:
+    passthrough = cli._profiled_vllm_passthrough("Qwen/Qwen3.5-9B", [])
+
+    assert passthrough == ["--tool-call-parser", "hermes"]
+
+
 def test_vllm_serve_idle_tuning_fails_loudly(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

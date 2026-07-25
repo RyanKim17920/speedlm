@@ -75,6 +75,10 @@ def loss_mask_from_offsets(
         and any(token_start < span.end and token_end > span.start for span in selected)
         for token_start, token_end in offsets
     )
+    if not selected:
+        # No generated assistant span is a valid, fail-closed row outcome. The
+        # rendered tokens remain usable as context but none may receive loss.
+        return mask
     if not any(mask):
         raise FinalAssistantMaskError(
             row_id,

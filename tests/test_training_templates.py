@@ -30,12 +30,18 @@ def _row() -> TrainingRow:
         id="fixture-row",
         conversation=(
             {"role": "user", "content": "first"},
-            {"role": "assistant", "channel": "analysis", "content": "old analysis"},
+            {
+                "role": "assistant",
+                "channel": "analysis",
+                "content": "old analysis",
+                "provenance_tag": "generated",
+            },
             {"role": "user", "content": "second"},
             {
                 "role": "assistant",
                 "reasoning_content": "new analysis",
                 "content": "final answer",
+                "provenance_tag": "generated",
             },
         ),
     )
@@ -147,7 +153,13 @@ def test_all_zero_mask_names_the_offending_row() -> None:
         prepare_training_row(
             TrainingRow(
                 id="named-bad-row",
-                conversation=({"role": "assistant", "content": "answer"},),
+                conversation=(
+                    {
+                        "role": "assistant",
+                        "content": "answer",
+                        "provenance_tag": "generated",
+                    },
+                ),
             ),
             template=ChatMLTemplate(),
             tokenizer=NoOffsetTokenizer(),

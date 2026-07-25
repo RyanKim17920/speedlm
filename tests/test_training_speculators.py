@@ -508,3 +508,41 @@ def test_model_revisions_are_resolved_and_used_by_prepare_and_train(
     train = runner.run_calls[5]
     assert train[train.index("--verifier-name-or-path") + 1] == "/snapshots/verifier"
     assert train[train.index("--from-pretrained") + 1] == "/snapshots/draft"
+
+
+def test_local_warm_start_is_pinned_with_resolved_verifier(
+    tmp_path: Path,
+    pipeline: SpeculatorsPipelineConfig,
+) -> None:
+    verifier = tmp_path / "verifier-snapshot"
+    verifier.mkdir()
+    warm_start = tmp_path / "draft-snapshot"
+    warm_start.mkdir()
+    (warm_start / "config.json").write_text(
+        json.dumps(
+            {
+                "speculators_config": {
+                    "verifier": {"name_or_path": "unresolved/verifier"}
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    (warm_start / "model.safetensors").write_bytes(b"weights")
+    configured = replace(
+        pipeline,
+        verifier_model=str(verifier),
+        warm_start_model=str(warm_start),
+    )
+    runner = _FakeRunner()
+    backend, work = _backend(tmp_path, configured, runner)
+    prepared = backend.prepare(work, should_abort=lambda: False)
+    hidden = backend.extract(prepared, work, should_abort=lambda: False)
+    backend.train(hidden, work, should_abort=lambda: False)
+
+    train = runner.run_calls[3]
+    pinned = work / "warm-start-pinned"
+    assert train[train.index("--from-pretrained") + 1] == str(pinned)
+    value = json.loads((pinned / "config.json").read_text(encoding="utf-8"))
+    assert value["speculators_config"]["verifier"]["name_or_path"] == str(verifier)
+    assert (pinned / "model.safetensors").is_symlink()

@@ -29,6 +29,9 @@ export PATH="/admin/home/ryan.kim/speedlm/.preflight/venvs/vllm/bin:$PATH"
   echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
   echo "model: $SPEEDLM_AGENT_MODEL"
   echo "agent override: ${SPEEDLM_AGENT_CLI:-auto-discover}"
+  echo "tool-call parser: ${SPEEDLM_AGENT_TOOL_CALL_PARSER:-per-model default}"
+  echo "reasoning parser: ${SPEEDLM_AGENT_REASONING_PARSER:-per-model default}"
+  echo "qwen bare mode: ${SPEEDLM_AGENT_QWEN_BARE:-0}"
   "$project_python" --version
   "$vllm_python" -c 'import importlib.metadata; print("vllm", importlib.metadata.version("vllm"))'
   for candidate in qwen-cli qwen-code qwen aider opencode claude codex; do

@@ -25,6 +25,7 @@ from speedlm.gateway.process import (
     forwarded_signals,
     reserve_loopback_port,
 )
+from speedlm.profiles import ProfileError, resolve_profile
 from speedlm.report import ReportError, build_gain_report, build_status_report
 from speedlm.runtime import gateway_runtime_record
 from speedlm.storage import StorageError, ensure_layout, resolve_layout
@@ -148,6 +149,29 @@ class _GatewayServer(uvicorn.Server):
         yield
 
 
+def _profiled_vllm_passthrough(
+    model: str,
+    passthrough: Sequence[str],
+) -> list[str]:
+    effective = list(passthrough)
+    try:
+        profile = resolve_profile(served_model=model)
+    except ProfileError:
+        return effective
+
+    for option, value in (
+        ("--tool-call-parser", profile.tool_call_parser),
+        ("--reasoning-parser", profile.reasoning_parser),
+    ):
+        supplied = any(
+            argument == option or argument.startswith(f"{option}=")
+            for argument in passthrough
+        )
+        if value is not None and not supplied:
+            effective.extend((option, value))
+    return effective
+
+
 async def _run_vllm_gateway(
     model: str,
     *,
@@ -167,7 +191,7 @@ async def _run_vllm_gateway(
     child = VLLMProcess(
         build_vllm_argv(
             model,
-            passthrough,
+            _profiled_vllm_passthrough(model, passthrough),
             host=LOOPBACK_HOST,
             port=child_port,
         ),

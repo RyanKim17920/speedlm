@@ -710,6 +710,8 @@ def _unprofiled_report(served_model: str, reason: str) -> dict[str, object]:
         "target_layer_ids": None,
         "chat_template_kind": "unknown",
         "max_seq_len": None,
+        "tool_call_parser": None,
+        "reasoning_parser": None,
         "trainable": False,
         "tuning_available": False,
         "detail": f"no profile matched {served_model!r}; tuning is unavailable ({reason})",

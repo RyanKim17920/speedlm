@@ -32,11 +32,15 @@ def test_builtin_profiles_load_and_validate(tmp_path: Path) -> None:
     assert profiles == dict(BUILTIN_PROFILES)
     assert GPT_OSS_EAGLE3_PROFILE.target_layer_ids == (2, 12, 21)
     assert GPT_OSS_EAGLE3_PROFILE.chat_template_kind == "harmony"
+    assert GPT_OSS_EAGLE3_PROFILE.tool_call_parser == "openai"
+    assert GPT_OSS_EAGLE3_PROFILE.reasoning_parser == "openai_gptoss"
     assert LLAMA_31_8B_EAGLE3_PROFILE.speculative_method == "eagle3"
     assert QWEN_35_9B_MTP_PROFILE.verifier_model == "Qwen/Qwen3.5-9B"
     assert QWEN_35_9B_MTP_PROFILE.draft_model is None
     assert QWEN_35_9B_MTP_PROFILE.speculative_method == "mtp"
     assert QWEN_35_9B_MTP_PROFILE.chat_template_kind == "chatml"
+    assert QWEN_35_9B_MTP_PROFILE.tool_call_parser == "hermes"
+    assert QWEN_35_9B_MTP_PROFILE.reasoning_parser is None
     assert QWEN_35_9B_MTP_PROFILE.speculative_config() == {
         "method": "mtp",
         "num_speculative_tokens": 3,
@@ -52,6 +56,16 @@ def test_user_profile_loads_and_overrides_builtin(tmp_path: Path) -> None:
 
     assert profiles[GPT_OSS_EAGLE3_PROFILE.name].num_speculative_tokens == 7
     assert len(profiles) == len(BUILTIN_PROFILES)
+
+
+def test_profile_parser_fields_round_trip() -> None:
+    data = GPT_OSS_EAGLE3_PROFILE.to_dict()
+
+    profile = ModelProfile.from_dict(data)
+
+    assert profile.tool_call_parser == "openai"
+    assert profile.reasoning_parser == "openai_gptoss"
+    assert profile.to_dict() == data
 
 
 @pytest.mark.parametrize(

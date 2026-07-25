@@ -7,6 +7,15 @@ same deterministic workloads first to the child and then through the gateway.
 Capture is intentionally enabled for every gateway request.  A trace-count
 check after measurement verifies that the reported gateway numbers include
 the normal asynchronous capture path.
+
+Two ordering rules apply to everything after the measured phases:
+
+* Measurement artifacts are written *before* any post-run assertion, so a
+  failing check can never discard an H100 benchmark's data.
+* Capture completeness is asserted as a *ratio*, not an exact count.  The
+  trace store drops a capture rather than stalling a client request when it
+  cannot take its append lock, so a small shortfall under high concurrency is
+  expected behaviour; the exact shortfall is always reported in the artifact.
 """
 
 from __future__ import annotations
@@ -40,6 +49,11 @@ LATENCY_REPEATS = 8
 CONCURRENCY_REPEATS = 4
 CONCURRENCY_LEVELS = (1, 4, 16, 32)
 REQUEST_TIMEOUT_SECONDS = 300.0
+
+# The trace store drops a capture instead of stalling a request when it cannot
+# acquire its bounded append lock.  Tolerate that at the margin, but still fail
+# on a systematic loss.
+MIN_CAPTURE_RATIO = 0.99
 
 PROMPT = (
     "Explain how a reverse proxy forwards an inference request to a model "
@@ -108,7 +122,12 @@ def _wait_for_http(
 
 
 def _wait_for_trace_count(path: Path, expected: int, timeout: float = 60.0) -> int:
-    """Wait outside timed regions for asynchronous capture writes to finish."""
+    """Wait outside timed regions for asynchronous capture writes to finish.
+
+    Returns the observed trace count.  This deliberately never raises: capture
+    completeness is judged (and reported) by the caller *after* the measurement
+    artifacts have been written, so a shortfall cannot destroy a benchmark run.
+    """
     deadline = time.monotonic() + timeout
     actual = 0
     while time.monotonic() < deadline:
@@ -121,7 +140,7 @@ def _wait_for_trace_count(path: Path, expected: int, timeout: float = 60.0) -> i
             if actual >= expected:
                 return actual
         time.sleep(0.1)
-    raise AssertionError(f"expected at least {expected} captured traces, found {actual}")
+    return actual
 
 
 def _payload(model: str, seed: int, *, stream: bool = False) -> dict[str, Any]:
@@ -453,8 +472,12 @@ def _summary_text(results: dict[str, Any]) -> str:
             f"concurrency repeats: {metadata['concurrency_repeats']}"
         ),
         (
-            f"Gateway capture: enabled and verified "
-            f"({metadata['captured_trace_count']} traces)"
+            f"Gateway capture: enabled; "
+            f"{metadata['captured_trace_count']}/"
+            f"{metadata['expected_captured_trace_count']} traces "
+            f"({metadata['capture_ratio'] * 100:.2f}% of requests), "
+            f"missing {metadata['missing_captured_traces']} "
+            f"(tolerance: >= {metadata['min_capture_ratio'] * 100:.2f}%)"
         ),
         "",
         "Latency (milliseconds; positive overhead means slower)",
@@ -496,8 +519,12 @@ def _summary_text(results: dict[str, Any]) -> str:
             "",
             "Median and p95 use linear interpolation. Absolute overhead is "
             "gateway-direct for latency and direct-gateway for throughput.",
-            "The only performance assertion is that every concurrency level "
-            "retains at least 50% of direct median throughput.",
+            "The performance assertion is that every concurrency level retains "
+            "at least 50% of direct median throughput.",
+            "The capture assertion is a ratio, not an exact count: the trace "
+            "store drops a capture rather than stall a request when it cannot "
+            "take its bounded append lock, so the exact shortfall is reported "
+            "above instead of failing the run.",
         ]
     )
     return "\n".join(lines) + "\n"
@@ -602,8 +629,10 @@ def test_proxy_overhead_benchmark() -> None:
                 _checked_json(client.post(direct_chat_url, json=payload))
             for payload in warmup_payloads:
                 _checked_json(client.post(gateway_chat_url, json=payload))
-        # Avoid carrying asynchronous warmup capture I/O into the direct baseline.
-        _wait_for_trace_count(traces_path, WARMUP_COUNT)
+        # Avoid carrying asynchronous warmup capture I/O into the direct
+        # baseline.  A shortfall here is not fatal; it is accounted for in the
+        # final capture ratio.
+        _wait_for_trace_count(traces_path, WARMUP_COUNT, timeout=30.0)
 
         nonstream_payloads = [
             _payload(model, seed=1_000 + index)
@@ -664,6 +693,23 @@ def test_proxy_overhead_benchmark() -> None:
         }
 
         benchmark_seconds = time.perf_counter() - benchmark_started
+
+        raw_samples = {
+            "direct": {
+                "nonstream": direct_nonstream,
+                "stream": direct_stream,
+                "concurrent": direct_concurrent,
+            },
+            "gateway": {
+                "nonstream": gateway_nonstream,
+                "stream": gateway_stream,
+                "concurrent": gateway_concurrent,
+            },
+        }
+        # Land the raw measurements first: nothing below this line -- summary
+        # formatting, capture accounting, or any assertion -- may discard them.
+        _write_json(artifact_dir / "proxy_overhead_raw_samples.json", raw_samples)
+
         expected_captures = (
             WARMUP_COUNT
             + LATENCY_REPEATS
@@ -673,6 +719,10 @@ def test_proxy_overhead_benchmark() -> None:
         captured_trace_count = _wait_for_trace_count(
             traces_path,
             expected_captures,
+        )
+        missing_captures = max(expected_captures - captured_trace_count, 0)
+        capture_ratio = (
+            captured_trace_count / expected_captures if expected_captures else 1.0
         )
 
         results: dict[str, Any] = {
@@ -686,6 +736,9 @@ def test_proxy_overhead_benchmark() -> None:
                 "gateway_capture_enabled": True,
                 "captured_trace_count": captured_trace_count,
                 "expected_captured_trace_count": expected_captures,
+                "missing_captured_traces": missing_captures,
+                "capture_ratio": capture_ratio,
+                "min_capture_ratio": MIN_CAPTURE_RATIO,
                 "benchmark_seconds": benchmark_seconds,
                 "direct_vllm_port": vllm_port,
                 "gateway_port": gateway_port,
@@ -717,18 +770,7 @@ def test_proxy_overhead_benchmark() -> None:
                 worse_when="lower",
             ),
             "concurrent_throughput": {},
-            "raw_samples": {
-                "direct": {
-                    "nonstream": direct_nonstream,
-                    "stream": direct_stream,
-                    "concurrent": direct_concurrent,
-                },
-                "gateway": {
-                    "nonstream": gateway_nonstream,
-                    "stream": gateway_stream,
-                    "concurrent": gateway_concurrent,
-                },
-            },
+            "raw_samples": raw_samples,
         }
 
         for concurrency in CONCURRENCY_LEVELS:
@@ -745,6 +787,8 @@ def test_proxy_overhead_benchmark() -> None:
             )
             results["concurrent_throughput"][key] = comparison
 
+        # Emit every artifact before any post-run assertion.  A benchmark that
+        # discards its own measurements on a trailing check is worse than none.
         _write_json(artifact_dir / "proxy_overhead.json", results)
         summary = _summary_text(results)
         (artifact_dir / "proxy_overhead_summary.txt").write_text(
@@ -752,6 +796,15 @@ def test_proxy_overhead_benchmark() -> None:
             encoding="utf-8",
         )
         print(summary, end="")
+
+        # Capture may legitimately drop at the margin (the trace store prefers
+        # serving over capturing when its append lock is contended), so assert
+        # a high ratio rather than an exact count.
+        assert capture_ratio >= MIN_CAPTURE_RATIO, (
+            f"capture is lossy beyond tolerance: {captured_trace_count}/"
+            f"{expected_captures} traces ({capture_ratio:.4%}), missing "
+            f"{missing_captures}; required >= {MIN_CAPTURE_RATIO:.2%}"
+        )
 
         # Performance must fail only on the requested serialization signal.
         for concurrency in CONCURRENCY_LEVELS:

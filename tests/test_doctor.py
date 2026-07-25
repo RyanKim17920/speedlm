@@ -312,6 +312,8 @@ def test_resolved_non_default_profile_is_validated() -> None:
     assert isinstance(profile, dict)
     assert profile["speculative_method"] == "mtp"
     assert profile["chat_template_kind"] == "chatml"
+    assert profile["tool_call_parser"] == "hermes"
+    assert profile["reasoning_parser"] is None
 
 
 def test_doctor_resolves_huggingface_cache_snapshot_path() -> None:

@@ -36,7 +36,14 @@ VLLM_VENV = Path("/admin/home/ryan.kim/speedlm/.preflight/venvs/vllm")
 VLLM = VLLM_VENV / "bin" / "vllm"
 DEFAULT_MODEL = "openai/gpt-oss-20b"
 SUCCESS_MARKER = "SPEEDLM_AGENT_SUCCESS"
-RESULT = {"total": 42, "count": 3, "status": "verified"}
+# Deliberately unguessable: the agent cannot produce `total` without actually
+# reading input.json, so a passing run proves the tool round trip happened.
+INPUT_VALUES = [317, 1289, 7, 4096]
+RESULT = {
+    "total": sum(INPUT_VALUES),
+    "count": len(INPUT_VALUES),
+    "status": "verified",
+}
 JsonObject = dict[str, Any]
 
 AGENT_TOOLS: list[JsonObject] = [
@@ -102,6 +109,9 @@ class AgentRun:
     returncode: int
     output: str
     discovered: Mapping[str, str]
+    final_text: str
+    advertised_tools: tuple[str, ...]
+    summary: Mapping[str, Any]
 
 
 def _require_live_e2e() -> None:
@@ -190,6 +200,50 @@ def _snapshot_for_model(model: str) -> Path:
     )
 
 
+def _model_parsers(model: str) -> tuple[str, str]:
+    """Return the ``(tool_call_parser, reasoning_parser)`` names for ``model``.
+
+    Verified against the pinned vLLM 0.25.1 registries in
+    ``/admin/home/ryan.kim/speedlm/.preflight/venvs/vllm``:
+
+    * ``vllm/tool_parsers/__init__.py`` registers ``"openai"`` ->
+      ``gptoss_tool_parser.GptOssToolParser`` and ``"hermes"`` ->
+      ``hermes_tool_parser.Hermes2ProToolParser``.
+    * ``vllm/reasoning/__init__.py`` registers ``"openai_gptoss"`` ->
+      ``gptoss_reasoning_parser.GptOssReasoningParser``.
+
+    ``vllm/parser/parser_manager.py::ParserManager.get_parser`` returns ``None``
+    when neither name is supplied, so a server started without these flags
+    cannot emit ``tool_calls`` at all, and for gpt-oss the Harmony ``final``
+    channel never lands in ``message.content`` -- responses come back empty.
+    ``ParserManager.get_tool_parser`` additionally ignores the tool parser
+    unless ``--enable-auto-tool-choice`` is passed.
+    """
+    lowered = model.lower()
+    if "gpt-oss" in lowered or "gpt_oss" in lowered:
+        return "openai", "openai_gptoss"
+    if "qwen" in lowered:
+        return "hermes", ""
+    return "", ""
+
+
+def _parser_args(model: str) -> list[str]:
+    """vLLM flags that make tool calling (and gpt-oss content) work at all.
+
+    Both names are overridable; set either env var to an empty string to omit
+    the corresponding flag entirely.
+    """
+    default_tool, default_reasoning = _model_parsers(model)
+    tool_parser = os.environ.get("SPEEDLM_AGENT_TOOL_CALL_PARSER", default_tool).strip()
+    reasoning_parser = os.environ.get("SPEEDLM_AGENT_REASONING_PARSER", default_reasoning).strip()
+    args: list[str] = []
+    if tool_parser:
+        args.extend(["--enable-auto-tool-choice", "--tool-call-parser", tool_parser])
+    if reasoning_parser:
+        args.extend(["--reasoning-parser", reasoning_parser])
+    return args
+
+
 def _default_vllm_args(model: str) -> list[str]:
     args = [
         "--max-model-len",
@@ -200,6 +254,7 @@ def _default_vllm_args(model: str) -> list[str]:
     ]
     if model.startswith("Qwen/Qwen3.5"):
         args.extend(["--gdn-prefill-backend", "triton"])
+    args.extend(_parser_args(model))
     return args
 
 
@@ -212,6 +267,10 @@ def _vllm_args(model: str) -> list[str]:
     except json.JSONDecodeError as exc:
         raise AssertionError("SPEEDLM_AGENT_VLLM_ARGS must be a JSON array") from exc
     assert isinstance(parsed, list) and all(isinstance(item, str) for item in parsed)
+    # A caller-supplied argv still needs the parser flags unless it sets them
+    # itself; without them this test can only ever measure a tool-less turn.
+    if "--tool-call-parser" not in parsed:
+        parsed.extend(_parser_args(model))
     return parsed
 
 
@@ -303,6 +362,73 @@ def _select_agent(discovered: Mapping[str, str]) -> tuple[str, str | None]:
     return "scripted", None
 
 
+def _parse_qwen_events(output: str) -> list[JsonObject]:
+    """Extract the ``--output-format json`` event array from qwen's stdout.
+
+    qwen prints human-readable warnings before the JSON array, so the payload
+    cannot be parsed with a bare ``json.loads`` of the whole stream.
+    """
+    for index, char in enumerate(output):
+        if char != "[":
+            continue
+        try:
+            value = json.loads(output[index:])
+        except json.JSONDecodeError:
+            continue
+        if isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
+    return []
+
+
+def _qwen_summary(events: Sequence[JsonObject]) -> tuple[str, tuple[str, ...], JsonObject]:
+    """Return ``(final_text, advertised_tools, summary)`` from qwen JSON events."""
+    final_text = ""
+    advertised: tuple[str, ...] = ()
+    summary: JsonObject = {
+        "events": len(events),
+        "api_requests": 0,
+        "api_errors": 0,
+        "tool_calls": 0,
+        "tool_calls_by_name": {},
+        "num_turns": 0,
+        "is_error": None,
+        "subtype": None,
+    }
+    for event in events:
+        if event.get("type") == "system" and event.get("subtype") == "init":
+            tools = event.get("tools")
+            if isinstance(tools, list):
+                advertised = tuple(item for item in tools if isinstance(item, str))
+        if event.get("type") != "result":
+            continue
+        result = event.get("result")
+        if isinstance(result, str) and result.strip():
+            final_text = result
+        summary["is_error"] = event.get("is_error")
+        summary["subtype"] = event.get("subtype")
+        summary["num_turns"] = event.get("num_turns", 0)
+        stats = event.get("stats")
+        if not isinstance(stats, dict):
+            continue
+        tools_stats = stats.get("tools")
+        if isinstance(tools_stats, dict):
+            summary["tool_calls"] = tools_stats.get("totalCalls", 0)
+            by_name = tools_stats.get("byName")
+            if isinstance(by_name, dict):
+                summary["tool_calls_by_name"] = {
+                    name: entry.get("totalCalls", entry) if isinstance(entry, dict) else entry
+                    for name, entry in by_name.items()
+                }
+        models = stats.get("models")
+        if isinstance(models, dict):
+            for entry in models.values():
+                api = entry.get("api") if isinstance(entry, dict) else None
+                if isinstance(api, dict):
+                    summary["api_requests"] += int(api.get("totalRequests", 0) or 0)
+                    summary["api_errors"] += int(api.get("totalErrors", 0) or 0)
+    return final_text, advertised, summary
+
+
 def _run_qwen_agent(
     executable: str,
     *,
@@ -312,9 +438,19 @@ def _run_qwen_agent(
     artifact_dir: Path,
     discovered: Mapping[str, str],
 ) -> AgentRun:
+    # NOTE: `--bare` is deliberately opt-in. qwen-code 0.19.x drops
+    # `argv.coreTools`/settings-derived allow lists in bare mode
+    # (`resolvedCoreTools = [...bareMode ? [] : argv.coreTools ?? []]`), so
+    # `--core-tools read_file write_file` silently did nothing: the 2026-07 live
+    # run advertised `read_file, edit, notebook_edit, run_shell_command` and had
+    # no `write_file` at all, making the task literally impossible. We instead
+    # isolate HOME so no user settings leak in, and let --core-tools apply.
+    bare = os.environ.get("SPEEDLM_AGENT_QWEN_BARE", "0") == "1"
+    agent_home = artifact_dir / "agent_home"
+    agent_home.mkdir(parents=True, exist_ok=True)
     command = [
         executable,
-        "--bare",
+        *(["--bare"] if bare else []),
         "--auth-type",
         "openai",
         "--openai-api-key",
@@ -333,6 +469,9 @@ def _run_qwen_agent(
         "--allowed-tools",
         "read_file",
         "write_file",
+        "--exclude-tools",
+        "run_shell_command",
+        "notebook_edit",
         "--output-format",
         "json",
         "--max-session-turns",
@@ -351,26 +490,48 @@ def _run_qwen_agent(
             "OPENAI_MODEL": model,
             "NO_PROXY": "127.0.0.1,localhost",
             "no_proxy": "127.0.0.1,localhost",
+            # Hermetic settings/context discovery without losing --core-tools.
+            "HOME": str(agent_home),
+            "XDG_CONFIG_HOME": str(agent_home / "config"),
+            "XDG_CACHE_HOME": str(agent_home / "cache"),
+            "QWEN_CODE_SUPPRESS_YOLO_WARNING": "1",
         }
     )
     timeout = _float_env("SPEEDLM_AGENT_SUBPROCESS_TIMEOUT", "420")
-    completed = subprocess.run(
-        command,
-        cwd=workspace,
-        env=env,
-        text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        timeout=timeout,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=workspace,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        partial = exc.output or ""
+        if isinstance(partial, bytes):
+            partial = partial.decode("utf-8", "replace")
+        (artifact_dir / "agent-output.txt").write_text(partial, encoding="utf-8")
+        raise AssertionError(
+            f"qwen agent exceeded SPEEDLM_AGENT_SUBPROCESS_TIMEOUT={timeout}s; "
+            f"last {len(partial)} bytes of output written to "
+            f"{artifact_dir / 'agent-output.txt'}"
+        ) from exc
     (artifact_dir / "agent-output.txt").write_text(completed.stdout, encoding="utf-8")
+    events = _parse_qwen_events(completed.stdout)
+    _write_json(artifact_dir / "agent-events.json", events)
+    final_text, advertised, summary = _qwen_summary(events)
     return AgentRun(
         kind="qwen",
         command=tuple(command),
         returncode=completed.returncode,
         output=completed.stdout,
         discovered=dict(discovered),
+        final_text=final_text,
+        advertised_tools=advertised,
+        summary=summary,
     )
 
 
@@ -520,6 +681,18 @@ def _scripted_agent(
         returncode=0,
         output=output,
         discovered=dict(discovered),
+        final_text=output,
+        advertised_tools=tuple(tool["function"]["name"] for tool in AGENT_TOOLS),
+        summary={
+            "events": len(transcript),
+            "api_requests": len(transcript),
+            "api_errors": 0,
+            "tool_calls": 2,
+            "tool_calls_by_name": {"read_file": 1, "write_file": 1},
+            "num_turns": len(transcript),
+            "is_error": False,
+            "subtype": "scripted",
+        },
     )
 
 
@@ -557,6 +730,8 @@ def _run_agent(
             "discovered": run.discovered,
             "command": list(run.command),
             "returncode": run.returncode,
+            "advertised_tools": list(run.advertised_tools),
+            "summary": dict(run.summary),
         },
     )
     return run
@@ -573,8 +748,14 @@ def _load_traces(path: Path) -> list[JsonObject]:
     return records
 
 
-def _wait_for_traces(path: Path, *, timeout: float = 30.0) -> list[JsonObject]:
+def _wait_for_traces(path: Path, *, timeout: float = 30.0) -> tuple[list[JsonObject], bool]:
+    """Poll ``path`` until the multi-turn tool session is fully captured.
+
+    Returns ``(records, complete)`` instead of raising so the caller can attach
+    the agent-side evidence that says *why* a run fell short.
+    """
     deadline = time.monotonic() + timeout
+    records: list[JsonObject] = []
     last_count = -1
     stable_since = time.monotonic()
     while time.monotonic() < deadline:
@@ -585,15 +766,99 @@ def _wait_for_traces(path: Path, *, timeout: float = 30.0) -> list[JsonObject]:
                 stable_since = time.monotonic()
             terminal = any(
                 isinstance(trace.get("messages"), list)
+                and trace["messages"]
                 and isinstance(trace["messages"][-1].get("content"), str)
                 and SUCCESS_MARKER in trace["messages"][-1]["content"]
                 for trace in records
             )
             if len(records) >= 3 and terminal and time.monotonic() - stable_since >= 0.5:
-                return records
+                return records, True
         time.sleep(0.1)
-    actual = path.read_text(encoding="utf-8") if path.exists() else "<missing>"
-    raise AssertionError(f"complete agent traces did not arrive at {path}:\n{actual}")
+    return records, False
+
+
+def _trace_shape(traces: Sequence[JsonObject]) -> list[str]:
+    """One human-readable line per captured trace, for failure reports."""
+    lines: list[str] = []
+    for index, trace in enumerate(traces):
+        messages = trace.get("messages")
+        roles = (
+            [str(message.get("role")) for message in messages] if isinstance(messages, list) else []
+        )
+        calls = trace.get("tool_calls")
+        names = (
+            [call.get("function", {}).get("name") for call in calls if isinstance(call, dict)]
+            if isinstance(calls, list)
+            else []
+        )
+        lines.append(
+            f"  trace[{index}] messages={roles} tool_calls={names} "
+            f"finish_reason={trace.get('finish_reason')!r} "
+            f"token_count_source={trace.get('token_count_source')!r}"
+        )
+    return lines
+
+
+def _tail(path: Path, *, limit: int = 4000) -> str:
+    if not path.is_file():
+        return "<missing>"
+    text = path.read_text(encoding="utf-8", errors="replace")
+    return text[-limit:] if len(text) > limit else text
+
+
+def _failure_report(
+    reason: str,
+    *,
+    agent_run: AgentRun,
+    traces: Sequence[JsonObject],
+    traces_path: Path,
+    gateway_log: Path,
+    workspace: Path,
+    vllm_argv: Sequence[str],
+) -> str:
+    """Tell the next operator which layer broke, not just that something did."""
+    tool_calls = agent_run.summary.get("tool_calls", 0)
+    captured_calls = sum(
+        len(trace.get("tool_calls") or []) for trace in traces if isinstance(trace, dict)
+    )
+    if not traces:
+        verdict = (
+            "NO TRACES CAPTURED -- the proxy never wrote a trace; capture or the "
+            "gateway is broken (check the gateway log below)."
+        )
+    elif tool_calls == 0 and captured_calls == 0:
+        verdict = (
+            "AGENT NEVER CALLED A TOOL -- capture worked but the model emitted no "
+            "tool_calls. Check that vLLM was started with --enable-auto-tool-choice "
+            "and a --tool-call-parser (and --reasoning-parser for gpt-oss, without "
+            "which message.content comes back empty)."
+        )
+    elif captured_calls == 0:
+        verdict = (
+            "AGENT CALLED TOOLS BUT CAPTURE MISSED THEM -- the CLI reports tool "
+            "calls while the traces record none; the capture path is broken."
+        )
+    else:
+        verdict = "TOOL CALLING WORKED -- the failure is downstream of tool use."
+    return "\n".join(
+        [
+            f"agent harness failure: {reason}",
+            f"verdict: {verdict}",
+            f"agent kind: {agent_run.kind} returncode={agent_run.returncode}",
+            f"agent advertised tools: {list(agent_run.advertised_tools)}",
+            f"agent summary: {json.dumps(dict(agent_run.summary), sort_keys=True)}",
+            f"vllm args: {shlex.join(str(item) for item in vllm_argv)}",
+            f"captured traces: {len(traces)} at {traces_path}",
+            *_trace_shape(traces),
+            f"workspace contents: {sorted(p.name for p in workspace.iterdir())}",
+            "--- agent final text ---",
+            agent_run.final_text or "<empty>",
+            "--- agent stdout (tail) ---",
+            agent_run.output[-4000:] or "<empty>",
+            "--- gateway + vLLM log (tail) ---",
+            _tail(gateway_log),
+        ]
+    )
 
 
 def _call_details(message: Mapping[str, Any]) -> list[tuple[str, str, JsonObject]]:
@@ -620,6 +885,7 @@ def _validate_trace_completeness(
     traces: Sequence[JsonObject],
     *,
     model: str,
+    advertised_tools: Sequence[str] = (),
 ) -> JsonObject:
     required = {
         "id",
@@ -633,6 +899,8 @@ def _validate_trace_completeness(
         "prompt_tokens",
         "completion_tokens",
         "token_count_source",
+        "finish_reason",
+        "stop_reason",
     }
     ids: set[str] = set()
     calls: dict[str, str] = {}
@@ -654,8 +922,11 @@ def _validate_trace_completeness(
         messages = trace["messages"]
         assert isinstance(messages, list) and messages
         assert messages[-1].get("role") == "assistant"
-        assert messages[-1].get("provenance") == "generated"
-        assert all(message.get("provenance") == "client_supplied" for message in messages[:-1])
+        assert messages[-1].get("provenance_tag") == "generated"
+        assert all(
+            message.get("provenance_tag") == "client_supplied"
+            for message in messages[:-1]
+        )
         for message in messages:
             assert isinstance(message, dict)
             assert isinstance(message.get("role"), str) and message["role"]
@@ -675,13 +946,26 @@ def _validate_trace_completeness(
         top_level_calls = trace["tool_calls"]
         assistant_calls = messages[-1].get("tool_calls", [])
         assert top_level_calls == assistant_calls
+        if assistant_calls:
+            assert trace["finish_reason"] == "tool_calls", trace
+        else:
+            assert isinstance(trace["finish_reason"], str) and trace["finish_reason"]
         content = messages[-1].get("content")
         if isinstance(content, str) and SUCCESS_MARKER in content:
             terminal_count += 1
 
     tool_names = {tool["function"]["name"] for tool in AGENT_TOOLS}
-    assert {"read_file", "write_file"} <= set(generated_call_names), generated_call_names
-    assert set(generated_call_names) <= tool_names, generated_call_names
+    # The real CLI owns its own tool registry; anything it advertised is a
+    # legitimate name, anything else is a hallucination.
+    allowed_names = tool_names | set(advertised_tools)
+    assert {"read_file", "write_file"} <= set(generated_call_names), (
+        "the agent did not exercise both the read and the write tool; "
+        f"observed {sorted(set(generated_call_names))}"
+    )
+    assert set(generated_call_names) <= allowed_names, (
+        f"agent invoked tools it was never offered: "
+        f"{sorted(set(generated_call_names) - allowed_names)}"
+    )
     assert len(calls) >= 2, calls
     assert calls.keys() <= observed_tool_results, (
         f"captured tool calls lack later tool results: {calls.keys() - observed_tool_results}"
@@ -805,6 +1089,7 @@ def _training_yield_report(
         "captured_trace_count": len(traces),
         "eligible_training_rows": len(eligible),
         "tokenizer_snapshot": str(snapshot),
+        "tool_schema_source": "harness agent adapter",
         "policies": table_rows,
     }
     return report, "\n".join(lines) + "\n"
@@ -828,7 +1113,7 @@ def test_agent_harness_full_circle() -> None:
     home = artifact_dir / "speedlm_home"
     workspace = artifact_dir / "agent_workspace"
     workspace.mkdir()
-    _write_json(workspace / "input.json", {"values": [8, 13, 21]})
+    _write_json(workspace / "input.json", {"values": INPUT_VALUES})
     gateway_log = artifact_dir / "gateway-and-vllm.log"
     gateway_port = _free_port()
     gateway_url = f"http://127.0.0.1:{gateway_port}"
@@ -852,6 +1137,7 @@ def test_agent_harness_full_circle() -> None:
                 f"CUDA_VISIBLE_DEVICES: {os.environ['CUDA_VISIBLE_DEVICES']}",
                 f"vllm_executable: {VLLM}",
                 f"tokenizer_snapshot: {snapshot}",
+                f"parser_args: {shlex.join(_parser_args(model)) or '<none>'}",
                 "",
             ]
         ),
@@ -895,19 +1181,54 @@ def test_agent_harness_full_circle() -> None:
             workspace=workspace,
             artifact_dir=artifact_dir,
         )
-        assert agent_run.returncode == 0, agent_run.output
-        assert SUCCESS_MARKER in agent_run.output, agent_run.output
-        result_path = workspace / "result.json"
-        assert result_path.is_file(), f"agent did not create {result_path}"
-        assert json.loads(result_path.read_text(encoding="utf-8")) == RESULT
-
         traces_path = home / "traces" / "traces.jsonl"
-        traces = _wait_for_traces(traces_path)
+
+        def _fail(reason: str) -> str:
+            traces_so_far = _load_traces(traces_path) if traces_path.is_file() else []
+            report = _failure_report(
+                reason,
+                agent_run=agent_run,
+                traces=traces_so_far,
+                traces_path=traces_path,
+                gateway_log=gateway_log,
+                workspace=workspace,
+                vllm_argv=command,
+            )
+            (artifact_dir / "failure-report.txt").write_text(report, encoding="utf-8")
+            return report
+
+        assert agent_run.returncode == 0, _fail(
+            f"agent CLI exited with code {agent_run.returncode}"
+        )
+        assert agent_run.summary.get("tool_calls", 0) >= 2, _fail(
+            "agent finished without making at least two tool calls -- the "
+            "multi-turn tool-calling session this test exists to measure never "
+            "happened"
+        )
+        marker_text = agent_run.final_text or agent_run.output
+        assert SUCCESS_MARKER in marker_text, _fail(
+            f"agent never emitted the {SUCCESS_MARKER} marker"
+        )
+        result_path = workspace / "result.json"
+        assert result_path.is_file(), _fail(f"agent did not create {result_path}")
+        assert json.loads(result_path.read_text(encoding="utf-8")) == RESULT, _fail(
+            "result.json does not match the value derived from input.json"
+        )
+
+        traces, complete = _wait_for_traces(traces_path)
+        assert complete, _fail(
+            "the captured trace stream never reached >=3 traces ending in a "
+            "terminal success turn"
+        )
         (artifact_dir / "traces.jsonl").write_text(
             traces_path.read_text(encoding="utf-8"),
             encoding="utf-8",
         )
-        completeness = _validate_trace_completeness(traces, model=model)
+        completeness = _validate_trace_completeness(
+            traces,
+            model=model,
+            advertised_tools=agent_run.advertised_tools,
+        )
         _write_json(artifact_dir / "trace-completeness.json", completeness)
 
         yield_report, yield_table = _training_yield_report(

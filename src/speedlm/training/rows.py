@@ -123,6 +123,7 @@ def _messages(
     *,
     row_id: str,
     tool_names: set[str],
+    trust_untagged_assistant_messages: bool,
 ) -> list[dict[str, Any]]:
     if not isinstance(value, (list, tuple)) or not value:
         raise ValueError(f"trace {row_id!r} messages must be a non-empty sequence")
@@ -140,6 +141,11 @@ def _messages(
         if message["content"] is None and role != "assistant":
             raise ValueError(f"{location}.content may be null only for assistant turns")
         if role == "assistant":
+            if (
+                trust_untagged_assistant_messages
+                and message.get("provenance_tag") is None
+            ):
+                message["provenance_tag"] = "generated"
             assistant_count += 1
             _validate_reasoning(message, location)
             _validate_calls(message, location, known_calls, tool_names)
@@ -231,8 +237,17 @@ def training_row_from_trace(
     *,
     tools: Sequence[Mapping[str, Any]] | None = None,
     model_revision: str | None = None,
+    trust_untagged_assistant_messages: bool = False,
 ) -> TrainingRow:
-    """Convert a production ``TraceRecord`` or JSON-compatible trace mapping."""
+    """Convert a production ``TraceRecord`` or JSON-compatible trace mapping.
+
+    Production captures must carry per-message provenance. Operators importing a
+    trusted offline corpus that predates provenance tags may explicitly set
+    ``trust_untagged_assistant_messages=True``. That opt-in relabels only untagged
+    assistant messages as ``"generated"``; unknown tags still fail closed.
+    """
+    if not isinstance(trust_untagged_assistant_messages, bool):
+        raise ValueError("trust_untagged_assistant_messages must be a boolean")
     if isinstance(trace, TraceRecord):
         raw: Mapping[str, Any] = trace.to_dict()
     else:
@@ -253,6 +268,7 @@ def training_row_from_trace(
         raw.get("messages"),
         row_id=row_id,
         tool_names={tool["function"]["name"] for tool in validated_tools},
+        trust_untagged_assistant_messages=trust_untagged_assistant_messages,
     )
     model = raw.get("model")
     if model is not None and (not isinstance(model, str) or not model):
@@ -287,6 +303,12 @@ def prepare_training_row(
         raise ValueError("max_seq_length must be a positive integer")
     rendered = template.render(row.conversation, tools=row.tools)
     spans = template.assistant_spans(rendered)
+    generated_spans = _generated_assistant_spans(
+        row,
+        template=template,
+        rendered=rendered,
+        spans=spans,
+    )
     kwargs: dict[str, object] = {
         "add_special_tokens": False,
         "return_offsets_mapping": True,
@@ -303,7 +325,7 @@ def prepare_training_row(
         )
     loss_mask = loss_mask_from_offsets(
         offsets,
-        spans,
+        generated_spans,
         policy=mask_policy,
         row_id=row.id,
     )
@@ -316,6 +338,45 @@ def prepare_training_row(
         assistant_spans=spans,
         mask_policy=mask_policy,
     )
+
+
+def _generated_assistant_spans(
+    row: TrainingRow,
+    *,
+    template: ChatTemplate,
+    rendered: str,
+    spans: Sequence[AssistantSpan],
+) -> tuple[AssistantSpan, ...]:
+    """Bind rendered spans to source messages and retain generated authorship.
+
+    Prefix rendering avoids trusting template turn numbers to distinguish adjacent
+    assistant messages. If a template is not prefix-stable, no span beyond the
+    unstable prefix is admitted for supervision.
+    """
+    if not spans:
+        return ()
+
+    prefix_length = 0
+    generated: list[AssistantSpan] = []
+    for message_index, message in enumerate(row.conversation):
+        prefix = template.render(
+            row.conversation[: message_index + 1],
+            tools=row.tools,
+        )
+        if not rendered.startswith(prefix) or len(prefix) < prefix_length:
+            break
+        next_prefix_length = len(prefix)
+        if (
+            message.get("role") == "assistant"
+            and message.get("provenance_tag") == "generated"
+        ):
+            generated.extend(
+                span
+                for span in spans
+                if prefix_length <= span.start and span.end <= next_prefix_length
+            )
+        prefix_length = next_prefix_length
+    return tuple(generated)
 
 
 def _integer_sequence(value: object, field: str, row_id: str) -> tuple[int, ...]:
