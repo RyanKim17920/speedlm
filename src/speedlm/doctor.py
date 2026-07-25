@@ -17,22 +17,47 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Final
+from typing import Final, cast
 
+from speedlm.profiles import (
+    BUILTIN_PROFILES,
+    ModelProfile,
+    ProfileConfig,
+    resolve_profile,
+)
 from speedlm.storage import resolve_layout
 
 NVIDIA_SMI_TIMEOUT_SECONDS: Final = 5.0
 DEFAULT_MIN_DISK_FREE_GB: Final = 20.0
 SCRATCH_LIMIT_MIB: Final = 5 * 1024
 
-PRIMARY_VERIFIER: Final = "openai/gpt-oss-20b"
-PRIMARY_DRAFT: Final = "RedHatAI/gpt-oss-20b-speculator.eagle3"
-FALLBACK_VERIFIER: Final = "meta-llama/Llama-3.1-8B-Instruct"
-FALLBACK_DRAFT: Final = "RedHatAI/Llama-3.1-8B-Instruct-speculator.eagle3"
+_BUILTIN_PROFILE_NAMES: Final = tuple(BUILTIN_PROFILES)
+_DEFAULT_PROFILE: Final = resolve_profile(
+    served_model=_BUILTIN_PROFILE_NAMES[0],
+    profiles=BUILTIN_PROFILES,
+)
+_FALLBACK_PROFILE: Final = resolve_profile(
+    served_model=_BUILTIN_PROFILE_NAMES[1],
+    profiles=BUILTIN_PROFILES,
+)
 
+
+def _required_draft(profile: ModelProfile) -> str:
+    if profile.draft_model is None:
+        raise RuntimeError(f"compatibility profile {profile.name!r} requires a draft")
+    return profile.draft_model
+
+
+# Compatibility exports for report.py and downstream callers. Doctor's own
+# validation resolves profiles dynamically and does not consult these aliases.
+PRIMARY_VERIFIER: Final = _DEFAULT_PROFILE.verifier_model
+PRIMARY_DRAFT: Final = _required_draft(_DEFAULT_PROFILE)
+FALLBACK_VERIFIER: Final = _FALLBACK_PROFILE.verifier_model
+FALLBACK_DRAFT: Final = _required_draft(_FALLBACK_PROFILE)
 SUPPORTED_MODEL_PAIRS: Final[Mapping[str, str]] = {
-    PRIMARY_VERIFIER: PRIMARY_DRAFT,
-    FALLBACK_VERIFIER: FALLBACK_DRAFT,
+    profile.verifier_model: profile.draft_model
+    for profile in BUILTIN_PROFILES.values()
+    if profile.draft_model is not None
 }
 
 EXPECTED_PACKAGES: Final[Mapping[str, str]] = {
@@ -614,7 +639,7 @@ def check_memory() -> Check:
 
 
 def _optional_string_attribute(config: object, name: str) -> str | None:
-    value = getattr(config, name, None)
+    value = config.get(name) if isinstance(config, Mapping) else getattr(config, name, None)
     return value if isinstance(value, str) and value else None
 
 
@@ -631,33 +656,35 @@ def _local_model_path(reference: str) -> Path | None:
     return None
 
 
-def check_model_pair(config: object) -> Check:
-    """Validate a supported verifier/EAGLE-3 pair without fetching weights."""
+def _resolve_doctor_profile(
+    config: object | None,
+    *,
+    home: Path | None,
+) -> ModelProfile:
+    if config is None:
+        return resolve_profile(served_model=_DEFAULT_PROFILE.name, home=home)
+    verifier = _optional_string_attribute(config, "verifier_model")
+    return resolve_profile(
+        cast(ProfileConfig, config),
+        served_model=verifier,
+        home=home,
+    )
+
+
+def check_model_pair(
+    config: object | None,
+    *,
+    home: Path | None = None,
+) -> Check:
+    """Validate the resolved profile's verifier/draft contract without fetching."""
 
     try:
-        verifier = _optional_string_attribute(config, "verifier_model")
-        if verifier is None:
-            verifier = _optional_string_attribute(config, "model")
+        profile = _resolve_doctor_profile(config, home=home)
+        verifier = profile.verifier_model
         explicit_draft = _optional_string_attribute(config, "draft_model")
-        if verifier is None:
-            return Check(
-                "model_pair",
-                CheckStatus.FAIL,
-                "No verifier model is configured",
-            )
-
-        expected_draft = SUPPORTED_MODEL_PAIRS.get(verifier)
-        if expected_draft is None:
-            supported = ", ".join(SUPPORTED_MODEL_PAIRS)
-            return Check(
-                "model_pair",
-                CheckStatus.FAIL,
-                f"Unsupported verifier {verifier!r}; supported verifiers: {supported}",
-                {"verifier": verifier, "draft": explicit_draft},
-            )
-
-        draft = explicit_draft or expected_draft
-        if draft != expected_draft:
+        expected_draft = profile.draft_model
+        draft = explicit_draft if explicit_draft is not None else expected_draft
+        if explicit_draft is not None and explicit_draft != expected_draft:
             return Check(
                 "model_pair",
                 CheckStatus.FAIL,
@@ -671,7 +698,7 @@ def check_model_pair(config: object) -> Check:
             )
 
         verifier_path = _local_model_path(verifier)
-        draft_path = _local_model_path(draft)
+        draft_path = _local_model_path(draft) if draft is not None else None
         for role, path in (("verifier", verifier_path), ("draft", draft_path)):
             if path is not None and (not path.exists() or not path.is_dir()):
                 return Check(
@@ -688,24 +715,48 @@ def check_model_pair(config: object) -> Check:
             return Check(
                 "model_pair",
                 CheckStatus.FAIL,
-                "Verifier and EAGLE-3 draft must use separate model directories",
+                "Verifier and draft must use separate model directories",
                 {"verifier": verifier, "draft": draft},
             )
 
-        pair_name = "primary" if verifier == PRIMARY_VERIFIER else "fallback"
+        if profile.name == _DEFAULT_PROFILE.name:
+            pair_name = "primary"
+        elif profile.name == _FALLBACK_PROFILE.name:
+            pair_name = "fallback"
+        else:
+            pair_name = profile.name
+        layout = "separate" if draft is not None else "native"
+        data: dict[str, object] = {
+            "pair": pair_name,
+            "profile": profile.name,
+            "verifier": verifier,
+            "draft": draft,
+            "method": profile.speculative_method,
+            "layout": layout,
+            "draft_derived": explicit_draft is None,
+            "trainable": profile.trainable,
+            "tuning_available": profile.trainable,
+        }
+        if not profile.trainable:
+            return Check(
+                "model_pair",
+                CheckStatus.WARN,
+                f"Profile {profile.name!r} is coherent for "
+                f"{profile.speculative_method}; tuning is unavailable for this method",
+                data,
+            )
+
+        draft_detail = (
+            "draft uses a separate model reference"
+            if draft is not None
+            else "draft is native to the verifier"
+        )
         return Check(
             "model_pair",
             CheckStatus.PASS,
-            f"{pair_name.capitalize()} verifier/draft pair is coherent; "
-            "EAGLE-3 draft uses a separate model reference",
-            {
-                "pair": pair_name,
-                "verifier": verifier,
-                "draft": draft,
-                "method": "eagle3",
-                "layout": "separate",
-                "draft_derived": explicit_draft is None,
-            },
+            f"Profile {profile.name!r} is coherent; "
+            f"{profile.speculative_method} {draft_detail}",
+            data,
         )
     except Exception as exc:
         return Check(
@@ -765,7 +816,7 @@ def plan_execution(
 
 
 def run_doctor(
-    config: object,
+    config: object | None = None,
     *,
     home: Path | None = None,
     minimum_disk_free_gb: float = DEFAULT_MIN_DISK_FREE_GB,
@@ -776,6 +827,7 @@ def run_doctor(
 
     layout = resolve_layout(home)
     gpu_probe = probe_gpu(timeout_seconds=timeout_seconds)
+    model_pair = check_model_pair(config, home=layout.root)
     checks = (
         check_python(),
         gpu_probe.check,
@@ -783,9 +835,16 @@ def run_doctor(
         check_packages(),
         check_disk(layout.root, minimum_free_gb=minimum_disk_free_gb),
         check_memory(),
-        check_model_pair(config),
+        model_pair,
     )
+    plan = plan_execution(gpu_probe, prefer_colocated=prefer_colocated)
+    if model_pair.data is not None and model_pair.data.get("tuning_available") is False:
+        plan = ExecutionPlan(
+            ExecutionMode.UNAVAILABLE,
+            f"Profile {model_pair.data['profile']!r} uses "
+            f"{model_pair.data['method']}; tuning is unavailable for this method",
+        )
     return DoctorReport(
         checks=checks,
-        plan=plan_execution(gpu_probe, prefer_colocated=prefer_colocated),
+        plan=plan,
     )

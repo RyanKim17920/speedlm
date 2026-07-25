@@ -11,6 +11,7 @@ import pytest
 
 import speedlm.doctor as doctor
 from speedlm.config import SpeedLMConfig
+from speedlm.profiles import QWEN_35_9B_MTP_PROFILE, ModelProfile
 
 
 def _completed(
@@ -293,6 +294,66 @@ def test_incoherent_model_pair_fails() -> None:
 
     assert result.status is doctor.CheckStatus.FAIL
     assert "incoherent" in result.detail
+
+
+def test_resolved_non_default_profile_is_validated() -> None:
+    result = doctor.check_model_pair(
+        SpeedLMConfig(model=QWEN_35_9B_MTP_PROFILE.verifier_model)
+    )
+
+    assert result.status is doctor.CheckStatus.PASS
+    assert result.data is not None
+    assert result.data["profile"] == QWEN_35_9B_MTP_PROFILE.name
+    assert result.data["verifier"] == QWEN_35_9B_MTP_PROFILE.verifier_model
+    assert result.data["draft"] is None
+    assert result.data["method"] == "mtp"
+    assert result.data["layout"] == "native"
+
+
+def test_non_trainable_profile_warns_that_tuning_is_unavailable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = ModelProfile(
+        name="local-ngram",
+        verifier_model="acme/local-verifier",
+        draft_model=None,
+        speculative_method="ngram",
+        num_speculative_tokens=4,
+        target_layer_ids=None,
+        chat_template_kind="auto",
+        max_seq_len=4096,
+    )
+    profiles_dir = tmp_path / "profiles"
+    profiles_dir.mkdir()
+    (profiles_dir / "local-ngram.json").write_text(
+        json.dumps(profile.to_dict()),
+        encoding="utf-8",
+    )
+
+    result = doctor.check_model_pair(
+        SpeedLMConfig(model=profile.verifier_model, profile=profile.name),
+        home=tmp_path,
+    )
+
+    assert result.status is doctor.CheckStatus.WARN
+    assert "tuning is unavailable" in result.detail
+    assert result.data is not None
+    assert result.data["profile"] == profile.name
+    assert result.data["method"] == "ngram"
+    assert result.data["trainable"] is False
+    assert result.data["tuning_available"] is False
+
+    monkeypatch.setattr(doctor.subprocess, "run", _healthy_run)
+    _patch_healthy_non_gpu_checks(monkeypatch)
+    report = doctor.run_doctor(
+        SpeedLMConfig(model=profile.verifier_model, profile=profile.name),
+        home=tmp_path,
+    )
+
+    assert report.overall_status is doctor.CheckStatus.WARN
+    assert report.execution_mode is doctor.ExecutionMode.UNAVAILABLE
+    assert "tuning is unavailable" in report.plan.detail
 
 
 def test_overall_status_is_worst_check() -> None:

@@ -6,6 +6,8 @@ from pathlib import Path
 
 import pytest
 
+import speedlm.cli as cli
+import speedlm.doctor as doctor
 from speedlm.cli import main
 
 
@@ -225,11 +227,75 @@ def test_status_home_flag_overrides_env(
     assert str(override) in out.out
 
 
-def test_doctor_returns_2(capsys) -> None:
-    code = main(["doctor"])
-    assert code == 2
+@pytest.mark.parametrize(
+    ("status", "expected_code"),
+    [
+        (doctor.CheckStatus.PASS, 0),
+        (doctor.CheckStatus.WARN, 0),
+        (doctor.CheckStatus.FAIL, 1),
+    ],
+)
+def test_doctor_exit_code_follows_overall_status(
+    status: doctor.CheckStatus,
+    expected_code: int,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    report = doctor.DoctorReport(
+        checks=(doctor.Check("probe", status, "result"),),
+        plan=doctor.ExecutionPlan(doctor.ExecutionMode.UNAVAILABLE, "test plan"),
+    )
+    monkeypatch.setenv("SPEEDLM_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "run_doctor", lambda _config, *, home: report)
+
+    assert main(["doctor"]) == expected_code
     out = capsys.readouterr()
-    assert "not yet implemented" in out.err
+    assert f"Overall: {status.value}" in out.out
+    assert out.err == ""
+
+
+def test_doctor_json_output_shape(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    report = doctor.DoctorReport(
+        checks=(doctor.Check("tuning", doctor.CheckStatus.WARN, "unavailable"),),
+        plan=doctor.ExecutionPlan(doctor.ExecutionMode.IDLE, "safe mode"),
+    )
+    monkeypatch.setenv("SPEEDLM_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "run_doctor", lambda _config, *, home: report)
+
+    assert main(["doctor", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert set(payload) == {"status", "execution_mode", "plan", "checks"}
+    assert payload["status"] == "WARN"
+    assert payload["execution_mode"] == "idle"
+    assert payload["checks"] == [
+        {"name": "tuning", "status": "WARN", "detail": "unavailable"}
+    ]
+
+
+def test_doctor_driver_unreachable_is_clean_fail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    error = "NVIDIA-SMI has failed because it couldn't communicate with the driver."
+
+    def unreachable(command, **_kwargs):
+        return doctor.subprocess.CompletedProcess(command, 9, "", error)
+
+    monkeypatch.setenv("SPEEDLM_HOME", str(tmp_path))
+    monkeypatch.setattr(doctor.subprocess, "run", unreachable)
+
+    assert main(["doctor"]) == 1
+    out = capsys.readouterr()
+    assert "[FAIL] gpu: nvidia-smi is present but cannot communicate" in out.out
+    assert "[SKIP] cuda: CUDA detection skipped" in out.out
+    assert "Execution mode: unavailable" in out.out
+    assert out.err == ""
 
 
 def test_no_args_returns_2(capsys) -> None:

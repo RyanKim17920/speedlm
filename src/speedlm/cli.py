@@ -12,7 +12,8 @@ from pathlib import Path
 import uvicorn
 
 from speedlm import __version__
-from speedlm.config import ConfigError, SamplingConfig, WrapperConfig
+from speedlm.config import ConfigError, SamplingConfig, WrapperConfig, load_config
+from speedlm.doctor import CheckStatus, run_doctor
 from speedlm.gateway.app import create_app
 from speedlm.gateway.process import (
     LOOPBACK_HOST,
@@ -24,7 +25,7 @@ from speedlm.gateway.process import (
 )
 from speedlm.report import ReportError, build_gain_report, build_status_report
 from speedlm.runtime import gateway_runtime_record
-from speedlm.storage import StorageError, ensure_layout
+from speedlm.storage import StorageError, ensure_layout, resolve_layout
 from speedlm.traces.normalize import NormalizeError, normalize_file
 from speedlm.traces.store import TraceError, TraceStore
 
@@ -81,8 +82,11 @@ def _build_parser() -> argparse.ArgumentParser:
         "--json", action="store_true", default=False, help="Emit JSON instead of text"
     )
 
-    # ---- stub subcommands ----
-    subparsers.add_parser("doctor", help="Diagnose environment issues")
+    # ---- doctor ----
+    doctor_parser = subparsers.add_parser("doctor", help="Diagnose environment issues")
+    doctor_parser.add_argument(
+        "--json", action="store_true", default=False, help="Emit JSON instead of text"
+    )
 
     return parser
 
@@ -343,11 +347,18 @@ def _cmd_gain(as_json: bool) -> int:
     return 0
 
 
-def _cmd_stub(name: str, description: str) -> int:
-    sys.stderr.write(
-        f"[speedlm] {name}: not yet implemented (will {description})\n"
-    )
-    return 2
+def _cmd_doctor(as_json: bool) -> int:
+    try:
+        layout = resolve_layout()
+        config_path = layout.root / "config.json"
+        config = load_config(config_path) if config_path.exists() else None
+        report = run_doctor(config, home=layout.root)
+    except (ConfigError, StorageError, OSError) as exc:
+        sys.stderr.write(f"[speedlm] error: {exc}\n")
+        return 1
+    rendered = report.to_json() if as_json else report.render_text()
+    sys.stdout.write(rendered + "\n")
+    return 1 if report.overall_status is CheckStatus.FAIL else 0
 
 
 # ---------------------------------------------------------------------------
@@ -415,9 +426,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     if command == "gain":
         return _cmd_gain(bool(args.json))
 
-    # ---- stubs ----
+    # ---- doctor ----
     if command == "doctor":
-        return _cmd_stub("doctor", "diagnose GPU, disk, and config issues")
+        return _cmd_doctor(bool(args.json))
 
     # Fallback (should not be reached)
     sys.stderr.write(f"[speedlm] error: unknown command: {command}\n")
