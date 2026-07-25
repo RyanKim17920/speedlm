@@ -2,21 +2,25 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import ipaddress
 import json
 import math
 import re
+import unicodedata
 from collections import Counter
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any
+from urllib.parse import unquote_to_bytes
 
 _PEM_RE = re.compile(
-    r"-----BEGIN (?P<label>[A-Z0-9 ]*PRIVATE KEY)-----"
+    r"-{5}\s*BEGIN\s+(?:[A-Z0-9]+\s+)*PRIVATE\s+KEY\s*-{5}"
     r".*?"
-    r"-----END (?P=label)-----",
-    re.DOTALL,
+    r"-{5}\s*END\s+(?:[A-Z0-9]+\s+)*PRIVATE\s+KEY\s*-{5}",
+    re.DOTALL | re.IGNORECASE,
 )
 _AUTHORIZATION_RE = re.compile(
     r"(?i)\b(?P<prefix>authorization\s*:\s*)"
@@ -71,6 +75,19 @@ _BASE64_RE = re.compile(
 _IMAGE_DATA_URI_RE = re.compile(
     r"data:image/[A-Za-z0-9.+-]+;base64,[A-Za-z0-9+/=\r\n]+",
     re.IGNORECASE,
+)
+_PLACEHOLDER_RE = re.compile(r"<REDACTED:[a-z0-9_]+>")
+_PERCENT_CANDIDATE_RE = re.compile(
+    r"(?<![A-Za-z0-9._~%-])(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})*"
+    r"%[0-9A-Fa-f]{2}(?:[A-Za-z0-9._~-]|%[0-9A-Fa-f]{2})*"
+    r"(?![A-Za-z0-9._~%-])"
+)
+_HEX_DECODE_CANDIDATE_RE = re.compile(
+    r"(?<![A-Fa-f0-9])[A-Fa-f0-9]{16,}(?![A-Fa-f0-9])"
+)
+_BASE64_DECODE_CANDIDATE_RE = re.compile(
+    r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{16,}={0,2}"
+    r"(?![A-Za-z0-9+/_=-])"
 )
 
 _PROVIDER_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
@@ -182,6 +199,26 @@ class _RedactionContext:
     placeholders: dict[str, str]
 
 
+@dataclass(frozen=True, slots=True)
+class _TextView:
+    text: str
+    source_spans: tuple[tuple[int, int], ...]
+
+    def source_span(self, start: int, end: int) -> tuple[int, int]:
+        if start >= end:
+            raise ValueError("text-view spans must be non-empty")
+        return self.source_spans[start][0], self.source_spans[end - 1][1]
+
+
+@dataclass(frozen=True, slots=True)
+class _Match:
+    start: int
+    end: int
+    secret: str
+    category: str
+    priority: int
+
+
 class Redactor:
     """Redact secrets from arbitrary JSON-like trace structures."""
 
@@ -230,13 +267,18 @@ class Redactor:
             changed = False
             result: dict[Any, Any] = {}
             for key, item in value.items():
+                redacted_key: Any = key
+                key_changed = False
+                if isinstance(key, str):
+                    redacted_key = self._redact_string(key, context)
+                    key_changed = redacted_key != key
                 child, child_changed = self._walk(
                     item,
                     context,
                     field_name=key if isinstance(key, str) else None,
                 )
-                result[key] = child
-                changed = changed or child_changed
+                result[redacted_key] = child
+                changed = changed or key_changed or child_changed
             return (result, True) if changed else (value, False)
 
         if isinstance(value, list):
@@ -282,11 +324,15 @@ class Redactor:
         fallback_category: str,
         context: _RedactionContext,
     ) -> str:
+        if _PLACEHOLDER_RE.fullmatch(value):
+            return value
         if fallback_category == "authorization":
             match = re.fullmatch(r"(?i)(bearer\s+|basic\s+)?(.+)", value)
             if match is not None:
                 scheme = match.group(1) or ""
                 secret = match.group(2)
+                if _PLACEHOLDER_RE.fullmatch(secret):
+                    return value
                 category = self._classify_secret(secret, "authorization")
                 return f"{scheme}{self._placeholder(secret, category, context)}"
         category = self._classify_secret(value, fallback_category)
@@ -296,162 +342,324 @@ class Redactor:
     def _sensitive_field_category(field_name: str | None) -> str | None:
         if field_name is None:
             return None
-        normalized = field_name.casefold().replace("-", "_")
+        normalized = "".join(
+            char
+            for char in unicodedata.normalize("NFKC", field_name)
+            if unicodedata.category(char) != "Cf"
+        )
+        normalized = normalized.casefold().replace("-", "_")
         return _SENSITIVE_FIELD_CATEGORIES.get(normalized)
 
     def _redact_string(self, text: str, context: _RedactionContext) -> str:
-        result = _PEM_RE.sub(
-            lambda match: self._placeholder(match.group(0), "private_key", context),
-            text,
-        )
-        result = _AUTHORIZATION_RE.sub(
-            lambda match: self._replace_authorization(match, context),
-            result,
-        )
-        result = _ASSIGNMENT_RE.sub(
-            lambda match: self._replace_assignment(match, context),
-            result,
-        )
-        result = _BEARER_RE.sub(
-            lambda match: self._replace_bearer(match, context),
-            result,
-        )
+        protected_spans = tuple(match.span() for match in _PLACEHOLDER_RE.finditer(text))
+        view = self._normalized_view(text)
+        matches = self._collect_direct_matches(text, view, protected_spans)
+        matches.extend(self._collect_decoded_matches(text, protected_spans))
+        if self.policy.entropy_enabled:
+            matches.extend(self._collect_entropy_matches(text, protected_spans))
 
-        for category, pattern in _PROVIDER_PATTERNS:
-            def _make_replacer(cat: str) -> Callable[[re.Match[str]], str]:
-                def replacer(m: re.Match[str]) -> str:
-                    return self._placeholder(m.group(0), cat, context)
-                return replacer
-            result = pattern.sub(
-                _make_replacer(category),
-                result,
+        selected = self._non_overlapping(matches)
+        if not selected:
+            return text
+
+        parts: list[str] = []
+        cursor = 0
+        for match in selected:
+            parts.append(text[cursor : match.start])
+            parts.append(self._placeholder(match.secret, match.category, context))
+            cursor = match.end
+        parts.append(text[cursor:])
+        return "".join(parts)
+
+    @staticmethod
+    def _normalized_view(text: str) -> _TextView:
+        characters: list[str] = []
+        spans: list[tuple[int, int]] = []
+        for index, source_char in enumerate(text):
+            normalized = unicodedata.normalize("NFKC", source_char)
+            for char in normalized:
+                if unicodedata.category(char) == "Cf":
+                    continue
+                characters.append(char)
+                spans.append((index, index + 1))
+        return _TextView("".join(characters), tuple(spans))
+
+    def _collect_direct_matches(
+        self,
+        source: str,
+        view: _TextView,
+        protected_spans: tuple[tuple[int, int], ...],
+    ) -> list[_Match]:
+        matches: list[_Match] = []
+
+        def add(
+            match: re.Match[str],
+            category: str,
+            *,
+            group: str | int = 0,
+            priority: int,
+        ) -> None:
+            view_start, view_end = match.span(group)
+            source_start, source_end = view.source_span(view_start, view_end)
+            if self._overlaps_spans(source_start, source_end, protected_spans):
+                return
+            secret = source[source_start:source_end]
+            matches.append(
+                _Match(source_start, source_end, secret, category, priority)
             )
 
-        result = _JWT_RE.sub(
-            lambda match: self._placeholder(match.group(0), "jwt", context),
-            result,
-        )
+        for match in _PEM_RE.finditer(view.text):
+            add(match, "private_key", priority=0)
+
+        for match in _AUTHORIZATION_RE.finditer(view.text):
+            secret = match.group("value")
+            add(
+                match,
+                self._classify_secret(secret, "authorization"),
+                group="value",
+                priority=10,
+            )
+        for match in _ASSIGNMENT_RE.finditer(view.text):
+            group = "quoted" if match.group("quoted") is not None else "plain"
+            secret = match.group(group)
+            fallback = self._sensitive_field_category(match.group("name")) or "secret"
+            add(
+                match,
+                self._classify_secret(secret, fallback),
+                group=group,
+                priority=10,
+            )
+        for match in _BEARER_RE.finditer(view.text):
+            secret = match.group("value")
+            add(
+                match,
+                self._classify_secret(secret, "bearer_token"),
+                group="value",
+                priority=10,
+            )
+        for category, pattern in _PROVIDER_PATTERNS:
+            for match in pattern.finditer(view.text):
+                add(match, category, priority=20)
+        for match in _JWT_RE.finditer(view.text):
+            add(match, "jwt", priority=20)
 
         if self.policy.redact_home_paths:
-            result = _HOME_PATH_RE.sub(
-                lambda match: self._placeholder(match.group(0), "home_path", context),
-                result,
-            )
+            for match in _HOME_PATH_RE.finditer(view.text):
+                add(match, "home_path", priority=30)
         if self.policy.redact_emails:
-            result = _EMAIL_RE.sub(
-                lambda match: self._placeholder(match.group(0), "email", context),
-                result,
-            )
+            for match in _EMAIL_RE.finditer(view.text):
+                add(match, "email", priority=30)
         if self.policy.redact_ipv4:
-            result = _IPV4_CANDIDATE_RE.sub(
-                lambda match: self._replace_ip(match, context, version=4),
-                result,
+            self._collect_ip_matches(
+                view,
+                source,
+                _IPV4_CANDIDATE_RE,
+                version=4,
+                protected_spans=protected_spans,
+                matches=matches,
             )
         if self.policy.redact_ipv6:
-            result = _IPV6_CANDIDATE_RE.sub(
-                lambda match: self._replace_ip(match, context, version=6),
-                result,
+            self._collect_ip_matches(
+                view,
+                source,
+                _IPV6_CANDIDATE_RE,
+                version=6,
+                protected_spans=protected_spans,
+                matches=matches,
             )
         if self.policy.redact_internal_hostnames:
-            result = _INTERNAL_HOST_RE.sub(
-                lambda match: self._placeholder(
-                    match.group(0), "internal_hostname", context
-                ),
-                result,
-            )
-        if self.policy.entropy_enabled:
-            result = self._redact_entropy(result, context)
-        return result
+            for match in _INTERNAL_HOST_RE.finditer(view.text):
+                add(match, "internal_hostname", priority=30)
+        return matches
 
-    def _replace_authorization(
-        self,
-        match: re.Match[str],
-        context: _RedactionContext,
-    ) -> str:
-        secret = match.group("value")
-        category = self._classify_secret(secret, "authorization")
-        return (
-            f"{match.group('prefix')}{match.group('scheme') or ''}"
-            f"{self._placeholder(secret, category, context)}"
-        )
-
-    def _replace_bearer(
-        self,
-        match: re.Match[str],
-        context: _RedactionContext,
-    ) -> str:
-        secret = match.group("value")
-        category = self._classify_secret(secret, "bearer_token")
-        return f"{match.group('prefix')}{self._placeholder(secret, category, context)}"
-
-    def _replace_assignment(
-        self,
-        match: re.Match[str],
-        context: _RedactionContext,
-    ) -> str:
-        quote = match.group("quote") or ""
-        secret = match.group("quoted") or match.group("plain")
-        fallback = self._sensitive_field_category(match.group("name")) or "secret"
-        category = self._classify_secret(secret, fallback)
-        placeholder = self._placeholder(secret, category, context)
-        return f"{match.group('prefix')}{quote}{placeholder}{quote}"
-
-    def _replace_ip(
-        self,
-        match: re.Match[str],
-        context: _RedactionContext,
+    @staticmethod
+    def _collect_ip_matches(
+        view: _TextView,
+        source: str,
+        pattern: re.Pattern[str],
         *,
         version: int,
-    ) -> str:
-        candidate = match.group(0)
+        protected_spans: tuple[tuple[int, int], ...],
+        matches: list[_Match],
+    ) -> None:
+        for match in pattern.finditer(view.text):
+            candidate = match.group(0)
+            try:
+                address = ipaddress.ip_address(candidate)
+            except ValueError:
+                continue
+            if address.version != version:
+                continue
+            start, end = view.source_span(*match.span())
+            if Redactor._overlaps_spans(start, end, protected_spans):
+                continue
+            matches.append(
+                _Match(start, end, source[start:end], f"ipv{version}", 30)
+            )
+
+    def _collect_decoded_matches(
+        self,
+        text: str,
+        protected_spans: tuple[tuple[int, int], ...],
+    ) -> list[_Match]:
+        image_spans = tuple(match.span() for match in _IMAGE_DATA_URI_RE.finditer(text))
+        matches: list[_Match] = []
+        patterns = (
+            ("percent", _PERCENT_CANDIDATE_RE),
+            ("hex", _HEX_DECODE_CANDIDATE_RE),
+            ("base64", _BASE64_DECODE_CANDIDATE_RE),
+        )
+        for encoding, pattern in patterns:
+            for candidate_match in pattern.finditer(text):
+                start, end = candidate_match.span()
+                if self._overlaps_spans(start, end, protected_spans):
+                    continue
+                if self._inside_spans(start, end, image_spans):
+                    continue
+                candidate = candidate_match.group(0)
+                decoded = self._safe_decode(candidate, encoding)
+                if decoded is None:
+                    continue
+                category = self._decoded_secret_category(decoded, depth=1)
+                if category is not None:
+                    matches.append(
+                        _Match(start, end, candidate, category, 5)
+                    )
+        return matches
+
+    def _decoded_secret_category(self, text: str, *, depth: int) -> str | None:
+        view = self._normalized_view(text)
+        direct = self._collect_direct_matches(text, view, ())
+        if direct:
+            return min(direct, key=lambda match: match.priority).category
+        if depth <= 0:
+            return None
+        for encoding, pattern in (
+            ("percent", _PERCENT_CANDIDATE_RE),
+            ("hex", _HEX_DECODE_CANDIDATE_RE),
+            ("base64", _BASE64_DECODE_CANDIDATE_RE),
+        ):
+            for candidate_match in pattern.finditer(text):
+                decoded = self._safe_decode(candidate_match.group(0), encoding)
+                if decoded is None:
+                    continue
+                category = self._decoded_secret_category(decoded, depth=depth - 1)
+                if category is not None:
+                    return category
+        return None
+
+    @staticmethod
+    def _safe_decode(candidate: str, encoding: str) -> str | None:
         try:
-            address = ipaddress.ip_address(candidate)
-        except ValueError:
-            return candidate
-        if address.version != version:
-            return candidate
-        return self._placeholder(candidate, f"ipv{version}", context)
+            if encoding == "percent":
+                decoded_bytes = unquote_to_bytes(candidate)
+                if decoded_bytes == candidate.encode("utf-8"):
+                    return None
+            elif encoding == "hex":
+                if len(candidate) % 2:
+                    return None
+                decoded_bytes = bytes.fromhex(candidate)
+            else:
+                padding = "=" * (-len(candidate) % 4)
+                decoded_bytes = base64.b64decode(
+                    candidate + padding,
+                    altchars=b"-_",
+                    validate=True,
+                )
+            decoded = decoded_bytes.decode("utf-8")
+        except (binascii.Error, UnicodeDecodeError, ValueError):
+            return None
+        if not decoded or any(
+            unicodedata.category(char) == "Cc" and char not in "\t\r\n"
+            for char in decoded
+        ):
+            return None
+        return decoded
 
-    def _redact_entropy(self, text: str, context: _RedactionContext) -> str:
-        protected_spans = tuple(match.span() for match in _IMAGE_DATA_URI_RE.finditer(text))
+    def _collect_entropy_matches(
+        self,
+        text: str,
+        protected_spans: tuple[tuple[int, int], ...],
+    ) -> list[_Match]:
+        image_spans = tuple(match.span() for match in _IMAGE_DATA_URI_RE.finditer(text))
+        matches: list[_Match] = []
 
-        def replace_hex(match: re.Match[str]) -> str:
+        for match in _HEX_RE.finditer(text):
             candidate = match.group(0)
             minimum = max(48, self.policy.entropy_min_length)
             if len(candidate) < minimum or len(candidate) == 40:
-                return candidate
-            if self._inside_spans(match.start(), match.end(), protected_spans):
-                return candidate
+                continue
+            if self._inside_spans(match.start(), match.end(), image_spans):
+                continue
+            if self._overlaps_spans(match.start(), match.end(), protected_spans):
+                continue
             if self._looks_like_hash_label(text, match.start()):
-                return candidate
+                continue
             if self._shannon_entropy(candidate) < self.policy.entropy_threshold:
-                return candidate
-            return self._placeholder(candidate, "high_entropy_hex", context)
+                continue
+            matches.append(
+                _Match(
+                    match.start(),
+                    match.end(),
+                    candidate,
+                    "high_entropy_hex",
+                    40,
+                )
+            )
 
-        result = _HEX_RE.sub(replace_hex, text)
-        protected_spans = tuple(match.span() for match in _IMAGE_DATA_URI_RE.finditer(result))
-
-        def replace_base64(match: re.Match[str]) -> str:
+        for match in _BASE64_RE.finditer(text):
             candidate = match.group(0)
-            if len(candidate.rstrip("=")) < self.policy.entropy_min_length:
-                return candidate
-            if self._inside_spans(match.start(), match.end(), protected_spans):
-                return candidate
+            unpadded = candidate.rstrip("=")
+            if len(unpadded) < self.policy.entropy_min_length:
+                continue
+            if self._inside_spans(match.start(), match.end(), image_spans):
+                continue
+            if self._overlaps_spans(match.start(), match.end(), protected_spans):
+                continue
             if not (
                 any(char.islower() for char in candidate)
                 and any(char.isupper() for char in candidate)
                 and any(char.isdigit() for char in candidate)
             ):
-                return candidate
-            if self._shannon_entropy(candidate.rstrip("=")) < self.policy.entropy_threshold:
-                return candidate
-            return self._placeholder(candidate, "high_entropy_base64", context)
+                continue
+            if self._shannon_entropy(unpadded) < self.policy.entropy_threshold:
+                continue
+            matches.append(
+                _Match(
+                    match.start(),
+                    match.end(),
+                    candidate,
+                    "high_entropy_base64",
+                    40,
+                )
+            )
+        return matches
 
-        return _BASE64_RE.sub(replace_base64, result)
+    @staticmethod
+    def _non_overlapping(matches: list[_Match]) -> tuple[_Match, ...]:
+        selected: list[_Match] = []
+        cursor = 0
+        for match in sorted(
+            matches,
+            key=lambda item: (item.start, item.priority, -(item.end - item.start)),
+        ):
+            if match.start < cursor:
+                continue
+            selected.append(match)
+            cursor = match.end
+        return tuple(selected)
 
     @staticmethod
     def _inside_spans(start: int, end: int, spans: tuple[tuple[int, int], ...]) -> bool:
         return any(start >= span_start and end <= span_end for span_start, span_end in spans)
+
+    @staticmethod
+    def _overlaps_spans(
+        start: int,
+        end: int,
+        spans: tuple[tuple[int, int], ...],
+    ) -> bool:
+        return any(start < span_end and end > span_start for span_start, span_end in spans)
 
     @staticmethod
     def _looks_like_hash_label(text: str, start: int) -> bool:

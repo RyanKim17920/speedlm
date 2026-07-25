@@ -23,6 +23,7 @@ from speedlm.traces.redact import RedactionReport, Redactor
 logger = logging.getLogger(__name__)
 
 _REDACTION_PLACEHOLDER_RE = re.compile(r"<REDACTED:([a-z0-9_]+)>")
+_PROVENANCE_TAGS = {"generated", "client_supplied"}
 
 # ── Exceptions ──────────────────────────────────────────────────────────────
 
@@ -57,7 +58,12 @@ class TraceRedactor(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class TraceRecord:
-    """Immutable record of a proxied chat/completion request."""
+    """Immutable record of a proxied chat/completion request.
+
+    Each message may carry a ``provenance_tag``. Only the exact value
+    ``"generated"`` establishes provider authorship; an absent tag is
+    deliberately treated as client-supplied/unknown by consumers.
+    """
 
     id: str
     timestamp: float
@@ -70,6 +76,8 @@ class TraceRecord:
     prompt_tokens: int | None
     completion_tokens: int | None
     token_count_source: str = "measured"
+    finish_reason: str | None = None
+    stop_reason: int | str | None = None
 
     def __post_init__(self) -> None:
         _validate_record(
@@ -84,6 +92,8 @@ class TraceRecord:
             self.prompt_tokens,
             self.completion_tokens,
             self.token_count_source,
+            self.finish_reason,
+            self.stop_reason,
         )
 
     @property
@@ -107,6 +117,8 @@ class TraceRecord:
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
             "token_count_source": self.token_count_source,
+            "finish_reason": self.finish_reason,
+            "stop_reason": self.stop_reason,
         }
 
     @classmethod
@@ -122,7 +134,8 @@ class TraceRecord:
         missing = required_keys - set(data.keys())
         if missing:
             raise TraceError(f"missing required key: {sorted(missing)[0]}")
-        unknown = set(data.keys()) - required_keys - {"token_count_source"}
+        optional_keys = {"token_count_source", "finish_reason", "stop_reason"}
+        unknown = set(data.keys()) - required_keys - optional_keys
         if unknown:
             raise TraceError(f"unknown key: {sorted(unknown)[0]}")
 
@@ -152,6 +165,8 @@ class TraceRecord:
                 )
                 else "measured",
             ),
+            finish_reason=data.get("finish_reason"),
+            stop_reason=data.get("stop_reason"),
         )
 
 
@@ -167,6 +182,8 @@ def _validate_record(
     prompt_tokens: int | None,
     completion_tokens: int | None,
     token_count_source: str,
+    finish_reason: str | None,
+    stop_reason: int | str | None,
 ) -> None:
     if not isinstance(rid, str) or not rid:
         raise TraceError("id must be a non-empty string")
@@ -188,6 +205,12 @@ def _validate_record(
             raise TraceError(f"messages[{i}]['role'] must be a non-empty string")
         if "content" not in msg:
             raise TraceError(f"messages[{i}] missing 'content'")
+        provenance_tag = msg.get("provenance_tag")
+        if provenance_tag is not None and provenance_tag not in _PROVENANCE_TAGS:
+            raise TraceError(
+                f"messages[{i}]['provenance_tag'] must be "
+                "'generated' or 'client_supplied'"
+            )
     if not isinstance(tool_calls, (tuple, list)):
         raise TraceError("tool_calls must be a sequence")
     for i, tc in enumerate(tool_calls):
@@ -217,6 +240,14 @@ def _validate_record(
             raise TraceError("completion_tokens must be >= 0")
     if token_count_source not in {"measured", "estimated"}:
         raise TraceError("token_count_source must be 'measured' or 'estimated'")
+    if finish_reason is not None and not isinstance(finish_reason, str):
+        raise TraceError("finish_reason must be a string or None")
+    if stop_reason is not None and not (
+        isinstance(stop_reason, str)
+        or not isinstance(stop_reason, bool)
+        and isinstance(stop_reason, int)
+    ):
+        raise TraceError("stop_reason must be a string, int, or None")
 
 
 def estimate_message_tokens(

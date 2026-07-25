@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
 from collections.abc import Sequence
 from pathlib import Path
@@ -138,6 +140,128 @@ def test_vllm_serve_passthrough(
     ]
 
 
+def test_vllm_serve_idle_tuning_fails_loudly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    launched = False
+
+    async def fake_run(*_args, **_kwargs) -> int:
+        nonlocal launched
+        launched = True
+        return 0
+
+    monkeypatch.setenv("SPEEDLM_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "_run_vllm_gateway", fake_run)
+
+    code = main(["vllm", "serve", "my-model", "--enable-idle-tuning"])
+
+    assert code != 0
+    assert not launched
+    assert "--enable-idle-tuning is not available" in capsys.readouterr().err
+
+
+def test_vllm_readiness_error_is_preserved_and_runtime_record_removed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instances = []
+
+    class FailingVLLMProcess:
+        pid = 4321
+
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.shutdown_called = False
+            instances.append(self)
+
+        async def start(self) -> None:
+            return None
+
+        async def wait_ready(self) -> None:
+            assert (tmp_path / "gateway.json").exists()
+            raise cli.ProcessError("vLLM readiness failed")
+
+        async def shutdown(self) -> None:
+            self.shutdown_called = True
+
+    monkeypatch.setenv("SPEEDLM_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "VLLMProcess", FailingVLLMProcess)
+    monkeypatch.setattr(cli, "reserve_loopback_port", lambda: 8123)
+    monkeypatch.setattr(
+        cli,
+        "forwarded_signals",
+        lambda *_args: contextlib.nullcontext(),
+    )
+
+    with pytest.raises(cli.ProcessError, match="vLLM readiness failed"):
+        asyncio.run(
+            cli._run_vllm_gateway(
+                "my-model",
+                wrapper=cli.WrapperConfig(host="127.0.0.1", port=8100),
+                passthrough=[],
+                store=cli.TraceStore(tmp_path / "traces" / "traces.jsonl"),
+            )
+        )
+
+    assert instances[0].shutdown_called
+    assert not (tmp_path / "gateway.json").exists()
+
+
+def test_vllm_version_is_passthrough(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    received: dict[str, object] = {}
+
+    async def fake_run(
+        model,
+        *,
+        wrapper,
+        passthrough,
+        store,
+        enable_tuning=False,
+        activity=None,
+    ) -> int:
+        received["passthrough"] = list(passthrough)
+        return 0
+
+    monkeypatch.setenv("SPEEDLM_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "_run_vllm_gateway", fake_run)
+
+    assert main(["vllm", "serve", "my-model", "--version"]) == 0
+    assert received["passthrough"] == ["--version"]
+    assert "speedlm " not in capsys.readouterr().out
+
+
+def test_vllm_home_is_passthrough_without_changing_speedlm_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    speedlm_home = tmp_path / "speedlm"
+    received: dict[str, object] = {}
+
+    async def fake_run(
+        model,
+        *,
+        wrapper,
+        passthrough,
+        store,
+        enable_tuning=False,
+        activity=None,
+    ) -> int:
+        received["passthrough"] = list(passthrough)
+        return 0
+
+    monkeypatch.setenv("SPEEDLM_HOME", str(speedlm_home))
+    monkeypatch.setattr(cli, "_run_vllm_gateway", fake_run)
+
+    assert main(["vllm", "serve", "my-model", "--home", "/vllm/home"]) == 0
+    assert received["passthrough"] == ["--home", "/vllm/home"]
+    assert speedlm_home.is_dir()
+
+
 def test_status_fresh_home(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
     home = tmp_path / "fresh"
     monkeypatch.setenv("SPEEDLM_HOME", str(home))
@@ -224,15 +348,23 @@ def test_gain_reports_persisted_decision(
     assert "tok/s" not in out.out
 
 
-def test_status_home_flag_overrides_env(
+@pytest.mark.parametrize("joined", [False, True])
+def test_status_home_flag_forms_override_default_without_touching_it(
+    joined: bool,
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
-    monkeypatch.setenv("SPEEDLM_HOME", str(tmp_path / "ignored"))
+    default = tmp_path / "user-home" / ".speedlm"
     override = tmp_path / "override"
-    code = main(["--home", str(override), "status"])
+    monkeypatch.delenv("SPEEDLM_HOME", raising=False)
+    monkeypatch.setenv("HOME", str(default.parent))
+    home_args = [f"--home={override}"] if joined else ["--home", str(override)]
+
+    code = main([*home_args, "status"])
+
     assert code == 0
     out = capsys.readouterr()
     assert str(override) in out.out
+    assert not default.exists()
 
 
 @pytest.mark.parametrize(

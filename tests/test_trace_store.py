@@ -4,6 +4,7 @@ from __future__ import annotations
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -44,7 +45,7 @@ def _rec(
 
 class TestRecordRoundTrip:
     def test_to_dict_from_dict_identity(self) -> None:
-        rec = _rec()
+        rec = replace(_rec(), finish_reason="stop", stop_reason=128009)
         d = rec.to_dict()
         rec2 = TraceRecord.from_dict(d)
         assert rec == rec2
@@ -69,15 +70,34 @@ class TestRecordRoundTrip:
     def test_legacy_zero_pair_is_inferred_as_estimated(self, tmp_path: Path) -> None:
         payload = _rec(prompt_tokens=0, completion_tokens=0).to_dict()
         del payload["token_count_source"]
+        del payload["finish_reason"]
+        del payload["stop_reason"]
 
         rec = TraceRecord.from_dict(payload)
         assert rec.token_count_source == "estimated"
+        assert rec.finish_reason is None
+        assert rec.stop_reason is None
 
         store = TraceStore(tmp_path / "t.jsonl")
         store.append(rec)
         stats = store.stats()
         assert stats.measured_tokens == 0
         assert stats.estimated_tokens == 0
+
+    def test_message_provenance_round_trip_and_legacy_default(self) -> None:
+        tagged = _rec().to_dict()
+        tagged["messages"][0]["provenance_tag"] = "client_supplied"
+        tagged["messages"][1]["provenance_tag"] = "generated"
+
+        record = TraceRecord.from_dict(tagged)
+
+        assert record.to_dict()["messages"] == tagged["messages"]
+
+        legacy = _rec().to_dict()
+        assert all(
+            message.get("provenance_tag") != "generated"
+            for message in TraceRecord.from_dict(legacy).messages
+        )
 
 
 # ── TraceRecord validation rejections ──────────────────────────────────────
@@ -146,6 +166,27 @@ class TestRecordValidation:
                 temperature=True,  # type: ignore[arg-type]
                 top_p=1.0,
                 seed=0, prompt_tokens=0, completion_tokens=0,
+            )
+
+    def test_invalid_message_provenance_tag(self) -> None:
+        with pytest.raises(TraceError, match="provenance_tag"):
+            TraceRecord(
+                id="x",
+                timestamp=1.0,
+                model="m",
+                messages=(
+                    {
+                        "role": "assistant",
+                        "content": "c",
+                        "provenance_tag": "untrusted",
+                    },
+                ),
+                tool_calls=(),
+                temperature=0.0,
+                top_p=1.0,
+                seed=0,
+                prompt_tokens=0,
+                completion_tokens=0,
             )
 
 

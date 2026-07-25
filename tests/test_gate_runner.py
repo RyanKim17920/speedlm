@@ -12,7 +12,7 @@ from speedlm.config import SamplingConfig, SpeedLMConfig
 from speedlm.gate.decide import Reason, Verdict
 from speedlm.gate.replay import ReplayResult, RequestResult, RunResults
 from speedlm.gate.runner import BenchmarkGateRunner
-from speedlm.gate.suite import BenchmarkSuite
+from speedlm.gate.suite import BenchmarkSuite, FrozenContext, SuiteError
 from speedlm.traces.store import TraceRecord
 
 
@@ -199,6 +199,7 @@ def _runner(
     scrapes: list[str],
     replay: FakeReplayExecutor | None = None,
     trace_source: FakeTraceSource | None = None,
+    training_context_hashes: set[str] | frozenset[str] | None = frozenset(),
     clock: Callable[[], float] | None = None,
 ) -> tuple[BenchmarkGateRunner, FakeEndpoint, FakeReplayExecutor, FakeTraceSource]:
     endpoint = FakeEndpoint()
@@ -212,6 +213,7 @@ def _runner(
         endpoint=endpoint,
         metrics_source=FakeMetricsSource(scrapes),
         replay_executor=replay_executor,
+        training_context_hashes=training_context_hashes,
         clock=clock or FakeClock(),
     )
     return runner, endpoint, replay_executor, traces
@@ -364,3 +366,40 @@ def test_existing_frozen_suite_is_loaded_without_rereading_traces(tmp_path: Path
 
     assert result.decision is not None
     assert traces.reads == 1
+
+
+def test_gate_refuses_to_run_without_training_provenance(tmp_path: Path) -> None:
+    runner, endpoint, replay, _ = _runner(
+        tmp_path,
+        scrapes=_normal_scrapes(),
+        training_context_hashes=None,
+    )
+
+    with pytest.raises(SuiteError, match="Cannot prove benchmark suite is held out"):
+        runner.benchmark(
+            tmp_path / "candidate",
+            timeout_seconds=30,
+            should_abort=lambda: False,
+        )
+
+    assert endpoint.activations == []
+    assert replay.calls == 0
+
+
+def test_gate_fails_loudly_on_training_suite_overlap(tmp_path: Path) -> None:
+    context_hash = FrozenContext.from_trace(_trace()).context_hash
+    runner, endpoint, replay, _ = _runner(
+        tmp_path,
+        scrapes=_normal_scrapes(),
+        training_context_hashes={context_hash},
+    )
+
+    with pytest.raises(SuiteError, match="context leakage detected"):
+        runner.benchmark(
+            tmp_path / "candidate",
+            timeout_seconds=30,
+            should_abort=lambda: False,
+        )
+
+    assert endpoint.activations == []
+    assert replay.calls == 0

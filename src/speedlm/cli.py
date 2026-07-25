@@ -9,13 +9,12 @@ import sys
 from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import uvicorn
 
 from speedlm import __version__
 from speedlm.config import ConfigError, SamplingConfig, WrapperConfig, load_config
-from speedlm.doctor import CheckStatus, ExecutionMode, run_doctor
+from speedlm.doctor import CheckStatus, run_doctor
 from speedlm.gateway.activity import ActivityTracker
 from speedlm.gateway.app import create_app
 from speedlm.gateway.process import (
@@ -32,84 +31,13 @@ from speedlm.storage import StorageError, ensure_layout, resolve_layout
 from speedlm.traces.normalize import NormalizeError, normalize_file
 from speedlm.traces.store import TraceError, TraceStore
 
-if TYPE_CHECKING:
-    from speedlm.tuner.service import TunerService
-
 logger = logging.getLogger("speedlm.cli")
 
-
-def _try_build_tuner_service(
-    model: str,
-    store: TraceStore,
-    activity: ActivityTracker,
-) -> TunerService | None:
-    """Attempt to construct the idle tuner service.
-
-    Returns None if construction fails for any reason, so that serving
-    continues even when tuning cannot be set up.
-    """
-    try:
-        from speedlm.config import SpeedLMConfig
-        from speedlm.doctor import run_doctor
-        from speedlm.storage import ensure_layout, resolve_layout
-        from speedlm.training.backends.eagle3 import Eagle3Backend
-        from speedlm.tuner.service import create_tuner_service
-    except ImportError as exc:
-        logger.warning("idle tuner dependencies not available: %s", exc)
-        return None
-
-    try:
-        layout = resolve_layout()
-        config_path = layout.root / "config.json"
-        config = load_config(config_path) if config_path.exists() else None
-        doctor_report = run_doctor(config, home=layout.root)
-        if doctor_report.execution_mode is ExecutionMode.UNAVAILABLE:
-            logger.info(
-                "idle tuner refused: doctor reports execution mode %s — %s",
-                doctor_report.execution_mode.value,
-                doctor_report.plan.detail,
-            )
-            return None
-    except Exception as exc:
-        logger.warning("could not run doctor to check GPU for tuning: %s", exc)
-        return None
-
-    try:
-        cfg = SpeedLMConfig(model=model, tuning_enabled=True)
-        _layout = ensure_layout()
-
-        backend = Eagle3Backend.__new__(Eagle3Backend)  # noqa: F405
-
-        from speedlm.gate.runner import BenchmarkGateRunner
-        from speedlm.gateway.control import RuntimeController
-
-        gate = BenchmarkGateRunner(
-            config=cfg,
-            trace_source=store,
-            suite_dir=_layout.runs_dir / "gate",
-            stock_draft="",
-            endpoint=None,  # type: ignore[arg-type]
-            metrics_source=None,  # type: ignore[arg-type]
-        )
-        runtime = RuntimeController(
-            activity=activity,
-            admission=None,  # type: ignore[arg-type]
-            http=None,  # type: ignore[arg-type]
-            process=None,  # type: ignore[arg-type]
-            active_draft="",
-        )
-        return create_tuner_service(
-            cfg,
-            activity=activity,
-            traces=store,
-            backend=backend,
-            gate=gate,
-            runtime=runtime,
-            enabled=True,
-        )
-    except Exception as exc:
-        logger.warning("idle tuner construction failed: %s", exc)
-        return None
+_IDLE_TUNING_UNAVAILABLE = (
+    "--enable-idle-tuning is not available: production tuner collaborators "
+    "are not fully wired"
+)
+_COMMANDS = frozenset({"vllm", "traces", "status", "gain", "doctor"})
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -185,9 +113,15 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _cmd_vllm_serve(
-    model: str, host: str, port: int, passthrough: list[str],
+    model: str,
+    host: str,
+    port: int,
+    passthrough: list[str],
     enable_tuning: bool = False,
 ) -> int:
+    if enable_tuning:
+        sys.stderr.write(f"[speedlm] error: {_IDLE_TUNING_UNAVAILABLE}\n")
+        return 1
     try:
         wrapper = WrapperConfig(host=host, port=port)
         layout = ensure_layout()
@@ -223,6 +157,9 @@ async def _run_vllm_gateway(
     enable_tuning: bool = False,
     activity: ActivityTracker | None = None,
 ) -> int:
+    if enable_tuning:
+        raise RuntimeError(_IDLE_TUNING_UNAVAILABLE)
+
     tracker = activity or ActivityTracker()
 
     child_port = reserve_loopback_port()
@@ -242,6 +179,7 @@ async def _run_vllm_gateway(
     )
     received_signal: int | None = None
     server: _GatewayServer | None = None
+    tuner_service: object | None = None
 
     def on_signal(signum: int) -> None:
         nonlocal received_signal
@@ -302,18 +240,6 @@ async def _run_vllm_gateway(
                 return 0 if server.started else 1
 
             server_task = asyncio.create_task(serve())
-            # Build and start the idle tuner after the gateway server is up
-            tuner_service: object | None = None
-            if enable_tuning:
-                tuner_service = _try_build_tuner_service(model, store, tracker)
-                if tuner_service is not None:
-                    try:
-                        tuner_service.start()
-                        logger.info("idle tuner service started")
-                    except Exception as exc:
-                        logger.warning("idle tuner start failed: %s", exc)
-                        tuner_service = None
-
             child_task = asyncio.create_task(child.wait())
             done, _ = await asyncio.wait(
                 {server_task, child_task},
@@ -478,23 +404,45 @@ def _cmd_doctor(as_json: bool) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _scan_global_options(argv: Sequence[str]) -> tuple[str | None, bool]:
+    """Read SpeedLM globals without inspecting wrapped-command arguments."""
+    home: str | None = None
+    show_version = False
+    index = 0
+    while index < len(argv):
+        argument = argv[index]
+        if argument in _COMMANDS:
+            break
+        if argument == "--home":
+            if index + 1 < len(argv):
+                home = argv[index + 1]
+            index += 2
+            continue
+        if argument.startswith("--home="):
+            home = argument.partition("=")[2]
+        elif argument == "--version":
+            show_version = True
+        index += 1
+    return home, show_version
+
+
 def main(argv: Sequence[str] | None = None) -> int:
+    logging.basicConfig(
+        level=logging.WARNING,
+        format="[speedlm] %(levelname)s: %(message)s",
+    )
     parser = _build_parser()
 
     if argv is None:
         argv = sys.argv[1:]
 
-    # Pre-scan for --home to set env before layout resolution
-    home_idx = None
-    for i, arg in enumerate(argv):
-        if arg == "--home":
-            home_idx = i
-            break
-    if home_idx is not None and home_idx + 1 < len(argv):
-        os.environ["SPEEDLM_HOME"] = argv[home_idx + 1]
+    # Stop at the subcommand: later options belong to the wrapped command.
+    home, show_version = _scan_global_options(argv)
+    if home is not None:
+        os.environ["SPEEDLM_HOME"] = home
 
-    # Handle --version before argparse
-    if "--version" in argv:
+    # Only a global --version is ours; a later one is a vLLM passthrough option.
+    if show_version:
         sys.stdout.write(f"speedlm {__version__}\n")
         return 0
 

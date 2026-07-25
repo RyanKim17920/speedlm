@@ -5,6 +5,7 @@ import json
 import logging
 import time
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any
 
 from speedlm.config import SamplingConfig
@@ -13,6 +14,9 @@ from speedlm.traces.normalize import normalize_record
 from speedlm.traces.store import TraceStore
 
 logger = logging.getLogger(__name__)
+
+_CAPTURE_ENDPOINTS = {"/v1/chat/completions", "/v1/completions"}
+_REASONING_FIELDS = {"reasoning_content", "reasoning", "thinking"}
 
 
 class CaptureManager:
@@ -37,6 +41,9 @@ class CaptureManager:
         timestamp: float,
     ) -> None:
         """Schedule one capture; validation and I/O failures are logged and dropped."""
+        if endpoint not in _CAPTURE_ENDPOINTS:
+            logger.info("skipping trace capture for unsupported endpoint: %s", endpoint)
+            return
         task = asyncio.create_task(
             self._capture(request_data, response, endpoint=endpoint, timestamp=timestamp)
         )
@@ -71,6 +78,11 @@ class CaptureManager:
                 defaults=self._defaults,
                 default_model=default_model if isinstance(default_model, str) else None,
             )
+            record = replace(
+                record,
+                finish_reason=response.finish_reason,
+                stop_reason=response.stop_reason,
+            )
             await asyncio.to_thread(self._store.append, record)
         except Exception as exc:
             logger.warning("dropping failed trace capture: %s", exc)
@@ -96,23 +108,39 @@ def _build_raw_record(
         if not isinstance(raw_messages, list):
             raise ValueError("chat request has no messages list")
         messages = [
-            dict(message) if isinstance(message, dict) else message
+            {**message, "provenance_tag": "client_supplied"}
+            if isinstance(message, dict)
+            else message
             for message in raw_messages
         ]
     elif endpoint == "/v1/completions":
         prompt = request_data.get("prompt")
         if not isinstance(prompt, (str, list)):
             raise ValueError("completion request has no supported prompt")
-        messages = [{"role": "user", "content": prompt}]
+        messages = [
+            {
+                "role": "user",
+                "content": prompt,
+                "provenance_tag": "client_supplied",
+            }
+        ]
     else:
         raise ValueError(f"unsupported capture endpoint: {endpoint}")
 
     assistant: dict[str, Any] = {
         "role": "assistant",
         "content": response.content,
+        "provenance_tag": "generated",
     }
     if response.tool_calls:
         assistant["tool_calls"] = [dict(call) for call in response.tool_calls]
+    if response.reasoning_content is not None:
+        assistant["reasoning_content"] = response.reasoning_content
+        if (
+            response.reasoning_field in _REASONING_FIELDS
+            and response.reasoning_field != "reasoning_content"
+        ):
+            assistant[response.reasoning_field] = response.reasoning_content
     messages.append(assistant)
 
     result: dict[str, Any] = {
@@ -123,6 +151,8 @@ def _build_raw_record(
             "prompt_tokens": response.prompt_tokens,
             "completion_tokens": response.completion_tokens,
         },
+        "finish_reason": response.finish_reason,
+        "stop_reason": response.stop_reason,
     }
     if response.id is not None:
         result["id"] = response.id

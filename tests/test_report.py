@@ -507,6 +507,25 @@ def test_gain_accepts_new_unmeasured_decision_with_null_deltas(home: Path) -> No
     assert "not measured" in report.render_text()
 
 
+def test_gain_reports_zero_stock_throughput_as_unmeasured(home: Path) -> None:
+    _write_decision(
+        home,
+        _decision_dict(
+            verdict="reject",
+            reason="throughput_unavailable",
+            acceptance_delta_pp=None,
+            throughput_delta_pct=None,
+            num_repeats=3,
+        ),
+    )
+
+    report = build_gain_report(now=1_000.0)
+
+    assert report.status is GainStatus.NOT_MEASURED
+    assert report.to_dict()["measurement"] is None
+    assert "no measurable throughput" in report.render_text()
+
+
 # ---------------------------------------------------------------------------
 # decision discovery / parsing
 # ---------------------------------------------------------------------------

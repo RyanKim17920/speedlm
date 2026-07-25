@@ -179,6 +179,21 @@ def test_reject_when_only_throughput_clears() -> None:
     assert dec.reason == Reason.ACCEPTANCE_BELOW_THRESHOLD
 
 
+def test_zero_stock_throughput_is_unmeasured_not_a_threshold_miss() -> None:
+    """A zero denominator cannot honestly produce a throughput delta."""
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.6, output_tok_per_sec=0.0),
+        _make_delta(acceptance_rate=0.7, output_tok_per_sec=100.0),
+        _valid_runs_with_tps(100.0),
+        _valid_runs_with_tps(100.0),
+        _pcfg(),
+    )
+
+    assert dec.verdict is Verdict.REJECT
+    assert dec.reason is Reason.THROUGHPUT_UNAVAILABLE
+    _assert_unmeasured_deltas(dec)
+
+
 def test_reject_on_counter_reset() -> None:
     """REJECT when counter reset is detected in stock metrics."""
     stock_metrics = _make_delta(reset_detected=True)

@@ -28,7 +28,7 @@ class _CharacterTokenizer:
 
 @pytest.mark.xfail(
     strict=True,
-    reason="captured client history carries no authorship provenance beyond client-set role",
+    reason="training rows do not yet exclude client_supplied assistant messages",
 )
 def test_client_supplied_assistant_turn_must_not_be_supervised() -> None:
     marker = "CLIENT_AUTHORED_ASSISTANT_TEXT"
@@ -65,6 +65,35 @@ def test_client_supplied_assistant_turn_must_not_be_supervised() -> None:
     )
 
     assert marker not in supervised
+
+
+def test_capture_assigns_trustworthy_per_message_provenance() -> None:
+    raw = _build_raw_record(
+        {
+            "model": "test-model",
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": "client history",
+                    "provenance_tag": "generated",
+                }
+            ],
+        },
+        AssembledResponse(
+            id="response-1",
+            model="test-model",
+            created=1_700_000_000.0,
+            content="provider response",
+            tool_calls=(),
+            prompt_tokens=5,
+            completion_tokens=2,
+        ),
+        endpoint="/v1/chat/completions",
+        timestamp=1_700_000_000.0,
+    )
+
+    assert raw["messages"][0]["provenance_tag"] == "client_supplied"
+    assert raw["messages"][-1]["provenance_tag"] == "generated"
 
 
 def test_one_large_assistant_message_can_dominate_sum_reduced_loss() -> None:

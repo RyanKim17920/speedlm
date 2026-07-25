@@ -215,6 +215,13 @@ def _fake_upstream(state: dict[str, Any]) -> FastAPI:
     async def chat(request: Request) -> Response:
         body = await request.json()
         if not body.get("stream"):
+            message: dict[str, Any] = {
+                "role": "assistant",
+                "content": "hello",
+                "tool_calls": [],
+            }
+            if isinstance(body.get("test_reasoning"), str):
+                message["reasoning"] = body["test_reasoning"]
             payload = {
                 "id": "chat-nonstream",
                 "created": 1_700_000_000,
@@ -222,11 +229,9 @@ def _fake_upstream(state: dict[str, Any]) -> FastAPI:
                 "choices": [
                     {
                         "index": 0,
-                        "message": {
-                            "role": "assistant",
-                            "content": "hello",
-                            "tool_calls": [],
-                        },
+                        "message": message,
+                        "finish_reason": "stop",
+                        "stop_reason": 128009,
                     }
                 ],
                 "usage": {"prompt_tokens": 3, "completion_tokens": 2},
@@ -238,6 +243,12 @@ def _fake_upstream(state: dict[str, Any]) -> FastAPI:
             )
 
         async def events() -> AsyncIterator[bytes]:
+            reasoning = body.get("test_reasoning")
+            reasoning_parts = (
+                [reasoning[: len(reasoning) // 2], reasoning[len(reasoning) // 2 :]]
+                if isinstance(reasoning, str)
+                else [None, None]
+            )
             chunks = [
                 {
                     "id": "chat-stream",
@@ -249,6 +260,7 @@ def _fake_upstream(state: dict[str, Any]) -> FastAPI:
                             "delta": {
                                 "role": "assistant",
                                 "content": "call ",
+                                "reasoning": reasoning_parts[0],
                                 "tool_calls": [
                                     {
                                         "index": 0,
@@ -270,6 +282,7 @@ def _fake_upstream(state: dict[str, Any]) -> FastAPI:
                             "index": 0,
                             "delta": {
                                 "content": "done",
+                                "reasoning": reasoning_parts[1],
                                 "tool_calls": [
                                     {
                                         "index": 0,
@@ -277,6 +290,8 @@ def _fake_upstream(state: dict[str, Any]) -> FastAPI:
                                     }
                                 ],
                             },
+                            "finish_reason": "tool_calls",
+                            "stop_reason": "end",
                         }
                     ],
                     "usage": {"prompt_tokens": 8, "completion_tokens": 5},
@@ -357,9 +372,10 @@ async def _close_clients(
     await upstream.aclose()
 
 
-def test_non_streaming_passthrough_preserves_body_and_status() -> None:
+def test_non_streaming_passthrough_preserves_body_and_status(tmp_path: Path) -> None:
     async def scenario() -> None:
-        client, upstream, _, gateway = await _clients()
+        store = TraceStore(tmp_path / "traces.jsonl")
+        client, upstream, _, gateway = await _clients(store=store)
         try:
             response = await client.get("/v1/passthrough")
             assert response.status_code == 201
@@ -367,6 +383,7 @@ def test_non_streaming_passthrough_preserves_body_and_status() -> None:
             assert response.headers["x-upstream"] == "yes"
         finally:
             await _close_clients(client, upstream, gateway)
+        assert not store.path.exists()
 
     asyncio.run(scenario())
 
@@ -428,10 +445,12 @@ def test_sse_reconstruction_with_multichunk_tool_call() -> None:
     assembler = SSEAssembler("/v1/chat/completions")
     events = [
         b'data: {"id":"x","model":"m","choices":[{"index":0,"delta":',
-        b'{"content":"hi","tool_calls":[{"index":0,"id":"tc","type":"function",',
+        b'{"content":"hi","reasoning":"check ","tool_calls":'
+        b'[{"index":0,"id":"tc","type":"function",',
         b'"function":{"name":"f","arguments":"{\\"x\\":"}}]}}]}\n\n',
-        b'data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,',
-        b'"function":{"arguments":"1}"}}]}}],"usage":{"prompt_tokens":4,',
+        b'data: {"choices":[{"index":0,"delta":{"reasoning":"this",'
+        b'"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]},'
+        b'"finish_reason":"tool_calls","stop_reason":7}],"usage":{"prompt_tokens":4,',
         b'"completion_tokens":2}}\n\ndata: [DONE]\n\n',
     ]
     for chunk in events:
@@ -447,6 +466,10 @@ def test_sse_reconstruction_with_multichunk_tool_call() -> None:
     )
     assert result.prompt_tokens == 4
     assert result.completion_tokens == 2
+    assert result.reasoning_content == "check this"
+    assert result.reasoning_field == "reasoning"
+    assert result.finish_reason == "tool_calls"
+    assert result.stop_reason == 7
     assert assembler.done
 
 
@@ -471,7 +494,13 @@ def test_json_response_without_usage_keeps_token_counts_unknown() -> None:
                 "choices": [
                     {
                         "index": 0,
-                        "message": {"role": "assistant", "content": "hello"},
+                        "message": {
+                            "role": "assistant",
+                            "content": "hello",
+                            "thinking": "carefully",
+                        },
+                        "finish_reason": "stop",
+                        "stop_reason": "eos",
                     }
                 ]
             }
@@ -482,6 +511,10 @@ def test_json_response_without_usage_keeps_token_counts_unknown() -> None:
     assert result is not None
     assert result.prompt_tokens is None
     assert result.completion_tokens is None
+    assert result.reasoning_content == "carefully"
+    assert result.reasoning_field == "thinking"
+    assert result.finish_reason == "stop"
+    assert result.stop_reason == "eos"
 
 
 def test_client_disconnect_cancels_upstream() -> None:
@@ -538,6 +571,7 @@ def test_capture_writes_exactly_one_trace(
                     "top_p": 0.9,
                     "seed": 7,
                     "stream": True,
+                    "test_reasoning": "inspect the tool arguments",
                 },
             )
             assert response.status_code == 200
@@ -549,10 +583,17 @@ def test_capture_writes_exactly_one_trace(
         record = records[0]
         assert record.model == "upstream-model"
         assert record.messages[-1]["content"] == "call done"
+        assert (
+            record.messages[-1]["reasoning_content"]
+            == "inspect the tool arguments"
+        )
+        assert record.messages[-1]["reasoning"] == "inspect the tool arguments"
         assert record.messages[-1]["tool_calls"] == list(record.tool_calls)
         assert record.tool_calls[0]["function"]["arguments"] == '{"city":"Paris"}'
         assert record.prompt_tokens == 8
         assert record.completion_tokens == 5
+        assert record.finish_reason == "tool_calls"
+        assert record.stop_reason == "end"
         assert (record.temperature, record.top_p, record.seed) == (0.2, 0.9, 7)
 
     asyncio.run(scenario())
@@ -570,6 +611,7 @@ def test_capture_without_usage_estimates_instead_of_recording_zero(
     async def scenario() -> None:
         store = TraceStore(tmp_path / "traces.jsonl")
         client, upstream, _, gateway = await _clients(store=store)
+        secret = "api_key=EXAMPLEFAKESECRET123456"
         try:
             response = await client.post(
                 "/v1/chat/completions",
@@ -577,6 +619,7 @@ def test_capture_without_usage_estimates_instead_of_recording_zero(
                     "model": "request-model",
                     "messages": [{"role": "user", "content": "hi"}],
                     "omit_usage": True,
+                    "test_reasoning": secret,
                 },
             )
             assert response.status_code == 200
@@ -586,6 +629,15 @@ def test_capture_without_usage_estimates_instead_of_recording_zero(
         records = list(store.iter_records())
         assert len(records) == 1
         record = records[0]
+        assert secret.encode() not in store.path.read_bytes()
+        assert record.messages[-1]["reasoning_content"] == (
+            "api_key=<REDACTED:api_key>"
+        )
+        assert record.messages[-1]["reasoning"] == (
+            "api_key=<REDACTED:api_key>"
+        )
+        assert record.finish_reason == "stop"
+        assert record.stop_reason == 128009
         assert record.token_count_source == "estimated"
         assert record.prompt_tokens
         assert record.completion_tokens

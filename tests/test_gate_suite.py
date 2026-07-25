@@ -40,7 +40,46 @@ def test_suite_build_deterministic_hash() -> None:
     suite1 = BenchmarkSuite.build(records)
     suite2 = BenchmarkSuite.build(records)
     assert suite1.suite_hash == suite2.suite_hash
-    assert len(suite1.contexts) == len(records)
+    assert len(suite1.contexts) == 1
+
+
+def test_suite_build_honors_held_out_fraction() -> None:
+    """build includes only the requested deterministic held-out subset."""
+    records = [_make_record(f"r{i}", f"content-{i}") for i in range(10)]
+
+    suite = BenchmarkSuite.build(records, held_out_fraction=0.3)
+    reversed_suite = BenchmarkSuite.build(
+        list(reversed(records)),
+        held_out_fraction=0.3,
+    )
+
+    assert len(suite.contexts) == 3
+    assert suite.suite_hash == reversed_suite.suite_hash
+
+
+def test_suite_build_honors_split_seed() -> None:
+    """Changing the split seed changes the deterministic held-out subset."""
+    records = [_make_record(f"r{i}", f"content-{i}") for i in range(10)]
+
+    seed_one = BenchmarkSuite.build(records, held_out_fraction=0.3, seed=1)
+    seed_two = BenchmarkSuite.build(records, held_out_fraction=0.3, seed=2)
+
+    assert seed_one.suite_hash != seed_two.suite_hash
+
+
+def test_suite_build_keeps_duplicate_contexts_on_one_side() -> None:
+    """Content-identical records cannot straddle the deterministic split."""
+    records = [
+        _make_record("duplicate-a", "same"),
+        _make_record("duplicate-b", "same"),
+        _make_record("other", "other"),
+    ]
+
+    suite = BenchmarkSuite.build(records, held_out_fraction=0.5)
+    selected_hashes = [context.context_hash for context in suite.contexts]
+
+    duplicate_hash = FrozenContext.from_trace(records[0]).context_hash
+    assert selected_hashes.count(duplicate_hash) in {0, 2}
 
 
 def test_suite_context_hash_deterministic() -> None:
@@ -160,7 +199,11 @@ def test_build_with_split_no_leakage() -> None:
         _make_record("h1", "held-out-1"),
         _make_record("h2", "held-out-2"),
     ]
-    suite = BenchmarkSuite.build_with_split(train, all_recs)
+    suite = BenchmarkSuite.build_with_split(
+        train,
+        all_recs,
+        held_out_fraction=1.0,
+    )
     # Should have only 2 contexts (the non-train ones)
     assert len(suite.contexts) == 2
 
@@ -196,3 +239,14 @@ def test_suite_invalid_fraction_raises() -> None:
         except SuiteError as exc:
             err = exc
         assert err is not None
+
+
+def test_suite_zero_fraction_raises_when_nothing_is_reserved() -> None:
+    records = [_make_record("r1", "hello")]
+
+    try:
+        BenchmarkSuite.build(records, held_out_fraction=0.0)
+    except SuiteError as exc:
+        assert "No held-out records selected" in str(exc)
+    else:
+        raise AssertionError("zero held-out fraction must not produce a suite")

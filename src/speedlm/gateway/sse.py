@@ -4,6 +4,9 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
+_SUPPORTED_ENDPOINTS = {"/v1/chat/completions", "/v1/completions"}
+_REASONING_FIELDS = ("reasoning_content", "reasoning", "thinking")
+
 
 @dataclass(frozen=True, slots=True)
 class AssembledResponse:
@@ -16,6 +19,10 @@ class AssembledResponse:
     tool_calls: tuple[dict[str, Any], ...]
     prompt_tokens: int | None
     completion_tokens: int | None
+    reasoning_content: str | None = None
+    reasoning_field: str | None = None
+    finish_reason: str | None = None
+    stop_reason: int | str | None = None
 
 
 @dataclass(slots=True)
@@ -63,20 +70,21 @@ class SSEAssembler:
     """
 
     def __init__(self, endpoint: str) -> None:
-        if endpoint not in {"/v1/chat/completions", "/v1/completions"}:
-            raise ValueError(f"unsupported SSE endpoint: {endpoint}")
         self._endpoint = endpoint
         self._line_buffer = bytearray()
         self._event_data: list[bytes] = []
         self._content: list[str] = []
+        self._reasoning: dict[str, list[str]] = {}
         self._tool_calls: dict[int, _ToolCall] = {}
         self._id: str | None = None
         self._model: str | None = None
         self._created: float | None = None
         self._prompt_tokens: int | None = None
         self._completion_tokens: int | None = None
+        self._finish_reason: str | None = None
+        self._stop_reason: int | str | None = None
         self._done = False
-        self._valid = True
+        self._valid = endpoint in _SUPPORTED_ENDPOINTS
         self._saw_choice = False
 
     @property
@@ -111,6 +119,10 @@ class SSEAssembler:
             self._consume_line(line)
         if self._event_data:
             self._consume_event()
+        reasoning_field = next(iter(self._reasoning), None)
+        reasoning_parts = (
+            self._reasoning[reasoning_field] if reasoning_field is not None else []
+        )
         return AssembledResponse(
             id=self._id,
             model=self._model,
@@ -121,6 +133,12 @@ class SSEAssembler:
             ),
             prompt_tokens=self._prompt_tokens,
             completion_tokens=self._completion_tokens,
+            reasoning_content=(
+                "".join(reasoning_parts) if reasoning_parts else None
+            ),
+            reasoning_field=reasoning_field,
+            finish_reason=self._finish_reason,
+            stop_reason=self._stop_reason,
         )
 
     def _consume_line(self, line: bytes) -> None:
@@ -177,6 +195,7 @@ class SSEAssembler:
         for choice in choices:
             if not isinstance(choice, dict) or choice.get("index", 0) != 0:
                 continue
+            self._consume_finish_details(choice)
             if self._endpoint == "/v1/completions":
                 text = choice.get("text")
                 if isinstance(text, str):
@@ -190,6 +209,7 @@ class SSEAssembler:
             content = delta.get("content")
             if isinstance(content, str):
                 self._content.append(content)
+            self._consume_reasoning(delta)
             tool_calls = delta.get("tool_calls")
             if not isinstance(tool_calls, list):
                 continue
@@ -200,6 +220,29 @@ class SSEAssembler:
                 if isinstance(index, bool) or not isinstance(index, int) or index < 0:
                     continue
                 self._tool_calls.setdefault(index, _ToolCall()).update(raw_call)
+
+    def _consume_reasoning(self, delta: dict[str, Any]) -> None:
+        for field in _REASONING_FIELDS:
+            value = delta.get(field)
+            if isinstance(value, str):
+                self._reasoning.setdefault(field, []).append(value)
+
+    def _consume_finish_details(self, choice: dict[str, Any]) -> None:
+        finish_reason = choice.get("finish_reason")
+        if isinstance(finish_reason, str):
+            self._finish_reason = finish_reason
+        elif finish_reason is not None:
+            self._valid = False
+
+        stop_reason = choice.get("stop_reason")
+        if (
+            isinstance(stop_reason, str)
+            or not isinstance(stop_reason, bool)
+            and isinstance(stop_reason, int)
+        ):
+            self._stop_reason = stop_reason
+        elif stop_reason is not None:
+            self._valid = False
 
     def _consume_usage(self, usage: Any) -> None:
         if usage is None:
@@ -229,7 +272,7 @@ class SSEAssembler:
 
 def parse_json_response(body: bytes, endpoint: str) -> AssembledResponse | None:
     """Parse a non-streaming OpenAI response, returning ``None`` fail-closed."""
-    if endpoint not in {"/v1/chat/completions", "/v1/completions"}:
+    if endpoint not in _SUPPORTED_ENDPOINTS:
         return None
     try:
         payload = json.loads(body)
@@ -250,6 +293,8 @@ def parse_json_response(body: bytes, endpoint: str) -> AssembledResponse | None:
         return None
 
     content: str | None
+    reasoning_content: str | None = None
+    reasoning_field: str | None = None
     tool_calls: tuple[dict[str, Any], ...] = ()
     if endpoint == "/v1/completions":
         text = choice.get("text")
@@ -264,6 +309,15 @@ def parse_json_response(body: bytes, endpoint: str) -> AssembledResponse | None:
         if raw_content is not None and not isinstance(raw_content, str):
             return None
         content = raw_content
+        for field in _REASONING_FIELDS:
+            raw_reasoning = message.get(field)
+            if raw_reasoning is None:
+                continue
+            if not isinstance(raw_reasoning, str):
+                return None
+            reasoning_content = raw_reasoning
+            reasoning_field = field
+            break
         raw_tool_calls = message.get("tool_calls", [])
         if not isinstance(raw_tool_calls, list) or not all(
             isinstance(call, dict) for call in raw_tool_calls
@@ -277,6 +331,16 @@ def parse_json_response(body: bytes, endpoint: str) -> AssembledResponse | None:
     response_id = payload.get("id")
     model = payload.get("model")
     created = payload.get("created")
+    finish_reason = choice.get("finish_reason")
+    if finish_reason is not None and not isinstance(finish_reason, str):
+        return None
+    stop_reason = choice.get("stop_reason")
+    if stop_reason is not None and not (
+        isinstance(stop_reason, str)
+        or not isinstance(stop_reason, bool)
+        and isinstance(stop_reason, int)
+    ):
+        return None
     return AssembledResponse(
         id=response_id if isinstance(response_id, str) and response_id else None,
         model=model if isinstance(model, str) and model else None,
@@ -291,6 +355,10 @@ def parse_json_response(body: bytes, endpoint: str) -> AssembledResponse | None:
         tool_calls=tool_calls,
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
+        reasoning_content=reasoning_content,
+        reasoning_field=reasoning_field,
+        finish_reason=finish_reason,
+        stop_reason=stop_reason,
     )
 
 

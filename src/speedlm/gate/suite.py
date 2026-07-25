@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -126,13 +127,15 @@ class BenchmarkSuite:
     ) -> BenchmarkSuite:
         """Build a suite from trace records, reserving held_out_fraction.
 
-        Uses a deterministic hash-based split so the same input always
-        yields the same suite.
+        Ranks unique context hashes with ``seed`` and reserves
+        ``ceil(unique_contexts * held_out_fraction)`` of them. The same input
+        always yields the same suite, and duplicate contexts cannot straddle
+        the split.
 
         Args:
             records: Ordered trace records.
-            held_out_fraction: Fraction of records to include in suite.
-            seed: Seed for the hash-based split (fixed at 42).
+            held_out_fraction: Fraction of unique contexts to include in suite.
+            seed: Seed for the hash-based split (defaults to 42).
 
         Returns:
             A new immutable :class:`BenchmarkSuite`.
@@ -140,17 +143,43 @@ class BenchmarkSuite:
         Raises:
             SuiteError: If fewer than 1 record survives filtering.
         """
-        if held_out_fraction < 0 or held_out_fraction > 1:
+        if (
+            isinstance(held_out_fraction, bool)
+            or not isinstance(held_out_fraction, (int, float))
+            or not math.isfinite(held_out_fraction)
+            or held_out_fraction < 0
+            or held_out_fraction > 1
+        ):
             raise SuiteError(
                 f"held_out_fraction must be in [0, 1], got {held_out_fraction}"
             )
+        if isinstance(seed, bool) or not isinstance(seed, int):
+            raise SuiteError(f"seed must be an integer, got {seed!r}")
 
         if not records:
             raise SuiteError("Cannot build suite from empty record list")
 
-        contexts = tuple(
-            FrozenContext.from_trace(rec) for rec in records
+        record_hashes = tuple(cls._record_hash(rec) for rec in records)
+        unique_hashes = set(record_hashes)
+        held_out_count = math.ceil(len(unique_hashes) * held_out_fraction)
+        ranked_hashes = sorted(
+            unique_hashes,
+            key=lambda context_hash: (
+                hashlib.sha256(f"{seed}:{context_hash}".encode("ascii")).digest(),
+                context_hash,
+            ),
         )
+        held_out_hashes = set(ranked_hashes[:held_out_count])
+        contexts = tuple(
+            FrozenContext.from_trace(rec)
+            for rec, context_hash in zip(records, record_hashes, strict=True)
+            if context_hash in held_out_hashes
+        )
+        if not contexts:
+            raise SuiteError(
+                "No held-out records selected; held_out_fraction must reserve "
+                "at least one context"
+            )
 
         suite_hash = cls._compute_hash(contexts)
 

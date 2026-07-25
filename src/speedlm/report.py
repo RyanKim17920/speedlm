@@ -60,6 +60,7 @@ UNMEASURED_REASONS: Final[frozenset[Reason]] = frozenset(
     {
         Reason.COUNTER_RESET,
         Reason.ACCEPTANCE_UNAVAILABLE,
+        Reason.THROUGHPUT_UNAVAILABLE,
         Reason.TOO_FEW_REPEATS,
         Reason.HIGH_INVALID_RATE,
         Reason.OUTPUT_MISMATCH,
@@ -77,6 +78,10 @@ _REASON_EXPLANATIONS: Final[Mapping[Reason, str]] = {
     Reason.ACCEPTANCE_UNAVAILABLE: (
         "vLLM did not expose speculative-decoding acceptance counters, so "
         "acceptance could not be measured"
+    ),
+    Reason.THROUGHPUT_UNAVAILABLE: (
+        "the stock benchmark produced no measurable throughput, so a throughput "
+        "gain could not be computed"
     ),
     Reason.HIGH_INVALID_RATE: "too many replayed requests failed to produce valid output",
     Reason.TOO_FEW_REPEATS: "the benchmark did not complete enough repeats to be meaningful",

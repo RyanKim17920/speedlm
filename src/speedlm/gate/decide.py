@@ -35,6 +35,7 @@ class Reason(Enum):
     THROUGHPUT_BELOW_THRESHOLD = "throughput_below_threshold"
     COUNTER_RESET = "counter_reset"
     ACCEPTANCE_UNAVAILABLE = "acceptance_unavailable"
+    THROUGHPUT_UNAVAILABLE = "throughput_unavailable"
     HIGH_INVALID_RATE = "high_invalid_rate"
     TOO_FEW_REPEATS = "too_few_repeats"
     OUTPUT_MISMATCH = "output_mismatch"
@@ -282,10 +283,25 @@ def decide_promotion(
             cand_tps=c_tps,
         )
 
+    # --- Validation: throughput unavailable ---
+    if s_tps <= 0:
+        return _make_reject(
+            reason=Reason.THROUGHPUT_UNAVAILABLE,
+            acceptance_delta_pp=None,
+            throughput_delta_pct=None,
+            pcfg=promotion_config,
+            num_repeats=min_runs,
+            per_repeat=per_repeat_tuple,
+            stock_acc=s_acc,
+            cand_acc=c_acc,
+            stock_tps=s_tps,
+            cand_tps=c_tps,
+        )
+
     # --- Compute deltas ---
     acceptance_delta_pp = (c_acc - s_acc) * 100.0
 
-    throughput_delta_pct = (c_tps - s_tps) / s_tps * 100.0 if s_tps > 0 else 0.0
+    throughput_delta_pct = (c_tps - s_tps) / s_tps * 100.0
 
     # --- Threshold: acceptance ---
     if acceptance_delta_pp < promotion_config.min_acceptance_delta_pp:

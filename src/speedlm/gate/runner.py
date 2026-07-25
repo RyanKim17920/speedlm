@@ -26,6 +26,7 @@ from speedlm.gate.metrics import (
 from speedlm.gate.replay import ReplayResult, replay_suite
 from speedlm.gate.suite import (
     BenchmarkSuite,
+    SuiteError,
     build_suite,
     load_suite,
     persist_suite,
@@ -163,6 +164,7 @@ class BenchmarkGateRunner:
         replay_executor: ReplayExecutor | None = None,
         repeats: int = 3,
         held_out_fraction: float = 0.2,
+        training_context_hashes: set[str] | frozenset[str] | None = None,
         clock: Clock = time.monotonic,
     ) -> None:
         if isinstance(repeats, bool) or not isinstance(repeats, int) or repeats < 3:
@@ -182,6 +184,11 @@ class BenchmarkGateRunner:
         self._replay_executor = replay_executor or HttpReplayExecutor()
         self._repeats = repeats
         self._held_out_fraction = float(held_out_fraction)
+        self._training_context_hashes = (
+            None
+            if training_context_hashes is None
+            else frozenset(training_context_hashes)
+        )
         self._clock = clock
 
     def benchmark(
@@ -227,6 +234,10 @@ class BenchmarkGateRunner:
 
         try:
             suite = stage("suite preparation", lambda _timeout: self._load_or_build_suite())
+            stage(
+                "suite leakage check",
+                lambda _timeout: self._check_suite_leakage(suite),
+            )
 
             stage(
                 "stock activation",
@@ -324,6 +335,21 @@ class BenchmarkGateRunner:
         )
         persist_suite(suite, self._suite_dir)
         return suite
+
+    def _check_suite_leakage(self, suite: BenchmarkSuite) -> None:
+        if self._training_context_hashes is None:
+            raise SuiteError(
+                "Cannot prove benchmark suite is held out: "
+                "training context hashes were not provided"
+            )
+        overlaps = suite.check_leakage(set(self._training_context_hashes))
+        if overlaps:
+            preview = ", ".join(overlaps[:3])
+            suffix = "" if len(overlaps) <= 3 else f", ... ({len(overlaps)} total)"
+            raise SuiteError(
+                "Training/benchmark context leakage detected: "
+                f"{preview}{suffix}"
+            )
 
     def _scrape(
         self,

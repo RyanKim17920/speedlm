@@ -37,10 +37,6 @@ def _persist(tmp_path: Path, content: object) -> str:
     return store.path.read_text(encoding="utf-8")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="redaction does not decode short base64-encoded assignments",
-)
 def test_base64_encoded_secret_must_not_reach_disk(tmp_path: Path) -> None:
     encoded = base64.b64encode(b"api_key=hunter2").decode("ascii")
 
@@ -49,10 +45,6 @@ def test_base64_encoded_secret_must_not_reach_disk(tmp_path: Path) -> None:
     assert encoded not in stored
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="redaction does not decode short hex-encoded assignments",
-)
 def test_hex_encoded_secret_must_not_reach_disk(tmp_path: Path) -> None:
     encoded = b"api_key=hunter2".hex()
 
@@ -61,10 +53,6 @@ def test_hex_encoded_secret_must_not_reach_disk(tmp_path: Path) -> None:
     assert encoded not in stored
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="redaction does not percent-decode before matching assignments",
-)
 def test_percent_encoded_secret_must_not_reach_disk(tmp_path: Path) -> None:
     encoded = quote("api_key=hunter2", safe="")
 
@@ -73,10 +61,6 @@ def test_percent_encoded_secret_must_not_reach_disk(tmp_path: Path) -> None:
     assert encoded not in stored
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="redaction does not normalize compatibility homoglyphs",
-)
 def test_unicode_homoglyph_secret_must_not_reach_disk(tmp_path: Path) -> None:
     obfuscated = "api＿key＝hunter2"  # full-width underscore and equals
 
@@ -85,10 +69,6 @@ def test_unicode_homoglyph_secret_must_not_reach_disk(tmp_path: Path) -> None:
     assert "hunter2" not in stored
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="zero-width characters split sensitive assignment names",
-)
 def test_zero_width_obfuscated_secret_must_not_reach_disk(tmp_path: Path) -> None:
     obfuscated = "api_\u200bkey=hunter2"
 
@@ -129,10 +109,6 @@ def test_secret_split_across_messages_must_not_reach_disk(tmp_path: Path) -> Non
     assert second not in stored
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="mapping keys are copied without redaction",
-)
 def test_secret_embedded_in_field_name_must_not_reach_disk(tmp_path: Path) -> None:
     sensitive_key = "password=hunter2"
     content = [{"type": "metadata", sensitive_key: "ordinary"}]
@@ -142,10 +118,6 @@ def test_secret_embedded_in_field_name_must_not_reach_disk(tmp_path: Path) -> No
     assert sensitive_key not in stored
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="obfuscated sensitive keys inside tool arguments are not normalized",
-)
 def test_obfuscated_tool_argument_secret_must_not_reach_disk(tmp_path: Path) -> None:
     arguments = json.dumps({"api_\u200bkey": "hunter2"})
     record = TraceRecord(
@@ -181,10 +153,6 @@ def test_obfuscated_tool_argument_secret_must_not_reach_disk(tmp_path: Path) -> 
     assert "hunter2" not in stored
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="PEM matching requires literal header whitespace and dash placement",
-)
 def test_whitespace_obfuscated_pem_must_not_reach_disk(tmp_path: Path) -> None:
     pem = (
         "-----BEGIN\tPRIVATE KEY-----\n"

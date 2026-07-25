@@ -265,6 +265,7 @@ def test_gate_decision_persistence_is_reported_as_measured_gain(
         endpoint=endpoint,
         metrics_source=metrics,
         replay_executor=_Replay(),
+        training_context_hashes=frozenset(),
         clock=lambda: 10.0,
     )
     now = [0.0]
