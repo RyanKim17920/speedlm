@@ -3,10 +3,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
-import json
 import os
 import sys
-import time
 from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -25,7 +23,8 @@ from speedlm.gateway.process import (
     reserve_loopback_port,
 )
 from speedlm.report import ReportError, build_gain_report, build_status_report
-from speedlm.storage import StorageError, atomic_write_json, ensure_layout
+from speedlm.runtime import gateway_runtime_record
+from speedlm.storage import StorageError, ensure_layout
 from speedlm.traces.normalize import NormalizeError, normalize_file
 from speedlm.traces.store import TraceError, TraceStore
 
@@ -137,7 +136,6 @@ async def _run_vllm_gateway(
     )
     received_signal: int | None = None
     server: _GatewayServer | None = None
-    runtime_path = store.path.parent.parent / "gateway.json"
 
     def on_signal(signum: int) -> None:
         nonlocal received_signal
@@ -148,16 +146,19 @@ async def _run_vllm_gateway(
             server.should_exit = True
 
     await child.start()
-    atomic_write_json(
-        runtime_path,
-        {
-            "pid": os.getpid(),
-            "child_pid": child.pid,
-            "host": wrapper.host,
-            "port": wrapper.port,
-            "model": model,
-            "started_at": time.time(),
-        },
+
+    # The runtime record is what makes this gateway visible to `speedlm status`.
+    # It lands in SPEEDLM_HOME (the same home `_cmd_vllm_serve` just ensured) and
+    # is entered on a stack so it is removed *after* the child is reaped, and so
+    # a SIGTERM arriving before uvicorn owns the signals still cleans it up.
+    record_stack = contextlib.ExitStack()
+    record_stack.enter_context(
+        gateway_runtime_record(
+            host=wrapper.host,
+            port=wrapper.port,
+            model=model,
+            child_pid=child.pid,
+        )
     )
     try:
         with forwarded_signals(child, on_signal):
@@ -219,18 +220,7 @@ async def _run_vllm_gateway(
         try:
             await child.shutdown()
         finally:
-            _remove_owned_runtime_record(runtime_path)
-
-
-def _remove_owned_runtime_record(path: Path) -> None:
-    """Remove this process's runtime record without clobbering a replacement."""
-    try:
-        record = json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, json.JSONDecodeError):
-        return
-    if isinstance(record, dict) and record.get("pid") == os.getpid():
-        with contextlib.suppress(OSError):
-            path.unlink()
+            record_stack.close()
 
 
 def _shell_exit_code(returncode: int) -> int:

@@ -44,3 +44,5 @@ htmlcov/
 # Agent tooling
 .serena/
 .claude/settings.local.json
+# E2E run artifacts (logs, SLURM output)
+/log_artifacts/
