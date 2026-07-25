@@ -13,7 +13,6 @@ from typing import Any
 import httpx
 import pytest
 
-
 pytestmark = pytest.mark.e2e
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -57,7 +56,9 @@ def _wait_for_gateway(url: str, process: subprocess.Popen[bytes], timeout: float
             except httpx.HTTPError as exc:
                 last_error = repr(exc)
             time.sleep(0.25)
-    raise AssertionError(f"gateway did not become ready within {timeout}s; last error: {last_error}")
+    raise AssertionError(
+        f"gateway did not become ready within {timeout}s; last error: {last_error}"
+    )
 
 
 def _post_json(
@@ -102,6 +103,7 @@ def _stream_chat(
     raw_chunks: list[tuple[float, bytes]] = []
     events: list[dict[str, Any]] = []
     saw_done = False
+    line_buffer = bytearray()
     started = time.monotonic()
     with client.stream("POST", url, json=payload) as response:
         assert response.status_code == 200, response.read().decode("utf-8", errors="replace")
@@ -109,7 +111,11 @@ def _stream_chat(
         for chunk in response.iter_raw():
             elapsed = time.monotonic() - started
             raw_chunks.append((elapsed, chunk))
-            for line in chunk.decode("utf-8", errors="strict").splitlines():
+            line_buffer.extend(chunk)
+            while b"\n" in line_buffer:
+                raw_line, _, remainder = line_buffer.partition(b"\n")
+                line_buffer[:] = remainder
+                line = raw_line.rstrip(b"\r").decode("utf-8", errors="strict")
                 if not line.startswith("data:"):
                     continue
                 data = line[5:].strip()
@@ -117,6 +123,7 @@ def _stream_chat(
                     saw_done = True
                 elif data:
                     events.append(json.loads(data))
+    assert not line_buffer.strip(), f"unterminated SSE bytes: {bytes(line_buffer)!r}"
 
     artifact.write_text(
         "".join(
