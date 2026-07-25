@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import base64
 import json
 import time
 from typing import Any
+from urllib.parse import quote
 
 import pytest
 
@@ -248,6 +250,29 @@ def test_same_secret_gets_same_placeholder_and_is_counted_twice() -> None:
     assert report.counts == {"github_token": 2}
 
 
+def test_existing_placeholder_is_immune_to_all_detection_passes() -> None:
+    placeholder = "<REDACTED:github_token>"
+
+    redacted, report = Redactor().redact_text(placeholder)
+
+    assert redacted == placeholder
+    assert report.total == 0
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        base64.b64encode(base64.b64encode(b"api_key=hunter2")).decode("ascii"),
+        quote(quote("api_key=hunter2", safe=""), safe=""),
+    ],
+)
+def test_decoded_secret_scan_is_depth_limited_to_two_levels(encoded: str) -> None:
+    redacted, report = Redactor().redact_text(encoded)
+
+    assert redacted == "<REDACTED:api_key>"
+    assert report.counts == {"api_key": 1}
+
+
 def test_ordinary_code_and_prose_are_not_over_redacted() -> None:
     git_sha = "9f2c7b40e18d9474b847eb01ff6c3e80a3d218fc"
     uuid = "123e4567-e89b-12d3-a456-426614174000"
@@ -272,6 +297,17 @@ def test_ordinary_code_and_prose_are_not_over_redacted() -> None:
     redacted, report = Redactor().redact_text(text)
 
     assert redacted == text
+    assert report.total == 0
+
+
+def test_bare_base64_image_blob_is_not_redacted() -> None:
+    image_blob = base64.b64encode(
+        b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 2
+    ).decode("ascii")
+
+    redacted, report = Redactor().redact_text(image_blob)
+
+    assert redacted == image_blob
     assert report.total == 0
 
 

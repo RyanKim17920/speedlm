@@ -616,6 +616,8 @@ class Redactor:
                 continue
             if self._overlaps_spans(match.start(), match.end(), protected_spans):
                 continue
+            if self._looks_like_base64_image(candidate):
+                continue
             if not (
                 any(char.islower() for char in candidate)
                 and any(char.isupper() for char in candidate)
@@ -634,6 +636,33 @@ class Redactor:
                 )
             )
         return matches
+
+    @staticmethod
+    def _looks_like_base64_image(candidate: str) -> bool:
+        try:
+            padding = "=" * (-len(candidate) % 4)
+            decoded = base64.b64decode(
+                candidate + padding,
+                altchars=b"-_",
+                validate=True,
+            )
+        except (binascii.Error, ValueError):
+            return False
+        signatures = (
+            b"\x89PNG\r\n\x1a\n",
+            b"\xff\xd8\xff",
+            b"GIF87a",
+            b"GIF89a",
+            b"BM",
+            b"II*\x00",
+            b"MM\x00*",
+            b"\x00\x00\x01\x00",
+        )
+        return decoded.startswith(signatures) or (
+            decoded.startswith(b"RIFF")
+            and len(decoded) >= 12
+            and decoded[8:12] == b"WEBP"
+        )
 
     @staticmethod
     def _non_overlapping(matches: list[_Match]) -> tuple[_Match, ...]:

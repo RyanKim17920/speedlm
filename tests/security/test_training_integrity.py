@@ -92,8 +92,10 @@ def test_capture_assigns_trustworthy_per_message_provenance() -> None:
         timestamp=1_700_000_000.0,
     )
 
-    assert raw["messages"][0]["provenance_tag"] == "client_supplied"
-    assert raw["messages"][-1]["provenance_tag"] == "generated"
+    trace = normalize_record(raw, defaults=SamplingConfig())
+
+    assert trace.messages[0]["provenance_tag"] == "client_supplied"
+    assert trace.messages[-1]["provenance_tag"] == "generated"
 
 
 def test_one_large_assistant_message_can_dominate_sum_reduced_loss() -> None:
