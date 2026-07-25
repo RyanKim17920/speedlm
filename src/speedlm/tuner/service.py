@@ -1,0 +1,422 @@
+"""Opt-in background service for idle speculative tuning."""
+
+from __future__ import annotations
+
+import logging
+import time
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
+from pathlib import Path
+from threading import Event, Lock, Thread, current_thread
+from typing import Protocol
+
+from speedlm.config import SpeedLMConfig
+from speedlm.profiles import ModelProfile, resolve_profile
+from speedlm.storage import ensure_layout
+from speedlm.traces.store import TraceStats
+from speedlm.training.base import SpeculatorBackend
+from speedlm.tuner.artifacts import ArtifactRegistry
+from speedlm.tuner.idle import ActivitySource, IdleDetector
+from speedlm.tuner.orchestrator import (
+    BenchmarkGate,
+    CycleOutcome,
+    CycleResult,
+    OrchestratorTimeouts,
+    RuntimeController,
+    TunerOrchestrator,
+)
+from speedlm.tuner.state import TunerStateMachine
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_POLL_INTERVAL_SECONDS = 1.0
+DEFAULT_MIN_TRACE_RECORDS = 32
+
+
+class TunerServiceConfigurationError(ValueError):
+    """Raised when service dependencies disagree with the selected profile."""
+
+
+class TunerServiceStopError(RuntimeError):
+    """Raised when a tuner worker does not stop within the requested timeout."""
+
+
+class TraceStatsSource(Protocol):
+    """Trace-buffer surface used by the scheduling policy."""
+
+    def stats(self) -> TraceStats: ...
+
+
+class CycleRunner(Protocol):
+    """Orchestrator surface needed by :class:`TunerService`."""
+
+    def run_once(self) -> CycleResult: ...
+
+    def recover(self) -> tuple[str, ...]: ...
+
+
+OrchestratorFactory = Callable[[ActivitySource], CycleRunner]
+
+
+@dataclass(frozen=True, slots=True)
+class _TraceWatermark:
+    count: int
+    tokens: int
+    oldest: float | None
+    newest: float | None
+    unknown_token_records: int
+
+    @classmethod
+    def from_stats(cls, stats: TraceStats) -> _TraceWatermark:
+        return cls(
+            count=stats.count,
+            tokens=stats.tokens,
+            oldest=stats.oldest,
+            newest=stats.newest,
+            unknown_token_records=stats.unknown_token_records,
+        )
+
+
+class _PreemptibleActivitySource:
+    """Add service shutdown to the gateway's request-driven abort signal."""
+
+    def __init__(self, source: ActivitySource, stop_requested: Event) -> None:
+        self._source = source
+        self._stop_requested = stop_requested
+
+    @property
+    def in_flight(self) -> int:
+        if self._stop_requested.is_set():
+            return max(1, self._source.in_flight)
+        return self._source.in_flight
+
+    @property
+    def last_activity(self) -> float:
+        if self._stop_requested.is_set():
+            return float("inf")
+        return self._source.last_activity
+
+
+def build_tuner_orchestrator(
+    config: SpeedLMConfig,
+    *,
+    activity: ActivitySource,
+    backend: SpeculatorBackend,
+    gate: BenchmarkGate,
+    runtime: RuntimeController,
+    home: Path | None = None,
+    profiles: Mapping[str, ModelProfile] | None = None,
+    state: TunerStateMachine | None = None,
+    artifacts: ArtifactRegistry | None = None,
+    work_root: Path | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    timeouts: OrchestratorTimeouts | None = None,
+    run_id_factory: Callable[[], str] | None = None,
+) -> TunerOrchestrator:
+    """Assemble a ready orchestrator from config and concrete effect objects.
+
+    The profile is resolved before any durable tuner objects are created, and
+    the injected backend must describe the same verifier and draft. This keeps
+    an explicit profile selection from silently training the wrong model pair.
+    """
+
+    profile = resolve_profile(
+        {"model": config.model, "profile": config.profile},
+        profiles=profiles,
+        home=home,
+    )
+    _validate_backend_profile(profile, backend)
+
+    layout = ensure_layout(home)
+    state_machine = state or TunerStateMachine(layout.runs_dir)
+    artifact_registry = artifacts or ArtifactRegistry(layout.runs_dir)
+
+    kwargs: dict[str, object] = {}
+    if timeouts is not None:
+        kwargs["timeouts"] = timeouts
+    if run_id_factory is not None:
+        kwargs["run_id_factory"] = run_id_factory
+
+    return TunerOrchestrator(
+        state=state_machine,
+        idle=IdleDetector(
+            activity,
+            threshold_seconds=config.idle_threshold_seconds,
+            clock=clock,
+        ),
+        backend=backend,
+        artifacts=artifact_registry,
+        runtime=runtime,
+        gate=gate,
+        work_root=work_root or layout.runs_dir,
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+def create_tuner_service(
+    config: SpeedLMConfig,
+    *,
+    activity: ActivitySource,
+    traces: TraceStatsSource,
+    backend: SpeculatorBackend,
+    gate: BenchmarkGate,
+    runtime: RuntimeController,
+    enabled: bool | None = None,
+    min_trace_records: int = DEFAULT_MIN_TRACE_RECORDS,
+    poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
+    home: Path | None = None,
+    profiles: Mapping[str, ModelProfile] | None = None,
+    state: TunerStateMachine | None = None,
+    artifacts: ArtifactRegistry | None = None,
+    work_root: Path | None = None,
+    clock: Callable[[], float] = time.monotonic,
+    timeouts: OrchestratorTimeouts | None = None,
+    run_id_factory: Callable[[], str] | None = None,
+) -> TunerService:
+    """Create the production service while retaining every effect seam.
+
+    ``enabled`` defaults to ``config.tuning_enabled`` when that config seam is
+    available, and otherwise to ``False``. An explicit argument permits CLI
+    wiring before or independently of persisted configuration.
+    """
+
+    def orchestrator_factory(cycle_activity: ActivitySource) -> TunerOrchestrator:
+        return build_tuner_orchestrator(
+            config,
+            activity=cycle_activity,
+            backend=backend,
+            gate=gate,
+            runtime=runtime,
+            home=home,
+            profiles=profiles,
+            state=state,
+            artifacts=artifacts,
+            work_root=work_root,
+            clock=clock,
+            timeouts=timeouts,
+            run_id_factory=run_id_factory,
+        )
+
+    return TunerService(
+        config,
+        activity=activity,
+        traces=traces,
+        orchestrator_factory=orchestrator_factory,
+        enabled=enabled,
+        min_trace_records=min_trace_records,
+        poll_interval_seconds=poll_interval_seconds,
+        clock=clock,
+    )
+
+
+class TunerService:
+    """Run at most one tuning cycle for each eligible trace-buffer watermark."""
+
+    def __init__(
+        self,
+        config: SpeedLMConfig,
+        *,
+        activity: ActivitySource,
+        traces: TraceStatsSource,
+        orchestrator_factory: OrchestratorFactory,
+        enabled: bool | None = None,
+        min_trace_records: int = DEFAULT_MIN_TRACE_RECORDS,
+        poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if enabled is None:
+            enabled = getattr(config, "tuning_enabled", False)
+        if not isinstance(enabled, bool):
+            raise TunerServiceConfigurationError("tuning enabled flag must be boolean")
+        if (
+            isinstance(min_trace_records, bool)
+            or not isinstance(min_trace_records, int)
+            or min_trace_records < 1
+        ):
+            raise TunerServiceConfigurationError("min_trace_records must be a positive integer")
+        if (
+            isinstance(poll_interval_seconds, bool)
+            or not isinstance(poll_interval_seconds, (int, float))
+            or poll_interval_seconds <= 0
+        ):
+            raise TunerServiceConfigurationError("poll_interval_seconds must be a positive number")
+
+        self._enabled = enabled
+        self._traces = traces
+        self._min_trace_records = min_trace_records
+        self._poll_interval_seconds = float(poll_interval_seconds)
+        self._stop_requested = Event()
+        self._activity = _PreemptibleActivitySource(activity, self._stop_requested)
+        self._idle = IdleDetector(
+            self._activity,
+            threshold_seconds=config.idle_threshold_seconds,
+            clock=clock,
+        )
+        self._orchestrator = orchestrator_factory(self._activity)
+        self._lock = Lock()
+        self._thread: Thread | None = None
+        self._last_attempted: _TraceWatermark | None = None
+        self._last_result: CycleResult | None = None
+        self._last_error: str | None = None
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    @property
+    def is_running(self) -> bool:
+        with self._lock:
+            return self._thread is not None and self._thread.is_alive()
+
+    @property
+    def last_result(self) -> CycleResult | None:
+        with self._lock:
+            return self._last_result
+
+    @property
+    def last_error(self) -> str | None:
+        with self._lock:
+            return self._last_error
+
+    @property
+    def orchestrator(self) -> CycleRunner:
+        """Return the assembled runner for diagnostics and tests."""
+
+        return self._orchestrator
+
+    def start(self) -> None:
+        """Start the watcher once; disabled services remain inert."""
+
+        if not self._enabled:
+            logger.info("idle tuner is disabled")
+            return
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop_requested.clear()
+            thread = Thread(
+                target=self._run,
+                name="speedlm-idle-tuner",
+                daemon=False,
+            )
+            self._thread = thread
+            thread.start()
+
+    def stop(self, *, timeout_seconds: float | None = None) -> None:
+        """Preempt any active cycle, restore serving, and join the watcher."""
+
+        if timeout_seconds is not None and (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or timeout_seconds <= 0
+        ):
+            raise ValueError("timeout_seconds must be a positive number or None")
+
+        self._stop_requested.set()
+        with self._lock:
+            thread = self._thread
+        if thread is None or thread is current_thread():
+            return
+
+        thread.join(timeout_seconds)
+        if thread.is_alive():
+            raise TunerServiceStopError(
+                f"tuner service did not stop within {timeout_seconds} seconds"
+            )
+        with self._lock:
+            if self._thread is thread:
+                self._thread = None
+
+    def _run(self) -> None:
+        try:
+            while not self._stop_requested.is_set():
+                self._poll_once()
+                self._stop_requested.wait(self._poll_interval_seconds)
+        finally:
+            self._recover_serving("service shutdown")
+
+    def _poll_once(self) -> None:
+        if not self._idle.should_tune or self._stop_requested.is_set():
+            return
+
+        try:
+            watermark = _TraceWatermark.from_stats(self._traces.stats())
+        except Exception as exc:
+            logger.exception("idle tuner could not inspect the trace buffer")
+            self._record_error(exc)
+            return
+
+        if (
+            watermark.count < self._min_trace_records
+            or watermark == self._last_attempted
+            or self._stop_requested.is_set()
+        ):
+            return
+
+        try:
+            result = self._orchestrator.run_once()
+        except Exception as exc:
+            self._last_attempted = watermark
+            logger.exception("idle tuning cycle raised an exception")
+            self._record_error(exc)
+            self._recover_serving("cycle exception")
+            return
+
+        if result.outcome is not CycleOutcome.NOT_IDLE:
+            self._last_attempted = watermark
+        self._record_result(result)
+        if result.outcome in {
+            CycleOutcome.FAILED,
+            CycleOutcome.FINAL_ASSISTANT_MASK_ERROR,
+        }:
+            logger.error("idle tuning cycle failed: %s", result.error or "unknown error")
+            if result.outcome is CycleOutcome.FAILED:
+                self._recover_serving("failed cycle")
+        elif result.outcome is CycleOutcome.PREEMPTED:
+            logger.info("idle tuning cycle preempted by serving activity")
+        elif result.outcome is not CycleOutcome.NOT_IDLE:
+            logger.info("idle tuning cycle completed: %s", result.outcome.value)
+
+    def _record_result(self, result: CycleResult) -> None:
+        with self._lock:
+            self._last_result = result
+            self._last_error = result.error
+
+    def _record_error(self, error: Exception) -> None:
+        with self._lock:
+            self._last_result = None
+            self._last_error = str(error)
+
+    def _recover_serving(self, context: str) -> None:
+        try:
+            errors = self._orchestrator.recover()
+        except Exception:
+            logger.exception("idle tuner could not recover serving during %s", context)
+            return
+        if errors:
+            logger.error(
+                "idle tuner serving recovery had errors during %s: %s",
+                context,
+                "; ".join(errors),
+            )
+
+
+def _validate_backend_profile(
+    profile: ModelProfile,
+    backend: SpeculatorBackend,
+) -> None:
+    if not profile.trainable:
+        raise TunerServiceConfigurationError(
+            f"profile {profile.name!r} uses non-trainable method {profile.speculative_method!r}"
+        )
+    info = backend.describe()
+    if info.verifier_model != profile.verifier_model:
+        raise TunerServiceConfigurationError(
+            f"backend verifier {info.verifier_model!r} does not match profile "
+            f"{profile.name!r} verifier {profile.verifier_model!r}"
+        )
+    if profile.draft_model is not None and info.draft_model != profile.draft_model:
+        raise TunerServiceConfigurationError(
+            f"backend draft {info.draft_model!r} does not match profile "
+            f"{profile.name!r} draft {profile.draft_model!r}"
+        )
