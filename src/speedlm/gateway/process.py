@@ -16,12 +16,15 @@ from typing import BinaryIO, cast
 import httpx
 
 from speedlm.config import (
+    DEFAULT_STARTUP_STALL_SECONDS as CONFIG_DEFAULT_STARTUP_STALL_SECONDS,
+)
+from speedlm.config import (
     DEFAULT_STARTUP_TIMEOUT_SECONDS as CONFIG_DEFAULT_STARTUP_TIMEOUT_SECONDS,
 )
-from speedlm.config import startup_timeout_seconds
+from speedlm.config import startup_stall_seconds, startup_timeout_seconds
 
 DEFAULT_STARTUP_TIMEOUT_SECONDS = CONFIG_DEFAULT_STARTUP_TIMEOUT_SECONDS
-DEFAULT_STARTUP_STALL_SECONDS = 180.0
+DEFAULT_STARTUP_STALL_SECONDS = CONFIG_DEFAULT_STARTUP_STALL_SECONDS
 DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 15.0
 LOG_TAIL_LINES = 20
 LOG_TAIL_MAX_BYTES = 64 * 1024
@@ -73,6 +76,7 @@ class VLLMProcess:
         *,
         health_url: str,
         startup_timeout: float | None = None,
+        startup_stall_timeout: float | None = None,
     ) -> None:
         if not argv:
             raise ValueError("argv must not be empty")
@@ -81,7 +85,13 @@ class VLLMProcess:
         self.startup_timeout = (
             startup_timeout_seconds() if startup_timeout is None else startup_timeout
         )
+        self.startup_stall_timeout = (
+            startup_stall_seconds()
+            if startup_stall_timeout is None
+            else startup_stall_timeout
+        )
         _validate_duration(self.startup_timeout, "startup timeout")
+        _validate_duration(self.startup_stall_timeout, "startup stall timeout")
         self._process: asyncio.subprocess.Process | None = None
         self._log_file: BinaryIO | None = None
         self._log_task: asyncio.Task[None] | None = None
@@ -111,11 +121,14 @@ class VLLMProcess:
         )
         self._log_file = cast(BinaryIO, log_file)
         self._saved_log_tail = None
+        child_env = os.environ.copy()
+        child_env.setdefault("PYTHONUNBUFFERED", "1")
         try:
             self._process = await asyncio.create_subprocess_exec(
                 *self.argv,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                env=child_env,
             )
         except OSError as exc:
             log_file.close()
@@ -128,10 +141,13 @@ class VLLMProcess:
         self,
         *,
         timeout: float | None = None,
-        stall_timeout: float = DEFAULT_STARTUP_STALL_SECONDS,
+        stall_timeout: float | None = None,
         poll_interval: float = 0.25,
     ) -> None:
         timeout = self.startup_timeout if timeout is None else timeout
+        stall_timeout = (
+            self.startup_stall_timeout if stall_timeout is None else stall_timeout
+        )
         _validate_duration(timeout, "startup timeout")
         _validate_duration(stall_timeout, "startup stall timeout")
         _validate_duration(poll_interval, "poll interval")
@@ -140,7 +156,9 @@ class VLLMProcess:
         started_at = loop.time()
         hard_deadline = started_at + timeout
         last_progress_at = started_at
+        last_log_progress_at = started_at
         log_size = self._log_size()
+        cpu_ticks = _process_tree_cpu_ticks(process.pid)
         async with httpx.AsyncClient(
             timeout=httpx.Timeout(1.0),
             follow_redirects=False,
@@ -157,6 +175,16 @@ class VLLMProcess:
                 if current_log_size > log_size:
                     log_size = current_log_size
                     last_progress_at = now
+                    last_log_progress_at = now
+
+                current_cpu_ticks = _process_tree_cpu_ticks(process.pid)
+                cpu_advanced = any(
+                    ticks > cpu_ticks.get(pid, ticks)
+                    for pid, ticks in current_cpu_ticks.items()
+                )
+                cpu_ticks.update(current_cpu_ticks)
+                if cpu_advanced:
+                    last_progress_at = now
 
                 hard_remaining = hard_deadline - now
                 if hard_remaining <= 0:
@@ -166,9 +194,13 @@ class VLLMProcess:
                     )
                 stall_remaining = stall_timeout - (now - last_progress_at)
                 if stall_remaining <= 0:
+                    stalled_for = now - last_progress_at
+                    log_silence = now - last_log_progress_at
                     await self._fail_readiness(
-                        f"vLLM startup stalled: child remained alive but its log did not "
-                        f"grow for {stall_timeout:g} seconds"
+                        f"vLLM startup stalled after {stalled_for:.1f} seconds without "
+                        f"log or CPU progress (log silence: {log_silence:.1f} seconds; "
+                        f"process alive: {'yes' if process.returncode is None else 'no'}; "
+                        "CPU time advanced: no)"
                     )
 
                 attempt_timeout = min(hard_remaining, stall_remaining)
@@ -211,11 +243,11 @@ class VLLMProcess:
             with contextlib.suppress(ProcessLookupError):
                 process.terminate()
             try:
-                returncode = await asyncio.wait_for(process.wait(), timeout=timeout)
+                returncode = await _wait_for_returncode(process, timeout=timeout)
             except TimeoutError:
                 with contextlib.suppress(ProcessLookupError):
                     process.kill()
-                returncode = await process.wait()
+                returncode = await _wait_for_returncode(process)
         await self._finish_log_capture()
         self._saved_log_tail = self._log_tail()
         if self._log_file is not None:
@@ -323,6 +355,71 @@ def _write_stderr(data: bytes) -> None:
         return
     sys.stderr.write(data.decode("utf-8", errors="replace"))
     sys.stderr.flush()
+
+
+def _process_tree_cpu_ticks(root_pid: int) -> dict[int, int]:
+    """Read user and system CPU ticks for a process and its live descendants."""
+    cpu_ticks: dict[int, int] = {}
+    pending = [root_pid]
+    while pending:
+        pid = pending.pop()
+        if pid in cpu_ticks:
+            continue
+        ticks = _process_cpu_ticks(pid)
+        if ticks is None:
+            continue
+        cpu_ticks[pid] = ticks
+        pending.extend(_process_child_pids(pid))
+    return cpu_ticks
+
+
+def _process_cpu_ticks(pid: int) -> int | None:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+    except OSError:
+        return None
+    closing_paren = stat.rfind(")")
+    if closing_paren < 0:
+        return None
+    fields = stat[closing_paren + 2 :].split()
+    try:
+        # fields starts at proc(5)'s field 3 (state); indexes 11/12 are
+        # fields 14/15 (utime/stime).
+        return int(fields[11]) + int(fields[12])
+    except (IndexError, ValueError):
+        return None
+
+
+def _process_child_pids(pid: int) -> set[int]:
+    children: set[int] = set()
+    task_dir = Path(f"/proc/{pid}/task")
+    try:
+        tasks = list(task_dir.iterdir())
+    except OSError:
+        return children
+    for task in tasks:
+        try:
+            raw_children = (task / "children").read_text(encoding="utf-8")
+            children.update(int(child_pid) for child_pid in raw_children.split())
+        except (OSError, ValueError):
+            continue
+    return children
+
+
+async def _wait_for_returncode(
+    process: asyncio.subprocess.Process,
+    *,
+    timeout: float | None = None,
+) -> int:
+    async def poll() -> int:
+        while process.returncode is None:
+            await asyncio.sleep(0.01)
+        return process.returncode
+
+    if timeout is None:
+        return await poll()
+    async with asyncio.timeout(timeout):
+        return await poll()
 
 
 def _validate_duration(value: float, name: str) -> None:
