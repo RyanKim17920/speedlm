@@ -2,11 +2,27 @@ from __future__ import annotations
 
 import contextlib
 import json
+import logging
 import os
+import threading
+import time
 from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+
+try:
+    import fcntl as _fcntl
+except ImportError:  # pragma: no cover - exercised only on non-POSIX platforms
+    _fcntl = None  # type: ignore[assignment]
+
+logger = logging.getLogger(__name__)
+
+_FILE_LOCK_TIMEOUT_SECONDS = 0.25
+_FILE_LOCK_POLL_SECONDS = 0.01
+_THREAD_LOCKS: dict[str, threading.Lock] = {}
+_THREAD_LOCKS_GUARD = threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -122,14 +138,109 @@ def atomic_write_json(path: Path, obj: object) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _thread_lock_for(path: Path) -> threading.Lock:
+    key = os.path.abspath(os.fspath(path))
+    with _THREAD_LOCKS_GUARD:
+        return _THREAD_LOCKS.setdefault(key, threading.Lock())
+
+
+def _file_lock_path(path: Path) -> Path:
+    """Return the stable sidecar locked by both append and atomic rewrite."""
+    return path.with_name(f".{path.name}.lock")
+
+
+@contextmanager
+def _exclusive_file_lock(
+    path: Path,
+    *,
+    timeout: float = _FILE_LOCK_TIMEOUT_SECONDS,
+) -> Iterator[bool]:
+    """Yield whether the bounded exclusive lock for *path* was acquired.
+
+    POSIX uses ``fcntl.flock`` on a stable sidecar so an atomic replacement of
+    *path* cannot invalidate the lock. Platforms without ``fcntl`` fall back to
+    a process-local thread lock; that preserves thread safety but cannot
+    coordinate writers in separate processes.
+    """
+    timeout = max(0.0, timeout)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        logger.warning("dropping write after lock setup failed for %s: %s", path, exc)
+        yield False
+        return
+
+    if _fcntl is None:
+        lock = _thread_lock_for(path)
+        acquired = lock.acquire(timeout=timeout)
+        if not acquired:
+            logger.warning("dropping write after file lock deadline for %s", path)
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            lock.release()
+        return
+
+    lock_path = _file_lock_path(path)
+    try:
+        lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+    except OSError as exc:
+        logger.warning("dropping write after lock open failed for %s: %s", path, exc)
+        yield False
+        return
+
+    acquired = False
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            try:
+                _fcntl.flock(lock_fd, _fcntl.LOCK_EX | _fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    logger.warning("dropping write after file lock deadline for %s", path)
+                    yield False
+                    return
+                time.sleep(min(_FILE_LOCK_POLL_SECONDS, remaining))
+            except OSError as exc:
+                logger.warning("dropping write after file lock failed for %s: %s", path, exc)
+                yield False
+                return
+
+        yield True
+    finally:
+        if acquired:
+            with contextlib.suppress(OSError):
+                _fcntl.flock(lock_fd, _fcntl.LOCK_UN)
+        with contextlib.suppress(OSError):
+            os.close(lock_fd)
+
+
+def _append_jsonl(path: Path, obj: object) -> bool:
+    """Append one JSON line, returning false when the bounded write is dropped."""
+    line = json.dumps(obj) + "\n"
+    with _exclusive_file_lock(path) as acquired:
+        if not acquired:
+            return False
+        try:
+            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+            with os.fdopen(fd, "a", encoding="utf-8") as f:
+                f.write(line)
+                f.flush()
+                os.fsync(f.fileno())
+        except OSError as exc:
+            logger.warning("dropping JSONL write for %s: %s", path, exc)
+            return False
+    return True
+
+
 def append_jsonl(path: Path, obj: object) -> None:
-    """Append a single JSON line to *path*, creating parent dirs if needed."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-    with os.fdopen(fd, "a", encoding="utf-8") as f:
-        f.write(json.dumps(obj) + "\n")
-        f.flush()
-        os.fsync(f.fileno())
+    """Append a JSON line, logging and dropping it if the bounded lock fails."""
+    _append_jsonl(path, obj)
 
 
 def read_jsonl(path: Path) -> Iterator[dict[str, object]]:

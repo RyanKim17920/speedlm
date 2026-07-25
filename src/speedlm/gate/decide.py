@@ -60,8 +60,8 @@ class Decision:
 
     verdict: Verdict
     reason: Reason
-    acceptance_delta_pp: float
-    throughput_delta_pct: float
+    acceptance_delta_pp: float | None
+    throughput_delta_pct: float | None
     min_acceptance_delta_pp: float
     min_throughput_delta_pct: float
     num_repeats: int
@@ -113,8 +113,8 @@ _INVALID_RATE_THRESHOLD = 0.1
 
 def _make_reject(
     reason: Reason,
-    acceptance_delta_pp: float,
-    throughput_delta_pct: float,
+    acceptance_delta_pp: float | None,
+    throughput_delta_pct: float | None,
     pcfg: PromotionConfig,
     num_repeats: int,
     per_repeat: tuple[RepeatSummary, ...],
@@ -176,8 +176,8 @@ def decide_promotion(
     if stock_metrics.reset_detected or candidate_metrics.reset_detected:
         return _make_reject(
             reason=Reason.COUNTER_RESET,
-            acceptance_delta_pp=0.0,
-            throughput_delta_pct=0.0,
+            acceptance_delta_pp=None,
+            throughput_delta_pct=None,
             pcfg=promotion_config,
             num_repeats=0,
             per_repeat=tuple(),
@@ -191,8 +191,8 @@ def decide_promotion(
     if not stock_metrics.acceptance_available or not candidate_metrics.acceptance_available:
         return _make_reject(
             reason=Reason.ACCEPTANCE_UNAVAILABLE,
-            acceptance_delta_pp=0.0,
-            throughput_delta_pct=0.0,
+            acceptance_delta_pp=None,
+            throughput_delta_pct=None,
             pcfg=promotion_config,
             num_repeats=0,
             per_repeat=tuple(),
@@ -210,8 +210,8 @@ def decide_promotion(
     if s_runs < _MIN_REPEATS or c_runs < _MIN_REPEATS:
         return _make_reject(
             reason=Reason.TOO_FEW_REPEATS,
-            acceptance_delta_pp=0.0,
-            throughput_delta_pct=0.0,
+            acceptance_delta_pp=None,
+            throughput_delta_pct=None,
             pcfg=promotion_config,
             num_repeats=min_runs,
             per_repeat=tuple(),
@@ -228,8 +228,8 @@ def decide_promotion(
     ):
         return _make_reject(
             reason=Reason.HIGH_INVALID_RATE,
-            acceptance_delta_pp=0.0,
-            throughput_delta_pct=0.0,
+            acceptance_delta_pp=None,
+            throughput_delta_pct=None,
             pcfg=promotion_config,
             num_repeats=min_runs,
             per_repeat=tuple(),
@@ -271,8 +271,8 @@ def decide_promotion(
     if total_mismatches > max_output_mismatches:
         return _make_reject(
             reason=Reason.OUTPUT_MISMATCH,
-            acceptance_delta_pp=0.0,
-            throughput_delta_pct=0.0,
+            acceptance_delta_pp=None,
+            throughput_delta_pct=None,
             pcfg=promotion_config,
             num_repeats=min_runs,
             per_repeat=per_repeat_tuple,

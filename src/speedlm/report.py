@@ -50,10 +50,11 @@ CONFIG_FILE_NAME: Final = "config.json"
 GATEWAY_FILE_NAME: Final = "gateway.json"
 ACTIVE_FILE_NAME: Final = "active.json"
 STATE_FILE_NAME: Final = "state.json"
+EVENTS_FILE_NAME: Final = "events.jsonl"
 DECISION_FILE_NAME: Final = "decision.json"
 
-#: Reasons whose ``Decision`` carries zeroed deltas because the gate aborted
-#: before it could measure anything.  Their numbers must never be reported.
+#: Reasons for which the gate aborted before it could measure comparable deltas.
+#: Legacy decisions may carry zeroes for these reasons; new decisions use nulls.
 UNMEASURED_REASONS: Final[frozenset[Reason]] = frozenset(
     {
         Reason.COUNTER_RESET,
@@ -609,27 +610,128 @@ def build_status_report(
 # ---------------------------------------------------------------------------
 
 
+def _decision_for_run_id(layout: Layout, run_id: object) -> Path | None:
+    if (
+        not isinstance(run_id, str)
+        or not run_id
+        or Path(run_id).name != run_id
+        or run_id in {".", ".."}
+    ):
+        return None
+    path = layout.runs_dir / run_id / DECISION_FILE_NAME
+    return path if path.is_file() else None
+
+
+def _journal_decision(layout: Layout) -> Path | None:
+    """Bind a decision mtime to the latest benchmark interval in the tuner journal."""
+    state_path = layout.runs_dir / STATE_FILE_NAME
+    events_path = layout.runs_dir / EVENTS_FILE_NAME
+    if not state_path.is_file() or not events_path.is_file():
+        return None
+    try:
+        state = _read_json_object(state_path)
+        state_sequence = _optional_int(state.get("sequence"))
+        state_updated_at = _optional_float(state.get("updated_at"))
+        lines = events_path.read_text(encoding="utf-8").splitlines()
+    except (OSError, ReportError):
+        return None
+    if state_sequence is None or state_updated_at is None:
+        return None
+
+    events: list[tuple[int, float, str | None]] = []
+    try:
+        for line in lines:
+            if not line.strip():
+                continue
+            event = json.loads(line)
+            if not isinstance(event, dict):
+                return None
+            sequence = _optional_int(event.get("sequence"))
+            event_time = _optional_float(event.get("timestamp"))
+            target = event.get("to")
+            if (
+                sequence is None
+                or event_time is None
+                or target is not None
+                and not isinstance(target, str)
+            ):
+                return None
+            if sequence <= state_sequence:
+                events.append((sequence, event_time, target))
+    except json.JSONDecodeError:
+        return None
+
+    benchmark_events = [event for event in events if event[2] == "BENCHMARKING"]
+    if not benchmark_events:
+        return None
+    benchmark_sequence, benchmark_started_at, _ = max(benchmark_events)
+    later_times = [
+        event_time
+        for sequence, event_time, _ in events
+        if sequence > benchmark_sequence
+    ]
+    benchmark_finished_at = (
+        min(later_times) if later_times else state_updated_at
+    )
+    if benchmark_finished_at < benchmark_started_at:
+        return None
+
+    matches: list[Path] = []
+    for path in layout.runs_dir.glob(f"*/{DECISION_FILE_NAME}"):
+        if not path.is_file():
+            continue
+        try:
+            modified_at = path.stat().st_mtime
+        except OSError:
+            continue
+        if benchmark_started_at <= modified_at <= benchmark_finished_at:
+            matches.append(path)
+    return matches[0] if len(matches) == 1 else None
+
+
 def find_latest_decision(layout: Layout) -> Path | None:
-    """Return the most recently modified ``decision.json`` under the runs dir."""
+    """Return the decision belonging to a run known by durable tuner provenance.
+
+    Explicit ``run_id`` links take precedence. Current tuner journals do not
+    persist that link yet, so their latest ``BENCHMARKING`` interval is used to
+    bind exactly one direct-child decision by write time. A lone direct-child
+    decision remains readable as a compatibility path for pre-journal homes;
+    recursive filesystem discovery is deliberately forbidden.
+    """
     runs_dir = layout.runs_dir
     if not runs_dir.is_dir():
         return None
-    candidates: list[Path] = []
-    direct = runs_dir / DECISION_FILE_NAME
-    if direct.is_file():
-        candidates.append(direct)
-    for pattern in (f"*/{DECISION_FILE_NAME}", f"*/*/{DECISION_FILE_NAME}"):
-        candidates.extend(path for path in runs_dir.glob(pattern) if path.is_file())
-    if not candidates:
+
+    provenance_present = False
+    for provenance_path in (
+        runs_dir / STATE_FILE_NAME,
+        *_active_pointer_candidates(layout),
+    ):
+        if not provenance_path.is_file():
+            continue
+        provenance_present = True
+        try:
+            provenance = _read_json_object(provenance_path)
+        except ReportError:
+            continue
+        if "run_id" in provenance:
+            return _decision_for_run_id(layout, provenance["run_id"])
+
+    events_path = runs_dir / EVENTS_FILE_NAME
+    if events_path.is_file():
+        provenance_present = True
+        decision = _journal_decision(layout)
+        if decision is not None:
+            return decision
+    if provenance_present:
         return None
 
-    def _mtime(path: Path) -> tuple[float, str]:
-        try:
-            return (path.stat().st_mtime, str(path))
-        except OSError:
-            return (0.0, str(path))
-
-    return max(candidates, key=_mtime)
+    legacy_candidates = [
+        path
+        for path in runs_dir.glob(f"*/{DECISION_FILE_NAME}")
+        if path.is_file()
+    ]
+    return legacy_candidates[0] if len(legacy_candidates) == 1 else None
 
 
 def _require_float(record: Mapping[str, Any], key: str, source: Path) -> float:
@@ -644,6 +746,22 @@ def _require_int(record: Mapping[str, Any], key: str, source: Path) -> int:
     if value is None:
         raise ReportError(f"{source}: '{key}' must be an integer")
     return value
+
+
+def _parse_delta(
+    record: Mapping[str, Any],
+    key: str,
+    source: Path,
+    *,
+    measured: bool,
+) -> float | None:
+    value = record.get(key)
+    if value is None and not measured:
+        return None
+    parsed = _optional_float(value)
+    if parsed is None:
+        raise ReportError(f"{source}: '{key}' must be numeric")
+    return parsed
 
 
 def _parse_repeat(record: Mapping[str, Any], source: Path) -> RepeatSummary:
@@ -669,6 +787,7 @@ def parse_decision(record: Mapping[str, Any], *, source: Path) -> Decision:
         reason = Reason(record["reason"])
     except (KeyError, TypeError, ValueError) as exc:
         raise ReportError(f"{source}: unusable 'verdict'/'reason'") from exc
+    measured = reason not in UNMEASURED_REASONS
 
     raw_repeats = record.get("per_repeat", [])
     if not isinstance(raw_repeats, list):
@@ -682,8 +801,12 @@ def parse_decision(record: Mapping[str, Any], *, source: Path) -> Decision:
     return Decision(
         verdict=verdict,
         reason=reason,
-        acceptance_delta_pp=_require_float(record, "acceptance_delta_pp", source),
-        throughput_delta_pct=_require_float(record, "throughput_delta_pct", source),
+        acceptance_delta_pp=_parse_delta(
+            record, "acceptance_delta_pp", source, measured=measured
+        ),
+        throughput_delta_pct=_parse_delta(
+            record, "throughput_delta_pct", source, measured=measured
+        ),
         min_acceptance_delta_pp=_require_float(record, "min_acceptance_delta_pp", source),
         min_throughput_delta_pct=_require_float(record, "min_throughput_delta_pct", source),
         num_repeats=_require_int(record, "num_repeats", source),
@@ -740,7 +863,12 @@ class GainReport:
     @property
     def deltas_measured(self) -> bool:
         """True only when the gate actually produced comparable numbers."""
-        return self.decision is not None and self.decision.reason not in UNMEASURED_REASONS
+        return (
+            self.decision is not None
+            and self.decision.reason not in UNMEASURED_REASONS
+            and self.decision.acceptance_delta_pp is not None
+            and self.decision.throughput_delta_pct is not None
+        )
 
     # -- rendering ---------------------------------------------------------
 
@@ -828,6 +956,10 @@ class GainReport:
             lines.append(self.detail)
             return "\n".join(lines)
 
+        acceptance_delta_pp = decision.acceptance_delta_pp
+        throughput_delta_pct = decision.throughput_delta_pct
+        assert acceptance_delta_pp is not None
+        assert throughput_delta_pct is not None
         lines.append(
             f"acceptance stock  : {decision.stock_avg_acceptance * 100:.2f}%"
         )
@@ -835,7 +967,7 @@ class GainReport:
             f"acceptance cand   : {decision.candidate_avg_acceptance * 100:.2f}%"
         )
         lines.append(
-            f"acceptance delta  : {decision.acceptance_delta_pp:+.2f} pp "
+            f"acceptance delta  : {acceptance_delta_pp:+.2f} pp "
             f"(threshold >= {decision.min_acceptance_delta_pp:.2f} pp)"
         )
         lines.append(
@@ -845,7 +977,7 @@ class GainReport:
             f"throughput cand   : {decision.candidate_avg_tok_per_sec:.2f} tok/s"
         )
         lines.append(
-            f"throughput delta  : {decision.throughput_delta_pct:+.2f}% "
+            f"throughput delta  : {throughput_delta_pct:+.2f}% "
             f"(threshold >= {decision.min_throughput_delta_pct:.2f}%)"
         )
         if decision.per_repeat:

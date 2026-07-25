@@ -1,12 +1,15 @@
 """Tests for speedlm.traces.store — TraceRecord, TraceStore, TraceStats."""
 from __future__ import annotations
 
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 import pytest
 
 from speedlm.config import TraceBufferConfig
+from speedlm.storage import _exclusive_file_lock
 from speedlm.traces.store import TraceError, TraceRecord, TraceStats, TraceStore
 
 # ── helpers ─────────────────────────────────────────────────────────────────
@@ -62,6 +65,19 @@ class TestRecordRoundTrip:
     def test_total_tokens(self) -> None:
         rec = _rec(prompt_tokens=200, completion_tokens=300)
         assert rec.total_tokens == 500
+
+    def test_legacy_zero_pair_is_inferred_as_estimated(self, tmp_path: Path) -> None:
+        payload = _rec(prompt_tokens=0, completion_tokens=0).to_dict()
+        del payload["token_count_source"]
+
+        rec = TraceRecord.from_dict(payload)
+        assert rec.token_count_source == "estimated"
+
+        store = TraceStore(tmp_path / "t.jsonl")
+        store.append(rec)
+        stats = store.stats()
+        assert stats.measured_tokens == 0
+        assert stats.estimated_tokens == 0
 
 
 # ── TraceRecord validation rejections ──────────────────────────────────────
@@ -265,6 +281,114 @@ class TestPruneNoOp:
     def test_missing_file_returns_0(self, tmp_path: Path) -> None:
         store = TraceStore(tmp_path / "missing.jsonl")
         assert store.prune() == 0
+
+
+# ── Concurrent append / prune locking ──────────────────────────────────────
+
+
+class TestStoreConcurrency:
+    def test_prune_concurrent_with_appends_loses_no_new_record(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        now = time.time()
+        append_count = 12
+        store = TraceStore(
+            tmp_path / "t.jsonl",
+            max_tokens=append_count * 10,
+            max_age_days=1.0,
+            redaction_enabled=False,
+        )
+        store.append(_rec(rid="expired", ts=now - 2 * 86400, prompt_tokens=10,
+                          completion_tokens=0))
+        barrier = threading.Barrier(append_count + 1)
+
+        def append_new(idx: int) -> object:
+            barrier.wait()
+            return store.append(
+                _rec(
+                    rid=f"new-{idx}",
+                    ts=now + idx / 1_000,
+                    prompt_tokens=10,
+                    completion_tokens=0,
+                )
+            )
+
+        def prune() -> int:
+            barrier.wait()
+            return store.prune(now=now)
+
+        with ThreadPoolExecutor(max_workers=append_count + 1) as pool:
+            append_futures = [pool.submit(append_new, idx) for idx in range(append_count)]
+            prune_future = pool.submit(prune)
+            append_results = [future.result() for future in append_futures]
+            dropped = prune_future.result()
+
+        records = list(store.iter_records())
+        assert all(result is not None for result in append_results)
+        assert dropped == 1
+        assert {record.id for record in records} == {
+            f"new-{idx}" for idx in range(append_count)
+        }
+        assert store.stats().tokens <= append_count * 10
+
+    def test_two_concurrent_prunes_cannot_reintroduce_a_record(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        now = time.time()
+        path = tmp_path / "t.jsonl"
+        loose_store = TraceStore(
+            path,
+            max_tokens=250,
+            max_age_days=365.0,
+            redaction_enabled=False,
+        )
+        strict_store = TraceStore(
+            path,
+            max_tokens=150,
+            max_age_days=365.0,
+            redaction_enabled=False,
+        )
+        for idx in range(3):
+            loose_store.append(
+                _rec(
+                    rid=f"r{idx}",
+                    ts=now - (30 - idx),
+                    prompt_tokens=100,
+                    completion_tokens=0,
+                )
+            )
+
+        barrier = threading.Barrier(2)
+
+        def prune(store: TraceStore) -> int:
+            barrier.wait()
+            return store.prune(now=now)
+
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            futures = [pool.submit(prune, store) for store in (loose_store, strict_store)]
+            dropped = [future.result() for future in futures]
+
+        assert sum(dropped) == 2
+        assert [record.id for record in strict_store.iter_records()] == ["r2"]
+
+    def test_append_drops_capture_when_lock_deadline_expires(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        path = tmp_path / "t.jsonl"
+        store = TraceStore(path, redaction_enabled=False)
+
+        with _exclusive_file_lock(path) as acquired:
+            assert acquired
+            started = time.monotonic()
+            result = store.append(_rec())
+            elapsed = time.monotonic() - started
+
+        assert result is None
+        assert elapsed < 1.0
+        assert not path.exists()
 
 
 # ── Missing file behaviour ─────────────────────────────────────────────────

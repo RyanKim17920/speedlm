@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from pathlib import Path
 
@@ -117,6 +119,27 @@ def test_append_and_read_jsonl(tmp_path: Path) -> None:
     results = list(read_jsonl(path))
     assert len(results) == 3
     assert [r["idx"] for r in results] == [0, 1, 2]
+
+
+def test_concurrent_large_appends_are_complete_json_lines(tmp_path: Path) -> None:
+    path = tmp_path / "large-events.jsonl"
+    worker_count = 16
+    barrier = threading.Barrier(worker_count)
+
+    def append_large_record(idx: int) -> None:
+        barrier.wait()
+        append_jsonl(path, {"idx": idx, "payload": str(idx) * 9_000})
+
+    with ThreadPoolExecutor(max_workers=worker_count) as pool:
+        futures = [pool.submit(append_large_record, idx) for idx in range(worker_count)]
+        for future in futures:
+            future.result()
+
+    lines = path.read_text(encoding="utf-8").splitlines()
+    records = [json.loads(line) for line in lines]
+    assert len(records) == worker_count
+    assert {record["idx"] for record in records} == set(range(worker_count))
+    assert all(len(record["payload"]) >= 9_000 for record in records)
 
 
 def test_read_jsonl_missing_file(tmp_path: Path) -> None:

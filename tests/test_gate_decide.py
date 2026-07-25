@@ -2,6 +2,7 @@
 
 from speedlm.config import PromotionConfig
 from speedlm.gate.decide import (
+    Decision,
     Reason,
     Verdict,
     decide_promotion,
@@ -112,6 +113,13 @@ def _valid_runs_with_tps(tps: float, count: int = 3) -> ReplayResult:
     return _make_replay(runs)
 
 
+def _assert_unmeasured_deltas(decision: Decision) -> None:
+    assert decision.acceptance_delta_pp is None
+    assert decision.throughput_delta_pct is None
+    assert decision.to_dict()["acceptance_delta_pp"] is None
+    assert decision.to_dict()["throughput_delta_pct"] is None
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
@@ -131,6 +139,8 @@ def test_promote_when_both_thresholds_clear() -> None:
     )
     assert dec.verdict == Verdict.PROMOTE
     assert dec.reason == Reason.BOTH_THRESHOLDS_MET
+    assert dec.acceptance_delta_pp is not None
+    assert dec.throughput_delta_pct is not None
     assert abs(dec.acceptance_delta_pp - 5.0) < 0.01
     assert abs(dec.throughput_delta_pct - 10.0) < 0.01
 
@@ -182,6 +192,7 @@ def test_reject_on_counter_reset() -> None:
     )
     assert dec.verdict == Verdict.REJECT
     assert dec.reason == Reason.COUNTER_RESET
+    _assert_unmeasured_deltas(dec)
 
 
 def test_reject_on_candidate_counter_reset() -> None:
@@ -197,6 +208,7 @@ def test_reject_on_candidate_counter_reset() -> None:
     )
     assert dec.verdict == Verdict.REJECT
     assert dec.reason == Reason.COUNTER_RESET
+    _assert_unmeasured_deltas(dec)
 
 
 def test_reject_on_acceptance_unavailable() -> None:
@@ -212,6 +224,7 @@ def test_reject_on_acceptance_unavailable() -> None:
     )
     assert dec.verdict == Verdict.REJECT
     assert dec.reason == Reason.ACCEPTANCE_UNAVAILABLE
+    _assert_unmeasured_deltas(dec)
 
 
 def test_reject_on_high_invalid_rate() -> None:
@@ -236,6 +249,7 @@ def test_reject_on_high_invalid_rate() -> None:
     )
     assert dec.verdict == Verdict.REJECT
     assert dec.reason == Reason.HIGH_INVALID_RATE
+    _assert_unmeasured_deltas(dec)
 
 
 def test_reject_on_too_few_repeats() -> None:
@@ -253,6 +267,7 @@ def test_reject_on_too_few_repeats() -> None:
     )
     assert dec.verdict == Verdict.REJECT
     assert dec.reason == Reason.TOO_FEW_REPEATS
+    _assert_unmeasured_deltas(dec)
 
 
 def test_reject_on_output_mismatch() -> None:
@@ -273,6 +288,7 @@ def test_reject_on_output_mismatch() -> None:
     )
     assert dec.verdict == Verdict.REJECT
     assert dec.reason == Reason.OUTPUT_MISMATCH
+    _assert_unmeasured_deltas(dec)
 
 
 def test_decision_has_per_repeat_data() -> None:

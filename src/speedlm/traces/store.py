@@ -142,7 +142,14 @@ class TraceRecord:
             token_count_source=data.get(
                 "token_count_source",
                 "estimated"
-                if data["prompt_tokens"] is None or data["completion_tokens"] is None
+                if (
+                    data["prompt_tokens"] is None
+                    or data["completion_tokens"] is None
+                    or (
+                        data["prompt_tokens"] == 0
+                        and data["completion_tokens"] == 0
+                    )
+                )
                 else "measured",
             ),
         )
@@ -444,6 +451,9 @@ class TraceStore:
         """
         if now is None:
             now = time.time()
+
+        if not self._path.exists():
+            return 0
 
         with _exclusive_file_lock(self._path) as acquired:
             if not acquired:

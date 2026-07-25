@@ -34,8 +34,8 @@ def _decision_dict(
     *,
     verdict: str = "promote",
     reason: str = "both_thresholds_met",
-    acceptance_delta_pp: float = 6.0,
-    throughput_delta_pct: float = 12.0,
+    acceptance_delta_pp: float | None = 6.0,
+    throughput_delta_pct: float | None = 12.0,
     num_repeats: int = 3,
     per_repeat: list[dict[str, Any]] | None = None,
     stock_acc: float = 0.62,
@@ -448,22 +448,80 @@ def test_gain_json_omits_measurement_when_unavailable(home: Path) -> None:
     assert payload["acceptance_available"] is False
 
 
+def test_gain_accepts_new_unmeasured_decision_with_null_deltas(home: Path) -> None:
+    path = _write_decision(
+        home,
+        _decision_dict(
+            verdict="reject",
+            reason="counter_reset",
+            acceptance_delta_pp=None,
+            throughput_delta_pct=None,
+            num_repeats=0,
+            per_repeat=[],
+        ),
+    )
+
+    decision = load_decision(path)
+    assert decision.acceptance_delta_pp is None
+    assert decision.throughput_delta_pct is None
+    assert decision.to_dict()["acceptance_delta_pp"] is None
+    assert decision.to_dict()["throughput_delta_pct"] is None
+
+    report = build_gain_report(now=1_000.0)
+    assert report.status is GainStatus.NOT_MEASURED
+    assert report.to_dict()["measurement"] is None
+    assert "not measured" in report.render_text()
+
+
 # ---------------------------------------------------------------------------
 # decision discovery / parsing
 # ---------------------------------------------------------------------------
 
 
-def test_find_latest_decision_picks_newest(home: Path) -> None:
-    older = _write_decision(home, _decision_dict(), run="run-a")
-    newer = _write_decision(
+def test_find_latest_decision_uses_explicit_run_not_newest_mtime(home: Path) -> None:
+    current = _write_decision(home, _decision_dict(), run="run-a")
+    foreign = _write_decision(
         home, _decision_dict(verdict="reject", reason="uncertain"), run="run-b"
     )
-    os.utime(older, (1_000, 1_000))
-    os.utime(newer, (2_000, 2_000))
+    os.utime(current, (1_000, 1_000))
+    os.utime(foreign, (2_000, 2_000))
+    (home / "runs" / "state.json").write_text(
+        json.dumps(
+            {
+                "state": "READY",
+                "sequence": 1,
+                "updated_at": 2_001.0,
+                "reason": "candidate serving",
+                "run_id": "run-a",
+            }
+        ),
+        encoding="utf-8",
+    )
 
     layout = resolve_layout()
-    assert find_latest_decision(layout) == newer
-    assert build_gain_report(now=1_000.0).source_path == newer
+    assert find_latest_decision(layout) == current
+    assert build_gain_report(now=1_000.0).source_path == current
+
+
+def test_foreign_decision_is_ignored_when_known_run_has_none(home: Path) -> None:
+    _write_decision(home, _decision_dict(), run="foreign-fixture")
+    (home / "runs" / "state.json").write_text(
+        json.dumps(
+            {
+                "state": "READY",
+                "sequence": 1,
+                "updated_at": 2_001.0,
+                "reason": "cycle failed before gate",
+                "run_id": "current-run",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert find_latest_decision(resolve_layout()) is None
+    report = build_gain_report(now=2_001.0)
+    assert report.status is GainStatus.NO_GATE_RUN
+    assert "No gate has ever run" in report.render_text()
 
 
 def test_find_latest_decision_absent(home: Path) -> None:

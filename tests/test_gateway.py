@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import sys
+import textwrap
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
 from pathlib import Path
 from typing import Any
@@ -15,8 +18,12 @@ from starlette.responses import Response
 
 from speedlm.gateway.activity import ActivityTracker
 from speedlm.gateway.app import create_app
-from speedlm.gateway.process import ProcessError, VLLMProcess, build_vllm_argv
-from speedlm.gateway.sse import SSEAssembler
+from speedlm.gateway.process import (
+    ProcessError,
+    VLLMProcess,
+    build_vllm_argv,
+)
+from speedlm.gateway.sse import SSEAssembler, parse_json_response
 from speedlm.traces.store import TraceRecord, TraceStore
 
 ASGIMessage = MutableMapping[str, Any]
@@ -208,23 +215,26 @@ def _fake_upstream(state: dict[str, Any]) -> FastAPI:
     async def chat(request: Request) -> Response:
         body = await request.json()
         if not body.get("stream"):
+            payload = {
+                "id": "chat-nonstream",
+                "created": 1_700_000_000,
+                "model": "upstream-model",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "content": "hello",
+                            "tool_calls": [],
+                        },
+                    }
+                ],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2},
+            }
+            if body.get("omit_usage"):
+                payload.pop("usage")
             return JSONResponse(
-                {
-                    "id": "chat-nonstream",
-                    "created": 1_700_000_000,
-                    "model": "upstream-model",
-                    "choices": [
-                        {
-                            "index": 0,
-                            "message": {
-                                "role": "assistant",
-                                "content": "hello",
-                                "tool_calls": [],
-                            },
-                        }
-                    ],
-                    "usage": {"prompt_tokens": 3, "completion_tokens": 2},
-                }
+                payload
             )
 
         async def events() -> AsyncIterator[bytes]:
@@ -440,6 +450,40 @@ def test_sse_reconstruction_with_multichunk_tool_call() -> None:
     assert assembler.done
 
 
+def test_sse_without_usage_keeps_token_counts_unknown() -> None:
+    assembler = SSEAssembler("/v1/chat/completions")
+    assembler.feed(
+        b'data: {"choices":[{"index":0,"delta":{"content":"hello"}}]}\n\n'
+        b"data: [DONE]\n\n"
+    )
+
+    result = assembler.finish()
+
+    assert result.prompt_tokens is None
+    assert result.completion_tokens is None
+    assert assembler.valid
+
+
+def test_json_response_without_usage_keeps_token_counts_unknown() -> None:
+    result = parse_json_response(
+        json.dumps(
+            {
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "hello"},
+                    }
+                ]
+            }
+        ).encode(),
+        "/v1/chat/completions",
+    )
+
+    assert result is not None
+    assert result.prompt_tokens is None
+    assert result.completion_tokens is None
+
+
 def test_client_disconnect_cancels_upstream() -> None:
     async def scenario() -> None:
         client, upstream, state, gateway = await _clients()
@@ -514,6 +558,41 @@ def test_capture_writes_exactly_one_trace(
     asyncio.run(scenario())
 
 
+def test_capture_without_usage_estimates_instead_of_recording_zero(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def immediate_to_thread(function: Any, *args: Any) -> Any:
+        return function(*args)
+
+    monkeypatch.setattr(asyncio, "to_thread", immediate_to_thread)
+
+    async def scenario() -> None:
+        store = TraceStore(tmp_path / "traces.jsonl")
+        client, upstream, _, gateway = await _clients(store=store)
+        try:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "request-model",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "omit_usage": True,
+                },
+            )
+            assert response.status_code == 200
+        finally:
+            await _close_clients(client, upstream, gateway)
+
+        records = list(store.iter_records())
+        assert len(records) == 1
+        record = records[0]
+        assert record.token_count_source == "estimated"
+        assert record.prompt_tokens
+        assert record.completion_tokens
+
+    asyncio.run(scenario())
+
+
 def test_capture_failure_does_not_fail_request(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -582,193 +661,152 @@ def test_child_argv_forces_loopback_and_preserves_passthrough() -> None:
     ]
 
 
-class _FakeChild:
-    def __init__(self) -> None:
-        self.pid = 12345
-        self.returncode: int | None = None
-        self.stdout = asyncio.StreamReader()
-        self.terminated = False
-        self.killed = False
-        self.wait_calls = 0
-        self._exited = asyncio.Event()
-
-    def emit(self, text: str) -> None:
-        self.stdout.feed_data(text.encode())
-
-    def exit(self, returncode: int) -> None:
-        if self.returncode is not None:
-            return
-        self.returncode = returncode
-        self.stdout.feed_eof()
-        self._exited.set()
-
-    async def wait(self) -> int:
-        self.wait_calls += 1
-        await self._exited.wait()
-        assert self.returncode is not None
-        return self.returncode
-
-    def terminate(self) -> None:
-        self.terminated = True
-        self.exit(-15)
-
-    def kill(self) -> None:
-        self.killed = True
-        self.exit(-9)
-
-    def send_signal(self, signum: int) -> None:
-        self.exit(-signum)
-
-
-class _FakeHealthClient:
-    def __init__(self, ready: Callable[[], bool], **kwargs: Any) -> None:
-        del kwargs
-        self._ready = ready
-
-    async def __aenter__(self) -> _FakeHealthClient:
-        return self
-
-    async def __aexit__(
-        self,
-        exc_type: type[BaseException] | None,
-        exc: BaseException | None,
-        traceback: object,
-    ) -> None:
-        del exc_type, exc, traceback
-
-    async def get(self, url: str) -> httpx.Response:
-        del url
-        return httpx.Response(200 if self._ready() else 503)
-
-
-async def _start_fake_child(
-    monkeypatch: pytest.MonkeyPatch,
-    fake: _FakeChild,
+async def _start_real_child(
+    script: str,
     *,
-    ready: Callable[[], bool] = lambda: False,
-    startup_timeout: float = 1.0,
+    health_url: str = "http://127.0.0.1:1/health",
+    startup_timeout: float = 2.0,
 ) -> VLLMProcess:
-    async def create_subprocess(*args: object, **kwargs: object) -> _FakeChild:
-        del args, kwargs
-        return fake
-
-    def client_factory(**kwargs: Any) -> _FakeHealthClient:
-        return _FakeHealthClient(ready, **kwargs)
-
-    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
-    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+    child_script = (
+        "import signal\n"
+        "signal.signal(signal.SIGTERM, signal.SIG_DFL)\n"
+        f"{textwrap.dedent(script)}"
+    )
     child = VLLMProcess(
-        ["vllm", "serve", "model"],
-        health_url="http://127.0.0.1:8000/health",
+        [sys.executable, "-c", child_script],
+        health_url=health_url,
         startup_timeout=startup_timeout,
     )
     await child.start()
     return child
 
 
-def test_readiness_allows_progress_past_old_timeout(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_readiness_allows_silent_descendant_cpu_progress_past_stall_window() -> None:
     async def scenario() -> None:
-        fake = _FakeChild()
-        loop = asyncio.get_running_loop()
-        started = loop.time()
-        child = await _start_fake_child(
-            monkeypatch,
-            fake,
-            ready=lambda: loop.time() - started >= 0.08,
-            startup_timeout=0.2,
+        child = await _start_real_child(
+            """
+            import os
+            import time
+
+            worker_pid = os.fork()
+            if worker_pid == 0:
+                deadline = time.perf_counter() + 0.6
+                while time.perf_counter() < deadline:
+                    pass
+                os._exit(0)
+
+            os.waitpid(worker_pid, 0)
+            time.sleep(9999)
+            """,
+            startup_timeout=1.5,
         )
-
-        async def make_progress() -> None:
-            while loop.time() - started < 0.1:
-                fake.emit("compiling another kernel\n")
-                await asyncio.sleep(0.015)
-
-        progress_task = asyncio.create_task(make_progress())
-        await child.wait_ready(stall_timeout=0.04, poll_interval=0.005)
-        assert loop.time() - started > 0.05
-        await progress_task
-        await child.shutdown()
+        started = time.monotonic()
+        readiness = asyncio.create_task(
+            child.wait_ready(stall_timeout=0.15, poll_interval=0.01)
+        )
+        try:
+            await asyncio.sleep(0.4)
+            assert not readiness.done()
+            assert time.monotonic() - started > 0.15
+            assert child.returncode is None
+        finally:
+            readiness.cancel()
+            with contextlib.suppress(asyncio.CancelledError, ProcessError):
+                await readiness
+            await child.shutdown()
 
     asyncio.run(scenario())
 
 
-def test_readiness_reports_early_exit_and_reaps_child(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_readiness_stalls_alive_silent_process_with_no_cpu_progress() -> None:
     async def scenario() -> None:
-        fake = _FakeChild()
-        child = await _start_fake_child(monkeypatch, fake)
+        child = await _start_real_child(
+            """
+            import time
+            time.sleep(9999)
+            """
+        )
+        with pytest.raises(ProcessError, match="startup stalled"):
+            await child.wait_ready(stall_timeout=0.15, poll_interval=0.01)
+        assert child.returncode is not None
 
-        async def exit_soon() -> None:
-            await asyncio.sleep(0.01)
-            fake.exit(7)
+    asyncio.run(scenario())
 
-        asyncio.create_task(exit_soon())
+
+def test_readiness_reports_early_exit_code_without_waiting_for_stall() -> None:
+    async def scenario() -> None:
+        child = await _start_real_child(
+            """
+            import sys
+            sys.exit(7)
+            """
+        )
+        started = time.monotonic()
         with pytest.raises(ProcessError, match="exited before readiness with code 7"):
-            await child.wait_ready(stall_timeout=0.1, poll_interval=0.005)
-        assert fake.wait_calls >= 1
+            await child.wait_ready(stall_timeout=1.0, poll_interval=0.01)
+        assert time.monotonic() - started < 1.0
+        assert child.returncode == 7
 
     asyncio.run(scenario())
 
 
-def test_readiness_reports_log_stall_and_reaps_child(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_readiness_stall_message_includes_diagnostics_and_log_tail() -> None:
     async def scenario() -> None:
-        fake = _FakeChild()
-        child = await _start_fake_child(monkeypatch, fake)
-        with pytest.raises(ProcessError, match="startup stalled.*log did not grow"):
-            await child.wait_ready(stall_timeout=0.03, poll_interval=0.005)
-        assert fake.terminated
-        assert fake.wait_calls >= 1
-
-    asyncio.run(scenario())
-
-
-def test_readiness_error_includes_last_twenty_log_lines(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    async def scenario() -> None:
-        fake = _FakeChild()
-        child = await _start_fake_child(monkeypatch, fake)
-        fake.emit("".join(f"child-line-{index:02d}\n" for index in range(25)))
-        await asyncio.sleep(0)
-        fake.exit(2)
-
+        child = await _start_real_child(
+            """
+            import time
+            for index in range(25):
+                print(f"child-line-{index:02d}")
+            time.sleep(9999)
+            """
+        )
         with pytest.raises(ProcessError) as raised:
-            await child.wait_ready(stall_timeout=0.1, poll_interval=0.005)
+            await child.wait_ready(stall_timeout=0.15, poll_interval=0.01)
         message = str(raised.value)
+        assert "startup stalled after" in message
+        assert "log silence:" in message
+        assert "process alive: yes" in message
+        assert "CPU time advanced: no" in message
         assert "Last 20 lines of vLLM log:" in message
         assert "child-line-05" in message
         assert "child-line-24" in message
         assert "child-line-04" not in message
+        assert child.returncode is not None
 
     asyncio.run(scenario())
 
 
-def test_readiness_enforces_absolute_hard_ceiling_while_logs_grow(
+def test_readiness_enforces_absolute_hard_ceiling_despite_cpu_progress() -> None:
+    async def scenario() -> None:
+        child = await _start_real_child(
+            """
+            while True:
+                pass
+            """,
+            startup_timeout=0.35,
+        )
+        with pytest.raises(ProcessError, match="absolute startup hard ceiling"):
+            await child.wait_ready(stall_timeout=0.2, poll_interval=0.01)
+        assert child.returncode is not None
+
+    asyncio.run(scenario())
+
+
+def test_child_python_output_is_forced_unbuffered(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async def scenario() -> None:
-        fake = _FakeChild()
-        child = await _start_fake_child(
-            monkeypatch,
-            fake,
-            startup_timeout=0.06,
+        monkeypatch.delenv("PYTHONUNBUFFERED", raising=False)
+        child = await _start_real_child(
+            """
+            import os
+            import time
+            print(f"unbuffered={os.environ.get('PYTHONUNBUFFERED')}")
+            time.sleep(9999)
+            """
         )
-
-        async def make_progress() -> None:
-            while fake.returncode is None:
-                fake.emit("still compiling\n")
-                await asyncio.sleep(0.01)
-
-        progress_task = asyncio.create_task(make_progress())
-        with pytest.raises(ProcessError, match="absolute startup hard ceiling"):
-            await child.wait_ready(stall_timeout=0.03, poll_interval=0.005)
-        await progress_task
-        assert fake.terminated
-        assert fake.wait_calls >= 1
+        with pytest.raises(ProcessError) as raised:
+            await child.wait_ready(stall_timeout=0.15, poll_interval=0.01)
+        assert "unbuffered=1" in str(raised.value)
 
     asyncio.run(scenario())

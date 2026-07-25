@@ -14,8 +14,8 @@ class AssembledResponse:
     created: float | None
     content: str | None
     tool_calls: tuple[dict[str, Any], ...]
-    prompt_tokens: int
-    completion_tokens: int
+    prompt_tokens: int | None
+    completion_tokens: int | None
 
 
 @dataclass(slots=True)
@@ -73,8 +73,8 @@ class SSEAssembler:
         self._id: str | None = None
         self._model: str | None = None
         self._created: float | None = None
-        self._prompt_tokens = 0
-        self._completion_tokens = 0
+        self._prompt_tokens: int | None = None
+        self._completion_tokens: int | None = None
         self._done = False
         self._valid = True
         self._saw_choice = False
@@ -274,8 +274,6 @@ def parse_json_response(body: bytes, endpoint: str) -> AssembledResponse | None:
     usage = payload.get("usage")
     prompt_tokens = _non_negative_int(usage, "prompt_tokens")
     completion_tokens = _non_negative_int(usage, "completion_tokens")
-    if prompt_tokens is None or completion_tokens is None:
-        return None
     response_id = payload.get("id")
     model = payload.get("model")
     created = payload.get("created")
@@ -297,11 +295,9 @@ def parse_json_response(body: bytes, endpoint: str) -> AssembledResponse | None:
 
 
 def _non_negative_int(value: Any, key: str) -> int | None:
-    if value is None:
-        return 0
     if not isinstance(value, dict):
         return None
-    result = value.get(key, 0)
+    result = value.get(key)
     if isinstance(result, bool) or not isinstance(result, int) or result < 0:
         return None
     return result
