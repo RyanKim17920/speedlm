@@ -366,16 +366,18 @@ PY
   } > "$stage_artifacts/run-summary.txt"
 )
 
+stage2_terminal="$(unique_file "$artifacts/stage2-terminal" .txt)"
+
 case "$mode" in
   stage1)
     run_stage1
     ;;
   stage2)
-    run_stage2 2>&1 | tee "$artifacts/stage2-terminal.txt"
+    run_stage2 2>&1 | tee "$stage2_terminal"
     ;;
   all)
     run_stage1
-    run_stage2 2>&1 | tee "$artifacts/stage2-terminal.txt"
+    run_stage2 2>&1 | tee "$stage2_terminal"
     ;;
   *)
     echo "usage: $0 [stage1|stage2|all]" >&2

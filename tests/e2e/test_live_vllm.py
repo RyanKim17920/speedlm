@@ -30,6 +30,40 @@ def _require_live_e2e() -> None:
     assert VLLM.is_file(), f"missing vLLM CLI: {VLLM}"
 
 
+def _unique_artifact_dir(root: Path, stage: str, limit: int = 999) -> Path:
+    """Create and return a fresh artifact directory for this run.
+
+    Uses ``root/stage`` when it is free, otherwise the first free
+    ``root/stage-runN``. ``mkdir(exist_ok=False)`` is kept so two concurrent
+    runs can never blend into one directory and a previous run's artifacts are
+    never overwritten -- but a rerun no longer fails outright.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    for attempt in range(1, limit + 1):
+        candidate = root / (stage if attempt == 1 else f"{stage}-run{attempt}")
+        try:
+            candidate.mkdir(exist_ok=False)
+        except FileExistsError:
+            continue
+        return candidate
+    raise AssertionError(f"could not allocate a free artifact directory under {root / stage}")
+
+
+def _ready_timeout() -> float:
+    """Gateway readiness cap in seconds, overridable for slow cold starts.
+
+    Some models pay a large one-time cost before serving (e.g. JIT-compiled
+    attention kernels), so this is an environment knob rather than a constant.
+    """
+    raw = os.environ.get("SPEEDLM_E2E_READY_TIMEOUT", "360")
+    try:
+        timeout = float(raw)
+    except ValueError as exc:
+        raise AssertionError(f"SPEEDLM_E2E_READY_TIMEOUT must be a number, got {raw!r}") from exc
+    assert timeout > 0, f"SPEEDLM_E2E_READY_TIMEOUT must be positive, got {raw!r}"
+    return timeout
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -257,8 +291,9 @@ def test_speedlm_against_live_vllm() -> None:
 
     artifact_root_raw = os.environ.get("SPEEDLM_E2E_ARTIFACT_DIR")
     assert artifact_root_raw, "SPEEDLM_E2E_ARTIFACT_DIR is required"
-    artifact_dir = Path(artifact_root_raw) / stage
-    artifact_dir.mkdir(parents=True, exist_ok=False)
+    artifact_dir = _unique_artifact_dir(Path(artifact_root_raw), stage)
+    print(f"stage artifact directory: {artifact_dir}")
+    ready_timeout = _ready_timeout()
     home = artifact_dir / "speedlm_home"
     gateway_log = artifact_dir / "gateway-and-vllm.log"
     gateway_port = _free_port()
@@ -307,7 +342,7 @@ def test_speedlm_against_live_vllm() -> None:
     )
     observed_pids: set[int] = set()
     try:
-        _wait_for_gateway(gateway_url, process, timeout=360.0)
+        _wait_for_gateway(gateway_url, process, timeout=ready_timeout)
         observed_pids = _descendant_pids(process.pid)
         assert observed_pids, "speedlm did not have a live vLLM child"
 
