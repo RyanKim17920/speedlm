@@ -175,6 +175,18 @@ def test_alias_resolution() -> None:
     assert cfg2.alias == "llama-2"
 
 
+def test_profile_reference() -> None:
+    cfg = SpeedLMConfig(model="hf/model", profile="custom-eagle3")
+    assert cfg.profile == "custom-eagle3"
+    assert SpeedLMConfig.from_dict(cfg.to_dict()).profile == "custom-eagle3"
+
+
+@pytest.mark.parametrize("value", ["", 1, False])
+def test_invalid_profile_reference(value: object) -> None:
+    with pytest.raises(ConfigError, match="profile must be a non-empty string or null"):
+        SpeedLMConfig(model="hf/model", profile=value)  # type: ignore[arg-type]
+
+
 def test_round_trip() -> None:
     cfg = SpeedLMConfig(
         model="bigscience/bloom",

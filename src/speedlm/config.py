@@ -188,6 +188,7 @@ class PromotionConfig:
 class SpeedLMConfig:
     model: str
     model_alias: str = ""
+    profile: str | None = None
     target: TargetConfig = field(default_factory=TargetConfig)
     wrapper: WrapperConfig = field(default_factory=WrapperConfig)
     buffer: TraceBufferConfig = field(default_factory=TraceBufferConfig)
@@ -202,6 +203,13 @@ class SpeedLMConfig:
         if not isinstance(self.model_alias, str):
             raise ConfigError(
                 f"model_alias must be a string, got {type(self.model_alias).__name__!r}"
+            )
+        if self.profile is not None and (
+            not isinstance(self.profile, str) or not self.profile
+        ):
+            raise ConfigError(
+                "profile must be a non-empty string or null, got "
+                f"{self.profile!r}"
             )
         if _is_bool(self.idle_threshold_seconds) or not isinstance(
             self.idle_threshold_seconds, (int, float)
@@ -237,6 +245,7 @@ class SpeedLMConfig:
         result: dict[str, Any] = {
             "model": self.model,
             "model_alias": self.model_alias,
+            "profile": self.profile,
             "idle_threshold_seconds": self.idle_threshold_seconds,
             "startup_timeout_seconds": self.startup_timeout_seconds,
         }
@@ -273,6 +282,7 @@ class SpeedLMConfig:
         known_keys = {
             "model",
             "model_alias",
+            "profile",
             "target",
             "wrapper",
             "buffer",
@@ -309,6 +319,7 @@ class SpeedLMConfig:
         return cls(
             model=data["model"],
             model_alias=data.get("model_alias", ""),
+            profile=data.get("profile"),
             target=TargetConfig(**target_data),
             wrapper=WrapperConfig(**wrapper_data),
             buffer=TraceBufferConfig(**buffer_data),
