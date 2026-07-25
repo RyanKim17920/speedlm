@@ -15,7 +15,7 @@ from starlette.responses import Response
 
 from speedlm.gateway.activity import ActivityTracker
 from speedlm.gateway.app import create_app
-from speedlm.gateway.process import build_vllm_argv
+from speedlm.gateway.process import ProcessError, VLLMProcess, build_vllm_argv
 from speedlm.gateway.sse import SSEAssembler
 from speedlm.traces.store import TraceRecord, TraceStore
 
@@ -580,3 +580,195 @@ def test_child_argv_forces_loopback_and_preserves_passthrough() -> None:
         "--port",
         "8123",
     ]
+
+
+class _FakeChild:
+    def __init__(self) -> None:
+        self.pid = 12345
+        self.returncode: int | None = None
+        self.stdout = asyncio.StreamReader()
+        self.terminated = False
+        self.killed = False
+        self.wait_calls = 0
+        self._exited = asyncio.Event()
+
+    def emit(self, text: str) -> None:
+        self.stdout.feed_data(text.encode())
+
+    def exit(self, returncode: int) -> None:
+        if self.returncode is not None:
+            return
+        self.returncode = returncode
+        self.stdout.feed_eof()
+        self._exited.set()
+
+    async def wait(self) -> int:
+        self.wait_calls += 1
+        await self._exited.wait()
+        assert self.returncode is not None
+        return self.returncode
+
+    def terminate(self) -> None:
+        self.terminated = True
+        self.exit(-15)
+
+    def kill(self) -> None:
+        self.killed = True
+        self.exit(-9)
+
+    def send_signal(self, signum: int) -> None:
+        self.exit(-signum)
+
+
+class _FakeHealthClient:
+    def __init__(self, ready: Callable[[], bool], **kwargs: Any) -> None:
+        del kwargs
+        self._ready = ready
+
+    async def __aenter__(self) -> _FakeHealthClient:
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        traceback: object,
+    ) -> None:
+        del exc_type, exc, traceback
+
+    async def get(self, url: str) -> httpx.Response:
+        del url
+        return httpx.Response(200 if self._ready() else 503)
+
+
+async def _start_fake_child(
+    monkeypatch: pytest.MonkeyPatch,
+    fake: _FakeChild,
+    *,
+    ready: Callable[[], bool] = lambda: False,
+    startup_timeout: float = 1.0,
+) -> VLLMProcess:
+    async def create_subprocess(*args: object, **kwargs: object) -> _FakeChild:
+        del args, kwargs
+        return fake
+
+    def client_factory(**kwargs: Any) -> _FakeHealthClient:
+        return _FakeHealthClient(ready, **kwargs)
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess)
+    monkeypatch.setattr(httpx, "AsyncClient", client_factory)
+    child = VLLMProcess(
+        ["vllm", "serve", "model"],
+        health_url="http://127.0.0.1:8000/health",
+        startup_timeout=startup_timeout,
+    )
+    await child.start()
+    return child
+
+
+def test_readiness_allows_progress_past_old_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        fake = _FakeChild()
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        child = await _start_fake_child(
+            monkeypatch,
+            fake,
+            ready=lambda: loop.time() - started >= 0.08,
+            startup_timeout=0.2,
+        )
+
+        async def make_progress() -> None:
+            while loop.time() - started < 0.1:
+                fake.emit("compiling another kernel\n")
+                await asyncio.sleep(0.015)
+
+        progress_task = asyncio.create_task(make_progress())
+        await child.wait_ready(stall_timeout=0.04, poll_interval=0.005)
+        assert loop.time() - started > 0.05
+        await progress_task
+        await child.shutdown()
+
+    asyncio.run(scenario())
+
+
+def test_readiness_reports_early_exit_and_reaps_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        fake = _FakeChild()
+        child = await _start_fake_child(monkeypatch, fake)
+
+        async def exit_soon() -> None:
+            await asyncio.sleep(0.01)
+            fake.exit(7)
+
+        asyncio.create_task(exit_soon())
+        with pytest.raises(ProcessError, match="exited before readiness with code 7"):
+            await child.wait_ready(stall_timeout=0.1, poll_interval=0.005)
+        assert fake.wait_calls >= 1
+
+    asyncio.run(scenario())
+
+
+def test_readiness_reports_log_stall_and_reaps_child(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        fake = _FakeChild()
+        child = await _start_fake_child(monkeypatch, fake)
+        with pytest.raises(ProcessError, match="startup stalled.*log did not grow"):
+            await child.wait_ready(stall_timeout=0.03, poll_interval=0.005)
+        assert fake.terminated
+        assert fake.wait_calls >= 1
+
+    asyncio.run(scenario())
+
+
+def test_readiness_error_includes_last_twenty_log_lines(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        fake = _FakeChild()
+        child = await _start_fake_child(monkeypatch, fake)
+        fake.emit("".join(f"child-line-{index:02d}\n" for index in range(25)))
+        await asyncio.sleep(0)
+        fake.exit(2)
+
+        with pytest.raises(ProcessError) as raised:
+            await child.wait_ready(stall_timeout=0.1, poll_interval=0.005)
+        message = str(raised.value)
+        assert "Last 20 lines of vLLM log:" in message
+        assert "child-line-05" in message
+        assert "child-line-24" in message
+        assert "child-line-04" not in message
+
+    asyncio.run(scenario())
+
+
+def test_readiness_enforces_absolute_hard_ceiling_while_logs_grow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        fake = _FakeChild()
+        child = await _start_fake_child(
+            monkeypatch,
+            fake,
+            startup_timeout=0.06,
+        )
+
+        async def make_progress() -> None:
+            while fake.returncode is None:
+                fake.emit("still compiling\n")
+                await asyncio.sleep(0.01)
+
+        progress_task = asyncio.create_task(make_progress())
+        with pytest.raises(ProcessError, match="absolute startup hard ceiling"):
+            await child.wait_ready(stall_timeout=0.03, poll_interval=0.005)
+        await progress_task
+        assert fake.terminated
+        assert fake.wait_calls >= 1
+
+    asyncio.run(scenario())

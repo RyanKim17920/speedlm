@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -18,6 +19,8 @@ from speedlm.storage import atomic_write_json
 
 DEFAULT_HOME_NAME = ".speedlm"
 HOME_ENV_VAR = "SPEEDLM_HOME"
+DEFAULT_STARTUP_TIMEOUT_SECONDS = 900.0
+STARTUP_TIMEOUT_ENV_VAR = "SPEEDLM_STARTUP_TIMEOUT_SECONDS"
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -64,6 +67,26 @@ def _validate_int_gte(value: Any, name: str, minimum: int) -> int:
         raise ConfigError(f"{name} must be an int, got {type(value).__name__!r}")
     if value < minimum:
         raise ConfigError(f"{name} must be >= {minimum}, got {value}")
+    return value
+
+
+def startup_timeout_seconds() -> float:
+    """Return the configured vLLM startup hard ceiling.
+
+    ``SPEEDLM_STARTUP_TIMEOUT_SECONDS`` overrides the default for process
+    launches that do not load a model config.
+    """
+    raw = os.environ.get(STARTUP_TIMEOUT_ENV_VAR)
+    if raw is None:
+        return DEFAULT_STARTUP_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ConfigError(
+            f"{STARTUP_TIMEOUT_ENV_VAR} must be numeric, got {raw!r}"
+        ) from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ConfigError(f"{STARTUP_TIMEOUT_ENV_VAR} must be > 0, got {raw!r}")
     return value
 
 
@@ -171,6 +194,7 @@ class SpeedLMConfig:
     promotion: PromotionConfig = field(default_factory=PromotionConfig)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     idle_threshold_seconds: float = 300.0
+    startup_timeout_seconds: float = field(default_factory=startup_timeout_seconds)
 
     def __post_init__(self) -> None:
         if not isinstance(self.model, str) or not self.model:
@@ -190,6 +214,20 @@ class SpeedLMConfig:
             raise ConfigError(
                 f"idle_threshold_seconds must be > 0, got {self.idle_threshold_seconds}"
             )
+        if _is_bool(self.startup_timeout_seconds) or not isinstance(
+            self.startup_timeout_seconds, (int, float)
+        ):
+            raise ConfigError(
+                "startup_timeout_seconds must be numeric, got "
+                f"{type(self.startup_timeout_seconds).__name__!r}"
+            )
+        if (
+            not math.isfinite(self.startup_timeout_seconds)
+            or self.startup_timeout_seconds <= 0
+        ):
+            raise ConfigError(
+                f"startup_timeout_seconds must be > 0, got {self.startup_timeout_seconds}"
+            )
 
     @property
     def alias(self) -> str:
@@ -200,6 +238,7 @@ class SpeedLMConfig:
             "model": self.model,
             "model_alias": self.model_alias,
             "idle_threshold_seconds": self.idle_threshold_seconds,
+            "startup_timeout_seconds": self.startup_timeout_seconds,
         }
         result["target"] = {
             "host": self.target.host,
@@ -240,6 +279,7 @@ class SpeedLMConfig:
             "promotion",
             "sampling",
             "idle_threshold_seconds",
+            "startup_timeout_seconds",
         }
         unknown = set(data.keys()) - known_keys
         if unknown:
@@ -275,6 +315,9 @@ class SpeedLMConfig:
             promotion=PromotionConfig(**promotion_data),
             sampling=SamplingConfig(**sampling_data),
             idle_threshold_seconds=data.get("idle_threshold_seconds", 300.0),
+            startup_timeout_seconds=data.get(
+                "startup_timeout_seconds", startup_timeout_seconds()
+            ),
         )
 
 

@@ -15,6 +15,7 @@ from speedlm.config import (
     load_config,
     save_config,
     speedlm_home,
+    startup_timeout_seconds,
 )
 
 # ---------------------------------------------------------------------------
@@ -33,6 +34,32 @@ def test_home_env_override(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setenv("SPEEDLM_HOME", str(tmp_path))
     home = speedlm_home()
     assert home == tmp_path.resolve()
+
+
+def test_startup_timeout_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SPEEDLM_STARTUP_TIMEOUT_SECONDS", raising=False)
+    assert startup_timeout_seconds() == 900.0
+    assert SpeedLMConfig(model="model").startup_timeout_seconds == 900.0
+
+
+def test_startup_timeout_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SPEEDLM_STARTUP_TIMEOUT_SECONDS", "123.5")
+    assert startup_timeout_seconds() == 123.5
+    assert SpeedLMConfig(model="model").startup_timeout_seconds == 123.5
+
+
+def test_startup_timeout_config_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SPEEDLM_STARTUP_TIMEOUT_SECONDS", "123.5")
+    config = SpeedLMConfig.from_dict(
+        {"model": "model", "startup_timeout_seconds": 456}
+    )
+    assert config.startup_timeout_seconds == 456
+
+
+@pytest.mark.parametrize("value", [0, -1, True, "slow"])
+def test_invalid_startup_timeout(value: object) -> None:
+    with pytest.raises(ConfigError):
+        SpeedLMConfig(model="model", startup_timeout_seconds=value)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
