@@ -135,6 +135,7 @@ def test_status_json_shape_fresh(home: Path) -> None:
         "traces",
         "tuner",
         "models",
+        "profile",
     }
     assert payload["gateway"]["state"] == "stopped"
     assert payload["active_draft"]["present"] is False
@@ -142,6 +143,9 @@ def test_status_json_shape_fresh(home: Path) -> None:
     assert payload["tuner"]["present"] is False
     assert payload["models"]["configured"] is False
     assert payload["models"]["verifier"]
+    assert isinstance(payload["profile"], dict)
+    assert payload["profile"]["status"] == "profiled"
+    assert payload["models"]["profile"] == payload["profile"]
 
 
 # ---------------------------------------------------------------------------
@@ -253,7 +257,37 @@ def test_status_model_pair_unsupported_verifier(home: Path) -> None:
     report = build_status_report(now=1_000.0)
     assert report.models.configured is True
     assert report.models.draft == "unknown"
-    assert "no supported EAGLE-3 draft" in report.models.detail
+    assert "no profile matched" in report.models.detail
+    payload = json.loads(report.to_json())
+    profile = payload["profile"]
+    assert isinstance(profile, dict)
+    assert profile["status"] == "unprofiled"
+    assert profile["name"] == "unprofiled"
+    assert profile["verifier_model"] == "some/other"
+    assert profile["trainable"] is False
+    assert profile["tuning_available"] is False
+    assert "no profile matched" in profile["detail"]
+    assert "tuning is unavailable" in profile["detail"]
+
+
+def test_status_resolves_profile_from_served_hf_snapshot_path(home: Path) -> None:
+    home.mkdir(parents=True)
+    served_model = (
+        "/root/.cache/huggingface/hub/"
+        "models--Qwen--Qwen3.5-9B/snapshots/0123456789abcdef"
+    )
+    (home / "gateway.json").write_text(
+        json.dumps({"pid": os.getpid(), "model": served_model}),
+        encoding="utf-8",
+    )
+
+    payload = json.loads(build_status_report(now=1_000.0).to_json())
+
+    assert payload["profile"]["status"] == "profiled"
+    assert payload["profile"]["name"] == "qwen3.5-9b-mtp"
+    assert payload["profile"]["verifier_model"] == "Qwen/Qwen3.5-9B"
+    assert payload["profile"]["speculative_method"] == "mtp"
+    assert payload["profile"]["chat_template_kind"] == "chatml"
 
 
 # ---------------------------------------------------------------------------

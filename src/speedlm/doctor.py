@@ -23,6 +23,7 @@ from speedlm.profiles import (
     BUILTIN_PROFILES,
     ModelProfile,
     ProfileConfig,
+    ProfileError,
     resolve_profile,
 )
 from speedlm.storage import resolve_layout
@@ -671,6 +672,50 @@ def _resolve_doctor_profile(
     )
 
 
+def _doctor_served_model(config: object | None) -> str:
+    if config is None:
+        return _DEFAULT_PROFILE.verifier_model
+    return (
+        _optional_string_attribute(config, "verifier_model")
+        or _optional_string_attribute(config, "model")
+        or "unknown"
+    )
+
+
+def _resolved_profile_report(profile: ModelProfile) -> dict[str, object]:
+    report = profile.to_dict()
+    detail = f"matched profile {profile.name!r}"
+    if not profile.trainable:
+        detail += (
+            f"; tuning is unavailable for {profile.speculative_method!r}"
+        )
+    report.update(
+        {
+            "status": "profiled",
+            "tuning_available": profile.trainable,
+            "detail": detail,
+        }
+    )
+    return report
+
+
+def _unprofiled_report(served_model: str, reason: str) -> dict[str, object]:
+    return {
+        "status": "unprofiled",
+        "name": "unprofiled",
+        "verifier_model": served_model,
+        "draft_model": None,
+        "speculative_method": "unknown",
+        "num_speculative_tokens": None,
+        "target_layer_ids": None,
+        "chat_template_kind": "unknown",
+        "max_seq_len": None,
+        "trainable": False,
+        "tuning_available": False,
+        "detail": f"no profile matched {served_model!r}; tuning is unavailable ({reason})",
+    }
+
+
 def check_model_pair(
     config: object | None,
     *,
@@ -736,6 +781,7 @@ def check_model_pair(
             "draft_derived": explicit_draft is None,
             "trainable": profile.trainable,
             "tuning_available": profile.trainable,
+            "resolved_profile": _resolved_profile_report(profile),
         }
         if not profile.trainable:
             return Check(
@@ -758,11 +804,45 @@ def check_model_pair(
             f"{profile.speculative_method} {draft_detail}",
             data,
         )
+    except ProfileError as exc:
+        served_model = _doctor_served_model(config)
+        unknown_profile = _unprofiled_report(served_model, str(exc))
+        unmatched_model = str(exc).startswith("no model profile matches ")
+        status = CheckStatus.WARN if unmatched_model else CheckStatus.FAIL
+        detail = (
+            f"No profile matched served model {served_model!r}; "
+            "tuning is unavailable"
+            if unmatched_model
+            else f"Could not load model profile for {served_model!r}: {exc}"
+        )
+        return Check(
+            "model_pair",
+            status,
+            detail,
+            {
+                "pair": "unprofiled",
+                "profile": "unprofiled",
+                "verifier": served_model,
+                "draft": None,
+                "method": "unknown",
+                "layout": "unknown",
+                "draft_derived": True,
+                "trainable": False,
+                "tuning_available": False,
+                "resolved_profile": unknown_profile,
+            },
+        )
     except Exception as exc:
+        served_model = _doctor_served_model(config)
         return Check(
             "model_pair",
             CheckStatus.FAIL,
             f"Could not validate model pair: {exc}",
+            {
+                "verifier": served_model,
+                "tuning_available": False,
+                "resolved_profile": _unprofiled_report(served_model, str(exc)),
+            },
         )
 
 

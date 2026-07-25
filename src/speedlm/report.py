@@ -28,8 +28,9 @@ from pathlib import Path
 from typing import Any, Final
 
 from speedlm.config import ConfigError, SpeedLMConfig, load_config
-from speedlm.doctor import PRIMARY_DRAFT, PRIMARY_VERIFIER, SUPPORTED_MODEL_PAIRS
+from speedlm.doctor import PRIMARY_VERIFIER
 from speedlm.gate.decide import Decision, Reason, RepeatSummary, Verdict
+from speedlm.profiles import ModelProfile, ProfileError, resolve_profile
 from speedlm.storage import Layout, resolve_layout
 from speedlm.traces.store import TraceStore
 
@@ -467,6 +468,7 @@ class ModelPairStatus:
     draft: str
     configured: bool
     detail: str
+    profile: Mapping[str, object]
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -474,45 +476,101 @@ class ModelPairStatus:
             "draft": self.draft,
             "configured": self.configured,
             "detail": self.detail,
+            "profile": dict(self.profile),
         }
 
 
-def read_model_pair(layout: Layout) -> ModelPairStatus:
-    """Resolve the model pair from ``<home>/config.json``, else the built-in default."""
-    path = layout.root / CONFIG_FILE_NAME
-    if not path.exists():
-        return ModelPairStatus(
-            verifier=PRIMARY_VERIFIER,
-            draft=PRIMARY_DRAFT,
-            configured=False,
-            detail=f"built-in default pair (no {path})",
+def _profile_report(profile: ModelProfile) -> dict[str, object]:
+    report = profile.to_dict()
+    detail = f"matched profile {profile.name!r}"
+    if not profile.trainable:
+        detail += (
+            f"; tuning is unavailable for {profile.speculative_method!r}"
         )
+    report.update(
+        {
+            "status": "profiled",
+            "tuning_available": profile.trainable,
+            "detail": detail,
+        }
+    )
+    return report
+
+
+def _unprofiled_report(served_model: str, reason: str) -> dict[str, object]:
+    return {
+        "status": "unprofiled",
+        "name": "unprofiled",
+        "verifier_model": served_model,
+        "draft_model": None,
+        "speculative_method": "unknown",
+        "num_speculative_tokens": None,
+        "target_layer_ids": None,
+        "chat_template_kind": "unknown",
+        "max_seq_len": None,
+        "trainable": False,
+        "tuning_available": False,
+        "detail": f"no profile matched {served_model!r}; tuning is unavailable ({reason})",
+    }
+
+
+def read_model_pair(
+    layout: Layout,
+    *,
+    served_model: str | None = None,
+) -> ModelPairStatus:
+    """Resolve the configured/served model to a profile without guessing a draft."""
+    path = layout.root / CONFIG_FILE_NAME
+    config: SpeedLMConfig | None = None
+    configured = path.exists()
+    source_detail: str
+    if not path.exists():
+        source_detail = f"built-in default pair (no {path})"
+    else:
+        try:
+            config = load_config(path)
+        except ConfigError as exc:
+            configured = False
+            source_detail = f"built-in default pair ({path} is unusable: {exc})"
+        else:
+            source_detail = f"configured in {path}"
+
+    candidate = served_model
+    if candidate is None and config is not None:
+        candidate = config.model
+    if candidate is None:
+        candidate = PRIMARY_VERIFIER
+
+    profile_config = (
+        None
+        if config is None
+        else {"model": config.model, "profile": config.profile}
+    )
     try:
-        config: SpeedLMConfig = load_config(path)
-    except ConfigError as exc:
+        profile = resolve_profile(
+            profile_config,
+            served_model=candidate,
+            home=layout.root,
+        )
+    except ProfileError as exc:
         return ModelPairStatus(
-            verifier=PRIMARY_VERIFIER,
-            draft=PRIMARY_DRAFT,
-            configured=False,
-            detail=f"built-in default pair ({path} is unusable: {exc})",
+            verifier=candidate,
+            draft="unknown",
+            configured=configured,
+            detail=(
+                f"no profile matched served model {candidate!r}; "
+                "tuning is unavailable"
+            ),
+            profile=_unprofiled_report(candidate, str(exc)),
         )
 
-    draft = SUPPORTED_MODEL_PAIRS.get(config.model)
-    if draft is None:
-        return ModelPairStatus(
-            verifier=config.model,
-            draft="unknown",
-            configured=True,
-            detail=(
-                f"configured verifier {config.model!r} has no supported EAGLE-3 draft; "
-                "run 'speedlm doctor' for details"
-            ),
-        )
+    draft = profile.draft_model if profile.draft_model is not None else "native"
     return ModelPairStatus(
-        verifier=config.model,
+        verifier=profile.verifier_model,
         draft=draft,
-        configured=True,
-        detail=f"configured in {path}",
+        configured=configured,
+        detail=source_detail,
+        profile=_profile_report(profile),
     )
 
 
@@ -544,6 +602,7 @@ class StatusReport:
             "traces": self.traces.to_dict(),
             "tuner": self.tuner.to_dict(),
             "models": self.models.to_dict(),
+            "profile": dict(self.models.profile),
         }
 
     def to_json(self, *, indent: int | None = 2) -> str:
@@ -593,14 +652,15 @@ def build_status_report(
 ) -> StatusReport:
     """Collect every ``status`` input without creating or mutating anything."""
     layout = resolve_layout(home)
+    gateway = read_gateway_status(layout)
     return StatusReport(
         home=layout.root,
         home_exists=layout.root.is_dir(),
-        gateway=read_gateway_status(layout),
+        gateway=gateway,
         active_draft=read_active_draft(layout),
         traces=read_trace_status(layout),
         tuner=read_tuner_status(layout),
-        models=read_model_pair(layout),
+        models=read_model_pair(layout, served_model=gateway.model),
         generated_at=time.time() if now is None else now,
     )
 

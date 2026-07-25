@@ -308,6 +308,55 @@ def test_resolved_non_default_profile_is_validated() -> None:
     assert result.data["draft"] is None
     assert result.data["method"] == "mtp"
     assert result.data["layout"] == "native"
+    profile = result.data["resolved_profile"]
+    assert isinstance(profile, dict)
+    assert profile["speculative_method"] == "mtp"
+    assert profile["chat_template_kind"] == "chatml"
+
+
+def test_doctor_resolves_huggingface_cache_snapshot_path() -> None:
+    served_model = (
+        "/root/.cache/huggingface/hub/"
+        "models--Qwen--Qwen3.5-9B/snapshots/0123456789abcdef"
+    )
+
+    result = doctor.check_model_pair(SpeedLMConfig(model=served_model))
+
+    assert result.status is doctor.CheckStatus.PASS
+    assert result.data is not None
+    assert result.data["profile"] == QWEN_35_9B_MTP_PROFILE.name
+    assert result.data["verifier"] == QWEN_35_9B_MTP_PROFILE.verifier_model
+    assert result.data["method"] == "mtp"
+
+
+def test_unknown_model_reports_unprofiled_and_tuning_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(doctor.subprocess, "run", _healthy_run)
+    _patch_healthy_non_gpu_checks(monkeypatch)
+
+    report = doctor.run_doctor(
+        SpeedLMConfig(model="acme/unknown-verifier"),
+        home=tmp_path,
+    )
+    payload = json.loads(report.to_json())
+    model_pair = next(
+        check for check in payload["checks"] if check["name"] == "model_pair"
+    )
+
+    assert model_pair["status"] == "WARN"
+    assert "no profile matched" in model_pair["detail"].lower()
+    assert "tuning is unavailable" in model_pair["detail"]
+    assert isinstance(model_pair["data"], dict)
+    assert model_pair["data"]["tuning_available"] is False
+    profile = model_pair["data"]["resolved_profile"]
+    assert isinstance(profile, dict)
+    assert profile["status"] == "unprofiled"
+    assert profile["verifier_model"] == "acme/unknown-verifier"
+    assert profile["tuning_available"] is False
+    assert report.execution_mode is doctor.ExecutionMode.UNAVAILABLE
+    assert report.overall_status is doctor.CheckStatus.WARN
 
 
 def test_non_trainable_profile_warns_that_tuning_is_unavailable(
@@ -343,6 +392,10 @@ def test_non_trainable_profile_warns_that_tuning_is_unavailable(
     assert result.data["method"] == "ngram"
     assert result.data["trainable"] is False
     assert result.data["tuning_available"] is False
+    resolved_profile = result.data["resolved_profile"]
+    assert isinstance(resolved_profile, dict)
+    assert resolved_profile["status"] == "profiled"
+    assert resolved_profile["tuning_available"] is False
 
     monkeypatch.setattr(doctor.subprocess, "run", _healthy_run)
     _patch_healthy_non_gpu_checks(monkeypatch)

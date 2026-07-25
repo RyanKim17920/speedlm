@@ -339,15 +339,25 @@ def _match_profile(
     by_name = profiles.get(name_or_verifier)
     if by_name is not None:
         return by_name
+
+    verifier_reference = name_or_verifier
+    for part in Path(name_or_verifier).parts:
+        if not part.startswith("models--"):
+            continue
+        repository_parts = part.removeprefix("models--").split("--")
+        if all(repository_parts):
+            verifier_reference = "/".join(repository_parts)
+            break
+
     verifier_matches = [
         profile
         for profile in profiles.values()
-        if profile.verifier_model == name_or_verifier
+        if profile.verifier_model == verifier_reference
     ]
     if len(verifier_matches) > 1:
         names = ", ".join(sorted(profile.name for profile in verifier_matches))
         raise ProfileError(
-            f"multiple profiles match verifier {name_or_verifier!r}: {names}; "
+            f"multiple profiles match verifier {verifier_reference!r}: {names}; "
             "set config.profile explicitly"
         )
     return verifier_matches[0] if verifier_matches else None
@@ -363,7 +373,9 @@ def resolve_profile(
     """Resolve a profile without ever guessing an unknown verifier's draft.
 
     An explicit ``config.profile`` wins.  Otherwise the served model, followed
-    by ``config.model``, must exactly match a profile name or verifier model.
+    by ``config.model``, must match a profile name or verifier model. Resolved
+    Hugging Face cache snapshot paths are matched by their embedded repository
+    ID (for example ``models--Qwen--Qwen3.5-9B``).
     """
 
     registry = profiles if profiles is not None else load_profiles(home)

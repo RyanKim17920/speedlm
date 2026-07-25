@@ -35,6 +35,8 @@ def test_builtin_profiles_load_and_validate(tmp_path: Path) -> None:
     assert LLAMA_31_8B_EAGLE3_PROFILE.speculative_method == "eagle3"
     assert QWEN_35_9B_MTP_PROFILE.verifier_model == "Qwen/Qwen3.5-9B"
     assert QWEN_35_9B_MTP_PROFILE.draft_model is None
+    assert QWEN_35_9B_MTP_PROFILE.speculative_method == "mtp"
+    assert QWEN_35_9B_MTP_PROFILE.chat_template_kind == "chatml"
     assert QWEN_35_9B_MTP_PROFILE.speculative_config() == {
         "method": "mtp",
         "num_speculative_tokens": 3,
@@ -113,6 +115,37 @@ def test_resolver_exact_name_match(name_or_verifier: str) -> None:
         resolve_profile(served_model=name_or_verifier, profiles=BUILTIN_PROFILES)
         is QWEN_35_9B_MTP_PROFILE
     )
+
+
+def test_resolver_matches_huggingface_cache_snapshot_path() -> None:
+    served_model = (
+        "~/.cache/huggingface/hub/"
+        "models--Qwen--Qwen3.5-9B/snapshots/0123456789abcdef"
+    )
+
+    assert (
+        resolve_profile(served_model=served_model, profiles=BUILTIN_PROFILES)
+        is QWEN_35_9B_MTP_PROFILE
+    )
+
+
+@pytest.mark.parametrize(
+    "served_model",
+    [
+        GPT_OSS_EAGLE3_PROFILE.name,
+        GPT_OSS_EAGLE3_PROFILE.verifier_model,
+        (
+            "/opt/huggingface/hub/models--openai--gpt-oss-20b/"
+            "snapshots/abcdef0123456789"
+        ),
+    ],
+)
+def test_gpt_oss_eagle3_resolution_regression(served_model: str) -> None:
+    resolved = resolve_profile(served_model=served_model, profiles=BUILTIN_PROFILES)
+
+    assert resolved is GPT_OSS_EAGLE3_PROFILE
+    assert resolved.speculative_method == "eagle3"
+    assert resolved.draft_model == "RedHatAI/gpt-oss-20b-speculator.eagle3"
 
 
 def test_resolver_uses_config_model_when_served_model_is_absent() -> None:
