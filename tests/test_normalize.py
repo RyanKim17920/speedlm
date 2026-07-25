@@ -245,3 +245,92 @@ class TestNormalizeFile:
         assert result.accepted_count == 2
         assert result.rejected_count == 1
         assert result.rejected[0].line == 2
+
+# ── ISO-8601 timestamp acceptance (Defect 1 regression) ────────────────────
+
+
+class TestISOTimestamp:
+    """ISO-8601 string timestamps must be accepted and normalized to epoch float."""
+
+    def test_iso_with_z(self) -> None:
+        data = _default_data(timestamp="2026-07-25T04:00:00Z")
+        rec = normalize_record(data, defaults=_defaults())
+        # 2026-07-25T04:00:00Z == 1784952000.0
+        assert rec.timestamp == 1784952000.0
+
+    def test_iso_with_positive_offset(self) -> None:
+        data = _default_data(timestamp="2026-07-25T04:00:00+00:00")
+        rec = normalize_record(data, defaults=_defaults())
+        assert rec.timestamp == 1784952000.0
+
+    def test_iso_with_nonzero_offset(self) -> None:
+        # +05:00 means wall clock is 5h ahead → epoch is 5h less
+        data = _default_data(timestamp="2026-07-25T09:00:00+05:00")
+        rec = normalize_record(data, defaults=_defaults())
+        # 2026-07-25T09:00:00+05:00 == 2026-07-25T04:00:00Z
+        assert rec.timestamp == 1784952000.0
+
+    def test_iso_naive_treated_as_utc(self) -> None:
+        data = _default_data(timestamp="2026-07-25T04:00:00")
+        rec = normalize_record(data, defaults=_defaults())
+        assert rec.timestamp == 1784952000.0
+
+    def test_epoch_int(self) -> None:
+        data = _default_data(timestamp=1700000000)
+        rec = normalize_record(data, defaults=_defaults())
+        assert rec.timestamp == 1700000000.0
+
+    def test_epoch_float(self) -> None:
+        data = _default_data(timestamp=1700000000.5)
+        rec = normalize_record(data, defaults=_defaults())
+        assert rec.timestamp == 1700000000.5
+
+    def test_malformed_string_rejected(self) -> None:
+        data = _default_data(timestamp="not-a-date")
+        with pytest.raises(NormalizeError, match="not a valid ISO-8601"):
+            normalize_record(data, defaults=_defaults())
+
+    def test_nan_rejected(self) -> None:
+
+        data = _default_data(timestamp=float("nan"))
+        with pytest.raises(NormalizeError, match="non-finite|finite"):
+            normalize_record(data, defaults=_defaults())
+
+    def test_inf_rejected(self) -> None:
+        data = _default_data(timestamp=float("inf"))
+        with pytest.raises(NormalizeError, match="non-finite|finite"):
+            normalize_record(data, defaults=_defaults())
+
+    def test_negative_iso_rejected(self) -> None:
+        data = _default_data(timestamp="0001-01-01T00:00:00+00:00")
+        with pytest.raises(NormalizeError, match=">= 0"):
+            normalize_record(data, defaults=_defaults())
+
+    def test_created_field_iso(self) -> None:
+        """The 'created' fallback also accepts ISO-8601 strings."""
+        data = _default_data()
+        del data["timestamp"]
+        data["created"] = "2026-07-25T04:00:00Z"
+        rec = normalize_record(data, defaults=_defaults())
+        assert rec.timestamp == 1784952000.0
+
+    def test_file_level_iso_accepted(self, tmp_path: Path) -> None:
+        """End-to-end: normalize_file accepts ISO timestamps."""
+        f = tmp_path / "iso.jsonl"
+        data = _default_data(timestamp="2026-07-25T04:00:00Z")
+        f.write_text(json.dumps(data) + "\n")
+        result = normalize_file(f, defaults=_defaults())
+        assert result.accepted_count == 1
+        assert result.rejected_count == 0
+        assert result.accepted[0].timestamp == 1784952000.0
+
+    def test_file_level_malformed_rejected(self, tmp_path: Path) -> None:
+        """End-to-end: malformed ISO strings are rejected, not crashed."""
+        f = tmp_path / "bad-tz.jsonl"
+        data = _default_data(timestamp="yesterday")
+        f.write_text(json.dumps(data) + "\n")
+        result = normalize_file(f, defaults=_defaults())
+        assert result.accepted_count == 0
+        assert result.rejected_count == 1
+        assert "ISO-8601" in result.rejected[0].reason
+

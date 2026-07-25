@@ -51,6 +51,9 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 testpaths = ["tests"]
 addopts = "-q"
 pythonpath = ["src"]
+markers = [
+    "e2e: real end-to-end tests that require a live GPU and vLLM server",
+]
 
 [tool.mypy]
 python_version = "3.12"

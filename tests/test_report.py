@@ -474,3 +474,45 @@ def test_load_decision_roundtrip(home: Path) -> None:
     path = _write_decision(home, _decision_dict())
     decision = load_decision(path)
     assert decision.to_dict() == _decision_dict()
+
+
+# ---------------------------------------------------------------------------
+# gain — provenance validation (Defect 2 regression)
+# ---------------------------------------------------------------------------
+
+
+def test_gain_inconsistent_per_repeat_is_unreadable(home: Path) -> None:
+    """A decision with num_repeats != len(per_repeat) is untrusted."""
+    payload = _decision_dict(num_repeats=3, per_repeat=[
+        {
+            "repeat_index": 0,
+            "stock_tok_per_sec": 100.0,
+            "candidate_tok_per_sec": 112.0,
+            "stock_acceptance_rate": 0.62,
+            "candidate_acceptance_rate": 0.68,
+            "invalid_rate": 0.0,
+            "output_mismatches": 0,
+        },
+    ])
+    _write_decision(home, payload)
+    report = build_gain_report(now=1_000.0)
+    assert report.status is GainStatus.UNREADABLE
+    assert report.decision is None
+    assert "inconsistent provenance" in report.render_text()
+
+
+def test_gain_decision_shows_mtime(home: Path) -> None:
+    """The decision file mtime must appear in the rendered text."""
+    _write_decision(home, _decision_dict())
+    report = build_gain_report(now=1_000.0)
+    text = report.render_text()
+    assert "source mtime" in text
+    assert report.source_mtime is not None
+
+
+def test_gain_decision_to_dict_includes_mtime(home: Path) -> None:
+    """The JSON output must contain source_mtime."""
+    _write_decision(home, _decision_dict())
+    payload = json.loads(build_gain_report(now=1_000.0).to_json())
+    assert "source_mtime" in payload
+    assert payload["source_mtime"] is not None

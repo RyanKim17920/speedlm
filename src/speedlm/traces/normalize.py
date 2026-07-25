@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import datetime
 import hashlib
 import json
+import math
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -53,6 +55,56 @@ def _generate_id(data: Mapping[str, Any]) -> str:
     return f"tr-{digest}"
 
 
+def _parse_timestamp_to_epoch(value: Any, *, index: int) -> float:
+    """Convert a timestamp value to epoch-seconds float.
+
+    Accepts:
+    - int or float (epoch seconds)
+    - ISO-8601 string (e.g., "2026-07-25T04:00:00Z", "+00:00" offset, naive)
+
+    Raises NormalizeError on malformed input.
+    """
+    if isinstance(value, bool):
+        raise NormalizeError(
+            f"record[{index}]: "
+            f"'timestamp' must be a number or ISO-8601 string (got bool)"
+        )
+    if isinstance(value, (int, float)):
+        if not math.isfinite(value):
+            raise NormalizeError(
+                f"record[{index}]: 'timestamp' must be a finite number"
+            )
+        if value < 0:
+            raise NormalizeError(
+                f"record[{index}]: 'timestamp' must be >= 0"
+            )
+        return float(value)
+    if isinstance(value, str):
+        try:
+            dt = datetime.datetime.fromisoformat(value)
+        except (ValueError, TypeError) as exc:
+            raise NormalizeError(
+                f"record[{index}]: "
+                f"'timestamp' is not a valid ISO-8601 string: {exc}"
+            ) from exc
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=datetime.UTC)
+        epoch = dt.timestamp()
+        if not math.isfinite(epoch):
+            raise NormalizeError(
+                f"record[{index}]: 'timestamp' converted to a non-finite epoch"
+            )
+        if epoch < 0:
+            raise NormalizeError(
+                f"record[{index}]: 'timestamp' must be >= 0"
+            )
+        return epoch
+    raise NormalizeError(
+        f"record[{index}]: 'timestamp' must be a number or "
+        f"ISO-8601 string (got {type(value).__name__})"
+    )
+
+
 # ── Public API ──────────────────────────────────────────────────────────────
 
 def normalize_record(
@@ -83,7 +135,8 @@ def normalize_record(
             )
         if "role" not in msg or not isinstance(msg["role"], str) or not msg["role"]:
             raise NormalizeError(
-                f"record[{index}]: messages[{i}] must have a non-empty string 'role'"
+                f"record[{index}]: "
+                f"messages[{i}] must have a non-empty string 'role'"
             )
         if "content" not in msg:
             raise NormalizeError(
@@ -113,24 +166,9 @@ def normalize_record(
     ts = data.get("timestamp")
     created = data.get("created")
     if ts is not None:
-        if isinstance(ts, bool) or not isinstance(ts, (int, float)):
-            raise NormalizeError(
-                f"record[{index}]: 'timestamp' must be a number (got {type(ts).__name__})"
-            )
-        if ts < 0:
-            raise NormalizeError(
-                f"record[{index}]: 'timestamp' must be >= 0"
-            )
+        ts = _parse_timestamp_to_epoch(ts, index=index)
     elif created is not None:
-        if isinstance(created, bool) or not isinstance(created, (int, float)):
-            raise NormalizeError(
-                f"record[{index}]: 'created' must be a number (got {type(created).__name__})"
-            )
-        if created < 0:
-            raise NormalizeError(
-                f"record[{index}]: 'created' must be >= 0"
-            )
-        ts = float(created)
+        ts = _parse_timestamp_to_epoch(created, index=index)
     else:
         ts = time.time()
 

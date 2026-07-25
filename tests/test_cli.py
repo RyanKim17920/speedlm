@@ -221,3 +221,32 @@ def test_no_args_returns_2(capsys) -> None:
 def test_version_returns_0(capsys) -> None:
     code = main(["--version"])
     assert code == 0
+
+
+def test_traces_import_iso_timestamp(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    """Defect 1 regression: ISO-8601 timestamps must be accepted end-to-end."""
+    monkeypatch.setenv("SPEEDLM_HOME", str(tmp_path))
+    jsonl = tmp_path / "iso.jsonl"
+    _write_jsonl(jsonl, [{
+        "id": "t1",
+        "timestamp": "2026-07-25T04:00:00Z",
+        "model": "openai/gpt-oss-20b",
+        "messages": [{"role": "user", "content": "hello"}],
+        "temperature": 0,
+        "top_p": 1,
+        "seed": 0,
+        "prompt_tokens": 5,
+        "completion_tokens": 3,
+    }])
+    code = main(["traces", "import", str(jsonl)])
+    assert code == 0
+    out = capsys.readouterr()
+    assert "accepted: 1" in out.out
+
+    code = main(["traces", "stats"])
+    assert code == 0
+    out = capsys.readouterr()
+    assert "count    : 1" in out.out
+    assert "tokens   : 8" in out.out

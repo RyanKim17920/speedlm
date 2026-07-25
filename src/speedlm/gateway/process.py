@@ -69,6 +69,10 @@ class VLLMProcess:
     def returncode(self) -> int | None:
         return self._process.returncode if self._process is not None else None
 
+    @property
+    def pid(self) -> int | None:
+        return self._process.pid if self._process is not None else None
+
     async def start(self) -> None:
         if self._process is not None:
             raise ProcessError("vLLM process has already been started")

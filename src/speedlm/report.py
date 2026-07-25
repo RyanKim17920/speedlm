@@ -17,6 +17,7 @@ fabricated or zeroed speedup.
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import time
@@ -720,6 +721,7 @@ class GainReport:
     status: GainStatus
     detail: str
     source_path: Path | None = None
+    source_mtime: float | None = None
     decision: Decision | None = None
     generated_at: float = 0.0
 
@@ -748,6 +750,7 @@ class GainReport:
             "detail": self.detail,
             "generated_at": self.generated_at,
             "source_path": str(self.source_path) if self.source_path is not None else None,
+            "source_mtime": self.source_mtime,
             "acceptance_available": self.acceptance_available,
             "counter_reset": self.counter_reset,
             "deltas_measured": self.deltas_measured,
@@ -799,6 +802,11 @@ class GainReport:
         lines = ["SpeedLM gain"]
         if self.source_path is not None:
             lines.append(f"source            : {self.source_path}")
+            if self.source_mtime is not None:
+                mtime_str = datetime.datetime.fromtimestamp(
+                    self.source_mtime, tz=datetime.UTC
+                ).isoformat()
+                lines.append(f"source mtime      : {mtime_str}")
 
         decision = self.decision
         if decision is None:
@@ -898,6 +906,10 @@ def build_gain_report(
     try:
         decision = load_decision(path)
     except ReportError as exc:
+        try:
+            mtime_val = path.stat().st_mtime
+        except OSError:
+            mtime_val = None
         return GainReport(
             status=GainStatus.UNREADABLE,
             detail=(
@@ -905,14 +917,43 @@ def build_gain_report(
                 "no gain is being reported."
             ),
             source_path=path,
+            source_mtime=mtime_val,
             generated_at=timestamp,
         )
+
+    # Provenance: structural consistency check
+    # When the gate completes repeats it writes per_repeat entries.  If per_repeat
+    # is non-empty but num_repeats disagrees, the file is untrusted.
+    # (Aborted decisions may legitimately have num_repeats > 0 with empty per_repeat.)
+    if decision.per_repeat and decision.num_repeats != len(decision.per_repeat):
+        try:
+            mtime_val = path.stat().st_mtime
+        except OSError:
+            mtime_val = None
+        return GainReport(
+            status=GainStatus.UNREADABLE,
+            detail=(
+                f"The gate decision at {path} has inconsistent provenance "
+                f"(num_repeats={decision.num_repeats} but "
+                f"len(per_repeat)={len(decision.per_repeat)}); no gain is being reported."
+            ),
+            source_path=path,
+            source_mtime=mtime_val,
+            generated_at=timestamp,
+        )
+
+    # Capture file mtime
+    try:
+        mtime_val = path.stat().st_mtime
+    except OSError:
+        mtime_val = None
 
     measured = decision.reason not in UNMEASURED_REASONS
     return GainReport(
         status=GainStatus.MEASURED if measured else GainStatus.NOT_MEASURED,
         detail=_gain_detail(decision),
         source_path=path,
+        source_mtime=mtime_val,
         decision=decision,
         generated_at=timestamp,
     )

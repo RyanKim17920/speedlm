@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import json
 import os
 import sys
+import time
 from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -23,7 +25,7 @@ from speedlm.gateway.process import (
     reserve_loopback_port,
 )
 from speedlm.report import ReportError, build_gain_report, build_status_report
-from speedlm.storage import StorageError, ensure_layout
+from speedlm.storage import StorageError, atomic_write_json, ensure_layout
 from speedlm.traces.normalize import NormalizeError, normalize_file
 from speedlm.traces.store import TraceError, TraceStore
 
@@ -135,6 +137,7 @@ async def _run_vllm_gateway(
     )
     received_signal: int | None = None
     server: _GatewayServer | None = None
+    runtime_path = store.path.parent.parent / "gateway.json"
 
     def on_signal(signum: int) -> None:
         nonlocal received_signal
@@ -145,6 +148,17 @@ async def _run_vllm_gateway(
             server.should_exit = True
 
     await child.start()
+    atomic_write_json(
+        runtime_path,
+        {
+            "pid": os.getpid(),
+            "child_pid": child.pid,
+            "host": wrapper.host,
+            "port": wrapper.port,
+            "model": model,
+            "started_at": time.time(),
+        },
+    )
     try:
         with forwarded_signals(child, on_signal):
             try:
@@ -202,7 +216,21 @@ async def _run_vllm_gateway(
                 return 128 + received_signal
             return server_code
     finally:
-        await child.shutdown()
+        try:
+            await child.shutdown()
+        finally:
+            _remove_owned_runtime_record(runtime_path)
+
+
+def _remove_owned_runtime_record(path: Path) -> None:
+    """Remove this process's runtime record without clobbering a replacement."""
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, OSError, json.JSONDecodeError):
+        return
+    if isinstance(record, dict) and record.get("pid") == os.getpid():
+        with contextlib.suppress(OSError):
+            path.unlink()
 
 
 def _shell_exit_code(returncode: int) -> int:
