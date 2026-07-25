@@ -1,0 +1,46 @@
+# Python
+__pycache__
+*.py[cod]
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Environment files
+.env
+.env.*
+
+# Model artifacts
+*.safetensors
+*.pt
+*.bin
+*.gguf
+*.onnx
+
+# Local artifact directories (root-anchored: src/speedlm/traces/ is source, not an artifact)
+/runs/
+/traces/
+/profiles/
+/artifacts/
+.speedlm/
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+
+# Agent tooling
+.serena/
+.claude/settings.local.json
