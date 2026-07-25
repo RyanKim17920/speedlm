@@ -7,6 +7,7 @@ import pytest
 from speedlm.config import (
     ConfigError,
     PromotionConfig,
+    RedactionConfig,
     SamplingConfig,
     SpeedLMConfig,
     TargetConfig,
@@ -15,6 +16,7 @@ from speedlm.config import (
     load_config,
     save_config,
     speedlm_home,
+    startup_stall_seconds,
     startup_timeout_seconds,
 )
 
@@ -60,6 +62,32 @@ def test_startup_timeout_config_override(monkeypatch: pytest.MonkeyPatch) -> Non
 def test_invalid_startup_timeout(value: object) -> None:
     with pytest.raises(ConfigError):
         SpeedLMConfig(model="model", startup_timeout_seconds=value)  # type: ignore[arg-type]
+
+
+def test_startup_stall_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SPEEDLM_STARTUP_STALL_SECONDS", raising=False)
+    assert startup_stall_seconds() == 600.0
+    assert SpeedLMConfig(model="model").startup_stall_seconds == 600.0
+
+
+def test_startup_stall_env_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SPEEDLM_STARTUP_STALL_SECONDS", "720.5")
+    assert startup_stall_seconds() == 720.5
+    assert SpeedLMConfig(model="model").startup_stall_seconds == 720.5
+
+
+def test_startup_stall_config_override(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SPEEDLM_STARTUP_STALL_SECONDS", "720.5")
+    config = SpeedLMConfig.from_dict(
+        {"model": "model", "startup_stall_seconds": 840}
+    )
+    assert config.startup_stall_seconds == 840
+
+
+@pytest.mark.parametrize("value", [0, -1, True, "slow"])
+def test_invalid_startup_stall(value: object) -> None:
+    with pytest.raises(ConfigError):
+        SpeedLMConfig(model="model", startup_stall_seconds=value)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------
@@ -150,6 +178,27 @@ def test_buffer_defaults() -> None:
 def test_buffer_zero_tokens() -> None:
     with pytest.raises(ConfigError):
         TraceBufferConfig(max_tokens=0)
+
+
+# ---------------------------------------------------------------------------
+# RedactionConfig
+# ---------------------------------------------------------------------------
+
+
+def test_redaction_enabled_by_default() -> None:
+    assert RedactionConfig().enabled is True
+    assert SpeedLMConfig(model="model").redaction.enabled is True
+
+
+def test_redaction_can_be_disabled_and_round_trips() -> None:
+    cfg = SpeedLMConfig(model="model", redaction=RedactionConfig(enabled=False))
+    assert SpeedLMConfig.from_dict(cfg.to_dict()).redaction.enabled is False
+
+
+@pytest.mark.parametrize("value", [0, 1, "false", None])
+def test_redaction_enabled_requires_bool(value: object) -> None:
+    with pytest.raises(ConfigError, match="redaction.enabled must be a bool"):
+        RedactionConfig(enabled=value)  # type: ignore[arg-type]
 
 
 # ---------------------------------------------------------------------------

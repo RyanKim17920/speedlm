@@ -1,19 +1,56 @@
 from __future__ import annotations
 
 import json
+import logging
+import re
 import time
-from collections.abc import Iterator, Mapping
-from dataclasses import dataclass
+from collections import Counter
+from collections.abc import Iterable, Iterator, Mapping
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from types import MappingProxyType
+from typing import Any, Protocol
 
-from speedlm.config import TraceBufferConfig
-from speedlm.storage import StorageError, append_jsonl, atomic_write_text, read_jsonl
+from speedlm.storage import (
+    StorageError,
+    _append_jsonl,
+    _exclusive_file_lock,
+    atomic_write_text,
+    read_jsonl,
+)
+from speedlm.traces.redact import RedactionReport, Redactor
+
+logger = logging.getLogger(__name__)
+
+_REDACTION_PLACEHOLDER_RE = re.compile(r"<REDACTED:([a-z0-9_]+)>")
 
 # ── Exceptions ──────────────────────────────────────────────────────────────
 
 class TraceError(ValueError):
     """Raised when a trace record fails validation or I/O errors occur."""
+
+
+class TraceBufferOptions(Protocol):
+    """Buffer limits required to configure a trace store."""
+
+    @property
+    def max_tokens(self) -> int: ...
+
+    @property
+    def max_age_days(self) -> float: ...
+
+
+class RedactionOptions(Protocol):
+    """Privacy setting required to configure a trace store."""
+
+    @property
+    def enabled(self) -> bool: ...
+
+
+class TraceRedactor(Protocol):
+    """Structure-preserving redactor used by the persistence boundary."""
+
+    def redact(self, value: Any) -> tuple[Any, RedactionReport]: ...
 
 
 # ── TraceRecord ─────────────────────────────────────────────────────────────
@@ -205,6 +242,58 @@ class TraceStats:
     unknown_token_records: int = 0
     measured_tokens: int = 0
     estimated_tokens: int = 0
+    redacted_records: int = 0
+    redaction_counts: Mapping[str, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "redaction_counts",
+            MappingProxyType(dict(self.redaction_counts)),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class RedactionSummary:
+    """Aggregate reports for one batch of newly written traces."""
+
+    records: int
+    counts: Mapping[str, int] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "counts", MappingProxyType(dict(self.counts)))
+
+    @property
+    def total(self) -> int:
+        return sum(self.counts.values())
+
+
+def summarize_redactions(
+    reports: Iterable[RedactionReport | None],
+) -> RedactionSummary:
+    """Aggregate successful append reports without retaining sensitive values."""
+    counts: Counter[str] = Counter()
+    records = 0
+    for report in reports:
+        if report is None:
+            continue
+        counts.update(report.counts)
+        if report.total:
+            records += 1
+    return RedactionSummary(records=records, counts=dict(sorted(counts.items())))
+
+
+def format_redaction_summary(summary: RedactionSummary) -> str:
+    """Render a secret-free summary suitable for ``traces import`` output."""
+    categories = ", ".join(
+        f"{category}: {count}" for category, count in summary.counts.items()
+    )
+    if not categories:
+        categories = "none"
+    return (
+        f"redacted: {summary.records} record(s), "
+        f"{summary.total} replacement(s) [{categories}]"
+    )
 
 
 # ── TraceStore ──────────────────────────────────────────────────────────────
@@ -218,6 +307,8 @@ class TraceStore:
         *,
         max_tokens: int = 8_000_000,
         max_age_days: float = 14.0,
+        redaction_enabled: bool = True,
+        redactor: TraceRedactor | None = None,
     ) -> None:
         if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
             raise TraceError("max_tokens must be a positive integer")
@@ -225,23 +316,64 @@ class TraceStore:
                 or not isinstance(max_age_days, (int, float))
                 or max_age_days <= 0):
             raise TraceError("max_age_days must be a positive number")
+        if not isinstance(redaction_enabled, bool):
+            raise TraceError("redaction_enabled must be a bool")
         self._path: Path = path
         self._max_tokens: int = max_tokens
         self._max_age_days: float = float(max_age_days)
+        # One redactor per long-lived store, safe for concurrent calls because
+        # Redactor scopes all mutable traversal state to each redact() call.
+        self._redactor: TraceRedactor | None = (
+            redactor or Redactor() if redaction_enabled else None
+        )
 
     @classmethod
-    def from_config(cls, path: Path, buffer: TraceBufferConfig) -> TraceStore:
-        """Create a store from a TraceBufferConfig."""
-        return cls(path, max_tokens=buffer.max_tokens, max_age_days=buffer.max_age_days)
+    def from_config(
+        cls,
+        path: Path,
+        buffer: TraceBufferOptions,
+        *,
+        redaction: RedactionOptions | None = None,
+    ) -> TraceStore:
+        """Create a store from trace-buffer and optional redaction config."""
+        return cls(
+            path,
+            max_tokens=buffer.max_tokens,
+            max_age_days=buffer.max_age_days,
+            redaction_enabled=redaction.enabled if redaction is not None else True,
+        )
 
     @property
     def path(self) -> Path:
         return self._path
 
-    def append(self, record: TraceRecord) -> None:
-        """Append a record to the JSONL file, creating parent dirs if needed."""
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        append_jsonl(self._path, record.to_dict())
+    def append(self, record: TraceRecord) -> RedactionReport | None:
+        """Redact and append one record, dropping it if redaction fails.
+
+        Returning ``None`` means privacy processing failed and nothing was
+        written. Storing the original record would turn a redactor fault into a
+        plaintext secret leak, so this persistence boundary fails closed.
+        """
+        trace_record = record.to_dict()
+        if self._redactor is not None:
+            try:
+                redacted, report = self._redactor.redact(trace_record)
+            except Exception as exc:
+                logger.warning(
+                    "dropping trace after redaction failure (%s)",
+                    type(exc).__name__,
+                )
+                return None
+            if not isinstance(redacted, Mapping):
+                logger.warning("dropping trace after redaction returned a non-mapping")
+                return None
+            trace_record = dict(redacted)
+        else:
+            report = RedactionReport({})
+
+        if not _append_jsonl(self._path, trace_record):
+            return None
+        return report
 
     def iter_records(self) -> Iterator[TraceRecord]:
         """Yield records from the JSONL file.
@@ -263,6 +395,8 @@ class TraceStore:
         unknown_token_records = 0
         measured_tokens = 0
         estimated_tokens = 0
+        redacted_records = 0
+        redaction_counts: Counter[str] = Counter()
         oldest: float | None = None
         newest: float | None = None
         for rec in self.iter_records():
@@ -275,6 +409,14 @@ class TraceStore:
                 estimated_tokens += record_tokens
                 if rec.total_tokens is None:
                     unknown_token_records += 1
+            record_redactions = Counter(
+                _REDACTION_PLACEHOLDER_RE.findall(
+                    json.dumps(rec.to_dict(), ensure_ascii=False)
+                )
+            )
+            if record_redactions:
+                redacted_records += 1
+                redaction_counts.update(record_redactions)
             if oldest is None or rec.timestamp < oldest:
                 oldest = rec.timestamp
             if newest is None or rec.timestamp > newest:
@@ -287,6 +429,8 @@ class TraceStore:
             unknown_token_records=unknown_token_records,
             measured_tokens=measured_tokens,
             estimated_tokens=estimated_tokens,
+            redacted_records=redacted_records,
+            redaction_counts=dict(sorted(redaction_counts.items())),
         )
 
     def prune(self, *, now: float | None = None) -> int:
@@ -301,45 +445,53 @@ class TraceStore:
         if now is None:
             now = time.time()
 
-        if not self._path.exists():
-            return 0
+        with _exclusive_file_lock(self._path) as acquired:
+            if not acquired:
+                return 0
 
-        records: list[TraceRecord] = []
-        try:
-            for rec in self.iter_records():
-                records.append(rec)
-        except TraceError:
-            return 0
+            if not self._path.exists():
+                return 0
 
-        if not records:
-            return 0
+            records: list[TraceRecord] = []
+            try:
+                for rec in self.iter_records():
+                    records.append(rec)
+            except TraceError:
+                return 0
 
-        # Sort ascending by timestamp (stable)
-        records.sort(key=lambda r: r.timestamp)
+            if not records:
+                return 0
 
-        initial_count = len(records)
-        age_seconds = self._max_age_days * 86400.0
+            # Sort ascending by timestamp (stable)
+            records.sort(key=lambda r: r.timestamp)
 
-        # Step 1: age filter (strict > — boundary records kept)
-        records = [r for r in records if (now - r.timestamp) <= age_seconds]
+            initial_count = len(records)
+            age_seconds = self._max_age_days * 86400.0
 
-        # Step 2: token budget — drop oldest-first
-        total = sum(_accounting_tokens(record) for record in records)
-        while total > self._max_tokens and records:
-            removed = records.pop(0)
-            total -= _accounting_tokens(removed)
+            # Step 1: age filter (strict > — boundary records kept)
+            records = [r for r in records if (now - r.timestamp) <= age_seconds]
 
-        dropped = initial_count - len(records)
-        if dropped == 0:
-            return 0
+            # Step 2: token budget — drop oldest-first
+            total = sum(_accounting_tokens(record) for record in records)
+            while total > self._max_tokens and records:
+                removed = records.pop(0)
+                total -= _accounting_tokens(removed)
 
-        # Step 3: atomic rewrite in ascending-timestamp order
-        lines = [json.dumps(r.to_dict()) for r in records]
-        text = "\n".join(lines)
-        if text:
-            text += "\n"
-        atomic_write_text(self._path, text)
-        return dropped
+            dropped = initial_count - len(records)
+            if dropped == 0:
+                return 0
+
+            # Step 3: atomic rewrite in ascending-timestamp order
+            lines = [json.dumps(r.to_dict()) for r in records]
+            text = "\n".join(lines)
+            if text:
+                text += "\n"
+            try:
+                atomic_write_text(self._path, text)
+            except OSError as exc:
+                logger.warning("leaving trace file unchanged after prune write failed: %s", exc)
+                return 0
+            return dropped
 
 
 def _accounting_tokens(record: TraceRecord) -> int:

@@ -21,6 +21,8 @@ DEFAULT_HOME_NAME = ".speedlm"
 HOME_ENV_VAR = "SPEEDLM_HOME"
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 900.0
 STARTUP_TIMEOUT_ENV_VAR = "SPEEDLM_STARTUP_TIMEOUT_SECONDS"
+DEFAULT_STARTUP_STALL_SECONDS = 600.0
+STARTUP_STALL_ENV_VAR = "SPEEDLM_STARTUP_STALL_SECONDS"
 
 # ---------------------------------------------------------------------------
 # Exceptions
@@ -87,6 +89,26 @@ def startup_timeout_seconds() -> float:
         ) from exc
     if not math.isfinite(value) or value <= 0:
         raise ConfigError(f"{STARTUP_TIMEOUT_ENV_VAR} must be > 0, got {raw!r}")
+    return value
+
+
+def startup_stall_seconds() -> float:
+    """Return the configured vLLM startup liveness window.
+
+    ``SPEEDLM_STARTUP_STALL_SECONDS`` overrides the default for process
+    launches that do not load a model config.
+    """
+    raw = os.environ.get(STARTUP_STALL_ENV_VAR)
+    if raw is None:
+        return DEFAULT_STARTUP_STALL_SECONDS
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ConfigError(
+            f"{STARTUP_STALL_ENV_VAR} must be numeric, got {raw!r}"
+        ) from exc
+    if not math.isfinite(value) or value <= 0:
+        raise ConfigError(f"{STARTUP_STALL_ENV_VAR} must be > 0, got {raw!r}")
     return value
 
 
@@ -210,6 +232,7 @@ class SpeedLMConfig:
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     idle_threshold_seconds: float = 300.0
     startup_timeout_seconds: float = field(default_factory=startup_timeout_seconds)
+    startup_stall_seconds: float = field(default_factory=startup_stall_seconds)
     tuning_enabled: bool = False
 
     def __post_init__(self) -> None:
@@ -251,6 +274,20 @@ class SpeedLMConfig:
             raise ConfigError(
                 f"startup_timeout_seconds must be > 0, got {self.startup_timeout_seconds}"
             )
+        if _is_bool(self.startup_stall_seconds) or not isinstance(
+            self.startup_stall_seconds, (int, float)
+        ):
+            raise ConfigError(
+                "startup_stall_seconds must be numeric, got "
+                f"{type(self.startup_stall_seconds).__name__!r}"
+            )
+        if (
+            not math.isfinite(self.startup_stall_seconds)
+            or self.startup_stall_seconds <= 0
+        ):
+            raise ConfigError(
+                f"startup_stall_seconds must be > 0, got {self.startup_stall_seconds}"
+            )
         if not isinstance(self.tuning_enabled, bool):
             raise ConfigError(
                 f"tuning_enabled must be a bool, got {type(self.tuning_enabled).__name__!r}"
@@ -267,6 +304,7 @@ class SpeedLMConfig:
             "profile": self.profile,
             "idle_threshold_seconds": self.idle_threshold_seconds,
             "startup_timeout_seconds": self.startup_timeout_seconds,
+            "startup_stall_seconds": self.startup_stall_seconds,
             "tuning_enabled": self.tuning_enabled,
         }
         result["target"] = {
@@ -314,6 +352,7 @@ class SpeedLMConfig:
             "sampling",
             "idle_threshold_seconds",
             "startup_timeout_seconds",
+            "startup_stall_seconds",
             "tuning_enabled",
         }
         unknown = set(data.keys()) - known_keys
@@ -355,6 +394,9 @@ class SpeedLMConfig:
             idle_threshold_seconds=data.get("idle_threshold_seconds", 300.0),
             startup_timeout_seconds=data.get(
                 "startup_timeout_seconds", startup_timeout_seconds()
+            ),
+            startup_stall_seconds=data.get(
+                "startup_stall_seconds", startup_stall_seconds()
             ),
             tuning_enabled=data.get("tuning_enabled", False),
         )
