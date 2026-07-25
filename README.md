@@ -55,7 +55,7 @@ speedlm doctor                               diagnose host environment
 
 This phase implements configuration, storage, the trace store (a rolling buffer
 bounded by token count and record age), OpenAI-JSONL normalization/import, and
-the CLI skeleton. The `traces import` and `traces stats` subcommands work
-today. The `vllm serve`, `status`, `gain`, and `doctor` subcommands are
-declared but not yet implemented; they exit non-zero when invoked. Draft-head
-training and promotion are not built yet.
+the streaming vLLM gateway. `speedlm vllm serve` now supervises a loopback vLLM
+child, proxies the OpenAI routes, and captures completed responses without
+buffering the client path. The `doctor` subcommand remains declared but not yet
+implemented.
