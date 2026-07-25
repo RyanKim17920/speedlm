@@ -1,14 +1,28 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import contextlib
 import os
 import sys
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 
+import uvicorn
+
 from speedlm import __version__
-from speedlm.config import ConfigError, SamplingConfig
+from speedlm.config import ConfigError, SamplingConfig, WrapperConfig
+from speedlm.gateway.app import create_app
+from speedlm.gateway.process import (
+    LOOPBACK_HOST,
+    ProcessError,
+    VLLMProcess,
+    build_vllm_argv,
+    forwarded_signals,
+    reserve_loopback_port,
+)
+from speedlm.report import ReportError, build_gain_report, build_status_report
 from speedlm.storage import StorageError, ensure_layout
 from speedlm.traces.normalize import NormalizeError, normalize_file
 from speedlm.traces.store import TraceError, TraceStore
@@ -46,9 +60,19 @@ def _build_parser() -> argparse.ArgumentParser:
     stats_parser = traces_sub.add_parser("stats", help="Show trace store statistics")
     stats_parser.add_argument("--store", default=None, help="Override trace store path")
 
+    # ---- status ----
+    status_parser = subparsers.add_parser("status", help="Show SpeedLM status")
+    status_parser.add_argument(
+        "--json", action="store_true", default=False, help="Emit JSON instead of text"
+    )
+
+    # ---- gain ----
+    gain_parser = subparsers.add_parser("gain", help="Show measured draft gain")
+    gain_parser.add_argument(
+        "--json", action="store_true", default=False, help="Emit JSON instead of text"
+    )
+
     # ---- stub subcommands ----
-    subparsers.add_parser("status", help="Show SpeedLM status")
-    subparsers.add_parser("gain", help="Show token gain analytics")
     subparsers.add_parser("doctor", help="Diagnose environment issues")
 
     return parser
@@ -62,16 +86,127 @@ def _build_parser() -> argparse.ArgumentParser:
 def _cmd_vllm_serve(
     model: str, host: str, port: int, passthrough: list[str]
 ) -> int:
-    addr = f"{host}:{port}"
-    passthrough_str = " ".join(f"{a!s}" for a in passthrough) if passthrough else "(none)"
-    msg = (
-        f"[speedlm] vllm serve (NOT YET IMPLEMENTED)\n"
-        f"  model : {model}\n"
-        f"  listen: {addr}\n"
-        f"  vllm argv: {passthrough_str}"
+    try:
+        wrapper = WrapperConfig(host=host, port=port)
+        layout = ensure_layout()
+        store = TraceStore(layout.traces_dir / "traces.jsonl")
+        return asyncio.run(
+            _run_vllm_gateway(
+                model,
+                wrapper=wrapper,
+                passthrough=passthrough,
+                store=store,
+            )
+        )
+    except (ConfigError, ProcessError, OSError, RuntimeError) as exc:
+        sys.stderr.write(f"[speedlm] error: {exc}\n")
+        return 1
+
+
+class _GatewayServer(uvicorn.Server):
+    """Let SpeedLM own signal forwarding instead of uvicorn."""
+
+    @contextlib.contextmanager
+    def capture_signals(self) -> Iterator[None]:
+        yield
+
+
+async def _run_vllm_gateway(
+    model: str,
+    *,
+    wrapper: WrapperConfig,
+    passthrough: Sequence[str],
+    store: TraceStore,
+) -> int:
+    child_port = reserve_loopback_port()
+    child_url = f"http://{LOOPBACK_HOST}:{child_port}"
+    child = VLLMProcess(
+        build_vllm_argv(
+            model,
+            passthrough,
+            host=LOOPBACK_HOST,
+            port=child_port,
+        ),
+        health_url=f"{child_url}/health",
     )
-    sys.stderr.write(msg + "\n")
-    return 2
+    sys.stderr.write(
+        f"[speedlm] launching vLLM on {LOOPBACK_HOST}:{child_port}; "
+        f"gateway listening on {wrapper.host}:{wrapper.port}\n"
+    )
+    received_signal: int | None = None
+    server: _GatewayServer | None = None
+
+    def on_signal(signum: int) -> None:
+        nonlocal received_signal
+        received_signal = signum
+        if server is not None:
+            if server.should_exit:
+                server.force_exit = True
+            server.should_exit = True
+
+    await child.start()
+    try:
+        with forwarded_signals(child, on_signal):
+            try:
+                await child.wait_ready()
+            except ProcessError:
+                if received_signal is not None:
+                    return 128 + received_signal
+                raise
+            if received_signal is not None:
+                return 128 + received_signal
+
+            app = create_app(
+                child_url,
+                trace_store=store,
+                sampling=SamplingConfig(),
+            )
+            server = _GatewayServer(
+                uvicorn.Config(
+                    app,
+                    host=wrapper.host,
+                    port=wrapper.port,
+                    log_level="info",
+                    lifespan="on",
+                )
+            )
+
+            async def serve() -> int:
+                if server is None:
+                    raise RuntimeError("gateway server was not initialized")
+                try:
+                    await server.serve()
+                except SystemExit as exc:
+                    return exc.code if isinstance(exc.code, int) else 1
+                return 0 if server.started else 1
+
+            server_task = asyncio.create_task(serve())
+            child_task = asyncio.create_task(child.wait())
+            done, _ = await asyncio.wait(
+                {server_task, child_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if child_task in done:
+                child_code = child_task.result()
+                server.should_exit = True
+                await server_task
+                if received_signal is not None:
+                    return 128 + received_signal
+                return _shell_exit_code(child_code)
+
+            server_code = server_task.result()
+            child_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await child_task
+            if received_signal is not None:
+                return 128 + received_signal
+            return server_code
+    finally:
+        await child.shutdown()
+
+
+def _shell_exit_code(returncode: int) -> int:
+    return returncode if returncode >= 0 else 128 - returncode
 
 
 def _cmd_traces_import(path_str: str, model: str | None, store: str | None) -> int:
@@ -154,6 +289,28 @@ def _cmd_traces_stats(store: str | None) -> int:
         return 1
 
 
+def _cmd_status(as_json: bool) -> int:
+    try:
+        report = build_status_report()
+    except (ConfigError, StorageError, TraceError, ReportError, OSError) as exc:
+        sys.stderr.write(f"[speedlm] error: {exc}\n")
+        return 1
+    rendered = report.to_json() if as_json else report.render_text()
+    sys.stdout.write(rendered + "\n")
+    return 0
+
+
+def _cmd_gain(as_json: bool) -> int:
+    try:
+        report = build_gain_report()
+    except (ConfigError, StorageError, ReportError, OSError) as exc:
+        sys.stderr.write(f"[speedlm] error: {exc}\n")
+        return 1
+    rendered = report.to_json() if as_json else report.render_text()
+    sys.stdout.write(rendered + "\n")
+    return 0
+
+
 def _cmd_stub(name: str, description: str) -> int:
     sys.stderr.write(
         f"[speedlm] {name}: not yet implemented (will {description})\n"
@@ -220,11 +377,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         if traces_cmd == "stats":
             return _cmd_traces_stats(args.store)
 
-    # ---- stubs ----
+    # ---- status / gain ----
     if command == "status":
-        return _cmd_stub("status", "show cluster and proxy health")
+        return _cmd_status(bool(args.json))
     if command == "gain":
-        return _cmd_stub("gain", "display token savings analytics")
+        return _cmd_gain(bool(args.json))
+
+    # ---- stubs ----
     if command == "doctor":
         return _cmd_stub("doctor", "diagnose GPU, disk, and config issues")
 
