@@ -7,8 +7,10 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
-from typing import Protocol
+from typing import Final, Protocol
 
+from speedlm.gate.decide import Decision
+from speedlm.storage import atomic_write_json
 from speedlm.tuner.artifacts import ArtifactRegistry, ArtifactSpec
 from speedlm.tuner.eagle3 import Eagle3Adapter, FinalAssistantMaskError
 from speedlm.tuner.idle import IdleDetector, TuningPreempted
@@ -17,20 +19,67 @@ from speedlm.tuner.state import TunerState, TunerStateMachine
 AbortCheck = Callable[[], bool]
 DraftReference = Path | str
 
+#: Name of the persisted gate decision inside a run directory.  Must match
+#: :data:`speedlm.report.DECISION_FILE_NAME`, which is what ``speedlm gain``
+#: looks for underneath the runs directory.
+DECISION_FILE_NAME: Final = "decision.json"
+
+
+class DecisionPersistError(RuntimeError):
+    """Raised when a gate decision cannot be persisted for later reporting."""
+
 
 @dataclass(frozen=True, slots=True)
 class GateResult:
-    """Outcome returned by the injected benchmark/promotion gate."""
+    """Outcome returned by the injected benchmark/promotion gate.
+
+    ``decision`` carries the gate's full :class:`~speedlm.gate.decide.Decision`
+    when the benchmark produced one.  It is what gets persisted as
+    ``decision.json`` so ``speedlm gain`` can report the measurement; a gate
+    that never got far enough to build one leaves it ``None``.
+    """
 
     passed: bool
     reason: str
     metrics: Mapping[str, object] = field(default_factory=dict)
+    decision: Decision | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.passed, bool):
             raise TypeError("gate result passed must be bool")
         if not isinstance(self.reason, str) or not self.reason:
             raise ValueError("gate result reason must be a non-empty string")
+        if self.decision is not None and not isinstance(self.decision, Decision):
+            raise TypeError("gate result decision must be a Decision or None")
+
+
+def write_decision(run_dir: Path, decision: Decision) -> Path:
+    """Atomically persist *decision* as ``<run_dir>/decision.json``.
+
+    The payload is exactly :meth:`Decision.to_dict`, which is the shape
+    :func:`speedlm.report.parse_decision` reads back.
+
+    ``speedlm gain`` distrusts any decision whose ``num_repeats`` disagrees with
+    the number of per-repeat rows, so an internally inconsistent decision is
+    rejected here rather than written out as an unreportable file.
+
+    Raises:
+        DecisionPersistError: If the decision is inconsistent or cannot be
+            written.
+    """
+    if decision.per_repeat and decision.num_repeats != len(decision.per_repeat):
+        raise DecisionPersistError(
+            "refusing to persist an inconsistent decision: "
+            f"num_repeats={decision.num_repeats} but "
+            f"len(per_repeat)={len(decision.per_repeat)}"
+        )
+    path = run_dir / DECISION_FILE_NAME
+    try:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        atomic_write_json(path, decision.to_dict())
+    except OSError as exc:
+        raise DecisionPersistError(f"cannot write gate decision {path}: {exc}") from exc
+    return path
 
 
 class BenchmarkGate(Protocol):
@@ -124,6 +173,8 @@ class CycleResult:
     artifact_id: str | None = None
     gate: GateResult | None = None
     error: str | None = None
+    #: Where the gate decision was persisted, when the gate produced one.
+    decision_path: Path | None = None
 
 
 class TunerOrchestrator:
@@ -239,6 +290,9 @@ class TunerOrchestrator:
                 timeout_seconds=self._timeouts.benchmark,
                 should_abort=lambda: guard.is_preempted,
             )
+            # Persist before the preemption check: a completed benchmark is a
+            # real measurement even if the cycle is abandoned immediately after.
+            decision_path = self._persist_decision(work_dir, gate_result)
             guard.check()
 
             if not gate_result.passed:
@@ -256,6 +310,7 @@ class TunerOrchestrator:
                     artifact_id=artifact_id,
                     gate=gate_result,
                     error="; ".join(cleanup_errors) if cleanup_errors else None,
+                    decision_path=decision_path,
                 )
 
             self._state.transition(
@@ -271,6 +326,7 @@ class TunerOrchestrator:
                 outcome=CycleOutcome.PROMOTED,
                 artifact_id=artifact_id,
                 gate=gate_result,
+                decision_path=decision_path,
             )
         except FinalAssistantMaskError as exc:
             cleanup_errors = self._rollback_after_failure(pointer_changed)
@@ -293,6 +349,19 @@ class TunerOrchestrator:
                 artifact_id=artifact_id,
                 error=_combine_error(exc, cleanup_errors),
             )
+
+    def _persist_decision(self, run_dir: Path, gate_result: GateResult) -> Path | None:
+        """Record the gate's decision so ``speedlm gain`` can report it.
+
+        Both promotions and rejections are written: a rejection is a real
+        measured result and must stay reportable.  A failure to persist is
+        fail-closed — the exception propagates, the cycle rolls back and
+        restores serving — because an unrecorded benchmark is exactly the
+        blindness this write exists to remove.
+        """
+        if gate_result.decision is None:
+            return None
+        return write_decision(run_dir, gate_result.decision)
 
     def recover(self) -> tuple[str, ...]:
         """Restore the durable active draft after an interrupted process."""

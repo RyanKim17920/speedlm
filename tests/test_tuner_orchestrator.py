@@ -1,9 +1,17 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import pytest
+
+from speedlm.config import PromotionConfig
+from speedlm.gate.decide import Decision, Reason, Verdict, decide_promotion
+from speedlm.gate.metrics import MetricsDelta
+from speedlm.gate.replay import ReplayResult, RequestResult, RunResults
+from speedlm.report import GainStatus, build_gain_report, load_decision
 from speedlm.tuner.artifacts import ArtifactRegistry, ArtifactSpec
 from speedlm.tuner.eagle3 import (
     Eagle3Adapter,
@@ -15,9 +23,12 @@ from speedlm.tuner.eagle3 import (
 )
 from speedlm.tuner.idle import IdleDetector
 from speedlm.tuner.orchestrator import (
+    DECISION_FILE_NAME,
     CycleOutcome,
+    DecisionPersistError,
     GateResult,
     TunerOrchestrator,
+    write_decision,
 )
 from speedlm.tuner.state import TunerState, TunerStateMachine
 
@@ -174,6 +185,7 @@ class FakeRuntime:
 @dataclass
 class FakeGate:
     passed: bool
+    decision: Decision | None = None
 
     def benchmark(
         self,
@@ -182,7 +194,81 @@ class FakeGate:
         timeout_seconds: float,
         should_abort: Callable[[], bool],
     ) -> GateResult:
-        return GateResult(self.passed, "thresholds met" if self.passed else "regression")
+        return GateResult(
+            self.passed,
+            "thresholds met" if self.passed else "regression",
+            decision=self.decision,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Real gate decisions (built through decide_promotion, not hand-rolled dicts)
+# ---------------------------------------------------------------------------
+
+
+def _run(
+    *, completion_tokens: int, latency_s: float, response_text: str = "ok"
+) -> RunResults:
+    results = tuple(
+        RequestResult(
+            context_hash="abcd1234",
+            latency_s=latency_s,
+            prompt_tokens=10,
+            completion_tokens=completion_tokens,
+            total_tokens=10 + completion_tokens,
+            response_text=response_text,
+            valid=True,
+        )
+        for _ in range(1)
+    )
+    return RunResults(
+        results=results,
+        total_latency_s=latency_s,
+        total_prompt_tokens=10,
+        total_completion_tokens=completion_tokens,
+        valid_count=len(results),
+        invalid_count=0,
+        invalid_rate=0.0,
+    )
+
+
+def _replay(*, completion_tokens: int, latency_s: float, repeats: int = 3) -> ReplayResult:
+    runs = [
+        _run(completion_tokens=completion_tokens, latency_s=latency_s)
+        for _ in range(repeats)
+    ]
+    return ReplayResult(
+        run_results=tuple(runs), num_runs=len(runs), suite_hash="suite-hash"
+    )
+
+
+def _delta(*, acceptance_rate: float, output_tok_per_sec: float) -> MetricsDelta:
+    return MetricsDelta(
+        reset_detected=False,
+        acceptance_available=True,
+        drafted_tokens=1000.0,
+        accepted_tokens=1000.0 * acceptance_rate,
+        acceptance_rate=acceptance_rate,
+        mean_accepted_length=2.0,
+        tpot_ms=10.0,
+        output_tok_per_sec=output_tok_per_sec,
+    )
+
+
+def _real_decision(*, promote: bool) -> Decision:
+    """Produce a genuine :class:`Decision` from the real gate logic."""
+    candidate_acceptance = 0.78 if promote else 0.61
+    candidate_tps = 130.0 if promote else 101.0
+    decision = decide_promotion(
+        _delta(acceptance_rate=0.60, output_tok_per_sec=100.0),
+        _delta(acceptance_rate=candidate_acceptance, output_tok_per_sec=candidate_tps),
+        _replay(completion_tokens=100, latency_s=1.0),
+        _replay(completion_tokens=130, latency_s=1.0),
+        PromotionConfig(),
+    )
+    expected = Verdict.PROMOTE if promote else Verdict.REJECT
+    assert decision.verdict is expected, decision
+    return decision
 
 
 def _adapter(
@@ -209,6 +295,8 @@ def _orchestrator(
     runtime: FakeRuntime | None = None,
     gate_passed: bool = True,
     adapter: Eagle3Adapter | None = None,
+    decision: Decision | None = None,
+    work_root: Path | None = None,
 ) -> tuple[TunerOrchestrator, TunerStateMachine, ArtifactRegistry, FakeRuntime]:
     activity = activity or FakeActivity()
     runtime = runtime or FakeRuntime(activity)
@@ -220,8 +308,8 @@ def _orchestrator(
         eagle3=adapter or _adapter(),
         artifacts=artifacts,
         runtime=runtime,
-        gate=FakeGate(gate_passed),
-        work_root=tmp_path / "work",
+        gate=FakeGate(gate_passed, decision),
+        work_root=work_root or (tmp_path / "work"),
         run_id_factory=lambda: "run-1",
     )
     return orchestrator, state, artifacts, runtime
@@ -319,6 +407,136 @@ def test_final_assistant_mask_error_is_distinct(tmp_path: Path) -> None:
     assert result.outcome is CycleOutcome.FINAL_ASSISTANT_MASK_ERROR
     assert "no final assistant tokens" in (result.error or "")
     assert state.state is TunerState.READY
+
+
+# ---------------------------------------------------------------------------
+# Decision persistence — the write half of `speedlm gain`
+# ---------------------------------------------------------------------------
+
+
+def test_decision_is_persisted_on_promote(tmp_path: Path) -> None:
+    decision = _real_decision(promote=True)
+    orchestrator, _, _, _ = _orchestrator(tmp_path, decision=decision)
+
+    result = orchestrator.run_once()
+
+    assert result.outcome is CycleOutcome.PROMOTED
+    path = tmp_path / "work" / "run-1" / DECISION_FILE_NAME
+    assert result.decision_path == path
+    assert json.loads(path.read_text(encoding="utf-8")) == decision.to_dict()
+
+
+def test_decision_is_persisted_on_reject(tmp_path: Path) -> None:
+    """A rejection is a real measured result and must stay reportable."""
+    decision = _real_decision(promote=False)
+    orchestrator, _, _, _ = _orchestrator(
+        tmp_path, gate_passed=False, decision=decision
+    )
+
+    result = orchestrator.run_once()
+
+    assert result.outcome is CycleOutcome.REJECTED
+    path = tmp_path / "work" / "run-1" / DECISION_FILE_NAME
+    assert result.decision_path == path
+    assert load_decision(path) == decision
+
+
+def test_no_decision_file_when_the_gate_produced_none(tmp_path: Path) -> None:
+    orchestrator, _, _, _ = _orchestrator(tmp_path)
+
+    result = orchestrator.run_once()
+
+    assert result.outcome is CycleOutcome.PROMOTED
+    assert result.decision_path is None
+    assert not (tmp_path / "work" / "run-1" / DECISION_FILE_NAME).exists()
+
+
+def test_inconsistent_decision_is_refused_rather_than_written(tmp_path: Path) -> None:
+    """`speedlm gain` distrusts these, so they must never reach disk."""
+    good = _real_decision(promote=True)
+    bad = Decision(
+        verdict=good.verdict,
+        reason=good.reason,
+        acceptance_delta_pp=good.acceptance_delta_pp,
+        throughput_delta_pct=good.throughput_delta_pct,
+        min_acceptance_delta_pp=good.min_acceptance_delta_pp,
+        min_throughput_delta_pct=good.min_throughput_delta_pct,
+        num_repeats=good.num_repeats + 1,
+        per_repeat=good.per_repeat,
+        stock_avg_acceptance=good.stock_avg_acceptance,
+        candidate_avg_acceptance=good.candidate_avg_acceptance,
+        stock_avg_tok_per_sec=good.stock_avg_tok_per_sec,
+        candidate_avg_tok_per_sec=good.candidate_avg_tok_per_sec,
+    )
+    run_dir = tmp_path / "run"
+
+    with pytest.raises(DecisionPersistError, match="inconsistent"):
+        write_decision(run_dir, bad)
+
+    assert not (run_dir / DECISION_FILE_NAME).exists()
+
+
+@pytest.mark.parametrize("promote", [True, False])
+def test_decision_round_trips_into_a_measured_gain_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, promote: bool
+) -> None:
+    """End-to-end contract: gate Decision -> decision.json -> `speedlm gain`.
+
+    This is the test that proves the two halves connect: the orchestrator writes
+    under the runs directory, and ``report.py`` finds, trusts, and renders it.
+    """
+    home = tmp_path / "home"
+    monkeypatch.setenv("SPEEDLM_HOME", str(home))
+    decision = _real_decision(promote=promote)
+    orchestrator, _, _, _ = _orchestrator(
+        tmp_path,
+        gate_passed=promote,
+        decision=decision,
+        work_root=home / "runs",
+    )
+
+    result = orchestrator.run_once()
+    assert result.outcome is (
+        CycleOutcome.PROMOTED if promote else CycleOutcome.REJECTED
+    )
+
+    report = build_gain_report()
+    assert report.status is GainStatus.MEASURED
+    assert report.deltas_measured is True
+    assert report.source_path == home / "runs" / "run-1" / DECISION_FILE_NAME
+    assert report.decision == decision
+
+    text = report.render_text()
+    assert f"verdict           : {decision.verdict.value}" in text
+    assert "throughput stock  : 100.00 tok/s" in text
+    assert f"repeats           : {decision.num_repeats}" in text
+    assert "not measured" not in text
+
+    payload = json.loads(report.to_json())
+    measurement = payload["measurement"]
+    assert measurement is not None
+    assert measurement["stock_tok_per_sec"] == decision.stock_avg_tok_per_sec
+    assert measurement["throughput_delta_pct"] == decision.throughput_delta_pct
+    assert len(payload["per_repeat"]) == decision.num_repeats
+
+
+def test_rejected_decision_keeps_its_reason_through_the_round_trip(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = tmp_path / "home"
+    monkeypatch.setenv("SPEEDLM_HOME", str(home))
+    decision = _real_decision(promote=False)
+    assert decision.reason is Reason.THROUGHPUT_BELOW_THRESHOLD
+    orchestrator, _, _, _ = _orchestrator(
+        tmp_path, gate_passed=False, decision=decision, work_root=home / "runs"
+    )
+
+    orchestrator.run_once()
+
+    report = build_gain_report()
+    assert report.decision is not None
+    assert report.decision.reason is Reason.THROUGHPUT_BELOW_THRESHOLD
+    assert "rejected because" in report.detail
 
 
 def test_scratch_quota_exceeded(tmp_path: Path) -> None:
