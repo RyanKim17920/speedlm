@@ -32,7 +32,7 @@ def test_traces_import_and_stats(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     code = main(["traces", "import", str(jsonl)])
     assert code == 0
     out = capsys.readouterr()
-    assert "accepted: 2" in out.out
+    assert "imported 2 record(s) [internal: 2]" in out.out
 
     code = main(["traces", "stats"])
     assert code == 0
@@ -49,7 +49,7 @@ def test_traces_import_mixed(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, ca
     code = main(["traces", "import", str(jsonl)])
     assert code == 0
     out = capsys.readouterr()
-    assert "accepted: 2" in out.out
+    assert "imported 2 record(s) [internal: 2]" in out.out
     assert "rejected: 1" in out.out
     assert "line 2:" in out.out
 
@@ -68,6 +68,25 @@ def test_traces_import_missing_file(monkeypatch: pytest.MonkeyPatch, capsys) -> 
     assert code == 1
     out = capsys.readouterr()
     assert "not found" in out.err
+
+
+def test_traces_import_help_explains_bootstrapping(capsys) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(["traces", "import", "--help"])
+    assert exc.value.code == 0
+    out = capsys.readouterr()
+    assert "auto-detects format" in out.out
+    assert "captured" in out.out
+    assert "automatically by 'speedlm vllm serve'" in out.out
+    assert "import is only for bootstrapping" in out.out
+
+
+def test_traces_help_uses_generic_import_description(capsys) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(["traces", "--help"])
+    assert exc.value.code == 0
+    out = capsys.readouterr()
+    assert "import traces from existing logs (auto-detects format)" in out.out
 
 
 def test_traces_stats_empty(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
@@ -243,10 +262,116 @@ def test_traces_import_iso_timestamp(
     code = main(["traces", "import", str(jsonl)])
     assert code == 0
     out = capsys.readouterr()
-    assert "accepted: 1" in out.out
+    assert "imported 1 record(s) [internal: 1]" in out.out
 
     code = main(["traces", "stats"])
     assert code == 0
     out = capsys.readouterr()
     assert "count    : 1" in out.out
     assert "tokens   : 8" in out.out
+
+
+def test_traces_import_openai_response_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    monkeypatch.setenv("SPEEDLM_HOME", str(tmp_path))
+    jsonl = tmp_path / "openai.jsonl"
+    tool_calls = [{
+        "id": "call-1",
+        "type": "function",
+        "function": {"name": "weather", "arguments": '{"city":"Paris"}'},
+    }]
+    _write_jsonl(jsonl, [{
+        "id": "chatcmpl-1",
+        "model": "gpt-4",
+        "choices": [{
+            "message": {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": tool_calls,
+            },
+            "finish_reason": "tool_calls",
+        }],
+        "usage": {"prompt_tokens": 5, "completion_tokens": 3},
+        "created": 1750000000,
+    }])
+
+    assert main(["traces", "import", str(jsonl)]) == 0
+    out = capsys.readouterr()
+    assert "imported 1 record(s) [openai-response: 1]" in out.out
+
+    stored = [
+        json.loads(line)
+        for line in (tmp_path / "traces" / "traces.jsonl").read_text().splitlines()
+    ]
+    assert stored[0]["id"] == "chatcmpl-1"
+    assert stored[0]["timestamp"] == 1750000000.0
+    assert stored[0]["messages"][0]["tool_calls"] == tool_calls
+    assert stored[0]["tool_calls"] == tool_calls
+
+    assert main(["traces", "stats"]) == 0
+    out = capsys.readouterr()
+    assert "count    : 1" in out.out
+    assert "tokens   : 8" in out.out
+
+
+def test_traces_import_bare_conversation_marks_estimated_tokens(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    monkeypatch.setenv("SPEEDLM_HOME", str(tmp_path))
+    jsonl = tmp_path / "bare.jsonl"
+    _write_jsonl(jsonl, [{
+        "model": "gpt-4",
+        "messages": [{"role": "user", "content": "hello"}],
+    }])
+
+    assert main(["traces", "import", str(jsonl)]) == 0
+    out = capsys.readouterr()
+    assert "imported 1 record(s) [bare-conversation: 1]" in out.out
+
+    stored = json.loads(
+        (tmp_path / "traces" / "traces.jsonl").read_text().splitlines()[0]
+    )
+    assert stored["prompt_tokens"] > 0
+    assert stored["completion_tokens"] >= 0
+    assert stored["token_count_source"] == "estimated"
+
+    assert main(["traces", "stats"]) == 0
+    out = capsys.readouterr().out
+    assert "measured : 0" in out
+    assert "estimated:" in out
+    assert "estimated: 0" not in out
+
+
+def test_traces_import_mixed_token_sources_and_proxy_capture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
+) -> None:
+    monkeypatch.setenv("SPEEDLM_HOME", str(tmp_path))
+    jsonl = tmp_path / "mixed-shapes.jsonl"
+    proxy = {
+        "capture": {
+            "request_payload": {
+                "model": "proxy-model",
+                "messages": [{"role": "user", "content": "hello"}],
+            },
+            "response_payload": {
+                "choices": [{
+                    "message": {"role": "assistant", "content": "hi"},
+                }],
+            },
+        },
+    }
+    _write_jsonl(jsonl, [GOOD_RECORD, proxy])
+
+    assert main(["traces", "import", str(jsonl)]) == 0
+    out = capsys.readouterr()
+    assert "internal: 1" in out.out
+    assert "proxy-capture: 1" in out.out
+
+    assert main(["traces", "stats"]) == 0
+    out = capsys.readouterr().out
+    assert "measured : 30" in out
+    estimated_line = next(
+        line for line in out.splitlines() if line.startswith("estimated:")
+    )
+    assert int(estimated_line.split(":", 1)[1]) > 0

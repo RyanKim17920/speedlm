@@ -30,8 +30,9 @@ class TraceRecord:
     temperature: float
     top_p: float
     seed: int
-    prompt_tokens: int
-    completion_tokens: int
+    prompt_tokens: int | None
+    completion_tokens: int | None
+    token_count_source: str = "measured"
 
     def __post_init__(self) -> None:
         _validate_record(
@@ -45,11 +46,14 @@ class TraceRecord:
             self.seed,
             self.prompt_tokens,
             self.completion_tokens,
+            self.token_count_source,
         )
 
     @property
-    def total_tokens(self) -> int:
-        """Sum of prompt and completion tokens."""
+    def total_tokens(self) -> int | None:
+        """Sum of token counts, or ``None`` when either count is unknown."""
+        if self.prompt_tokens is None or self.completion_tokens is None:
+            return None
         return self.prompt_tokens + self.completion_tokens
 
     def to_dict(self) -> dict[str, Any]:
@@ -65,6 +69,7 @@ class TraceRecord:
             "seed": self.seed,
             "prompt_tokens": self.prompt_tokens,
             "completion_tokens": self.completion_tokens,
+            "token_count_source": self.token_count_source,
         }
 
     @classmethod
@@ -80,7 +85,7 @@ class TraceRecord:
         missing = required_keys - set(data.keys())
         if missing:
             raise TraceError(f"missing required key: {sorted(missing)[0]}")
-        unknown = set(data.keys()) - required_keys
+        unknown = set(data.keys()) - required_keys - {"token_count_source"}
         if unknown:
             raise TraceError(f"unknown key: {sorted(unknown)[0]}")
 
@@ -97,6 +102,12 @@ class TraceRecord:
             seed=data["seed"],
             prompt_tokens=data["prompt_tokens"],
             completion_tokens=data["completion_tokens"],
+            token_count_source=data.get(
+                "token_count_source",
+                "estimated"
+                if data["prompt_tokens"] is None or data["completion_tokens"] is None
+                else "measured",
+            ),
         )
 
 
@@ -109,8 +120,9 @@ def _validate_record(
     temperature: float,
     top_p: float,
     seed: int,
-    prompt_tokens: int,
-    completion_tokens: int,
+    prompt_tokens: int | None,
+    completion_tokens: int | None,
+    token_count_source: str,
 ) -> None:
     if not isinstance(rid, str) or not rid:
         raise TraceError("id must be a non-empty string")
@@ -149,14 +161,35 @@ def _validate_record(
         raise TraceError("seed must be an int (not bool)")
     if seed < 0:
         raise TraceError("seed must be >= 0")
-    if isinstance(prompt_tokens, bool) or not isinstance(prompt_tokens, int):
-        raise TraceError("prompt_tokens must be an int (not bool)")
-    if prompt_tokens < 0:
-        raise TraceError("prompt_tokens must be >= 0")
-    if isinstance(completion_tokens, bool) or not isinstance(completion_tokens, int):
-        raise TraceError("completion_tokens must be an int (not bool)")
-    if completion_tokens < 0:
-        raise TraceError("completion_tokens must be >= 0")
+    if prompt_tokens is not None:
+        if isinstance(prompt_tokens, bool) or not isinstance(prompt_tokens, int):
+            raise TraceError("prompt_tokens must be an int or None (not bool)")
+        if prompt_tokens < 0:
+            raise TraceError("prompt_tokens must be >= 0")
+    if completion_tokens is not None:
+        if isinstance(completion_tokens, bool) or not isinstance(completion_tokens, int):
+            raise TraceError("completion_tokens must be an int or None (not bool)")
+        if completion_tokens < 0:
+            raise TraceError("completion_tokens must be >= 0")
+    if token_count_source not in {"measured", "estimated"}:
+        raise TraceError("token_count_source must be 'measured' or 'estimated'")
+
+
+def estimate_message_tokens(
+    messages: tuple[Mapping[str, Any], ...] | list[Mapping[str, Any]],
+) -> tuple[int, int]:
+    """Cheap chars/4 estimate split into prompt and assistant tokens."""
+    prompt_chars = 0
+    completion_chars = 0
+    for message in messages:
+        chars = len(json.dumps(dict(message), ensure_ascii=False, default=str))
+        if message.get("role") == "assistant":
+            completion_chars += chars
+        else:
+            prompt_chars += chars
+    prompt_tokens = (prompt_chars + 3) // 4
+    completion_tokens = (completion_chars + 3) // 4
+    return prompt_tokens, completion_tokens
 
 
 # ── TraceStats ──────────────────────────────────────────────────────────────
@@ -169,6 +202,9 @@ class TraceStats:
     tokens: int
     oldest: float | None
     newest: float | None
+    unknown_token_records: int = 0
+    measured_tokens: int = 0
+    estimated_tokens: int = 0
 
 
 # ── TraceStore ──────────────────────────────────────────────────────────────
@@ -224,16 +260,34 @@ class TraceStore:
         """Compute aggregate statistics over all records."""
         count = 0
         tokens = 0
+        unknown_token_records = 0
+        measured_tokens = 0
+        estimated_tokens = 0
         oldest: float | None = None
         newest: float | None = None
         for rec in self.iter_records():
             count += 1
-            tokens += rec.total_tokens
+            record_tokens = _accounting_tokens(rec)
+            tokens += record_tokens
+            if rec.token_count_source == "measured" and rec.total_tokens is not None:
+                measured_tokens += record_tokens
+            else:
+                estimated_tokens += record_tokens
+                if rec.total_tokens is None:
+                    unknown_token_records += 1
             if oldest is None or rec.timestamp < oldest:
                 oldest = rec.timestamp
             if newest is None or rec.timestamp > newest:
                 newest = rec.timestamp
-        return TraceStats(count=count, tokens=tokens, oldest=oldest, newest=newest)
+        return TraceStats(
+            count=count,
+            tokens=tokens,
+            oldest=oldest,
+            newest=newest,
+            unknown_token_records=unknown_token_records,
+            measured_tokens=measured_tokens,
+            estimated_tokens=estimated_tokens,
+        )
 
     def prune(self, *, now: float | None = None) -> int:
         """Prune by age then token budget; return number of records dropped.
@@ -270,10 +324,10 @@ class TraceStore:
         records = [r for r in records if (now - r.timestamp) <= age_seconds]
 
         # Step 2: token budget — drop oldest-first
-        total = sum(r.total_tokens for r in records)
+        total = sum(_accounting_tokens(record) for record in records)
         while total > self._max_tokens and records:
             removed = records.pop(0)
-            total -= removed.total_tokens
+            total -= _accounting_tokens(removed)
 
         dropped = initial_count - len(records)
         if dropped == 0:
@@ -286,3 +340,11 @@ class TraceStore:
             text += "\n"
         atomic_write_text(self._path, text)
         return dropped
+
+
+def _accounting_tokens(record: TraceRecord) -> int:
+    total = record.total_tokens
+    if total is not None:
+        return total
+    prompt_tokens, completion_tokens = estimate_message_tokens(list(record.messages))
+    return prompt_tokens + completion_tokens

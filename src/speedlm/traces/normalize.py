@@ -5,13 +5,14 @@ import hashlib
 import json
 import math
 import time
-from collections.abc import Mapping
+from collections import Counter
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from speedlm.config import SamplingConfig
-from speedlm.traces.store import TraceRecord
+from speedlm.traces.store import TraceRecord, estimate_message_tokens
 
 # ── Exceptions ──────────────────────────────────────────────────────────────
 
@@ -36,6 +37,7 @@ class NormalizeResult:
 
     accepted: tuple[TraceRecord, ...]
     rejected: tuple[Rejection, ...]
+    detected_shapes: tuple[str, ...] = ()
 
     @property
     def accepted_count(self) -> int:
@@ -44,6 +46,11 @@ class NormalizeResult:
     @property
     def rejected_count(self) -> int:
         return len(self.rejected)
+
+    @property
+    def shape_counts(self) -> dict[str, int]:
+        """Accepted records grouped by their detected external shape."""
+        return dict(Counter(self.detected_shapes))
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────
@@ -105,6 +112,328 @@ def _parse_timestamp_to_epoch(value: Any, *, index: int) -> float:
     )
 
 
+def _detect_shape(data: Mapping[str, Any], *, index: int) -> str:
+    """Structurally identify one supported external record envelope."""
+    has_choices = "choices" in data
+    reply_fields = [key for key in ("response", "completion") if key in data]
+    has_pair_envelope = "request" in data or bool(reply_fields)
+
+    if has_pair_envelope:
+        return "request-response"
+    if has_choices and "messages" in data:
+        return "proxy-capture"
+    if has_choices:
+        return "openai-response"
+    if "messages" in data:
+        has_tokens = (
+            "usage" in data
+            or "prompt_tokens" in data
+            or "completion_tokens" in data
+        )
+        return "internal" if has_tokens else "bare-conversation"
+    if _has_recoverable_conversation(data):
+        return "proxy-capture"
+    raise NormalizeError(
+        f"record[{index}]: cannot recover a conversation: no messages "
+        "or assistant content found"
+    )
+
+
+def _choice_message(
+    response: Mapping[str, Any],
+    *,
+    index: int,
+) -> dict[str, Any]:
+    choices = response.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise NormalizeError(
+            f"record[{index}]: openai-response 'choices' must be a non-empty list"
+        )
+    choice = choices[0]
+    if not isinstance(choice, dict):
+        raise NormalizeError(
+            f"record[{index}]: choices[0] must be an object"
+        )
+    message = choice.get("message")
+    if not isinstance(message, dict):
+        raise NormalizeError(
+            f"record[{index}]: choices[0].message must be an object"
+        )
+    result = dict(message)
+    result.setdefault("role", "assistant")
+    result.setdefault("content", None)
+    return result
+
+
+def _openai_response_to_internal(
+    data: Mapping[str, Any],
+    *,
+    index: int,
+) -> dict[str, Any]:
+    assistant = _choice_message(data, index=index)
+
+    normalized = dict(data)
+    normalized.pop("choices", None)
+    normalized["messages"] = [assistant]
+    tool_calls = assistant.get("tool_calls")
+    if tool_calls is not None:
+        normalized["tool_calls"] = tool_calls
+    return normalized
+
+
+def _assistant_reply(value: Any, *, field: str, index: int) -> dict[str, Any]:
+    if isinstance(value, str):
+        return {"role": "assistant", "content": value}
+    if not isinstance(value, dict):
+        raise NormalizeError(
+            f"record[{index}]: '{field}' must be a string or object"
+        )
+
+    raw_message = value.get("message")
+    if raw_message is not None:
+        if not isinstance(raw_message, dict):
+            raise NormalizeError(
+                f"record[{index}]: {field}.message must be an object"
+            )
+        message = dict(raw_message)
+        message.setdefault("role", "assistant")
+        message.setdefault("content", None)
+        return message
+    if "role" in value or "content" in value or "tool_calls" in value:
+        message = dict(value)
+        message.setdefault("role", "assistant")
+        message.setdefault("content", None)
+        return message
+    if "text" in value:
+        return {"role": "assistant", "content": value["text"]}
+    raise NormalizeError(
+        f"record[{index}]: '{field}' object must contain 'message', "
+        "'content', or 'text'"
+    )
+
+
+def _request_response_to_internal(
+    data: Mapping[str, Any],
+    *,
+    index: int,
+) -> dict[str, Any]:
+    reply_fields = [key for key in ("response", "completion") if key in data]
+    reply_field = reply_fields[0] if reply_fields else None
+
+    request: Mapping[str, Any]
+    request_raw = data.get("request")
+    if request_raw is not None:
+        if not isinstance(request_raw, dict):
+            raise NormalizeError(
+                f"record[{index}]: 'request' must be an object"
+            )
+        if "messages" in data:
+            raise NormalizeError(
+                f"record[{index}]: ambiguous request messages: both "
+                "request.messages and top-level 'messages' are present"
+            )
+        request = request_raw
+    else:
+        request = data
+
+    request_messages = request.get("messages")
+    if not isinstance(request_messages, list) or not request_messages:
+        raise NormalizeError(
+            f"record[{index}]: request 'messages' must be a non-empty list"
+        )
+
+    reply_raw = data[reply_field] if reply_field is not None else None
+    response_metadata: Mapping[str, Any] = {}
+    assistant: dict[str, Any] | None = None
+    if isinstance(reply_raw, dict) and "choices" in reply_raw:
+        assistant = _choice_message(reply_raw, index=index)
+        response_metadata = reply_raw
+    elif reply_field is not None:
+        assistant = _assistant_reply(reply_raw, field=reply_field, index=index)
+        if isinstance(reply_raw, dict):
+            response_metadata = reply_raw
+
+    combined_messages = [
+        dict(message) if isinstance(message, dict) else message
+        for message in request_messages
+    ]
+    if assistant is not None:
+        combined_messages.append(assistant)
+    normalized: dict[str, Any] = {
+        "messages": combined_messages,
+    }
+
+    # Response metadata wins over envelope metadata; request parameters supply
+    # the final fallback for the values that belong to the original request.
+    for key in (
+        "id", "model", "timestamp", "created", "usage",
+        "prompt_tokens", "completion_tokens",
+    ):
+        if key in response_metadata:
+            normalized[key] = response_metadata[key]
+        elif key in data and key not in {"request", reply_field}:
+            normalized[key] = data[key]
+        elif key in request:
+            normalized[key] = request[key]
+    for key in ("temperature", "top_p", "seed"):
+        if key in request:
+            normalized[key] = request[key]
+        elif key in data and key not in {"request", reply_field}:
+            normalized[key] = data[key]
+        elif key in response_metadata:
+            normalized[key] = response_metadata[key]
+
+    if assistant is not None:
+        tool_calls = assistant.get("tool_calls")
+        if tool_calls is not None:
+            normalized["tool_calls"] = tool_calls
+    return normalized
+
+
+def _walk_mappings(value: Any) -> Iterator[Mapping[str, Any]]:
+    if isinstance(value, Mapping):
+        yield value
+        for child in value.values():
+            yield from _walk_mappings(child)
+    elif isinstance(value, list):
+        for child in value:
+            yield from _walk_mappings(child)
+
+
+def _nested_messages(
+    data: Mapping[str, Any],
+) -> tuple[list[Any] | None, Mapping[str, Any] | None]:
+    for mapping in _walk_mappings(data):
+        messages = mapping.get("messages")
+        if isinstance(messages, list) and messages:
+            return messages, mapping
+    return None, None
+
+
+def _nested_assistant(
+    data: Mapping[str, Any],
+    *,
+    excluded: set[int],
+    index: int,
+) -> tuple[dict[str, Any] | None, Mapping[str, Any] | None]:
+    mappings = list(_walk_mappings(data))
+    for mapping in mappings:
+        if "choices" in mapping:
+            try:
+                return _choice_message(mapping, index=index), mapping
+            except NormalizeError:
+                continue
+    for mapping in mappings:
+        if id(mapping) in excluded or mapping.get("role") != "assistant":
+            continue
+        if "content" in mapping or "tool_calls" in mapping:
+            assistant = dict(mapping)
+            assistant.setdefault("content", None)
+            return assistant, mapping
+    for mapping in mappings:
+        for key in ("assistant", "reply", "response", "completion", "output"):
+            if key not in mapping:
+                continue
+            try:
+                return _assistant_reply(mapping[key], field=key, index=index), mapping
+            except NormalizeError:
+                continue
+    return None, None
+
+
+def _has_recoverable_conversation(data: Mapping[str, Any]) -> bool:
+    messages, _ = _nested_messages(data)
+    if messages is not None:
+        return True
+    assistant, _ = _nested_assistant(data, excluded=set(), index=0)
+    return assistant is not None
+
+
+def _first_nested(
+    mappings: list[Mapping[str, Any]],
+    key: str,
+) -> Any:
+    for mapping in mappings:
+        if key in mapping:
+            return mapping[key]
+    return None
+
+
+def _proxy_capture_to_internal(
+    data: Mapping[str, Any],
+    *,
+    index: int,
+) -> dict[str, Any]:
+    request_messages, request_metadata = _nested_messages(data)
+    excluded = {
+        id(message)
+        for message in request_messages or []
+        if isinstance(message, Mapping)
+    }
+    assistant, response_metadata = _nested_assistant(
+        data,
+        excluded=excluded,
+        index=index,
+    )
+    if request_messages is None and assistant is None:
+        raise NormalizeError(
+            f"record[{index}]: cannot recover a conversation: no messages "
+            "or assistant content found"
+        )
+
+    messages = [
+        dict(message) if isinstance(message, Mapping) else message
+        for message in (request_messages or [])
+    ]
+    if assistant is not None:
+        messages.append(assistant)
+    normalized: dict[str, Any] = {"messages": messages}
+
+    mappings = list(_walk_mappings(data))
+    response_first = [
+        mapping for mapping in (response_metadata, *mappings)
+        if mapping is not None
+    ]
+    request_first = [
+        mapping for mapping in (request_metadata, *mappings)
+        if mapping is not None
+    ]
+    for key in (
+        "id", "timestamp", "created", "usage",
+        "prompt_tokens", "completion_tokens",
+    ):
+        value = _first_nested(response_first, key)
+        if value is not None:
+            normalized[key] = value
+    for key in ("model", "temperature", "top_p", "seed"):
+        value = _first_nested(request_first, key)
+        if value is not None:
+            normalized[key] = value
+    if assistant is not None and "tool_calls" in assistant:
+        normalized["tool_calls"] = assistant["tool_calls"]
+    return normalized
+
+
+def _to_internal_shape(
+    data: Mapping[str, Any],
+    *,
+    shape: str,
+    index: int,
+) -> dict[str, Any]:
+    if shape == "openai-response":
+        return _openai_response_to_internal(data, index=index)
+    if shape == "request-response":
+        try:
+            return _request_response_to_internal(data, index=index)
+        except NormalizeError:
+            if _has_recoverable_conversation(data):
+                return _proxy_capture_to_internal(data, index=index)
+            raise
+    if shape == "proxy-capture":
+        return _proxy_capture_to_internal(data, index=index)
+    return dict(data)
+
+
 # ── Public API ──────────────────────────────────────────────────────────────
 
 def normalize_record(
@@ -114,7 +443,7 @@ def normalize_record(
     default_model: str | None = None,
     index: int = 0,
 ) -> TraceRecord:
-    """Validate and normalize a single external OpenAI-format record.
+    """Auto-detect, validate, and normalize one supported external record.
 
     Raises NormalizeError on any violation.
 
@@ -122,8 +451,11 @@ def normalize_record(
     because external OpenAI logs carry noise.
     """
 
+    shape = _detect_shape(data, index=index)
+    normalized = _to_internal_shape(data, shape=shape, index=index)
+
     # --- messages (required, non-empty list of {role, content}) ---
-    messages = data.get("messages")
+    messages = normalized.get("messages")
     if not isinstance(messages, list) or len(messages) == 0:
         raise NormalizeError(
             f"record[{index}]: 'messages' must be a non-empty list"
@@ -145,26 +477,24 @@ def normalize_record(
     messages_tuple: tuple[dict[str, Any], ...] = tuple(dict(m) for m in messages)
 
     # --- model ---
-    model = data.get("model")
+    model = normalized.get("model")
     if isinstance(model, str) and model:
         pass
     elif default_model is not None:
         model = default_model
     else:
-        raise NormalizeError(
-            f"record[{index}]: 'model' is required (no default_model provided)"
-        )
+        model = "unknown"
 
     # --- id ---
-    rid = data.get("id")
+    rid = normalized.get("id")
     if isinstance(rid, str) and rid:
         pass
     else:
         rid = _generate_id(data)
 
     # --- timestamp ---
-    ts = data.get("timestamp")
-    created = data.get("created")
+    ts = normalized.get("timestamp")
+    created = normalized.get("created")
     if ts is not None:
         ts = _parse_timestamp_to_epoch(ts, index=index)
     elif created is not None:
@@ -173,7 +503,7 @@ def normalize_record(
         ts = time.time()
 
     # --- sampling parameters ---
-    temperature = data.get("temperature")
+    temperature = normalized.get("temperature")
     if temperature is not None:
         if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
             raise NormalizeError(
@@ -186,7 +516,7 @@ def normalize_record(
     else:
         temperature = defaults.temperature
 
-    top_p = data.get("top_p")
+    top_p = normalized.get("top_p")
     if top_p is not None:
         if isinstance(top_p, bool) or not isinstance(top_p, (int, float)):
             raise NormalizeError(
@@ -199,7 +529,7 @@ def normalize_record(
     else:
         top_p = defaults.top_p
 
-    seed = data.get("seed")
+    seed = normalized.get("seed")
     if seed is not None:
         if isinstance(seed, bool) or not isinstance(seed, int):
             raise NormalizeError(
@@ -213,7 +543,7 @@ def normalize_record(
         seed = defaults.seed
 
     # --- tool_calls ---
-    tool_calls_raw = data.get("tool_calls")
+    tool_calls_raw = normalized.get("tool_calls")
     if tool_calls_raw is not None:
         if not isinstance(tool_calls_raw, list):
             raise NormalizeError(
@@ -231,7 +561,11 @@ def normalize_record(
         tool_calls = ()
 
     # --- token counts ---
-    prompt_tokens, completion_tokens = _extract_tokens(data, index)
+    prompt_tokens, completion_tokens, token_count_source = _extract_tokens(
+        normalized,
+        index,
+        messages_tuple,
+    )
 
     return TraceRecord(
         id=rid,
@@ -242,67 +576,48 @@ def normalize_record(
         temperature=float(temperature),
         top_p=float(top_p),
         seed=int(seed),
-        prompt_tokens=int(prompt_tokens),
-        completion_tokens=int(completion_tokens),
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        token_count_source=token_count_source,
     )
 
 
-def _extract_tokens(data: Mapping[str, Any], index: int) -> tuple[int, int]:
-    """Extract (prompt_tokens, completion_tokens) from an external record."""
+def _extract_tokens(
+    data: Mapping[str, Any],
+    index: int,
+    messages: tuple[dict[str, Any], ...],
+) -> tuple[int, int, str]:
+    """Use measured counts when complete; otherwise estimate without rejecting."""
+    del index  # Token problems deliberately fall back to estimates.
+    estimated_prompt, estimated_completion = estimate_message_tokens(list(messages))
     usage = data.get("usage")
     if isinstance(usage, dict):
         pt = usage.get("prompt_tokens")
         ct = usage.get("completion_tokens")
-        if pt is not None:
-            if isinstance(pt, bool) or not isinstance(pt, int):
-                raise NormalizeError(
-                    f"record[{index}]: usage.prompt_tokens must be an int"
-                )
-            if pt < 0:
-                raise NormalizeError(
-                    f"record[{index}]: usage.prompt_tokens must be >= 0"
-                )
-        else:
-            pt = 0
-        if ct is not None:
-            if isinstance(ct, bool) or not isinstance(ct, int):
-                raise NormalizeError(
-                    f"record[{index}]: usage.completion_tokens must be an int"
-                )
-            if ct < 0:
-                raise NormalizeError(
-                    f"record[{index}]: usage.completion_tokens must be >= 0"
-                )
-        else:
-            ct = 0
-        return pt, ct
+    else:
+        pt = data.get("prompt_tokens")
+        ct = data.get("completion_tokens")
 
-    # No usage dict: try top-level keys
-    pt = data.get("prompt_tokens")
-    ct = data.get("completion_tokens")
-    if pt is not None:
-        if isinstance(pt, bool) or not isinstance(pt, int):
-            raise NormalizeError(
-                f"record[{index}]: 'prompt_tokens' must be an int"
-            )
-        if pt < 0:
-            raise NormalizeError(
-                f"record[{index}]: 'prompt_tokens' must be >= 0"
-            )
-    else:
-        pt = 0
-    if ct is not None:
-        if isinstance(ct, bool) or not isinstance(ct, int):
-            raise NormalizeError(
-                f"record[{index}]: 'completion_tokens' must be an int"
-            )
-        if ct < 0:
-            raise NormalizeError(
-                f"record[{index}]: 'completion_tokens' must be >= 0"
-            )
-    else:
-        ct = 0
-    return pt, ct
+    measured_pt = _usable_token_count(pt)
+    measured_ct = _usable_token_count(ct)
+    if measured_pt is not None and measured_ct is not None:
+        source = (
+            "estimated"
+            if data.get("token_count_source") == "estimated"
+            else "measured"
+        )
+        return measured_pt, measured_ct, source
+    return (
+        measured_pt if measured_pt is not None else estimated_prompt,
+        measured_ct if measured_ct is not None else estimated_completion,
+        "estimated",
+    )
+
+
+def _usable_token_count(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
 
 
 def normalize_file(
@@ -327,6 +642,7 @@ def normalize_file(
         raise NormalizeError(f"file not found: {path}")
 
     accepted: list[TraceRecord] = []
+    detected_shapes: list[str] = []
     rejected: list[Rejection] = []
 
     with open(path, encoding="utf-8") as fh:
@@ -355,6 +671,7 @@ def normalize_file(
                 )
                 continue
             try:
+                shape = _detect_shape(obj, index=line_no)
                 record = normalize_record(
                     obj,
                     defaults=defaults,
@@ -362,6 +679,7 @@ def normalize_file(
                     index=line_no,
                 )
                 accepted.append(record)
+                detected_shapes.append(shape)
             except NormalizeError as e:
                 rejected.append(
                     Rejection(
@@ -374,4 +692,5 @@ def normalize_file(
     return NormalizeResult(
         accepted=tuple(accepted),
         rejected=tuple(rejected),
+        detected_shapes=tuple(detected_shapes),
     )

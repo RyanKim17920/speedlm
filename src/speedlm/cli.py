@@ -52,7 +52,15 @@ def _build_parser() -> argparse.ArgumentParser:
     traces_parser = subparsers.add_parser("traces", help="Trace management")
     traces_sub = traces_parser.add_subparsers(dest="traces_command")
 
-    import_parser = traces_sub.add_parser("import", help="Import OpenAI-format JSONL traces")
+    import_parser = traces_sub.add_parser(
+        "import",
+        help="import traces from existing logs (auto-detects format)",
+        description=(
+            "Import traces from existing logs (auto-detects format). "
+            "Traces are captured automatically by 'speedlm vllm serve'; "
+            "import is only for bootstrapping."
+        ),
+    )
     import_parser.add_argument("path", help="Path to JSONL file")
     import_parser.add_argument("--model", default=None, help="Default model name")
     import_parser.add_argument("--store", default=None, help="Override trace store path")
@@ -247,8 +255,12 @@ def _cmd_traces_import(path_str: str, model: str | None, store: str | None) -> i
         accepted = result.accepted_count
         rejected = result.rejected_count
 
-        out_lines: list[str] = []
-        out_lines.append(f"accepted: {accepted}")
+        shape_summary = ", ".join(
+            f"{shape}: {count}" for shape, count in result.shape_counts.items()
+        )
+        out_lines = [
+            f"imported {accepted} record(s) [{shape_summary}]"
+        ]
         if rejected > 0:
             out_lines.append(f"rejected: {rejected}")
             for rej in result.rejected[:10]:
@@ -295,6 +307,8 @@ def _cmd_traces_stats(store: str | None) -> int:
         lines = [
             f"count    : {stats.count}",
             f"tokens   : {stats.tokens}",
+            f"measured : {stats.measured_tokens}",
+            f"estimated: {stats.estimated_tokens}",
             f"oldest   : {oldest_str}",
             f"newest   : {newest_str}",
             f"store    : {store_path}",

@@ -113,11 +113,11 @@ class TestMissingMessages:
 
 
 class TestModelHandling:
-    def test_missing_model_no_default_rejected(self) -> None:
+    def test_missing_model_no_default_uses_unknown(self) -> None:
         data = _default_data()
         del data["model"]
-        with pytest.raises(NormalizeError, match="model"):
-            normalize_record(data, defaults=_defaults(), default_model=None)
+        rec = normalize_record(data, defaults=_defaults(), default_model=None)
+        assert rec.model == "unknown"
 
     def test_default_model_applied(self) -> None:
         data = _default_data()
@@ -153,12 +153,23 @@ class TestTokenExtraction:
         assert rec.prompt_tokens == 10
         assert rec.completion_tokens == 20
 
-    def test_no_usage_defaults_to_zero(self) -> None:
+    def test_no_usage_is_estimated(self) -> None:
         data = _default_data()
         del data["usage"]
         rec = normalize_record(data, defaults=_defaults())
-        assert rec.prompt_tokens == 0
-        assert rec.completion_tokens == 0
+        assert rec.prompt_tokens > 0
+        assert rec.completion_tokens > 0
+        assert rec.token_count_source == "estimated"
+        assert rec.to_dict()["token_count_source"] == "estimated"
+
+    def test_unparseable_tokens_are_estimated(self) -> None:
+        data = _default_data(
+            usage={"prompt_tokens": "unknown", "completion_tokens": -1}
+        )
+        rec = normalize_record(data, defaults=_defaults())
+        assert rec.prompt_tokens > 0
+        assert rec.completion_tokens > 0
+        assert rec.token_count_source == "estimated"
 
     def test_top_level_tokens(self) -> None:
         data = _default_data()
@@ -202,6 +213,7 @@ class TestNormalizeFile:
         result = normalize_file(f, defaults=_defaults())
         assert result.accepted_count == 1
         assert result.rejected_count == 0
+        assert result.shape_counts == {"internal": 1}
 
     def test_malformed_json_becomes_rejection(self, tmp_path: Path) -> None:
         f = tmp_path / "data.jsonl"
@@ -212,13 +224,15 @@ class TestNormalizeFile:
         assert result.rejected[0].line == 2
         assert isinstance(result.rejected[0], Rejection)
 
-    def test_missing_model_rejected(self, tmp_path: Path) -> None:
+    def test_missing_model_accepted(self, tmp_path: Path) -> None:
         data = _default_data()
         del data["model"]
         f = tmp_path / "data.jsonl"
         f.write_text(json.dumps(data) + "\n")
         result = normalize_file(f, defaults=_defaults(), default_model=None)
-        assert result.rejected_count == 1
+        assert result.accepted_count == 1
+        assert result.rejected_count == 0
+        assert result.accepted[0].model == "unknown"
 
     def test_default_model_in_file(self, tmp_path: Path) -> None:
         data = _default_data()
@@ -245,6 +259,207 @@ class TestNormalizeFile:
         assert result.accepted_count == 2
         assert result.rejected_count == 1
         assert result.rejected[0].line == 2
+
+
+# ── External shape auto-detection ──────────────────────────────────────────
+
+
+class TestExternalShapes:
+    def test_openai_chat_completion_response(self) -> None:
+        data = {
+            "id": "chatcmpl-1",
+            "model": "gpt-4",
+            "choices": [{
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3},
+            "created": 1750000000,
+        }
+        rec = normalize_record(data, defaults=_defaults())
+        assert rec.id == "chatcmpl-1"
+        assert rec.timestamp == 1750000000.0
+        assert rec.messages == ({"role": "assistant", "content": "hi"},)
+        assert rec.prompt_tokens == 5
+        assert rec.completion_tokens == 3
+
+    def test_openai_tool_calls_preserved(self) -> None:
+        tool_calls = [{
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": "weather", "arguments": '{"city":"Paris"}'},
+        }]
+        data = {
+            "model": "gpt-4",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": tool_calls,
+                },
+                "finish_reason": "tool_calls",
+            }],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 4},
+            "created": 1750000000,
+        }
+        rec = normalize_record(data, defaults=_defaults())
+        assert rec.messages[0]["tool_calls"] == tool_calls
+        assert rec.tool_calls == tuple(tool_calls)
+
+    def test_openai_response_without_usage_is_estimated(self) -> None:
+        data = {
+            "model": "gpt-4",
+            "choices": [{
+                "message": {"role": "assistant", "content": "hi"},
+            }],
+            "created": 1750000000,
+        }
+        rec = normalize_record(data, defaults=_defaults())
+        assert rec.token_count_source == "estimated"
+        assert rec.completion_tokens > 0
+
+    def test_nested_request_response_pair(self) -> None:
+        data = {
+            "request": {
+                "model": "gpt-4",
+                "messages": [{"role": "user", "content": "hello"}],
+                "temperature": 0.2,
+            },
+            "response": {
+                "id": "chatcmpl-pair",
+                "model": "gpt-4-0613",
+                "choices": [{
+                    "message": {"role": "assistant", "content": "hi"},
+                    "finish_reason": "stop",
+                }],
+                "usage": {"prompt_tokens": 5, "completion_tokens": 3},
+                "created": 1750000000,
+            },
+        }
+        rec = normalize_record(data, defaults=_defaults())
+        assert rec.id == "chatcmpl-pair"
+        assert rec.model == "gpt-4-0613"
+        assert rec.messages == (
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        )
+        assert rec.temperature == 0.2
+        assert rec.prompt_tokens == 5
+        assert rec.completion_tokens == 3
+
+    def test_flat_request_completion_pair(self) -> None:
+        data = {
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hello"}],
+            "completion": "hi",
+        }
+        rec = normalize_record(data, defaults=_defaults())
+        assert rec.messages[-1] == {"role": "assistant", "content": "hi"}
+        assert rec.prompt_tokens > 0
+        assert rec.completion_tokens > 0
+        assert rec.token_count_source == "estimated"
+
+    def test_bare_conversation(self) -> None:
+        data = {
+            "model": "gpt-4",
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi"},
+            ],
+        }
+        rec = normalize_record(data, defaults=_defaults())
+        assert rec.messages == tuple(data["messages"])
+        assert rec.prompt_tokens > 0
+        assert rec.completion_tokens > 0
+        assert rec.token_count_source == "estimated"
+
+    def test_combined_messages_and_choices_recovers_conversation(self) -> None:
+        data = {
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hello"}],
+            "choices": [{
+                "message": {"role": "assistant", "content": "hi"},
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3},
+        }
+        rec = normalize_record(data, defaults=_defaults())
+        assert rec.messages == (
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        )
+
+    def test_unrecognized_shape_rejected(self) -> None:
+        with pytest.raises(NormalizeError, match="cannot recover a conversation"):
+            normalize_record({"model": "gpt-4"}, defaults=_defaults())
+
+    def test_arbitrary_proxy_capture(self) -> None:
+        data = {
+            "event": {
+                "incoming_payload": {
+                    "body": {
+                        "model": "proxy-model",
+                        "messages": [{"role": "user", "content": "hello"}],
+                    },
+                },
+                "upstream_result": {
+                    "data": {
+                        "id": "proxy-1",
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": "hi",
+                            },
+                        }],
+                    },
+                },
+            },
+        }
+        rec = normalize_record(data, defaults=_defaults())
+        assert rec.id == "proxy-1"
+        assert rec.model == "proxy-model"
+        assert rec.messages == (
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi"},
+        )
+        assert rec.token_count_source == "estimated"
+
+    def test_file_reports_each_detected_shape(self, tmp_path: Path) -> None:
+        internal = _default_data()
+        response = {
+            "model": "gpt-4",
+            "choices": [{
+                "message": {"role": "assistant", "content": "hi"},
+                "finish_reason": "stop",
+            }],
+            "usage": {"prompt_tokens": 5, "completion_tokens": 3},
+            "created": 1750000000,
+        }
+        bare = {
+            "model": "gpt-4",
+            "messages": [{"role": "user", "content": "hello"}],
+        }
+        proxy = {
+            "event": {
+                "input": {
+                    "messages": [{"role": "user", "content": "hello"}],
+                },
+                "output": {"role": "assistant", "content": "hi"},
+            },
+        }
+        path = tmp_path / "shapes.jsonl"
+        path.write_text(
+            "\n".join(
+                json.dumps(item) for item in (response, internal, bare, proxy)
+            ) + "\n"
+        )
+        result = normalize_file(path, defaults=_defaults())
+        assert result.accepted_count == 4
+        assert result.shape_counts == {
+            "openai-response": 1,
+            "internal": 1,
+            "bare-conversation": 1,
+            "proxy-capture": 1,
+        }
 
 # ── ISO-8601 timestamp acceptance (Defect 1 regression) ────────────────────
 
@@ -333,4 +548,3 @@ class TestISOTimestamp:
         assert result.accepted_count == 0
         assert result.rejected_count == 1
         assert "ISO-8601" in result.rejected[0].reason
-
