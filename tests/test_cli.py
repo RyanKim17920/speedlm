@@ -105,7 +105,15 @@ def test_vllm_serve_passthrough(
 ) -> None:
     received: dict[str, object] = {}
 
-    async def fake_run(model, *, wrapper, passthrough, store) -> int:
+    async def fake_run(
+        model,
+        *,
+        wrapper,
+        passthrough,
+        store,
+        enable_tuning=False,
+        activity=None,
+    ) -> int:
         received.update(
             model=model,
             wrapper=wrapper,

@@ -175,6 +175,19 @@ class TraceBufferConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class RedactionConfig:
+    """Privacy controls for newly persisted traces."""
+
+    enabled: bool = True
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ConfigError(
+                f"redaction.enabled must be a bool, got {type(self.enabled).__name__!r}"
+            )
+
+
+@dataclass(frozen=True, slots=True)
 class PromotionConfig:
     min_acceptance_delta_pp: float = 1.0
     min_throughput_delta_pct: float = 2.0
@@ -192,10 +205,12 @@ class SpeedLMConfig:
     target: TargetConfig = field(default_factory=TargetConfig)
     wrapper: WrapperConfig = field(default_factory=WrapperConfig)
     buffer: TraceBufferConfig = field(default_factory=TraceBufferConfig)
+    redaction: RedactionConfig = field(default_factory=RedactionConfig)
     promotion: PromotionConfig = field(default_factory=PromotionConfig)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     idle_threshold_seconds: float = 300.0
     startup_timeout_seconds: float = field(default_factory=startup_timeout_seconds)
+    tuning_enabled: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.model, str) or not self.model:
@@ -236,6 +251,10 @@ class SpeedLMConfig:
             raise ConfigError(
                 f"startup_timeout_seconds must be > 0, got {self.startup_timeout_seconds}"
             )
+        if not isinstance(self.tuning_enabled, bool):
+            raise ConfigError(
+                f"tuning_enabled must be a bool, got {type(self.tuning_enabled).__name__!r}"
+            )
 
     @property
     def alias(self) -> str:
@@ -248,6 +267,7 @@ class SpeedLMConfig:
             "profile": self.profile,
             "idle_threshold_seconds": self.idle_threshold_seconds,
             "startup_timeout_seconds": self.startup_timeout_seconds,
+            "tuning_enabled": self.tuning_enabled,
         }
         result["target"] = {
             "host": self.target.host,
@@ -260,6 +280,9 @@ class SpeedLMConfig:
         result["buffer"] = {
             "max_tokens": self.buffer.max_tokens,
             "max_age_days": self.buffer.max_age_days,
+        }
+        result["redaction"] = {
+            "enabled": self.redaction.enabled,
         }
         result["promotion"] = {
             "min_acceptance_delta_pp": self.promotion.min_acceptance_delta_pp,
@@ -286,10 +309,12 @@ class SpeedLMConfig:
             "target",
             "wrapper",
             "buffer",
+            "redaction",
             "promotion",
             "sampling",
             "idle_threshold_seconds",
             "startup_timeout_seconds",
+            "tuning_enabled",
         }
         unknown = set(data.keys()) - known_keys
         if unknown:
@@ -311,6 +336,7 @@ class SpeedLMConfig:
         target_data = _nested(data, "target", {"host", "port"})
         wrapper_data = _nested(data, "wrapper", {"host", "port"})
         buffer_data = _nested(data, "buffer", {"max_tokens", "max_age_days"})
+        redaction_data = _nested(data, "redaction", {"enabled"})
         promotion_data = _nested(
             data, "promotion", {"min_acceptance_delta_pp", "min_throughput_delta_pct"}
         )
@@ -323,12 +349,14 @@ class SpeedLMConfig:
             target=TargetConfig(**target_data),
             wrapper=WrapperConfig(**wrapper_data),
             buffer=TraceBufferConfig(**buffer_data),
+            redaction=RedactionConfig(**redaction_data),
             promotion=PromotionConfig(**promotion_data),
             sampling=SamplingConfig(**sampling_data),
             idle_threshold_seconds=data.get("idle_threshold_seconds", 300.0),
             startup_timeout_seconds=data.get(
                 "startup_timeout_seconds", startup_timeout_seconds()
             ),
+            tuning_enabled=data.get("tuning_enabled", False),
         )
 
 

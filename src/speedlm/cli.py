@@ -3,17 +3,20 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import logging
 import os
 import sys
 from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import uvicorn
 
 from speedlm import __version__
 from speedlm.config import ConfigError, SamplingConfig, WrapperConfig, load_config
-from speedlm.doctor import CheckStatus, run_doctor
+from speedlm.doctor import CheckStatus, ExecutionMode, run_doctor
+from speedlm.gateway.activity import ActivityTracker
 from speedlm.gateway.app import create_app
 from speedlm.gateway.process import (
     LOOPBACK_HOST,
@@ -28,6 +31,85 @@ from speedlm.runtime import gateway_runtime_record
 from speedlm.storage import StorageError, ensure_layout, resolve_layout
 from speedlm.traces.normalize import NormalizeError, normalize_file
 from speedlm.traces.store import TraceError, TraceStore
+
+if TYPE_CHECKING:
+    from speedlm.tuner.service import TunerService
+
+logger = logging.getLogger("speedlm.cli")
+
+
+def _try_build_tuner_service(
+    model: str,
+    store: TraceStore,
+    activity: ActivityTracker,
+) -> TunerService | None:
+    """Attempt to construct the idle tuner service.
+
+    Returns None if construction fails for any reason, so that serving
+    continues even when tuning cannot be set up.
+    """
+    try:
+        from speedlm.config import SpeedLMConfig
+        from speedlm.doctor import run_doctor
+        from speedlm.storage import ensure_layout, resolve_layout
+        from speedlm.training.backends.eagle3 import Eagle3Backend
+        from speedlm.tuner.service import create_tuner_service
+    except ImportError as exc:
+        logger.warning("idle tuner dependencies not available: %s", exc)
+        return None
+
+    try:
+        layout = resolve_layout()
+        config_path = layout.root / "config.json"
+        config = load_config(config_path) if config_path.exists() else None
+        doctor_report = run_doctor(config, home=layout.root)
+        if doctor_report.execution_mode is ExecutionMode.UNAVAILABLE:
+            logger.info(
+                "idle tuner refused: doctor reports execution mode %s — %s",
+                doctor_report.execution_mode.value,
+                doctor_report.plan.detail,
+            )
+            return None
+    except Exception as exc:
+        logger.warning("could not run doctor to check GPU for tuning: %s", exc)
+        return None
+
+    try:
+        cfg = SpeedLMConfig(model=model, tuning_enabled=True)
+        _layout = ensure_layout()
+
+        backend = Eagle3Backend.__new__(Eagle3Backend)  # noqa: F405
+
+        from speedlm.gate.runner import BenchmarkGateRunner
+        from speedlm.gateway.control import RuntimeController
+
+        gate = BenchmarkGateRunner(
+            config=cfg,
+            trace_source=store,
+            suite_dir=_layout.runs_dir / "gate",
+            stock_draft="",
+            endpoint=None,  # type: ignore[arg-type]
+            metrics_source=None,  # type: ignore[arg-type]
+        )
+        runtime = RuntimeController(
+            activity=activity,
+            admission=None,  # type: ignore[arg-type]
+            http=None,  # type: ignore[arg-type]
+            process=None,  # type: ignore[arg-type]
+            active_draft="",
+        )
+        return create_tuner_service(
+            cfg,
+            activity=activity,
+            traces=store,
+            backend=backend,
+            gate=gate,
+            runtime=runtime,
+            enabled=True,
+        )
+    except Exception as exc:
+        logger.warning("idle tuner construction failed: %s", exc)
+        return None
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -48,6 +130,12 @@ def _build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument("model", help="Model name or path")
     serve_parser.add_argument("--host", default="127.0.0.1", help="Wrapper listen host")
     serve_parser.add_argument("--port", type=int, default=8100, help="Wrapper listen port")
+    serve_parser.add_argument(
+        "--enable-idle-tuning",
+        action="store_true",
+        default=False,
+        help="Start the idle auto-tuner in the background",
+    )
 
     # ---- traces import ----
     traces_parser = subparsers.add_parser("traces", help="Trace management")
@@ -97,7 +185,8 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _cmd_vllm_serve(
-    model: str, host: str, port: int, passthrough: list[str]
+    model: str, host: str, port: int, passthrough: list[str],
+    enable_tuning: bool = False,
 ) -> int:
     try:
         wrapper = WrapperConfig(host=host, port=port)
@@ -109,6 +198,7 @@ def _cmd_vllm_serve(
                 wrapper=wrapper,
                 passthrough=passthrough,
                 store=store,
+                enable_tuning=enable_tuning,
             )
         )
     except (ConfigError, ProcessError, OSError, RuntimeError) as exc:
@@ -130,7 +220,11 @@ async def _run_vllm_gateway(
     wrapper: WrapperConfig,
     passthrough: Sequence[str],
     store: TraceStore,
+    enable_tuning: bool = False,
+    activity: ActivityTracker | None = None,
 ) -> int:
+    tracker = activity or ActivityTracker()
+
     child_port = reserve_loopback_port()
     child_url = f"http://{LOOPBACK_HOST}:{child_port}"
     child = VLLMProcess(
@@ -186,7 +280,7 @@ async def _run_vllm_gateway(
             app = create_app(
                 child_url,
                 trace_store=store,
-                sampling=SamplingConfig(),
+                activity=tracker,
             )
             server = _GatewayServer(
                 uvicorn.Config(
@@ -208,6 +302,18 @@ async def _run_vllm_gateway(
                 return 0 if server.started else 1
 
             server_task = asyncio.create_task(serve())
+            # Build and start the idle tuner after the gateway server is up
+            tuner_service: object | None = None
+            if enable_tuning:
+                tuner_service = _try_build_tuner_service(model, store, tracker)
+                if tuner_service is not None:
+                    try:
+                        tuner_service.start()
+                        logger.info("idle tuner service started")
+                    except Exception as exc:
+                        logger.warning("idle tuner start failed: %s", exc)
+                        tuner_service = None
+
             child_task = asyncio.create_task(child.wait())
             done, _ = await asyncio.wait(
                 {server_task, child_task},
@@ -229,6 +335,12 @@ async def _run_vllm_gateway(
                 return 128 + received_signal
             return server_code
     finally:
+        # Stop tuner service before tearing down vLLM
+        if tuner_service is not None:
+            try:
+                tuner_service.stop(timeout_seconds=10.0)  # type: ignore[attr-defined]
+            except Exception as exc:
+                logger.warning("idle tuner stop failed: %s", exc)
         try:
             await child.shutdown()
         finally:
@@ -406,8 +518,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             sub.add_argument("model")
             sub.add_argument("--host", default="127.0.0.1")
             sub.add_argument("--port", type=int, default=8100)
+            sub.add_argument("--enable-idle-tuning", action="store_true", default=False)
             s_args, s_unknown = sub.parse_known_args(serve_argv)
-            return _cmd_vllm_serve(s_args.model, s_args.host, s_args.port, s_unknown)
+            return _cmd_vllm_serve(
+                s_args.model, s_args.host, s_args.port, s_unknown,
+                enable_tuning=getattr(s_args, "enable_idle_tuning", False),
+            )
 
     # ---- traces ----
     if command == "traces":
