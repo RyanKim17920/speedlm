@@ -7,11 +7,15 @@ the login-node test suite never imports CUDA, vLLM, or Speculators.
 
 from __future__ import annotations
 
+import inspect
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
+
+from speedlm.training.base import BackendInfo
+from speedlm.training.masking import FinalAssistantMaskError, MaskPolicy
 
 MAX_SCRATCH_BYTES = 5 * 1024 * 1024 * 1024
 DEFAULT_VERIFIER_MODEL = "openai/gpt-oss-20b"
@@ -22,10 +26,6 @@ AbortCheck = Callable[[], bool]
 
 class Eagle3Error(RuntimeError):
     """Base class for EAGLE-3 adapter failures."""
-
-
-class FinalAssistantMaskError(Eagle3Error):
-    """Training rows contain no trainable final-assistant tokens."""
 
 
 class ScratchQuotaExceeded(Eagle3Error):
@@ -106,20 +106,54 @@ class Eagle3Config:
     """Models and training controls for one EAGLE-3 adapter."""
 
     verifier_model: str = DEFAULT_VERIFIER_MODEL
+    verifier_revision: str | None = None
     draft_model: str = DEFAULT_DRAFT_MODEL
+    draft_revision: str | None = None
     from_pretrained: str = DEFAULT_DRAFT_MODEL
+    target_layer_ids: tuple[int, ...] = (2, 12, 21)
+    sequence_length: int = 8_192
+    num_speculative_steps: int = 3
+    mask_policy: MaskPolicy = MaskPolicy.FINAL_TURN_ALL_CHANNELS
     training_params: Mapping[str, object] = field(default_factory=dict)
     timeouts: Eagle3Timeouts = field(default_factory=Eagle3Timeouts)
     scratch_quota_bytes: int = MAX_SCRATCH_BYTES
 
     def __post_init__(self) -> None:
-        for name, value in (
+        for model_name, model_value in (
             ("verifier_model", self.verifier_model),
             ("draft_model", self.draft_model),
             ("from_pretrained", self.from_pretrained),
         ):
-            if not isinstance(value, str) or not value:
-                raise ValueError(f"{name} must be a non-empty string")
+            if not isinstance(model_value, str) or not model_value:
+                raise ValueError(f"{model_name} must be a non-empty string")
+        for revision_name, revision_value in (
+            ("verifier_revision", self.verifier_revision),
+            ("draft_revision", self.draft_revision),
+        ):
+            if revision_value is not None and (
+                not isinstance(revision_value, str) or not revision_value
+            ):
+                raise ValueError(f"{revision_name} must be a non-empty string or null")
+        if (
+            not isinstance(self.target_layer_ids, tuple)
+            or not self.target_layer_ids
+            or any(
+                isinstance(layer, bool) or not isinstance(layer, int) or layer < 0
+                for layer in self.target_layer_ids
+            )
+            or len(set(self.target_layer_ids)) != len(self.target_layer_ids)
+        ):
+            raise ValueError("target_layer_ids must be unique non-negative integers")
+        if (
+            isinstance(self.sequence_length, bool)
+            or not isinstance(self.sequence_length, int)
+            or self.sequence_length < 1
+        ):
+            raise ValueError("sequence_length must be a positive integer")
+        if self.num_speculative_steps != 3:
+            raise ValueError("EAGLE-3 requires exactly 3 speculative/TTT steps")
+        if not isinstance(self.mask_policy, MaskPolicy):
+            raise ValueError("mask_policy must be an explicit MaskPolicy")
         if (
             isinstance(self.scratch_quota_bytes, bool)
             or not isinstance(self.scratch_quota_bytes, int)
@@ -127,6 +161,27 @@ class Eagle3Config:
             or self.scratch_quota_bytes > MAX_SCRATCH_BYTES
         ):
             raise ValueError("scratch_quota_bytes must be in 1..5 GiB")
+
+    @property
+    def effective_training_params(self) -> Mapping[str, object]:
+        """Parameters including the verified EAGLE-3 distillation contract."""
+        result = dict(self.training_params)
+        result.update(
+            {
+                "target_layer_ids": self.target_layer_ids,
+                "sequence_length": self.sequence_length,
+                "num_speculative_steps": self.num_speculative_steps,
+                "distillation_loss": "soft_kl",
+                "draft_vocabulary": "reduced_d2t_t2d",
+                "ttt_loss_reduction": "sum",
+                "mask_policy": self.mask_policy.value,
+            }
+        )
+        if self.verifier_revision is not None:
+            result["verifier_revision"] = self.verifier_revision
+        if self.draft_revision is not None:
+            result["draft_revision"] = self.draft_revision
+        return result
 
 
 class TraceSnapshotLeaser(Protocol):
@@ -233,6 +288,15 @@ class Eagle3Adapter:
         self._validator = validator
         self._clock = clock
 
+    def describe(self) -> BackendInfo:
+        """Return backend-neutral metadata for orchestration and provenance."""
+        return BackendInfo(
+            verifier_model=self.config.verifier_model,
+            draft_model=self.config.draft_model,
+            from_pretrained=self.config.from_pretrained,
+            training_params=self.config.training_params,
+        )
+
     def prepare(self, work_dir: Path, *, should_abort: AbortCheck) -> PreparedData:
         """Lease traces and render training rows without touching a GPU."""
         work_dir.mkdir(parents=True, exist_ok=True)
@@ -248,15 +312,22 @@ class Eagle3Adapter:
         )
         started = self._clock()
         try:
-            rows_path = self._renderer.render_rows(
+            rows_path = _call_with_supported_keywords(
+                self._renderer.render_rows,
                 snapshot,
                 work_dir / "training-rows",
                 timeout_seconds=self.config.timeouts.render,
                 should_abort=should_abort,
+                mask_policy=self.config.mask_policy,
+                sequence_length=self.config.sequence_length,
             )
+        except FinalAssistantMaskError:
+            raise
         except Exception as exc:
             if exc.__class__.__name__ == "FinalAssistantMaskError":
-                raise FinalAssistantMaskError(str(exc)) from exc
+                raise FinalAssistantMaskError(
+                    "<unknown>", self.config.mask_policy, str(exc)
+                ) from exc
             raise
         self._finish_stage(
             "training row render",
@@ -277,10 +348,14 @@ class Eagle3Adapter:
         """Extract verifier hidden states."""
         self._check(work_dir, should_abort)
         started = self._clock()
-        hidden_states = self._extractor.extract_hidden_states(
+        hidden_states = _call_with_supported_keywords(
+            self._extractor.extract_hidden_states,
             prepared.rows_path,
             work_dir / "hidden-states",
             verifier_model=self.config.verifier_model,
+            verifier_revision=self.config.verifier_revision,
+            target_layer_ids=self.config.target_layer_ids,
+            sequence_length=self.config.sequence_length,
             timeout_seconds=self.config.timeouts.extract,
             should_abort=should_abort,
         )
@@ -309,7 +384,7 @@ class Eagle3Adapter:
             hidden_states,
             work_dir / "speculators-training",
             from_pretrained=self.config.from_pretrained,
-            training_params=self.config.training_params,
+            training_params=self.config.effective_training_params,
             timeout_seconds=self.config.timeouts.train,
             should_abort=should_abort,
         )
@@ -339,7 +414,23 @@ class Eagle3Adapter:
         *,
         should_abort: AbortCheck,
     ) -> Path:
-        """Build and validate the separate standalone draft-model directory."""
+        """Compatibility helper that runs the distinct materialize/validate stages."""
+        draft_directory = self.materialize(
+            result,
+            work_dir,
+            should_abort=should_abort,
+        )
+        self.validate(draft_directory, should_abort=should_abort)
+        return draft_directory
+
+    def materialize(
+        self,
+        result: TrainingResult,
+        work_dir: Path,
+        *,
+        should_abort: AbortCheck,
+    ) -> Path:
+        """Build the separate standalone draft-model directory."""
         self._check(work_dir, should_abort)
         started = self._clock()
         draft_directory = self._materializer.materialize(
@@ -359,6 +450,17 @@ class Eagle3Adapter:
             raise Eagle3Error(
                 f"materializer did not return a draft directory: {draft_directory}"
             )
+        return draft_directory
+
+    def validate(
+        self,
+        draft_directory: Path,
+        *,
+        should_abort: AbortCheck,
+    ) -> None:
+        """Validate a materialized draft against the configured verifier."""
+        work_dir = draft_directory.parent
+        self._check(work_dir, should_abort)
         started = self._clock()
         self._validator.validate(
             draft_directory,
@@ -373,7 +475,6 @@ class Eagle3Adapter:
             work_dir,
             should_abort,
         )
-        return draft_directory
 
     def _finish_stage(
         self,
@@ -411,3 +512,22 @@ def scratch_usage(path: Path) -> int:
         elif entry.is_file():
             total += entry.stat().st_size
     return total
+
+
+def _call_with_supported_keywords[T](
+    function: Callable[..., T],
+    *args: object,
+    **kwargs: object,
+) -> T:
+    """Pass generalized parameters while preserving legacy injected effects."""
+    parameters = inspect.signature(function).parameters.values()
+    accepts_arbitrary = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD for parameter in parameters
+    )
+    supported_names = {parameter.name for parameter in parameters}
+    supported = (
+        kwargs
+        if accepts_arbitrary
+        else {name: value for name, value in kwargs.items() if name in supported_names}
+    )
+    return function(*args, **supported)

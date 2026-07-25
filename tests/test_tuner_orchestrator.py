@@ -12,11 +12,13 @@ from speedlm.gate.decide import Decision, Reason, Verdict, decide_promotion
 from speedlm.gate.metrics import MetricsDelta
 from speedlm.gate.replay import ReplayResult, RequestResult, RunResults
 from speedlm.report import GainStatus, build_gain_report, load_decision
+from speedlm.training.base import BackendInfo, SpeculatorBackend
+from speedlm.training.masking import FinalAssistantMaskError
 from speedlm.tuner.artifacts import ArtifactRegistry, ArtifactSpec
 from speedlm.tuner.eagle3 import (
     Eagle3Adapter,
     Eagle3Config,
-    FinalAssistantMaskError,
+    PreparedData,
     ScratchQuotaExceeded,
     TraceSnapshot,
     TrainingResult,
@@ -201,6 +203,95 @@ class FakeGate:
         )
 
 
+@dataclass
+class FakeBackend:
+    """Small structural implementation of the generalized backend protocol."""
+
+    mask_error: bool = False
+    training_error: Exception | None = None
+    calls: list[str] = field(default_factory=list)
+
+    def describe(self) -> BackendInfo:
+        return BackendInfo(
+            verifier_model="fake/verifier",
+            draft_model="fake/draft",
+            from_pretrained="fake/base-draft",
+            training_params={"steps": 2},
+        )
+
+    def prepare(
+        self,
+        work_dir: Path,
+        *,
+        should_abort: Callable[[], bool],
+    ) -> PreparedData:
+        self.calls.append("prepare")
+        if self.mask_error:
+            raise FinalAssistantMaskError("no final assistant tokens")
+        snapshot_path = work_dir / "trace-snapshot"
+        snapshot_path.mkdir()
+        rows_path = work_dir / "rows.jsonl"
+        rows_path.write_text("{}\n", encoding="utf-8")
+        return PreparedData(
+            snapshot=TraceSnapshot(snapshot_path, "trace-hash"),
+            rows_path=rows_path,
+        )
+
+    def extract(
+        self,
+        prepared: PreparedData,
+        work_dir: Path,
+        *,
+        should_abort: Callable[[], bool],
+    ) -> Path:
+        self.calls.append("extract")
+        hidden_states_path = work_dir / "hidden.pt"
+        hidden_states_path.write_bytes(b"hidden")
+        return hidden_states_path
+
+    def train(
+        self,
+        extracted: Path,
+        work_dir: Path,
+        *,
+        should_abort: Callable[[], bool],
+    ) -> TrainingResult:
+        self.calls.append("train")
+        if self.training_error is not None:
+            raise self.training_error
+        checkpoint = work_dir / "checkpoint_best"
+        checkpoint.mkdir()
+        (checkpoint / "weights.bin").write_bytes(b"trained")
+        return TrainingResult(checkpoint, 0)
+
+    def materialize(
+        self,
+        trained: TrainingResult,
+        work_dir: Path,
+        *,
+        should_abort: Callable[[], bool],
+    ) -> Path:
+        self.calls.append("materialize")
+        draft_directory = work_dir / "draft-model"
+        draft_directory.mkdir()
+        (draft_directory / "config.json").write_text(
+            '{"model_type":"fake"}',
+            encoding="utf-8",
+        )
+        (draft_directory / "weights.bin").write_bytes(
+            (trained.checkpoint_best / "weights.bin").read_bytes()
+        )
+        return draft_directory
+
+    def validate(
+        self,
+        artifact: Path,
+        *,
+        should_abort: Callable[[], bool],
+    ) -> None:
+        self.calls.append("validate")
+
+
 # ---------------------------------------------------------------------------
 # Real gate decisions (built through decide_promotion, not hand-rolled dicts)
 # ---------------------------------------------------------------------------
@@ -271,7 +362,7 @@ def _real_decision(*, promote: bool) -> Decision:
     return decision
 
 
-def _adapter(
+def _eagle3_adapter(
     *,
     trainer: FakeTrainer | None = None,
     renderer: FakeRenderer | None = None,
@@ -294,7 +385,7 @@ def _orchestrator(
     activity: FakeActivity | None = None,
     runtime: FakeRuntime | None = None,
     gate_passed: bool = True,
-    adapter: Eagle3Adapter | None = None,
+    backend: SpeculatorBackend | None = None,
     decision: Decision | None = None,
     work_root: Path | None = None,
 ) -> tuple[TunerOrchestrator, TunerStateMachine, ArtifactRegistry, FakeRuntime]:
@@ -305,7 +396,7 @@ def _orchestrator(
     orchestrator = TunerOrchestrator(
         state=state,
         idle=IdleDetector(activity, threshold_seconds=5.0, clock=lambda: 10.0),
-        eagle3=adapter or _adapter(),
+        backend=backend or FakeBackend(),
         artifacts=artifacts,
         runtime=runtime,
         gate=FakeGate(gate_passed, decision),
@@ -316,18 +407,26 @@ def _orchestrator(
 
 
 def test_happy_path_reaches_promoting_then_ready(tmp_path: Path) -> None:
-    trainer = FakeTrainer()
+    backend = FakeBackend()
     orchestrator, state, artifacts, runtime = _orchestrator(
         tmp_path,
-        adapter=_adapter(trainer=trainer),
+        backend=backend,
     )
 
     result = orchestrator.run_once()
 
     assert result.outcome is CycleOutcome.PROMOTED
     assert state.state is TunerState.READY
-    assert artifacts.active() is not None
-    assert trainer.seen_from_pretrained == "RedHatAI/gpt-oss-20b-speculator.eagle3"
+    active = artifacts.active()
+    assert active is not None
+    assert active.manifest.base_draft == "fake/base-draft"
+    assert backend.calls == [
+        "prepare",
+        "extract",
+        "train",
+        "materialize",
+        "validate",
+    ]
     events = state.events_path.read_text(encoding="utf-8")
     assert '"to": "PROMOTING"' in events
     assert runtime.calls == ["quiesce", "sleep", "start_candidate", "wake"]
@@ -382,10 +481,10 @@ def test_preemption_aborts_and_restores_serving(tmp_path: Path) -> None:
 
 
 def test_training_stderr_is_surfaced_and_runtime_restored(tmp_path: Path) -> None:
-    trainer = FakeTrainer(returncode=9, stderr="CUDA out of memory")
+    backend = FakeBackend(training_error=RuntimeError("CUDA out of memory"))
     orchestrator, state, _, _ = _orchestrator(
         tmp_path,
-        adapter=_adapter(trainer=trainer),
+        backend=backend,
     )
 
     result = orchestrator.run_once()
@@ -399,7 +498,7 @@ def test_training_stderr_is_surfaced_and_runtime_restored(tmp_path: Path) -> Non
 def test_final_assistant_mask_error_is_distinct(tmp_path: Path) -> None:
     orchestrator, state, _, _ = _orchestrator(
         tmp_path,
-        adapter=_adapter(renderer=FakeRenderer(mask_error=True)),
+        backend=FakeBackend(mask_error=True),
     )
 
     result = orchestrator.run_once()
@@ -540,7 +639,7 @@ def test_rejected_decision_keeps_its_reason_through_the_round_trip(
 
 
 def test_scratch_quota_exceeded(tmp_path: Path) -> None:
-    adapter = _adapter(renderer=FakeRenderer(bytes_to_write=32), quota=20)
+    adapter = _eagle3_adapter(renderer=FakeRenderer(bytes_to_write=32), quota=20)
     work = tmp_path / "scratch"
 
     try:

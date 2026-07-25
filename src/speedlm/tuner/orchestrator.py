@@ -1,4 +1,4 @@
-"""Fail-closed orchestration of one idle EAGLE-3 tuning cycle."""
+"""Fail-closed orchestration of one idle speculative tuning cycle."""
 
 from __future__ import annotations
 
@@ -11,8 +11,9 @@ from typing import Final, Protocol
 
 from speedlm.gate.decide import Decision
 from speedlm.storage import atomic_write_json
+from speedlm.training.base import SpeculatorBackend
+from speedlm.training.masking import FinalAssistantMaskError
 from speedlm.tuner.artifacts import ArtifactRegistry, ArtifactSpec
-from speedlm.tuner.eagle3 import Eagle3Adapter, FinalAssistantMaskError
 from speedlm.tuner.idle import IdleDetector, TuningPreempted
 from speedlm.tuner.state import TunerState, TunerStateMachine
 
@@ -185,7 +186,7 @@ class TunerOrchestrator:
         *,
         state: TunerStateMachine,
         idle: IdleDetector,
-        eagle3: Eagle3Adapter,
+        backend: SpeculatorBackend,
         artifacts: ArtifactRegistry,
         runtime: RuntimeController,
         gate: BenchmarkGate,
@@ -195,7 +196,7 @@ class TunerOrchestrator:
     ) -> None:
         self._state = state
         self._idle = idle
-        self._eagle3 = eagle3
+        self._backend = backend
         self._artifacts = artifacts
         self._runtime = runtime
         self._gate = gate
@@ -238,36 +239,41 @@ class TunerOrchestrator:
             guard.check()
 
             self._state.transition(TunerState.EXTRACTING, reason="vLLM sleeping")
-            prepared = self._eagle3.prepare(
+            prepared = self._backend.prepare(
                 work_dir,
                 should_abort=lambda: guard.is_preempted,
             )
-            hidden_states = self._eagle3.extract(
+            extracted = self._backend.extract(
                 prepared,
                 work_dir,
                 should_abort=lambda: guard.is_preempted,
             )
             guard.check()
 
-            self._state.transition(TunerState.TRAINING, reason="hidden states extracted")
-            training = self._eagle3.train(
-                hidden_states,
+            self._state.transition(TunerState.TRAINING, reason="training signals extracted")
+            trained = self._backend.train(
+                extracted,
                 work_dir,
                 should_abort=lambda: guard.is_preempted,
             )
-            draft_directory = self._eagle3.materialize_and_validate(
-                training,
+            draft_directory = self._backend.materialize(
+                trained,
                 work_dir,
                 should_abort=lambda: guard.is_preempted,
             )
+            self._backend.validate(
+                draft_directory,
+                should_abort=lambda: guard.is_preempted,
+            )
+            backend_info = self._backend.describe()
             artifact = self._artifacts.publish(
                 draft_directory,
                 ArtifactSpec(
-                    verifier_model=self._eagle3.config.verifier_model,
-                    draft_model=self._eagle3.config.draft_model,
-                    base_draft=self._eagle3.config.from_pretrained,
+                    verifier_model=backend_info.verifier_model,
+                    draft_model=backend_info.draft_model,
+                    base_draft=backend_info.from_pretrained,
                     trace_hash=prepared.snapshot.content_hash,
-                    training_params=self._eagle3.config.training_params,
+                    training_params=backend_info.training_params,
                 ),
             )
             artifact_id = artifact.artifact_id
@@ -452,7 +458,7 @@ class TunerOrchestrator:
         active = self._artifacts.active()
         if active is not None:
             return active.path
-        return self._eagle3.config.from_pretrained
+        return self._backend.describe().from_pretrained
 
 
 def _combine_error(error: Exception, cleanup_errors: tuple[str, ...]) -> str:

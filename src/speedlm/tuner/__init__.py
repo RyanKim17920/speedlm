@@ -1,5 +1,7 @@
 """Idle-time EAGLE-3 auto-tuning for SpeedLM."""
 
+from speedlm.training.base import BackendInfo, SpeculatorBackend
+from speedlm.training.masking import FinalAssistantMaskError
 from speedlm.tuner.artifacts import (
     Artifact,
     ArtifactError,
@@ -12,7 +14,6 @@ from speedlm.tuner.eagle3 import (
     DEFAULT_VERIFIER_MODEL,
     Eagle3Adapter,
     Eagle3Config,
-    FinalAssistantMaskError,
     ScratchQuotaExceeded,
     TrainingError,
 )
@@ -41,6 +42,7 @@ __all__ = [
     "ArtifactManifest",
     "ArtifactRegistry",
     "ArtifactSpec",
+    "BackendInfo",
     "BenchmarkGate",
     "CycleOutcome",
     "CycleResult",
@@ -52,6 +54,7 @@ __all__ = [
     "IllegalTransitionError",
     "RuntimeController",
     "ScratchQuotaExceeded",
+    "SpeculatorBackend",
     "StateSnapshot",
     "TrainingError",
     "TunerOrchestrator",
