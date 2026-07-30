@@ -436,3 +436,147 @@ def test_a_genuine_comparison_always_reports_both_deltas() -> None:
         assert dec.acceptance_delta_pp is not None
         assert dec.throughput_delta_pct is not None
         assert dec.num_repeats > 0
+
+
+# ---------------------------------------------------------------------------
+# Shipped defaults: the gate must discriminate improvement from timing noise
+# ---------------------------------------------------------------------------
+
+#: Job 368670's measured arms, as recorded in its decision.json.  Acceptance was
+#: byte-identical between arms (1155 drafted / 730 accepted on both), and the
+#: throughput delta was +0.96% -- inside the run's own 1.43% standard error, and
+#: it flips to -0.78% if the first scored repeat is dropped.
+_J368670_ACCEPTANCE = 730.0 / 1155.0
+_J368670_STOCK_TPS = 82.92028682232012
+_J368670_CANDIDATE_TPS = 83.71705649227111
+
+
+def _decide_with_shipped_defaults(
+    *,
+    stock_acc: float,
+    cand_acc: float,
+    stock_tps: float,
+    cand_tps: float,
+) -> Decision:
+    """Run the real gate under the real shipped PromotionConfig defaults."""
+    return decide_promotion(
+        _make_delta(acceptance_rate=stock_acc, output_tok_per_sec=stock_tps),
+        _make_delta(acceptance_rate=cand_acc, output_tok_per_sec=cand_tps),
+        _valid_runs_with_tps(stock_tps),
+        _valid_runs_with_tps(cand_tps),
+        PromotionConfig(),
+    )
+
+
+def test_shipped_defaults_are_the_noise_derived_ones() -> None:
+    """Pin the defaults the rest of these tests reason about."""
+    pcfg = PromotionConfig()
+    assert pcfg.min_acceptance_delta_pp == 1.0
+    assert pcfg.min_throughput_delta_pct == -2.0
+
+
+def test_job_368670_marginal_candidate_is_rejected_under_shipped_defaults() -> None:
+    """The regression that started this: a within-noise win must not promote.
+
+    Under the 0.0/0.0 gate this exact measurement returned ``promote`` with
+    ``both_thresholds_met``.  Acceptance did not move at all, so there is no
+    evidence the candidate draft head is better -- only that the clock wobbled.
+    """
+    dec = _decide_with_shipped_defaults(
+        stock_acc=_J368670_ACCEPTANCE,
+        cand_acc=_J368670_ACCEPTANCE,
+        stock_tps=_J368670_STOCK_TPS,
+        cand_tps=_J368670_CANDIDATE_TPS,
+    )
+
+    assert dec.verdict == Verdict.REJECT
+    assert dec.reason == Reason.ACCEPTANCE_BELOW_THRESHOLD
+    assert dec.acceptance_delta_pp == 0.0
+    assert dec.throughput_delta_pct is not None
+    assert 0.9 < dec.throughput_delta_pct < 1.0
+
+
+def test_a_zeroed_gate_would_still_have_promoted_job_368670() -> None:
+    """Guard the premise: the reject above comes from the thresholds, not luck."""
+    dec = decide_promotion(
+        _make_delta(
+            acceptance_rate=_J368670_ACCEPTANCE, output_tok_per_sec=_J368670_STOCK_TPS
+        ),
+        _make_delta(
+            acceptance_rate=_J368670_ACCEPTANCE, output_tok_per_sec=_J368670_CANDIDATE_TPS
+        ),
+        _valid_runs_with_tps(_J368670_STOCK_TPS),
+        _valid_runs_with_tps(_J368670_CANDIDATE_TPS),
+        _pcfg(acc_pp=0.0, throughput_pct=0.0),
+    )
+
+    assert dec.verdict == Verdict.PROMOTE
+    assert dec.reason == Reason.BOTH_THRESHOLDS_MET
+
+
+def test_sub_threshold_acceptance_gains_are_rejected_under_shipped_defaults() -> None:
+    """Anything short of a full point of acceptance fails closed.
+
+    0.087 pp is the counter quantum -- a single accepted token out of the ~1155
+    drafted in a suite pass -- and 0.99 pp sits just under the bar.  Neither is
+    evidence of a better head, so neither ships, however good the clock looks.
+    """
+    for gain_pp in (0.0, 0.087, 0.5, 0.99):
+        dec = _decide_with_shipped_defaults(
+            stock_acc=0.60,
+            cand_acc=0.60 + gain_pp / 100.0,
+            stock_tps=100.0,
+            cand_tps=140.0,
+        )
+        assert dec.verdict == Verdict.REJECT, gain_pp
+        assert dec.reason == Reason.ACCEPTANCE_BELOW_THRESHOLD, gain_pp
+
+
+def test_acceptance_bar_promotes_exactly_at_one_point() -> None:
+    """The bar is inclusive: a clean 1.0 pp gain with flat throughput ships."""
+    dec = _decide_with_shipped_defaults(
+        stock_acc=0.60, cand_acc=0.61, stock_tps=100.0, cand_tps=100.0
+    )
+
+    assert dec.verdict == Verdict.PROMOTE
+    assert dec.reason == Reason.BOTH_THRESHOLDS_MET
+    assert dec.acceptance_delta_pp is not None
+    assert abs(dec.acceptance_delta_pp - 1.0) < 1e-9
+
+
+def test_throughput_guard_tolerates_jitter_but_not_a_regression() -> None:
+    """A real acceptance win survives noise-sized slowdowns, not real ones.
+
+    -1.9% is inside the measured jitter band (1.10% standard error at five
+    repeats), so it must not veto a candidate that genuinely improved
+    acceptance.  -2.1% is past the guard, and -19.2% is job 368648's actual
+    un-warmed regression.
+    """
+    for slowdown_pct, expected in (
+        (-1.9, Verdict.PROMOTE),
+        (-2.0, Verdict.PROMOTE),
+        (-2.1, Verdict.REJECT),
+        (-19.2, Verdict.REJECT),
+    ):
+        dec = _decide_with_shipped_defaults(
+            stock_acc=0.60,
+            cand_acc=0.65,
+            stock_tps=100.0,
+            cand_tps=100.0 * (1.0 + slowdown_pct / 100.0),
+        )
+        assert dec.verdict == expected, slowdown_pct
+        if expected is Verdict.REJECT:
+            assert dec.reason == Reason.THROUGHPUT_BELOW_THRESHOLD, slowdown_pct
+
+
+def test_acceptance_is_checked_before_throughput_under_shipped_defaults() -> None:
+    """When both bars fail, the reported reason names the promotion criterion."""
+    dec = _decide_with_shipped_defaults(
+        stock_acc=0.60, cand_acc=0.60, stock_tps=100.0, cand_tps=50.0
+    )
+
+    assert dec.verdict == Verdict.REJECT
+    assert dec.reason == Reason.ACCEPTANCE_BELOW_THRESHOLD
+    # The throughput number is still reported so the operator sees both facts.
+    assert dec.throughput_delta_pct is not None
+    assert abs(dec.throughput_delta_pct + 50.0) < 1e-9
