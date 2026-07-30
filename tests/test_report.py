@@ -644,7 +644,48 @@ def test_find_latest_decision_absent(home: Path) -> None:
 def test_load_decision_roundtrip(home: Path) -> None:
     path = _write_decision(home, _decision_dict())
     decision = load_decision(path)
-    assert decision.to_dict() == _decision_dict()
+
+    loaded = decision.to_dict()
+    original = _decision_dict()
+    assert {k: loaded[k] for k in original} == original
+
+
+def test_loading_a_pre_pinned_decision_labels_the_statistic_it_gated_on(
+    home: Path,
+) -> None:
+    """A record with no ``throughput_statistic`` gated on the Prometheus window.
+
+    Its ``throughput_delta_pct`` and ``*_avg_tok_per_sec`` came from that
+    window, so they are mirrored into the Prometheus fields and labelled as
+    such rather than being reattributed to the statistic that gates today.
+    """
+    path = _write_decision(home, _decision_dict())
+    decision = load_decision(path)
+
+    assert decision.throughput_statistic == "prometheus_decode_window"
+    assert decision.prometheus_throughput_delta_pct == 12.0
+    assert decision.stock_prometheus_decode_tok_per_sec == 100.0
+    assert decision.candidate_prometheus_decode_tok_per_sec == 112.0
+
+
+def test_decision_written_by_todays_gate_round_trips_its_statistic(
+    home: Path,
+) -> None:
+    """A record carrying both statistics keeps them distinct across a reload."""
+    payload = _decision_dict()
+    payload["throughput_statistic"] = "replay_per_repeat_mean"
+    payload["prometheus_throughput_delta_pct"] = -3.1805
+    payload["stock_prometheus_decode_tok_per_sec"] = 83.3062
+    payload["candidate_prometheus_decode_tok_per_sec"] = 80.6567
+    path = _write_decision(home, payload)
+
+    decision = load_decision(path)
+
+    assert decision.throughput_statistic == "replay_per_repeat_mean"
+    assert decision.throughput_delta_pct == 12.0
+    assert decision.prometheus_throughput_delta_pct == -3.1805
+    assert decision.throughput_statistic_gap_pp == pytest.approx(15.1805, abs=1e-4)
+    assert decision.to_dict()["throughput_statistic"] == "replay_per_repeat_mean"
 
 
 # ---------------------------------------------------------------------------
