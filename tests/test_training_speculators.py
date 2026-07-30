@@ -606,12 +606,12 @@ def test_model_revisions_are_resolved_and_used_by_prepare_and_train(
     )
     backend.train(hidden, work, should_abort=lambda: False)
 
-    assert runner.run_calls[0][-2:] == ("org/verifier", "verifier-sha")
+    assert runner.run_calls[0][3:5] == ("org/verifier", "verifier-sha")
     assert "--model" in runner.run_calls[1]
     assert runner.run_calls[1][runner.run_calls[1].index("--model") + 1] == (
         "/snapshots/verifier"
     )
-    assert runner.run_calls[4][-2:] == ("org/draft", "draft-sha")
+    assert runner.run_calls[4][3:5] == ("org/draft", "draft-sha")
     train = runner.run_calls[5]
     assert train[train.index("--verifier-name-or-path") + 1] == "/snapshots/verifier"
     assert train[train.index("--from-pretrained") + 1] == "/snapshots/draft"

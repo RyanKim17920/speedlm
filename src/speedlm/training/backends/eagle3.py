@@ -83,11 +83,32 @@ _ROW_ID = re.compile(
     r"(?:row(?:_id)?|index)\s*(?:=|:|is)?\s*['\"]?([A-Za-z0-9_.:/-]+)",
     re.IGNORECASE,
 )
-_RESOLVE_MODEL = (
-    "from huggingface_hub import snapshot_download;"
-    "import sys;"
-    "print(snapshot_download(repo_id=sys.argv[1],revision=sys.argv[2]))"
-)
+#: Resolve a repo to an on-disk snapshot without letting the pin tighten what
+#: counts as resolvable.  ``snapshot_download`` only runs
+#: ``_raise_if_incomplete_snapshot`` when an explicit revision is given, so a
+#: pinned revision demands a byte-complete snapshot where the unpinned call
+#: was happy with whatever the cache held.  Deployments here pull the cache
+#: minimally on purpose -- shards, tokenizer and configs, not licences and
+#: READMEs -- so the pin alone turned a working offline cache into
+#: IncompleteSnapshotError (job 368710).
+#:
+#: ``allow_patterns`` narrows completeness to the files training actually
+#: reads, and the fallback drops to the unpinned call so a pinned cycle can
+#: never resolve *less* than an unpinned one would.
+_RESOLVE_MODEL = """
+import sys
+from huggingface_hub import snapshot_download
+from huggingface_hub.errors import IncompleteSnapshotError
+repo = sys.argv[1]
+revision = sys.argv[2]
+patterns = sys.argv[3:] or None
+try:
+    path = snapshot_download(repo_id=repo, revision=revision, allow_patterns=patterns)
+except IncompleteSnapshotError as error:
+    print(f"SPEEDLM_INCOMPLETE_SNAPSHOT={error}", file=sys.stderr)
+    path = snapshot_download(repo_id=repo)
+print(path)
+""".strip()
 _AUDIT_MASKS = """
 from datasets import load_from_disk
 import sys
@@ -166,6 +187,15 @@ class SpeculatorsPipelineConfig:
     enforce_eager: bool = True
     gpu_memory_utilization: float = 0.80
     scratch_quota_bytes: int = MAX_SCRATCH_BYTES
+    #: Files a pinned snapshot must contain to count as resolved.  Weights,
+    #: the shard index, configs, the tokenizer and the chat template are what
+    #: extraction and training open; licences, model cards and alternative
+    #: runtime formats are not, and requiring them only breaks minimal caches.
+    model_resolve_allow_patterns: tuple[str, ...] = (
+        "*.json",
+        "*.safetensors",
+        "*.jinja",
+    )
     model_resolve_timeout_seconds: float = 600.0
     server_shutdown_timeout_seconds: float = 10.0
     health_poll_interval_seconds: float = 0.25
@@ -315,6 +345,7 @@ class _Resolver:
                 _RESOLVE_MODEL,
                 model,
                 revision,
+                *self.config.model_resolve_allow_patterns,
             ],
             cwd=self.config.speculators_repo,
             env=_environment(self.config),

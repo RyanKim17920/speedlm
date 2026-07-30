@@ -1,6 +1,22 @@
 from __future__ import annotations
 
-from speedlm.training.backends.eagle3 import Eagle3Backend, Eagle3Config
+import contextlib
+import io
+import sys
+import types
+from collections.abc import Sequence
+from pathlib import Path
+from unittest import mock
+
+from speedlm.training.backends.eagle3 import (
+    _RESOLVE_MODEL,
+    Eagle3Backend,
+    Eagle3Config,
+    SpeculatorsPipelineConfig,
+    _Resolver,
+    _State,
+)
+from speedlm.training.backends.speculators_runner import ProcessResult
 from speedlm.training.base import SpeculatorBackend
 from speedlm.training.masking import (
     MaskPolicy,
@@ -92,3 +108,123 @@ def test_describe_records_an_unresolved_revision_as_null() -> None:
 
     assert "verifier_revision" in params
     assert params["verifier_revision"] is None
+
+
+def _pipeline(tmp_path: Path) -> SpeculatorsPipelineConfig:
+    script = tmp_path / "check_prepared.py"
+    script.write_text("", encoding="utf-8")
+    return SpeculatorsPipelineConfig(
+        prepared_validator_script=script,
+        speculators_repo=tmp_path,
+        training_python=tmp_path / "python",
+        verifier_revision="6cee5e81ee83917806bbde320786a8fb61efebee",
+    )
+
+
+class _CapturingRunner:
+    def __init__(self) -> None:
+        self.argv: tuple[str, ...] = ()
+
+    def run(self, argv: Sequence[str], **_kwargs: object) -> ProcessResult:
+        self.argv = tuple(argv)
+        return ProcessResult(
+            argv=tuple(argv),
+            returncode=0,
+            stdout="/data/hf-cache/hub/models--openai--gpt-oss-20b/snapshots/abc\n",
+            stderr="",
+        )
+
+
+def test_a_pinned_revision_narrows_completeness_to_the_files_training_reads(
+    tmp_path: Path,
+) -> None:
+    """The pin must not demand licences and model cards a minimal cache omits."""
+    pipeline = _pipeline(tmp_path)
+    runner = _CapturingRunner()
+    resolver = _Resolver(pipeline, runner, _State())
+
+    resolver.verifier(lambda: False, tmp_path)
+
+    assert pipeline.model_resolve_allow_patterns == ("*.json", "*.safetensors", "*.jinja")
+    assert runner.argv[-3:] == pipeline.model_resolve_allow_patterns
+    assert runner.argv[3] == "openai/gpt-oss-20b"
+    assert runner.argv[4] == "6cee5e81ee83917806bbde320786a8fb61efebee"
+
+
+def _run_resolve_script(
+    argv: list[str],
+    *,
+    incomplete_for_revision: bool,
+) -> tuple[str, list[dict[str, object]]]:
+    """Execute the real _RESOLVE_MODEL source against a stub huggingface_hub."""
+    calls: list[dict[str, object]] = []
+
+    class IncompleteSnapshotError(Exception):
+        pass
+
+    def snapshot_download(
+        *,
+        repo_id: str,
+        revision: str | None = None,
+        allow_patterns: object = None,
+    ) -> str:
+        calls.append(
+            {
+                "repo_id": repo_id,
+                "revision": revision,
+                "allow_patterns": allow_patterns,
+            }
+        )
+        if revision is not None and incomplete_for_revision:
+            raise IncompleteSnapshotError(
+                f"The cached snapshot for {repo_id!r} is incomplete: "
+                "8 file(s) are missing (.gitattributes, LICENSE, README.md, ...)"
+            )
+        return "/data/hf-cache/hub/snapshots/resolved"
+
+    hub = types.ModuleType("huggingface_hub")
+    hub.snapshot_download = snapshot_download  # type: ignore[attr-defined]
+    errors = types.ModuleType("huggingface_hub.errors")
+    errors.IncompleteSnapshotError = IncompleteSnapshotError  # type: ignore[attr-defined]
+
+    stdout = io.StringIO()
+    with mock.patch.dict(
+        sys.modules,
+        {"huggingface_hub": hub, "huggingface_hub.errors": errors},
+    ), mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(
+        stdout
+    ), contextlib.redirect_stderr(io.StringIO()):
+        exec(compile(_RESOLVE_MODEL, "<resolve>", "exec"), {"__name__": "__main__"})
+    return stdout.getvalue().strip(), calls
+
+
+def test_a_pinned_revision_resolves_the_partial_offline_cache(tmp_path: Path) -> None:
+    """A complete-enough minimal cache resolves under the pin, no fallback."""
+    path, calls = _run_resolve_script(
+        ["-", "openai/gpt-oss-20b", "6cee5e81", "*.json", "*.safetensors"],
+        incomplete_for_revision=False,
+    )
+
+    assert path == "/data/hf-cache/hub/snapshots/resolved"
+    assert calls == [
+        {
+            "repo_id": "openai/gpt-oss-20b",
+            "revision": "6cee5e81",
+            "allow_patterns": ["*.json", "*.safetensors"],
+        }
+    ]
+
+
+def test_a_pinned_revision_is_never_stricter_than_the_unpinned_path() -> None:
+    """Reproduces job 368710: the pin alone raised IncompleteSnapshotError.
+
+    Whatever the pinned call rejects, the unpinned call must still be tried --
+    a pin is provenance, and it must not shrink the set of caches that load.
+    """
+    path, calls = _run_resolve_script(
+        ["-", "openai/gpt-oss-20b", "6cee5e81", "*.json"],
+        incomplete_for_revision=True,
+    )
+
+    assert path == "/data/hf-cache/hub/snapshots/resolved"
+    assert [call["revision"] for call in calls] == ["6cee5e81", None]
