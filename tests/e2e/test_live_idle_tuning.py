@@ -233,6 +233,28 @@ def _trace_count(path: Path) -> int:
         return 0
 
 
+def _trace_ids(path: Path) -> set[str]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return set()
+    ids: set[str] = set()
+    for line in lines:
+        if not line:
+            continue
+        try:
+            value: object = json.loads(line)
+        except json.JSONDecodeError:
+            # Trace append is fsynced but a lock-free polling reader can observe
+            # the final line between buffered writes. Retry on the next poll.
+            return set()
+        assert isinstance(value, dict), f"{path} must contain JSON objects"
+        trace_id = value.get("id")
+        assert isinstance(trace_id, str) and trace_id, f"trace has no valid id: {value}"
+        ids.add(trace_id)
+    return ids
+
+
 def _scheduler_result_after(
     path: Path,
     *,
@@ -419,6 +441,8 @@ def test_live_idle_tuning_preempts_then_completes() -> None:
             "Preempt the sleeping idle tuner, restore serving, and reply with READY.",
             timeout=request_timeout,
         )
+        queued_id = queued_body.get("id")
+        assert isinstance(queued_id, str) and queued_id, queued_body
         _write_json(artifact_dir / "queued-response.json", queued_body)
         _write_json(
             artifact_dir / "preemption-observation.json",
@@ -441,13 +465,10 @@ def test_live_idle_tuning_preempts_then_completes() -> None:
         )
         assert isinstance(preempted, dict)
 
-        expected_traces = config.tuning.min_trace_records + 1
         _wait_until(
             "the queued request to be captured",
             lambda: (
-                count
-                if (count := _trace_count(traces_path)) >= expected_traces
-                else None
+                queued_id if queued_id in _trace_ids(traces_path) else None
             ),
             process=process,
             timeout=60.0,
