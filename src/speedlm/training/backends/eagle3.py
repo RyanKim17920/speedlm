@@ -14,6 +14,7 @@ import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from speedlm.training.backends.speculators_runner import (
     ProcessResult,
@@ -53,6 +54,15 @@ DEFAULT_SPECULATORS_REPO = Path(
 DEFAULT_SPECULATORS_PYTHON = Path(
     os.environ.get("SPEEDLM_TRAINING_PYTHON", sys.executable)
 )
+_SPECULATORS_DATA_NAME = "speculators-conversations.jsonl"
+_SPECULATORS_ROLES = {
+    "human": "user",
+    "user": "user",
+    "gpt": "assistant",
+    "assistant": "assistant",
+    "system": "system",
+    "tool": "tool",
+}
 _ZERO_MASK = re.compile(
     r"(?:all[- ]zero|no trainable|nonzero loss|loss[- ]mask tokens)",
     re.IGNORECASE,
@@ -107,6 +117,16 @@ missing = {"d2t", "t2d"} - keys
 if missing:
     raise SystemExit(f"materialized draft is missing vocab mappings: {sorted(missing)}")
 """.strip()
+
+
+class EmptySpeculatorsDatasetError(Eagle3Error):
+    """No captured record survived conversion into the Speculators contract."""
+
+    def __init__(self, source: Path) -> None:
+        self.source = source
+        super().__init__(
+            f"no captured trace in {source} converted to a Speculators conversation"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -369,15 +389,22 @@ class SpeculatorsTrainingRowRenderer:
         if mask_policy is not self.config.mask_policy:
             raise Eagle3Error("renderer mask policy does not match configured policy")
         seq_len = sequence_length or self.config.sequence_length
+        started = time.monotonic()
         scratch = destination.parent
+        data = scratch / _SPECULATORS_DATA_NAME
         guard = _guard(
-            scratch, self.config.scratch_quota_bytes, should_abort, (destination,)
+            scratch, self.config.scratch_quota_bytes, should_abort, (destination, data)
         )
         try:
             verifier = self.resolver.verifier(guard, scratch)
-            observed_row_count = _jsonl_record_count(snapshot.path)
-            if observed_row_count < 1:
-                raise Eagle3Error("training trace snapshot contains no records")
+            _remove(data)
+            observed_row_count = _render_speculators_dataset(
+                snapshot,
+                data,
+                guard=guard,
+                started=started,
+                timeout=timeout_seconds,
+            )
             row_count = self.config.row_count or observed_row_count
             prepare = self.runner.run(
                 [
@@ -386,7 +413,7 @@ class SpeculatorsTrainingRowRenderer:
                     "--model",
                     verifier,
                     "--data",
-                    str(snapshot.path),
+                    str(data),
                     "--output",
                     str(destination),
                     "--seq-length",
@@ -427,6 +454,7 @@ class SpeculatorsTrainingRowRenderer:
             return destination
         except BaseException:
             _remove(destination)
+            _remove(data)
             raise
 
     def _zero_row(
@@ -878,12 +906,115 @@ def _positive_int(name: str, value: object) -> None:
         raise ValueError(f"{name} must be a positive integer")
 
 
-def _jsonl_record_count(path: Path) -> int:
+def _speculators_content(value: object) -> str:
+    """Flatten a captured content value into the plain text the loader reads."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray)):
+        return "".join(
+            part["text"]
+            for part in value
+            if isinstance(part, Mapping) and isinstance(part.get("text"), str)
+        )
+    return ""
+
+
+def _speculators_turn(turn: object) -> dict[str, Any] | None:
+    """Convert one captured turn, or return None when the loader would drop it."""
+    if not isinstance(turn, Mapping):
+        return None
+    raw_role = turn.get("from", turn.get("role"))
+    role = _SPECULATORS_ROLES.get(raw_role) if isinstance(raw_role, str) else None
+    if role is None:
+        return None
+    raw_content = turn.get("value")
+    if raw_content is None:
+        raw_content = turn.get("content")
+    converted: dict[str, Any] = {"role": role, "content": _speculators_content(raw_content)}
+    calls = turn.get("tool_calls")
+    if isinstance(calls, Sequence) and not isinstance(calls, (str, bytes)) and calls:
+        converted["tool_calls"] = list(calls)
+    call_id = turn.get("tool_call_id")
+    if isinstance(call_id, str) and call_id:
+        converted["tool_call_id"] = call_id
+    # The loader reads either key and re-emits both; carry whichever was captured.
+    reasoning = turn.get("thinking") or turn.get("reasoning_content")
+    if isinstance(reasoning, str) and reasoning:
+        converted["thinking"] = reasoning
+        converted["reasoning_content"] = reasoning
+    return converted
+
+
+def _speculators_record(record: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Convert one captured trace, or return None when it trains nothing."""
+    turns_value = record.get("conversations")
+    if not isinstance(turns_value, (list, tuple)):
+        turns_value = record.get("messages")
+    if not isinstance(turns_value, (list, tuple)):
+        return None
+    turns = [
+        converted
+        for converted in (_speculators_turn(turn) for turn in turns_value)
+        if converted is not None
+    ]
+    if not any(turn["role"] == "assistant" for turn in turns):
+        return None
+    converted_record: dict[str, Any] = {"conversations": turns}
+    row_id = record.get("id")
+    if isinstance(row_id, str) and row_id:
+        converted_record["id"] = row_id
+    tools = record.get("tools")
+    if isinstance(tools, (list, tuple)) and tools:
+        converted_record["tools"] = list(tools)
+    return converted_record
+
+
+def _render_speculators_dataset(
+    snapshot: TraceSnapshot,
+    destination: Path,
+    *,
+    guard: AbortCheck,
+    started: float,
+    timeout: float,
+) -> int:
+    """Rewrite a leased trace snapshot into the Speculators loader contract.
+
+    SpeedLM captures a top-level ``messages`` key while the Speculators loader
+    reads a top-level ``conversations`` key, so handing the snapshot over verbatim
+    builds an empty dataset without reporting an error. Records that carry no
+    trainable assistant turn are dropped, and an entirely empty result fails loudly
+    rather than reaching training as a silently empty dataset.
+    """
+    written = 0
     try:
-        with path.open("rb") as source:
-            return sum(1 for line in source if line.strip())
+        with (
+            snapshot.path.open("r", encoding="utf-8") as source,
+            destination.open("x", encoding="utf-8") as output,
+        ):
+            for number, line in enumerate(source, start=1):
+                _deadline(started, timeout, "Speculators row rendering")
+                _abort(guard, "Speculators row rendering")
+                if not line.strip():
+                    continue
+                location = f"{snapshot.path} line {number}"
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError as error:
+                    raise Eagle3Error(f"{location} is not valid JSON") from error
+                if not isinstance(record, Mapping):
+                    raise Eagle3Error(f"{location} is not a JSON object")
+                converted = _speculators_record(record)
+                if converted is None:
+                    continue
+                output.write(json.dumps(converted, ensure_ascii=False) + "\n")
+                written += 1
     except OSError as error:
-        raise Eagle3Error(f"cannot count training records in {path}: {error}") from error
+        raise Eagle3Error(
+            f"cannot render Speculators rows from {snapshot.path}: {error}"
+        ) from error
+    if not written:
+        raise EmptySpeculatorsDatasetError(snapshot.path)
+    return written
 
 
 def _integer(name: str, value: object) -> int:
@@ -1031,6 +1162,7 @@ def _writable(path: Path) -> None:
 def _cleanup_transients(work_dir: Path) -> None:
     for name in (
         "trace-snapshot",
+        _SPECULATORS_DATA_NAME,
         "training-rows",
         "hidden-states",
         "speculators-training",
@@ -1060,6 +1192,7 @@ __all__ = [
     "Eagle3Config",
     "Eagle3Error",
     "Eagle3Timeouts",
+    "EmptySpeculatorsDatasetError",
     "FilesystemTraceSnapshotLeaser",
     "FinalAssistantMaskError",
     "HiddenStateExtractor",
