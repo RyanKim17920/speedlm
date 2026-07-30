@@ -524,8 +524,9 @@ class SpeculatorsHiddenStateExtractor:
         target_layer_ids: Sequence[int] | None = None,
         sequence_length: int | None = None,
     ) -> Path:
-        del verifier_model, verifier_revision, sequence_length
+        del verifier_model, verifier_revision
         layers = tuple(target_layer_ids or self.config.target_layer_ids)
+        seq_len = sequence_length or self.config.sequence_length
         row_count = (
             self.state.row_count
             if self.state is not None and self.state.row_count is not None
@@ -553,6 +554,8 @@ class SpeculatorsHiddenStateExtractor:
                     "--",
                     "--port",
                     str(self.config.port),
+                    "--max-model-len",
+                    str(seq_len),
                     "--max-num-seqs",
                     str(self.config.max_num_seqs),
                     *(["--enforce-eager"] if self.config.enforce_eager else []),
