@@ -127,11 +127,12 @@ async def _send_request(
     client: Any,
     ctx: FrozenContext,
     sampling: SamplingConfig,
+    model: str,
 ) -> RequestResult:
     """Send a single context to the OpenAI-compatible endpoint."""
     import httpx
     payload: dict[str, Any] = {
-        "model": "auto",
+        "model": model,
         "messages": [dict(m) for m in ctx.messages],
         "temperature": sampling.temperature,
         "top_p": sampling.top_p,
@@ -226,11 +227,12 @@ async def _run_single(
     client: Any,
     suite: BenchmarkSuite,
     sampling: SamplingConfig,
+    model: str,
 ) -> RunResults:
     """Execute one full pass over the suite."""
     results: list[RequestResult] = []
     for ctx in suite.contexts:
-        result = await _send_request(client, ctx, sampling)
+        result = await _send_request(client, ctx, sampling, model)
         results.append(result)
 
     total_latency = sum(r.latency_s for r in results)
@@ -257,6 +259,7 @@ async def replay_suite(
     *,
     repeats: int = 1,
     timeout: float = 120.0,
+    model: str = "auto",
 ) -> ReplayResult:
     """Replay suite against an OpenAI-compatible endpoint N times.
 
@@ -288,7 +291,7 @@ async def replay_suite(
         headers={"Content-Type": "application/json"},
     ) as client:
         for _ in range(repeats):
-            run = await _run_single(client, suite, sampling)
+            run = await _run_single(client, suite, sampling, model)
             runs.append(run)
 
     return ReplayResult(

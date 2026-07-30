@@ -52,15 +52,19 @@ class FrozenContext:
     def from_trace(
         cls,
         record: TraceRecord,
-        expected_response: str = "",
+        expected_response: str | None = None,
     ) -> FrozenContext:
-        """Build a frozen context from a trace record.
+        """Build a request context and reference output from a captured trace.
 
-        The context hash is computed over a canonical JSON representation
-        of the messages list (sorted keys, no whitespace variation).
+        Captured traces append the provider-authored assistant message to the
+        original request. Replaying that whole list would benchmark a
+        continuation *after* the answer instead of the captured input. The
+        final generated assistant is therefore removed and used as the
+        reference output.
         """
+        messages, captured_response = cls._input_messages(record)
         canonical = json.dumps(
-            [dict(m) for m in record.messages],
+            messages,
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=True,
@@ -68,12 +72,39 @@ class FrozenContext:
         ctx_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
         return cls(
             context_hash=ctx_hash,
-            messages=tuple(dict(m) for m in record.messages),
+            messages=tuple(messages),
             seed=record.seed,
             temperature=record.temperature,
             top_p=record.top_p,
-            expected_response=expected_response,
+            expected_response=(
+                captured_response if expected_response is None else expected_response
+            ),
         )
+
+    @staticmethod
+    def _input_messages(record: TraceRecord) -> tuple[list[dict[str, Any]], str]:
+        messages = [dict(message) for message in record.messages]
+        output_index: int | None = None
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if (
+                message.get("role") == "assistant"
+                and message.get("provenance_tag") == "generated"
+            ):
+                output_index = index
+                break
+        if output_index is None:
+            inputs = messages
+            expected = ""
+        else:
+            output = messages[output_index].get("content")
+            expected = output if isinstance(output, str) else ""
+            inputs = messages[:output_index]
+        for message in inputs:
+            message.pop("provenance_tag", None)
+        if not inputs:
+            raise SuiteError(f"trace {record.id!r} has no replayable input messages")
+        return inputs, expected
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -207,16 +238,7 @@ class BenchmarkSuite:
                 (leakage), or if no held-out records remain.
         """
         # Build a set of train context hashes
-        train_hashes = set()
-        for rec in train_records:
-            canonical = json.dumps(
-                [dict(m) for m in rec.messages],
-                sort_keys=True,
-                separators=(",", ":"),
-                ensure_ascii=True,
-            )
-            h = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
-            train_hashes.add(h)
+        train_hashes = {cls._record_hash(record) for record in train_records}
 
         # Filter out train records from all records
         held_out = [
@@ -233,8 +255,9 @@ class BenchmarkSuite:
 
     @staticmethod
     def _record_hash(rec: TraceRecord) -> str:
+        messages, _ = FrozenContext._input_messages(rec)
         canonical = json.dumps(
-            [dict(m) for m in rec.messages],
+            messages,
             sort_keys=True,
             separators=(",", ":"),
             ensure_ascii=True,

@@ -39,6 +39,12 @@ if TYPE_CHECKING:
 AbortCheck = Callable[[], bool]
 DraftReference = Path | str
 Clock = Callable[[], float]
+TrainingHashes = (
+    set[str]
+    | frozenset[str]
+    | Callable[[], set[str] | frozenset[str]]
+)
+SuiteDirectory = Path | Callable[[], Path]
 _T = TypeVar("_T")
 
 
@@ -102,6 +108,11 @@ class HttpReplayExecutor:
 
     _POLL_SECONDS = 0.05
 
+    def __init__(self, *, model: str = "auto") -> None:
+        if not model:
+            raise ValueError("replay model must be non-empty")
+        self._model = model
+
     def replay(
         self,
         suite: BenchmarkSuite,
@@ -122,6 +133,7 @@ class HttpReplayExecutor:
                     sampling,
                     repeats=repeats,
                     timeout=timeout_seconds,
+                    model=self._model,
                 )
             )
             try:
@@ -157,14 +169,14 @@ class BenchmarkGateRunner:
         *,
         config: SpeedLMConfig,
         trace_source: TraceSource,
-        suite_dir: Path,
+        suite_dir: SuiteDirectory,
         stock_draft: DraftReference,
         endpoint: DraftEndpoint,
         metrics_source: MetricsSource,
         replay_executor: ReplayExecutor | None = None,
         repeats: int = 3,
         held_out_fraction: float = 0.2,
-        training_context_hashes: set[str] | frozenset[str] | None = None,
+        training_context_hashes: TrainingHashes | None = None,
         clock: Clock = time.monotonic,
     ) -> None:
         if isinstance(repeats, bool) or not isinstance(repeats, int) or repeats < 3:
@@ -181,14 +193,12 @@ class BenchmarkGateRunner:
         self._stock_draft = stock_draft
         self._endpoint = endpoint
         self._metrics_source = metrics_source
-        self._replay_executor = replay_executor or HttpReplayExecutor()
+        self._replay_executor = replay_executor or HttpReplayExecutor(
+            model=config.alias,
+        )
         self._repeats = repeats
         self._held_out_fraction = float(held_out_fraction)
-        self._training_context_hashes = (
-            None
-            if training_context_hashes is None
-            else frozenset(training_context_hashes)
-        )
+        self._training_context_hashes = training_context_hashes
         self._clock = clock
 
     def benchmark(
@@ -326,14 +336,15 @@ class BenchmarkGateRunner:
         )
 
     def _load_or_build_suite(self) -> BenchmarkSuite:
-        manifest = self._suite_dir / "suite_manifest.json"
+        suite_dir = self._suite_dir() if callable(self._suite_dir) else self._suite_dir
+        manifest = suite_dir / "suite_manifest.json"
         if manifest.exists():
-            return load_suite(self._suite_dir)
+            return load_suite(suite_dir)
         suite = build_suite(
             tuple(self._trace_source.iter_records()),
             held_out_fraction=self._held_out_fraction,
         )
-        persist_suite(suite, self._suite_dir)
+        persist_suite(suite, suite_dir)
         return suite
 
     def _check_suite_leakage(self, suite: BenchmarkSuite) -> None:
@@ -342,7 +353,9 @@ class BenchmarkGateRunner:
                 "Cannot prove benchmark suite is held out: "
                 "training context hashes were not provided"
             )
-        overlaps = suite.check_leakage(set(self._training_context_hashes))
+        configured = self._training_context_hashes
+        hashes = configured() if callable(configured) else configured
+        overlaps = suite.check_leakage(set(hashes))
         if overlaps:
             preview = ", ".join(overlaps[:3])
             suffix = "" if len(overlaps) <= 3 else f", ... ({len(overlaps)} total)"

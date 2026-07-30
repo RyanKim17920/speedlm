@@ -191,6 +191,37 @@ def test_frozen_context_serialization() -> None:
     assert ctx.expected_response == ctx2.expected_response
 
 
+def test_frozen_context_replays_input_not_captured_generated_output() -> None:
+    record = TraceRecord(
+        id="captured",
+        timestamp=1000.0,
+        model="test-model",
+        messages=(
+            {"role": "system", "content": "be concise"},
+            {"role": "user", "content": "hello"},
+            {
+                "role": "assistant",
+                "content": "hi there",
+                "provenance_tag": "generated",
+            },
+        ),
+        tool_calls=(),
+        temperature=0.0,
+        top_p=1.0,
+        seed=0,
+        prompt_tokens=10,
+        completion_tokens=5,
+    )
+
+    context = FrozenContext.from_trace(record)
+
+    assert context.messages == (
+        {"role": "system", "content": "be concise"},
+        {"role": "user", "content": "hello"},
+    )
+    assert context.expected_response == "hi there"
+
+
 def test_build_with_split_no_leakage() -> None:
     """build_with_split ensures train/held-out disjointness."""
     train = [_make_record("t1", "train-content")]

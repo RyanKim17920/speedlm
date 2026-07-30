@@ -111,7 +111,7 @@ class SpeculatorsPipelineConfig:
     """Configurable reproduction of the verified Speculators pipeline."""
 
     prepared_validator_script: Path
-    row_count: int
+    row_count: int | None = None
     speculators_repo: Path = DEFAULT_SPECULATORS_REPO
     training_python: Path = DEFAULT_SPECULATORS_PYTHON
     vllm_python: Path | None = None
@@ -162,7 +162,6 @@ class SpeculatorsPipelineConfig:
             ):
                 raise ValueError(f"{name} must be non-empty or null")
         for name, integer_value in (
-            ("row_count", self.row_count),
             ("sequence_length", self.sequence_length),
             ("epochs", self.epochs),
             ("port", self.port),
@@ -170,6 +169,8 @@ class SpeculatorsPipelineConfig:
             ("max_num_seqs", self.max_num_seqs),
         ):
             _positive_int(name, integer_value)
+        if self.row_count is not None:
+            _positive_int("row_count", self.row_count)
         if self.port > 65_535:
             raise ValueError("port must be at most 65535")
         if (
@@ -223,6 +224,7 @@ class SpeculatorsPipelineConfig:
 @dataclass(slots=True)
 class _State:
     prepared: Path | None = None
+    row_count: int | None = None
     verifier: str | None = None
     warm_start: str | None = None
 
@@ -370,6 +372,10 @@ class SpeculatorsTrainingRowRenderer:
         )
         try:
             verifier = self.resolver.verifier(guard, scratch)
+            observed_row_count = _jsonl_record_count(snapshot.path)
+            if observed_row_count < 1:
+                raise Eagle3Error("training trace snapshot contains no records")
+            row_count = self.config.row_count or observed_row_count
             prepare = self.runner.run(
                 [
                     str(self.config.training_python),
@@ -399,7 +405,7 @@ class SpeculatorsTrainingRowRenderer:
                     str(self.config.training_python),
                     str(self.config.prepared_validator_script),
                     str(destination),
-                    str(self.config.row_count),
+                    str(row_count),
                     "--require-nonzero-loss-mask",
                     "--max-seq-len",
                     str(seq_len),
@@ -414,6 +420,7 @@ class SpeculatorsTrainingRowRenderer:
                 raise FinalAssistantMaskError(row_id, mask_policy)
             _success("prepared dataset validation", checked)
             self.state.prepared = destination
+            self.state.row_count = row_count
             return destination
         except BaseException:
             _remove(destination)
@@ -460,6 +467,7 @@ class SpeculatorsHiddenStateExtractor:
         health_check: Callable[[str, float], bool],
         sleeper: Callable[[float], None],
         clock: Callable[[], float],
+        state: _State | None = None,
     ) -> None:
         self.config = config
         self.runner = runner
@@ -467,6 +475,7 @@ class SpeculatorsHiddenStateExtractor:
         self.health_check = health_check
         self.sleeper = sleeper
         self.clock = clock
+        self.state = state
 
     def extract_hidden_states(
         self,
@@ -482,6 +491,13 @@ class SpeculatorsHiddenStateExtractor:
     ) -> Path:
         del verifier_model, verifier_revision, sequence_length
         layers = tuple(target_layer_ids or self.config.target_layer_ids)
+        row_count = (
+            self.state.row_count
+            if self.state is not None and self.state.row_count is not None
+            else self.config.row_count
+        )
+        if row_count is None:
+            raise Eagle3Error("training row count was not recorded before extraction")
         scratch = destination.parent
         guard = _guard(
             scratch, self.config.scratch_quota_bytes, should_abort, (destination,)
@@ -547,7 +563,7 @@ class SpeculatorsHiddenStateExtractor:
                     "--output",
                     str(destination),
                     "--max-samples",
-                    str(self.config.row_count),
+                    str(row_count),
                     "--concurrency",
                     str(self.config.concurrency),
                     "--validate-outputs",
@@ -785,12 +801,15 @@ class Eagle3Backend(Eagle3Adapter):
         cls,
         pipeline: SpeculatorsPipelineConfig,
         *,
-        trace_source: Path,
+        trace_source: Path | None = None,
+        trace_leaser: TraceSnapshotLeaser | None = None,
         runner: ProcessRunner | None = None,
         health_check: Callable[[str, float], bool] | None = None,
         sleeper: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
     ) -> Eagle3Backend:
+        if (trace_source is None) == (trace_leaser is None):
+            raise ValueError("provide exactly one of trace_source or trace_leaser")
         process_runner = runner or SubprocessRunner(clock=clock)
         state = _State()
         resolver = _Resolver(pipeline, process_runner, state)
@@ -813,8 +832,13 @@ class Eagle3Backend(Eagle3Adapter):
         )
         return cls(
             config,
-            leaser=FilesystemTraceSnapshotLeaser(
-                trace_source, scratch_quota_bytes=pipeline.scratch_quota_bytes
+            leaser=(
+                trace_leaser
+                if trace_leaser is not None
+                else FilesystemTraceSnapshotLeaser(
+                    trace_source,  # type: ignore[arg-type]
+                    scratch_quota_bytes=pipeline.scratch_quota_bytes,
+                )
             ),
             renderer=SpeculatorsTrainingRowRenderer(
                 pipeline, process_runner, resolver, state
@@ -826,6 +850,7 @@ class Eagle3Backend(Eagle3Adapter):
                 health_check=health_check or _health,
                 sleeper=sleeper,
                 clock=clock,
+                state=state,
             ),
             trainer=SpeculatorsTrainingProcess(
                 pipeline, process_runner, resolver, state
@@ -848,6 +873,14 @@ class Eagle3Backend(Eagle3Adapter):
 def _positive_int(name: str, value: object) -> None:
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{name} must be a positive integer")
+
+
+def _jsonl_record_count(path: Path) -> int:
+    try:
+        with path.open("rb") as source:
+            return sum(1 for line in source if line.strip())
+    except OSError as error:
+        raise Eagle3Error(f"cannot count training records in {path}: {error}") from error
 
 
 def _integer(name: str, value: object) -> int:
