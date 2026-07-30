@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -304,3 +305,51 @@ def test_split_requires_two_unique_contexts(tmp_path: Path) -> None:
 
     assert not (tmp_path / "cycle" / "snapshot").exists()
     assert not (tmp_path / "cycle" / "held-out").exists()
+
+
+def test_a_lease_reports_leased_and_buffered_counts(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The window was unobservable: no log, no event, no side file.
+
+    A reader of the run artifacts could not tell how many records were leased
+    out of how many exist, so neither the window nor its binding could be
+    confirmed from a run.
+    """
+    records = tuple(_record(f"trace-{index}", f"prompt-{index}") for index in range(20))
+    leaser = HeldOutTraceSnapshotLeaser(
+        _CursorTraceSource(tmp_path / "traces.jsonl", records),  # type: ignore[arg-type]
+        held_out_fraction=0.4,
+        scratch_quota_bytes=1_000_000,
+        training_window_records=6,
+    )
+
+    with caplog.at_level(logging.INFO, logger="speedlm.training.split"):
+        _lease(leaser, tmp_path / "cycle" / "snapshot")
+
+    message = caplog.records[-1].getMessage()
+    assert "6-record window over 20 buffered record(s)" in message
+    assert "window=6" in message
+    assert "bound=True" in message
+
+
+def test_a_lease_reports_a_window_that_did_not_bind(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A window wider than the corpus must say so rather than look identical."""
+    records = tuple(_record(f"trace-{index}", f"prompt-{index}") for index in range(9))
+    leaser = HeldOutTraceSnapshotLeaser(
+        _CursorTraceSource(tmp_path / "traces.jsonl", records),  # type: ignore[arg-type]
+        held_out_fraction=0.4,
+        scratch_quota_bytes=1_000_000,
+        training_window_records=256,
+    )
+
+    with caplog.at_level(logging.INFO, logger="speedlm.training.split"):
+        _lease(leaser, tmp_path / "cycle" / "snapshot")
+
+    message = caplog.records[-1].getMessage()
+    assert "9-record window over 9 buffered record(s)" in message
+    assert "bound=False" in message

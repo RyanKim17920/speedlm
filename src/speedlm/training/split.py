@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import threading
 import time
@@ -15,6 +16,8 @@ from speedlm.gate.suite import BenchmarkSuite, persist_suite
 from speedlm.traces.store import TraceRecord, TraceStore
 from speedlm.tuner.eagle3 import Eagle3Error, TraceSnapshot
 from speedlm.tuner.idle import TuningPreempted
+
+logger = logging.getLogger(__name__)
 
 
 class HeldOutTraceSnapshotLeaser:
@@ -101,7 +104,7 @@ class HeldOutTraceSnapshotLeaser:
         should_abort: Callable[[], bool],
     ) -> TraceSnapshot:
         started = time.monotonic()
-        records = self._select_window()
+        records, buffered = self._select_window()
         self._checkpoint(started, timeout_seconds, should_abort)
         if len(records) < 2:
             raise Eagle3Error("at least two trace records are required for a held-out split")
@@ -158,6 +161,23 @@ class HeldOutTraceSnapshotLeaser:
                 os.fsync(output.fileno())
             suite_dir = destination.parent / "held-out"
             persist_suite(suite, suite_dir)
+            # One line per lease, not per record: without it the window is
+            # unobservable by construction -- a reader cannot tell whether a
+            # cycle trained on the whole corpus or on a bound window, nor
+            # whether the configured window bound anything at all.
+            logger.info(
+                "leased %d training record(s) and %d held-out context(s) from a "
+                "%d-record window over %d buffered record(s) (window=%s, bound=%s)",
+                len(training),
+                len(suite.contexts),
+                len(records),
+                buffered,
+                self._training_window_records,
+                bool(
+                    self._training_window_records is not None
+                    and buffered > self._training_window_records
+                ),
+            )
             with self._lock:
                 self._training_context_hashes = training_hashes
                 self._benchmarked_context_hashes |= held_out
@@ -169,8 +189,12 @@ class HeldOutTraceSnapshotLeaser:
                 destination.rmdir()
             raise
 
-    def _select_window(self) -> tuple[TraceRecord, ...]:
-        """Return the newest ``training_window_records`` records.
+    def _select_window(self) -> tuple[tuple[TraceRecord, ...], int]:
+        """Return the newest ``training_window_records`` records and the total.
+
+        The buffered total is returned alongside so a lease can report how
+        much of the corpus it actually addressed; without both numbers the
+        window is indistinguishable from a full scan in the run artifacts.
 
         With no window configured this is the historical full scan, kept so
         that callers with a small, bounded corpus pay nothing for the cursor.
@@ -184,9 +208,11 @@ class HeldOutTraceSnapshotLeaser:
         """
         window = self._training_window_records
         if window is None:
-            return tuple(self._source.iter_records())
-        start = max(0, self._source.count_records() - window)
-        return tuple(self._source.iter_records(start=start))
+            records = tuple(self._source.iter_records())
+            return records, len(records)
+        buffered = self._source.count_records()
+        start = max(0, buffered - window)
+        return tuple(self._source.iter_records(start=start)), buffered
 
     @staticmethod
     def _checkpoint(
