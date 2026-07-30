@@ -11,13 +11,16 @@ from typing import Final, Protocol
 from speedlm.gateway.activity import ActivityTracker
 
 AbortCheck = Callable[[], bool]
+CaptureBarrier = Callable[[float, AbortCheck], None]
 DraftReference = Path | str
 
 # Keep these paths here rather than spreading vLLM's control API through the
 # gateway. They deliberately do not use the public proxy's /v1 namespace.
 VLLM_SLEEP_ENDPOINT: Final = "/sleep"
 VLLM_WAKE_ENDPOINT: Final = "/wake_up"
+VLLM_IS_SLEEPING_ENDPOINT: Final = "/is_sleeping"
 VLLM_SLEEP_LEVEL: Final = "1"
+VLLM_SLEEP_MODE: Final = "wait"
 
 DEFAULT_POLL_INTERVAL_SECONDS: Final = 0.05
 DEFAULT_RECOVERY_TIMEOUT_SECONDS: Final = 600.0
@@ -49,6 +52,15 @@ class VLLMControlHTTP(Protocol):
 
     def wait_ready(self, *, timeout_seconds: float) -> None:
         """Return only after the child is ready to serve requests."""
+
+    def wait_sleeping(
+        self,
+        sleeping: bool,
+        *,
+        timeout_seconds: float,
+        should_abort: AbortCheck,
+    ) -> None:
+        """Return only when vLLM reports the requested authoritative state."""
 
 
 class ChildProcessControl(Protocol):
@@ -143,6 +155,7 @@ class RuntimeController:
         sleeper: Callable[[float], None] = time.sleep,
         poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
         recovery_timeout_seconds: float = DEFAULT_RECOVERY_TIMEOUT_SECONDS,
+        capture_barrier: CaptureBarrier | None = None,
     ) -> None:
         if not str(active_draft):
             raise ValueError("active draft must be non-empty")
@@ -158,6 +171,7 @@ class RuntimeController:
         self._sleeper = sleeper
         self._poll_interval_seconds = poll_interval_seconds
         self._recovery_timeout_seconds = recovery_timeout_seconds
+        self._capture_barrier = capture_barrier
         self._admissions_stopped = False
         self._sleeping = False
 
@@ -177,6 +191,8 @@ class RuntimeController:
                 self._check_abort(should_abort, "quiesce")
                 remaining = deadline.remaining()
                 self._sleeper(min(self._poll_interval_seconds, remaining))
+            if self._capture_barrier is not None:
+                self._capture_barrier(deadline.remaining(), should_abort)
             self._check_abort(should_abort, "quiesce")
             deadline.check()
         except Exception:
@@ -200,7 +216,15 @@ class RuntimeController:
                 self._http.post(
                     VLLM_SLEEP_ENDPOINT,
                     timeout_seconds=deadline.remaining(),
-                    query={"level": VLLM_SLEEP_LEVEL},
+                    query={
+                        "level": VLLM_SLEEP_LEVEL,
+                        "mode": VLLM_SLEEP_MODE,
+                    },
+                )
+                self._http.wait_sleeping(
+                    True,
+                    timeout_seconds=deadline.remaining(),
+                    should_abort=should_abort,
                 )
                 deadline.check()
                 self._sleeping = True
@@ -267,6 +291,11 @@ class RuntimeController:
                 self._http.post(
                     VLLM_WAKE_ENDPOINT,
                     timeout_seconds=deadline.remaining(),
+                )
+                self._http.wait_sleeping(
+                    False,
+                    timeout_seconds=deadline.remaining(),
+                    should_abort=lambda: False,
                 )
                 deadline.check()
                 self._sleeping = False

@@ -11,6 +11,7 @@ from speedlm.gateway.activity import ActivityTracker
 from speedlm.gateway.control import (
     VLLM_SLEEP_ENDPOINT,
     VLLM_SLEEP_LEVEL,
+    VLLM_SLEEP_MODE,
     VLLM_WAKE_ENDPOINT,
     AdmissionGate,
     ControlAborted,
@@ -65,6 +66,8 @@ class FakeHTTP:
     fail_ready_count: int = 0
     advance_post: float = 0.0
     advance_ready: float = 0.0
+    sleeping_waits: list[tuple[bool, float]] = field(default_factory=list)
+    fail_sleeping_wait: bool = False
 
     def post(
         self,
@@ -86,6 +89,19 @@ class FakeHTTP:
         if self.fail_ready_count:
             self.fail_ready_count -= 1
             raise RuntimeError("readiness failed")
+
+    def wait_sleeping(
+        self,
+        sleeping: bool,
+        *,
+        timeout_seconds: float,
+        should_abort: Callable[[], bool],
+    ) -> None:
+        self.sleeping_waits.append((sleeping, timeout_seconds))
+        if should_abort():
+            raise ControlAborted("sleep-state wait aborted")
+        if self.fail_sleeping_wait:
+            raise RuntimeError("sleep-state wait failed")
 
 
 @dataclass(frozen=True)
@@ -263,8 +279,13 @@ def test_sleep_uses_level_one_endpoint() -> None:
     rig.controller.sleep(timeout_seconds=2.0, should_abort=lambda: False)
 
     assert rig.http.post_calls == [
-        HTTPCall(VLLM_SLEEP_ENDPOINT, 2.0, {"level": VLLM_SLEEP_LEVEL})
+        HTTPCall(
+            VLLM_SLEEP_ENDPOINT,
+            2.0,
+            {"level": VLLM_SLEEP_LEVEL, "mode": VLLM_SLEEP_MODE},
+        )
     ]
+    assert rig.http.sleeping_waits == [(True, 2.0)]
     assert not rig.admission.admitting
 
 
@@ -283,12 +304,25 @@ def test_sleep_failure_restores_active_service_and_admission() -> None:
     assert rig.admission.admitting
 
 
+def test_sleep_state_confirmation_failure_restores_service() -> None:
+    rig = make_rig()
+    quiesce(rig)
+    rig.http.fail_sleeping_wait = True
+
+    with pytest.raises(RuntimeError, match="sleep-state wait failed"):
+        rig.controller.sleep(timeout_seconds=2.0, should_abort=lambda: False)
+
+    assert rig.http.sleeping_waits == [(True, 2.0)]
+    assert [call.draft for call in rig.process.calls] == ["base-draft"]
+    assert rig.admission.admitting
+
+
 def test_abort_after_sleep_restores_service() -> None:
     rig = make_rig()
     quiesce(rig)
     checks = iter((False, True))
 
-    with pytest.raises(ControlAborted, match="sleep aborted"):
+    with pytest.raises(ControlAborted, match="aborted"):
         rig.controller.sleep(timeout_seconds=2.0, should_abort=lambda: next(checks))
 
     assert rig.process.running
@@ -379,9 +413,25 @@ def test_wake_calls_endpoint_confirms_readiness_and_reopens_admission() -> None:
     rig.controller.wake(timeout_seconds=3.0)
 
     assert rig.http.post_calls[-1] == HTTPCall(VLLM_WAKE_ENDPOINT, 3.0, None)
+    assert rig.http.sleeping_waits[-1] == (False, 3.0)
     assert rig.http.ready_timeouts == [3.0]
     assert rig.admission.admitting
     assert rig.process.running
+
+
+def test_wake_state_confirmation_failure_recovers_before_reopening() -> None:
+    rig = make_rig()
+    quiesce(rig)
+    rig.controller.sleep(timeout_seconds=2.0, should_abort=lambda: False)
+    rig.http.fail_sleeping_wait = True
+
+    with pytest.raises(RuntimeError, match="sleep-state wait failed"):
+        rig.controller.wake(timeout_seconds=3.0)
+
+    assert rig.http.sleeping_waits[-1] == (False, 3.0)
+    assert [call.draft for call in rig.process.calls] == ["base-draft"]
+    assert rig.http.ready_timeouts
+    assert rig.admission.admitting
 
 
 def test_quiesce_honors_timeout_and_reopens_admission() -> None:
