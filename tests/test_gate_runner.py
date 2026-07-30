@@ -145,15 +145,15 @@ def _snapshot(
     accepted: float,
     rejected: float,
 ) -> str:
+    drafted = accepted + rejected
     return "\n".join(
         (
-            f"generated_tokens_total {generated}",
-            "prompt_tokens_total 100",
-            f"time_per_output_token_ns_sum {elapsed_ns}",
-            f"vllm:speculated_tokens_total {accepted + rejected}",
-            f"vllm:accepted_tokens_total {accepted}",
-            f"vllm:accept_token_count_total {accepted}",
-            f"vllm:reject_token_count_total {rejected}",
+            f'vllm:generation_tokens_total{{engine="0"}} {generated}',
+            'vllm:prompt_tokens_total{engine="0"} 100',
+            f'vllm:request_decode_time_seconds_sum{{engine="0"}} {elapsed_ns / 1e9}',
+            f'vllm:spec_decode_num_draft_tokens_total{{engine="0"}} {drafted}',
+            f'vllm:spec_decode_num_accepted_tokens_total{{engine="0"}} {accepted}',
+            f'vllm:spec_decode_num_drafts_total{{engine="0"}} {drafted}',
         )
     )
 

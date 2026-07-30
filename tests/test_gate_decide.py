@@ -370,3 +370,69 @@ def test_decision_is_frozen() -> None:
         _pcfg(),
     )
     assert dataclasses.is_dataclass(dec)
+
+
+# ---------------------------------------------------------------------------
+# Provenance: the report must not misrepresent how much was measured
+# ---------------------------------------------------------------------------
+
+def test_num_repeats_always_matches_the_reported_per_repeat_rows() -> None:
+    """`num_repeats` is a claim about the run and must be backed by rows.
+
+    The shipped bug persisted `num_repeats: 0, per_repeat: []` on the
+    acceptance-unavailable path even though three suite passes had run, which
+    made a measurement failure indistinguishable from a benchmark that never
+    executed.
+    """
+    for stock_metrics, cand_metrics in (
+        (_make_delta(), _make_delta(acceptance_available=False)),
+        (_make_delta(), _make_delta(reset_detected=True)),
+        (_make_delta(), _make_delta()),
+    ):
+        dec = decide_promotion(
+            stock_metrics, cand_metrics,
+            _valid_runs_with_tps(100.0),
+            _valid_runs_with_tps(110.0),
+            _pcfg(acc_pp=0.0, throughput_pct=0.0),
+        )
+        assert dec.num_repeats == len(dec.per_repeat), dec.reason
+        assert dec.num_repeats == 3, dec.reason
+
+
+def test_zero_sample_benchmark_can_never_promote() -> None:
+    """An empty replay must fail closed, not sail through on metric deltas."""
+    empty = _make_replay([])
+
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.60, output_tok_per_sec=100.0),
+        _make_delta(acceptance_rate=0.99, output_tok_per_sec=999.0),
+        empty,
+        empty,
+        _pcfg(acc_pp=0.0, throughput_pct=0.0),
+    )
+
+    assert dec.verdict == Verdict.REJECT
+    assert dec.reason == Reason.TOO_FEW_REPEATS
+    assert dec.num_repeats == 0
+    assert dec.per_repeat == ()
+    _assert_unmeasured_deltas(dec)
+
+
+def test_a_genuine_comparison_always_reports_both_deltas() -> None:
+    """Any threshold verdict must carry the numbers it was based on."""
+    for cand_tps, cand_acc in ((110.0, 0.70), (90.0, 0.70), (110.0, 0.50)):
+        dec = decide_promotion(
+            _make_delta(acceptance_rate=0.60, output_tok_per_sec=100.0),
+            _make_delta(acceptance_rate=cand_acc, output_tok_per_sec=cand_tps),
+            _valid_runs_with_tps(100.0),
+            _valid_runs_with_tps(cand_tps),
+            _pcfg(acc_pp=0.0, throughput_pct=0.0),
+        )
+        assert dec.reason in {
+            Reason.BOTH_THRESHOLDS_MET,
+            Reason.ACCEPTANCE_BELOW_THRESHOLD,
+            Reason.THROUGHPUT_BELOW_THRESHOLD,
+        }
+        assert dec.acceptance_delta_pp is not None
+        assert dec.throughput_delta_pct is not None
+        assert dec.num_repeats > 0

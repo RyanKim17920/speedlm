@@ -172,75 +172,17 @@ def decide_promotion(
     s_acc = stock_metrics.acceptance_rate
     c_acc = candidate_metrics.acceptance_rate
 
-
-    # --- Validation: counter reset ---
-    if stock_metrics.reset_detected or candidate_metrics.reset_detected:
-        return _make_reject(
-            reason=Reason.COUNTER_RESET,
-            acceptance_delta_pp=None,
-            throughput_delta_pct=None,
-            pcfg=promotion_config,
-            num_repeats=0,
-            per_repeat=tuple(),
-            stock_acc=s_acc,
-            cand_acc=c_acc,
-            stock_tps=s_tps,
-            cand_tps=c_tps,
-        )
-
-    # --- Validation: acceptance unavailable ---
-    if not stock_metrics.acceptance_available or not candidate_metrics.acceptance_available:
-        return _make_reject(
-            reason=Reason.ACCEPTANCE_UNAVAILABLE,
-            acceptance_delta_pp=None,
-            throughput_delta_pct=None,
-            pcfg=promotion_config,
-            num_repeats=0,
-            per_repeat=tuple(),
-            stock_acc=s_acc,
-            cand_acc=c_acc,
-            stock_tps=s_tps,
-            cand_tps=c_tps,
-        )
-
-    # --- Validation: too few repeats ---
+    # How many suite passes each arm actually completed.  This is a fact about
+    # the benchmark run, so it is established before any validation short
+    # circuits: a report claiming zero repeats must mean the replay really did
+    # not run, not merely that the decision stopped looking.
     s_runs = stock_replay.num_runs
     c_runs = candidate_replay.num_runs
     min_runs = min(s_runs, c_runs)
 
-    if s_runs < _MIN_REPEATS or c_runs < _MIN_REPEATS:
-        return _make_reject(
-            reason=Reason.TOO_FEW_REPEATS,
-            acceptance_delta_pp=None,
-            throughput_delta_pct=None,
-            pcfg=promotion_config,
-            num_repeats=min_runs,
-            per_repeat=tuple(),
-            stock_acc=s_acc,
-            cand_acc=c_acc,
-            stock_tps=s_tps,
-            cand_tps=c_tps,
-        )
-
-    # --- Validation: high invalid rate ---
-    if (
-        stock_replay.avg_invalid_rate > _INVALID_RATE_THRESHOLD
-        or candidate_replay.avg_invalid_rate > _INVALID_RATE_THRESHOLD
-    ):
-        return _make_reject(
-            reason=Reason.HIGH_INVALID_RATE,
-            acceptance_delta_pp=None,
-            throughput_delta_pct=None,
-            pcfg=promotion_config,
-            num_repeats=min_runs,
-            per_repeat=tuple(),
-            stock_acc=s_acc,
-            cand_acc=c_acc,
-            stock_tps=s_tps,
-            cand_tps=c_tps,
-        )
-
     # --- Build per-repeat summaries + count mismatches ---
+    # Derived purely from replay data, so these survive a metrics failure and
+    # keep ``num_repeats == len(per_repeat)`` true on every path.
     per_repeat_list: list[RepeatSummary] = []
     total_mismatches = 0
 
@@ -267,6 +209,69 @@ def decide_promotion(
         )
 
     per_repeat_tuple = tuple(per_repeat_list)
+
+    # --- Validation: counter reset ---
+    if stock_metrics.reset_detected or candidate_metrics.reset_detected:
+        return _make_reject(
+            reason=Reason.COUNTER_RESET,
+            acceptance_delta_pp=None,
+            throughput_delta_pct=None,
+            pcfg=promotion_config,
+            num_repeats=min_runs,
+            per_repeat=per_repeat_tuple,
+            stock_acc=s_acc,
+            cand_acc=c_acc,
+            stock_tps=s_tps,
+            cand_tps=c_tps,
+        )
+
+    # --- Validation: acceptance unavailable ---
+    if not stock_metrics.acceptance_available or not candidate_metrics.acceptance_available:
+        return _make_reject(
+            reason=Reason.ACCEPTANCE_UNAVAILABLE,
+            acceptance_delta_pp=None,
+            throughput_delta_pct=None,
+            pcfg=promotion_config,
+            num_repeats=min_runs,
+            per_repeat=per_repeat_tuple,
+            stock_acc=s_acc,
+            cand_acc=c_acc,
+            stock_tps=s_tps,
+            cand_tps=c_tps,
+        )
+
+    # --- Validation: too few repeats ---
+    if s_runs < _MIN_REPEATS or c_runs < _MIN_REPEATS:
+        return _make_reject(
+            reason=Reason.TOO_FEW_REPEATS,
+            acceptance_delta_pp=None,
+            throughput_delta_pct=None,
+            pcfg=promotion_config,
+            num_repeats=min_runs,
+            per_repeat=per_repeat_tuple,
+            stock_acc=s_acc,
+            cand_acc=c_acc,
+            stock_tps=s_tps,
+            cand_tps=c_tps,
+        )
+
+    # --- Validation: high invalid rate ---
+    if (
+        stock_replay.avg_invalid_rate > _INVALID_RATE_THRESHOLD
+        or candidate_replay.avg_invalid_rate > _INVALID_RATE_THRESHOLD
+    ):
+        return _make_reject(
+            reason=Reason.HIGH_INVALID_RATE,
+            acceptance_delta_pp=None,
+            throughput_delta_pct=None,
+            pcfg=promotion_config,
+            num_repeats=min_runs,
+            per_repeat=per_repeat_tuple,
+            stock_acc=s_acc,
+            cand_acc=c_acc,
+            stock_tps=s_tps,
+            cand_tps=c_tps,
+        )
 
     # --- Validation: output mismatch ---
     if total_mismatches > max_output_mismatches:

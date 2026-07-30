@@ -328,7 +328,12 @@ class BenchmarkGateRunner:
             metrics={
                 "suite_hash": suite.suite_hash,
                 "num_contexts": len(suite.contexts),
-                "num_repeats": self._repeats,
+                # Observed, not configured: a report that says three repeats
+                # ran must mean three repeats ran.
+                "num_repeats": min(stock_replay.num_runs, candidate_replay.num_runs),
+                "requested_repeats": self._repeats,
+                "stock_runs": stock_replay.num_runs,
+                "candidate_runs": candidate_replay.num_runs,
                 "stock": _delta_dict(stock_delta),
                 "candidate": _delta_dict(candidate_delta),
             },
