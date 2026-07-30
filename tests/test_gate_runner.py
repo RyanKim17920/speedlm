@@ -606,3 +606,41 @@ def test_decision_records_the_warmup_it_excluded(tmp_path: Path) -> None:
     assert result.decision.warmup_repeats == 1
     assert result.decision.to_dict()["warmup_repeats"] == 1
     assert result.decision.to_dict()["num_repeats"] == 3
+
+
+def test_every_scrape_body_is_returned_verbatim(tmp_path: Path) -> None:
+    scrapes = _normal_scrapes()
+    expected = list(scrapes)
+    runner, _, _, _ = _runner(tmp_path, scrapes=scrapes)
+
+    result = runner.benchmark(
+        tmp_path / "candidate",
+        timeout_seconds=30,
+        should_abort=lambda: False,
+    )
+
+    assert dict(result.metrics_bodies) == {
+        "stock-before": expected[0],
+        "stock-after": expected[1],
+        "candidate-before": expected[2],
+        "candidate-after": expected[3],
+    }
+
+
+def test_scrape_bodies_survive_an_abort(tmp_path: Path) -> None:
+    scrapes = _normal_scrapes()
+    expected = list(scrapes)
+    runner, _, replay, _ = _runner(tmp_path, scrapes=scrapes)
+
+    # Abort after the scored stock replay, i.e. once one scrape has happened.
+    def should_abort() -> bool:
+        return replay.calls >= 2
+
+    result = runner.benchmark(
+        tmp_path / "candidate",
+        timeout_seconds=30,
+        should_abort=should_abort,
+    )
+
+    assert result.decision is None
+    assert dict(result.metrics_bodies) == {"stock-before": expected[0]}

@@ -38,11 +38,16 @@ class GateResult:
     when the benchmark produced one.  It is what gets persisted as
     ``decision.json`` so ``speedlm gain`` can report the measurement; a gate
     that never got far enough to build one leaves it ``None``.
+
+    ``metrics_bodies`` maps a scrape label to the verbatim Prometheus body the
+    gate read.  It is the evidence behind every derived rate, persisted next to
+    the decision so provenance questions are answerable from artifacts.
     """
 
     passed: bool
     reason: str
     metrics: Mapping[str, object] = field(default_factory=dict)
+    metrics_bodies: Mapping[str, str] = field(default_factory=dict)
     decision: Decision | None = None
 
     def __post_init__(self) -> None:

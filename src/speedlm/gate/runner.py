@@ -250,6 +250,21 @@ class BenchmarkGateRunner:
             checkpoint(f"after {name}")
             return result
 
+        # Every scrape's raw exposition is kept verbatim.  Acceptance is a
+        # counter delta, so a reader who doubts a reported rate can only
+        # reconcile it against the absolute counters that produced it, and a
+        # parsed-and-discarded body makes that question unanswerable without a
+        # re-run.
+        bodies: dict[str, str] = {}
+
+        def scrape(name: str, label: str) -> MetricsSnapshot:
+            def operation(available: float) -> MetricsSnapshot:
+                snapshot, text = self._scrape(available, should_abort)
+                bodies[label] = text
+                return snapshot
+
+            return stage(name, operation)
+
         try:
             suite = stage("suite preparation", lambda _timeout: self._load_or_build_suite())
             stage(
@@ -275,17 +290,17 @@ class BenchmarkGateRunner:
                 "stock warmup",
                 lambda available: self._warmup(suite, available, should_abort),
             )
-            stock_before = stage(
+            stock_before = scrape(
                 "stock metrics pre-scrape",
-                lambda available: self._scrape(available, should_abort),
+                "stock-before",
             )
             stock_replay = stage(
                 "stock replay",
                 lambda available: self._replay(suite, available, should_abort),
             )
-            stock_after = stage(
+            stock_after = scrape(
                 "stock metrics post-scrape",
-                lambda available: self._scrape(available, should_abort),
+                "stock-after",
             )
             stock_delta = stage(
                 "stock metric delta",
@@ -304,17 +319,17 @@ class BenchmarkGateRunner:
                 "candidate warmup",
                 lambda available: self._warmup(suite, available, should_abort),
             )
-            candidate_before = stage(
+            candidate_before = scrape(
                 "candidate metrics pre-scrape",
-                lambda available: self._scrape(available, should_abort),
+                "candidate-before",
             )
             candidate_replay = stage(
                 "candidate replay",
                 lambda available: self._replay(suite, available, should_abort),
             )
-            candidate_after = stage(
+            candidate_after = scrape(
                 "candidate metrics post-scrape",
-                lambda available: self._scrape(available, should_abort),
+                "candidate-after",
             )
             candidate_delta = stage(
                 "candidate metric delta",
@@ -337,12 +352,14 @@ class BenchmarkGateRunner:
                 passed=False,
                 reason=str(exc),
                 metrics={"aborted": True},
+                metrics_bodies=bodies,
             )
         except (BenchmarkTimedOut, TimeoutError) as exc:
             return _gate_result(
                 passed=False,
                 reason=str(exc) or "benchmark timed out",
                 metrics={"timed_out": True},
+                metrics_bodies=bodies,
             )
 
         return _gate_result(
@@ -367,6 +384,7 @@ class BenchmarkGateRunner:
                 "stock": _delta_dict(stock_delta),
                 "candidate": _delta_dict(candidate_delta),
             },
+            metrics_bodies=bodies,
             decision=decision,
         )
 
@@ -403,12 +421,12 @@ class BenchmarkGateRunner:
         self,
         timeout_seconds: float,
         should_abort: AbortCheck,
-    ) -> MetricsSnapshot:
+    ) -> tuple[MetricsSnapshot, str]:
         text = self._metrics_source.scrape(
             timeout_seconds=timeout_seconds,
             should_abort=should_abort,
         )
-        return parse_metrics(text)
+        return parse_metrics(text), text
 
     def _replay(
         self,
@@ -499,6 +517,7 @@ def _gate_result(
     passed: bool,
     reason: str,
     metrics: dict[str, object],
+    metrics_bodies: dict[str, str] | None = None,
     decision: Decision | None = None,
 ) -> GateResult:
     # Importing GateResult at module load time would cycle while the
@@ -509,5 +528,6 @@ def _gate_result(
         passed=passed,
         reason=reason,
         metrics=metrics,
+        metrics_bodies=dict(metrics_bodies or {}),
         decision=decision,
     )
