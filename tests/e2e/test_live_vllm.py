@@ -177,8 +177,21 @@ def _stream_chat(
         for choice in event.get("choices", [])
         if isinstance(choice, dict)
     )
+    reasoning_content = "".join(
+        delta_value
+        for event in events
+        for choice in event.get("choices", [])
+        if isinstance(choice, dict)
+        for delta in [choice.get("delta")]
+        if isinstance(delta, dict)
+        for field in ("reasoning_content", "reasoning", "thinking")
+        for delta_value in [delta.get(field)]
+        if isinstance(delta_value, str)
+    )
     usage_events = [event["usage"] for event in events if isinstance(event.get("usage"), dict)]
-    assert content, "stream contained no assistant content"
+    assert content or reasoning_content, (
+        "stream contained neither assistant content nor reasoning"
+    )
     assert usage_events, "stream_options.include_usage did not produce usage"
     usage = usage_events[-1]
     assert usage["prompt_tokens"] > 0
@@ -187,6 +200,7 @@ def _stream_chat(
         "id": next(event["id"] for event in events if isinstance(event.get("id"), str)),
         "model": next(event["model"] for event in events if isinstance(event.get("model"), str)),
         "content": content,
+        "reasoning_content": reasoning_content or None,
         "usage": usage,
         "raw_chunk_count": len(raw_chunks),
         "event_count": len(events),
@@ -364,8 +378,21 @@ def test_speedlm_against_live_vllm() -> None:
                 nonstream_payload,
                 artifact_dir / "nonstream-response.txt",
             )
-            nonstream_content = nonstream["choices"][0]["message"]["content"]
-            assert isinstance(nonstream_content, str) and nonstream_content.strip()
+            nonstream_message = nonstream["choices"][0]["message"]
+            nonstream_content = nonstream_message.get("content")
+            nonstream_reasoning = next(
+                (
+                    nonstream_message[field]
+                    for field in ("reasoning_content", "reasoning", "thinking")
+                    if isinstance(nonstream_message.get(field), str)
+                ),
+                None,
+            )
+            assert (
+                isinstance(nonstream_content, str) and nonstream_content.strip()
+            ) or (
+                isinstance(nonstream_reasoning, str) and nonstream_reasoning.strip()
+            )
 
             stream_payload = {
                 "model": model,
@@ -445,6 +472,16 @@ def test_speedlm_against_live_vllm() -> None:
 
         assert nonstream_trace["messages"][-1]["content"] == nonstream_content
         assert stream_trace["messages"][-1]["content"] == stream_content
+        if nonstream_reasoning:
+            assert (
+                nonstream_trace["messages"][-1]["reasoning_content"]
+                == nonstream_reasoning
+            )
+        if stream["reasoning_content"]:
+            assert (
+                stream_trace["messages"][-1]["reasoning_content"]
+                == stream["reasoning_content"]
+            )
         assert tool_trace["tool_calls"] == tool_calls
         for trace, payload, usage in (
             (nonstream_trace, nonstream_payload, nonstream["usage"]),

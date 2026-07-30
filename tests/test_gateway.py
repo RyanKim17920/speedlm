@@ -16,14 +16,16 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.responses import Response
 
+from speedlm.gateway import proxy as proxy_module
 from speedlm.gateway.activity import ActivityTracker
 from speedlm.gateway.app import create_app
+from speedlm.gateway.capture import CaptureManager
 from speedlm.gateway.process import (
     ProcessError,
     VLLMProcess,
     build_vllm_argv,
 )
-from speedlm.gateway.sse import SSEAssembler, parse_json_response
+from speedlm.gateway.sse import AssembledResponse, SSEAssembler, parse_json_response
 from speedlm.traces.store import TraceRecord, TraceStore
 
 ASGIMessage = MutableMapping[str, Any]
@@ -542,6 +544,16 @@ def test_admin_routes_are_blocked() -> None:
                 "/v1/load_lora_adapter",
             ):
                 assert (await client.get(path)).status_code == 404
+            for path in (
+                "/abort_requests",
+                "/collective_rpc",
+                "/pause",
+                "/reset_mm_cache",
+                "/scale_elastic_ep",
+                "/start_profile",
+                "/update_weights",
+            ):
+                assert (await client.post(path)).status_code == 404
             assert state["admin_called"] is False
         finally:
             await _close_clients(client, upstream, gateway)
@@ -595,6 +607,11 @@ def test_capture_writes_exactly_one_trace(
         assert record.finish_reason == "tool_calls"
         assert record.stop_reason == "end"
         assert (record.temperature, record.top_p, record.seed) == (0.2, 0.9, 7)
+        assert record.exchange_id is not None
+        manifests = list(gateway.state.exchange_ledger.iter_manifests())
+        assert [manifest["exchange_id"] for manifest in manifests] == [
+            record.exchange_id
+        ]
 
     asyncio.run(scenario())
 
@@ -675,6 +692,172 @@ def test_capture_failure_does_not_fail_request(
         finally:
             await _close_clients(client, upstream, gateway)
         assert not store.path.exists()
+        stats = store.stats()
+        assert stats.total_dropped == 1
+        assert stats.drops_by_reason["capture_error"] == 1
+
+    asyncio.run(scenario())
+
+
+def test_request_body_overflow_is_counted_and_logged(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def immediate_to_thread(function: Any, *args: Any) -> Any:
+        return function(*args)
+
+    monkeypatch.setattr(asyncio, "to_thread", immediate_to_thread)
+    monkeypatch.setattr(proxy_module, "_MAX_CAPTURE_BODY_BYTES", 512)
+
+    async def scenario() -> None:
+        store = TraceStore(tmp_path / "traces.jsonl")
+        client, upstream, _, gateway = await _clients(store=store)
+        try:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "request-model",
+                    "messages": [{"role": "user", "content": "x" * 2_000}],
+                },
+            )
+            assert response.status_code == 200
+        finally:
+            await _close_clients(client, upstream, gateway)
+
+        stats = store.stats()
+        assert stats.total_dropped == 1
+        assert stats.drops_by_reason["body_overflow"] == 1
+
+    with caplog.at_level("WARNING"):
+        asyncio.run(scenario())
+
+    assert "request body overflow" in caplog.text
+    assert "size=" in caplog.text
+    assert "limit=512" in caplog.text
+
+
+def test_counter_write_failure_does_not_fail_client_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def immediate_to_thread(function: Any, *args: Any) -> Any:
+        return function(*args)
+
+    monkeypatch.setattr(asyncio, "to_thread", immediate_to_thread)
+    monkeypatch.setattr(proxy_module, "_MAX_CAPTURE_BODY_BYTES", 512)
+
+    def fail_counter_write(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError("stats disk unavailable")
+
+    monkeypatch.setattr(
+        "speedlm.traces.store.atomic_write_json",
+        fail_counter_write,
+    )
+
+    async def scenario() -> None:
+        store = TraceStore(tmp_path / "traces.jsonl")
+        client, upstream, _, gateway = await _clients(store=store)
+        try:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "request-model",
+                    "messages": [{"role": "user", "content": "x" * 2_000}],
+                },
+            )
+            assert response.status_code == 200
+            assert response.json()["choices"][0]["message"]["content"] == "hello"
+        finally:
+            await _close_clients(client, upstream, gateway)
+
+        assert not store.stats_path.exists()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("observer_method", ["feed", "finish"])
+def test_response_observer_errors_are_counted(
+    observer_method: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def immediate_to_thread(function: Any, *args: Any) -> Any:
+        return function(*args)
+
+    monkeypatch.setattr(asyncio, "to_thread", immediate_to_thread)
+
+    def fail_observer(*_args: Any, **_kwargs: Any) -> None:
+        raise RuntimeError("observer failed")
+
+    monkeypatch.setattr(
+        proxy_module._ResponseObserver,
+        observer_method,
+        fail_observer,
+    )
+
+    async def scenario() -> None:
+        store = TraceStore(tmp_path / "traces.jsonl")
+        client, upstream, _, gateway = await _clients(store=store)
+        try:
+            response = await client.post(
+                "/v1/chat/completions",
+                json={
+                    "model": "request-model",
+                    "messages": [{"role": "user", "content": "hi"}],
+                },
+            )
+            assert response.status_code == 200
+        finally:
+            await _close_clients(client, upstream, gateway)
+
+        stats = store.stats()
+        assert stats.total_dropped == 1
+        assert stats.drops_by_reason["stream_observer_error"] == 1
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_capture_is_counted_as_shutdown_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def scenario() -> None:
+        append_started = asyncio.Event()
+        store = TraceStore(tmp_path / "traces.jsonl")
+        capture = CaptureManager(store)
+
+        async def blocked_worker(function: Any, *args: Any) -> Any:
+            if getattr(function, "__name__", "") == "append":
+                append_started.set()
+                await asyncio.Event().wait()
+            return function(*args)
+
+        monkeypatch.setattr(capture, "_run_in_worker", blocked_worker)
+        capture.submit(
+            {
+                "model": "request-model",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+            AssembledResponse(
+                id="response-id",
+                model="response-model",
+                created=1_700_000_000.0,
+                content="hello",
+                tool_calls=(),
+                prompt_tokens=1,
+                completion_tokens=1,
+            ),
+            endpoint="/v1/chat/completions",
+            timestamp=1_700_000_000.0,
+        )
+        await append_started.wait()
+        next(iter(capture._tasks)).cancel()
+        await capture.drain()
+
+        stats = store.stats()
+        assert stats.total_dropped == 1
+        assert stats.drops_by_reason["shutdown_pending"] == 1
 
     asyncio.run(scenario())
 

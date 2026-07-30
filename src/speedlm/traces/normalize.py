@@ -560,6 +560,20 @@ def normalize_record(
     else:
         tool_calls = ()
 
+    # --- request tool schemas ---
+    tools_raw = normalized.get("tools")
+    if tools_raw is not None:
+        if not isinstance(tools_raw, list):
+            raise NormalizeError(f"record[{index}]: 'tools' must be a list")
+        for i, tool in enumerate(tools_raw):
+            if not isinstance(tool, dict):
+                raise NormalizeError(
+                    f"record[{index}]: tools[{i}] must be an object"
+                )
+        tools: tuple[dict[str, Any], ...] = tuple(dict(tool) for tool in tools_raw)
+    else:
+        tools = ()
+
     # --- token counts ---
     prompt_tokens, completion_tokens, token_count_source = _extract_tokens(
         normalized,
@@ -578,6 +592,7 @@ def normalize_record(
         seed=int(seed),
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
+        tools=tools,
         token_count_source=token_count_source,
     )
 

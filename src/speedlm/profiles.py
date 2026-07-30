@@ -8,8 +8,13 @@ operators can replace them by name with JSON files in
 
 from __future__ import annotations
 
+import ast
+import importlib
 import json
-from collections.abc import Mapping
+import os
+import re
+import shutil
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -19,6 +24,12 @@ from speedlm.config import speedlm_home
 
 SpeculativeMethod = Literal["eagle3", "mtp", "medusa", "ngram", "draft_model"]
 ChatTemplateKind = Literal["harmony", "chatml", "auto"]
+ParserSource = Literal[
+    "auto-detected",
+    "profile-pinned",
+    "user-supplied",
+    "none",
+]
 
 SPECULATIVE_METHODS: Final = frozenset(
     {"eagle3", "mtp", "medusa", "ngram", "draft_model"}
@@ -29,6 +40,37 @@ NON_TRAINABLE_METHODS: Final = frozenset({"ngram"})
 
 class ProfileError(ValueError):
     """Raised when a model profile cannot be loaded or resolved safely."""
+
+
+@dataclass(frozen=True, slots=True)
+class ParserRegistry:
+    """Names and lazy-registration metadata discovered from the installed vLLM."""
+
+    tool_parsers: tuple[str, ...] = ()
+    reasoning_parsers: tuple[str, ...] = ()
+    tool_metadata: Mapping[str, str] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
+    reasoning_metadata: Mapping[str, str] = field(
+        default_factory=dict,
+        repr=False,
+        compare=False,
+    )
+    errors: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ParserResolution:
+    """Effective parser values plus the winning level of the override chain."""
+
+    model_type: str | None
+    registry: ParserRegistry
+    tool_call_parser: str | None
+    reasoning_parser: str | None
+    tool_call_parser_source: ParserSource
+    reasoning_parser_source: ParserSource
 
 
 def _non_empty_string(value: Any, field_name: str) -> str:
@@ -449,4 +491,461 @@ def resolve_profile(
     raise ProfileError(
         f"no model profile matches {attempted}; set config.profile explicitly. "
         f"Available profiles: {_available_profiles(registry)}"
+    )
+
+
+def _lazy_target(value: object) -> str:
+    if (
+        isinstance(value, tuple)
+        and len(value) >= 2
+        and isinstance(value[0], str)
+        and isinstance(value[1], str)
+    ):
+        return f"{value[0]}.{value[1]}"
+    return ""
+
+
+def _manager_registry(
+    module_name: str,
+    manager_name: str,
+    eager_attribute: str,
+) -> tuple[tuple[str, ...], Mapping[str, str]]:
+    """Read eager and lazy parser names after importing the registering package."""
+
+    module = importlib.import_module(module_name)
+    manager = getattr(module, manager_name)
+    lazy = getattr(manager, "lazy_parsers", {})
+    eager = getattr(manager, eager_attribute, {})
+
+    lazy_mapping = lazy if isinstance(lazy, Mapping) else {}
+    eager_mapping = eager if isinstance(eager, Mapping) else {}
+    names = tuple(
+        sorted(
+            key
+            for key in set(lazy_mapping) | set(eager_mapping)
+            if isinstance(key, str) and key
+        )
+    )
+    metadata_map = {
+        name: " ".join(
+            part
+            for part in (
+                name,
+                _lazy_target(lazy_mapping.get(name)),
+            )
+            if part
+        )
+        for name in names
+    }
+    return names, MappingProxyType(metadata_map)
+
+
+def discover_vllm_parser_registry() -> ParserRegistry:
+    """Discover the installed vLLM parser set without loading parser classes.
+
+    Importing each public parser package runs vLLM's lazy-registration hook.
+    The lazy maps are therefore authoritative even while the eager maps remain
+    empty, which is the normal state before a parser is first used.
+    """
+
+    errors: list[str] = []
+    tool_parsers: tuple[str, ...] = ()
+    reasoning_parsers: tuple[str, ...] = ()
+    tool_metadata: Mapping[str, str] = {}
+    reasoning_metadata: Mapping[str, str] = {}
+
+    try:
+        tool_parsers, tool_metadata = _manager_registry(
+            "vllm.tool_parsers",
+            "ToolParserManager",
+            "tool_parsers",
+        )
+    except Exception as exc:
+        errors.append(f"tool parsers: {type(exc).__name__}: {exc}")
+
+    try:
+        reasoning_parsers, reasoning_metadata = _manager_registry(
+            "vllm.reasoning",
+            "ReasoningParserManager",
+            "reasoning_parsers",
+        )
+    except Exception as exc:
+        errors.append(f"reasoning parsers: {type(exc).__name__}: {exc}")
+
+    if not tool_parsers or not reasoning_parsers:
+        external = _external_vllm_parser_registry()
+        if external is not None:
+            tool_parsers = tuple(sorted(set(tool_parsers) | set(external.tool_parsers)))
+            reasoning_parsers = tuple(
+                sorted(set(reasoning_parsers) | set(external.reasoning_parsers))
+            )
+            tool_metadata = MappingProxyType(
+                {**external.tool_metadata, **tool_metadata}
+            )
+            reasoning_metadata = MappingProxyType(
+                {**external.reasoning_metadata, **reasoning_metadata}
+            )
+            errors.extend(external.errors)
+
+    return ParserRegistry(
+        tool_parsers=tool_parsers,
+        reasoning_parsers=reasoning_parsers,
+        tool_metadata=tool_metadata,
+        reasoning_metadata=reasoning_metadata,
+        errors=tuple(errors),
+    )
+
+
+def _external_vllm_parser_registry() -> ParserRegistry | None:
+    """Read lazy parser declarations from the vLLM executable environment.
+
+    SpeedLM intentionally does not depend on vLLM in its own lightweight
+    virtualenv. Parsing vLLM's literal lazy-registration tables avoids loading
+    torch/CUDA in the gateway process and works for any parser names shipped by
+    the installed vLLM version.
+    """
+    executable = shutil.which("vllm")
+    if executable is None:
+        return None
+    environment = Path(executable).resolve().parent.parent
+    site_packages = sorted(environment.glob("lib/python*/site-packages"))
+    for site in site_packages:
+        package = site / "vllm"
+        tool = _literal_parser_registry(
+            package / "tool_parsers" / "__init__.py",
+            "_TOOL_PARSERS_TO_REGISTER",
+            module_prefix="vllm.tool_parsers",
+        )
+        reasoning = _literal_parser_registry(
+            package / "reasoning" / "__init__.py",
+            "_REASONING_PARSERS_TO_REGISTER",
+            module_prefix="vllm.reasoning",
+        )
+        if tool is None and reasoning is None:
+            continue
+        tool_names, tool_metadata = tool or ((), {})
+        reasoning_names, reasoning_metadata = reasoning or ((), {})
+        return ParserRegistry(
+            tool_parsers=tool_names,
+            reasoning_parsers=reasoning_names,
+            tool_metadata=tool_metadata,
+            reasoning_metadata=reasoning_metadata,
+        )
+    return None
+
+
+def _literal_parser_registry(
+    path: Path,
+    variable_name: str,
+    *,
+    module_prefix: str,
+) -> tuple[tuple[str, ...], Mapping[str, str]] | None:
+    try:
+        module = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    except (OSError, SyntaxError, UnicodeError):
+        return None
+    raw: object | None = None
+    for statement in module.body:
+        if not isinstance(statement, (ast.Assign, ast.AnnAssign)):
+            continue
+        targets = (
+            statement.targets
+            if isinstance(statement, ast.Assign)
+            else [statement.target]
+        )
+        if not any(
+            isinstance(target, ast.Name) and target.id == variable_name
+            for target in targets
+        ):
+            continue
+        if statement.value is None:
+            return None
+        try:
+            raw = ast.literal_eval(statement.value)
+        except (ValueError, TypeError):
+            return None
+        break
+    if not isinstance(raw, dict):
+        return None
+    entries: dict[str, str] = {}
+    for name, target in raw.items():
+        if (
+            not isinstance(name, str)
+            or not name
+            or not isinstance(target, tuple)
+            or len(target) < 2
+            or not isinstance(target[0], str)
+            or not isinstance(target[1], str)
+        ):
+            continue
+        entries[name] = f"{name} {module_prefix}.{target[0]}.{target[1]}"
+    return tuple(sorted(entries)), MappingProxyType(entries)
+
+
+def read_model_type(
+    model: str,
+    *,
+    allow_remote: bool = False,
+) -> str | None:
+    """Read ``model_type`` from config.json, optionally using Transformers."""
+
+    candidate = Path(model).expanduser()
+    config_path = candidate / "config.json" if candidate.is_dir() else candidate
+    if config_path.is_file():
+        try:
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(raw, Mapping):
+            return None
+        model_type = raw.get("model_type")
+        return model_type if isinstance(model_type, str) and model_type else None
+
+    cached_config = _cached_model_config(model)
+    if cached_config is not None:
+        return read_model_type(str(cached_config))
+
+    if not allow_remote:
+        return None
+    try:
+        transformers = importlib.import_module("transformers")
+        config = transformers.AutoConfig.from_pretrained(
+            model,
+            trust_remote_code=False,
+        )
+        model_type = getattr(config, "model_type", None)
+        return model_type if isinstance(model_type, str) and model_type else None
+    except Exception:
+        return None
+
+
+def _cached_model_config(model: str) -> Path | None:
+    if "/" not in model or model.startswith(("/", ".")):
+        return None
+    hub_cache = os.environ.get("HF_HUB_CACHE")
+    if hub_cache is not None:
+        hub = Path(hub_cache).expanduser()
+    else:
+        hf_home = Path(
+            os.environ.get("HF_HOME", str(Path.home() / ".cache" / "huggingface"))
+        ).expanduser()
+        hub = hf_home / "hub"
+    repository = hub / f"models--{model.replace('/', '--')}"
+    reference = repository / "refs" / "main"
+    candidates: list[Path] = []
+    try:
+        revision = reference.read_text(encoding="utf-8").strip()
+    except OSError:
+        revision = ""
+    if revision:
+        candidates.append(repository / "snapshots" / revision / "config.json")
+    snapshots = repository / "snapshots"
+    if snapshots.is_dir():
+        candidates.extend(
+            path / "config.json"
+            for path in sorted(snapshots.iterdir(), reverse=True)
+            if path.is_dir()
+        )
+    return next((path for path in candidates if path.is_file()), None)
+
+
+_PARSER_NOISE_TERMS: Final = frozenset(
+    {
+        "adapter",
+        "class",
+        "engine",
+        "json",
+        "model",
+        "module",
+        "parser",
+        "py",
+        "reasoning",
+        "tool",
+        "vllm",
+        "xml",
+    }
+)
+
+
+def _name_terms(value: str) -> set[str]:
+    separated = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", value)
+    parts = [
+        part.lower()
+        for part in re.split(r"[^A-Za-z0-9]+", separated)
+        if part
+    ]
+    terms = set(parts)
+    compact = "".join(parts)
+    if compact:
+        terms.add(compact)
+    for part in parts:
+        family = re.sub(r"\d.*$", "", part)
+        if family:
+            terms.add(family)
+    return terms - _PARSER_NOISE_TERMS
+
+
+def _expanded_model_terms(model_type: str) -> set[str]:
+    return _name_terms(model_type)
+
+
+def _best_parser_match(
+    model_type: str,
+    parsers: Sequence[str],
+    metadata: Mapping[str, str],
+    *,
+    tool_dialect: str | None = None,
+) -> str | None:
+    model_terms = _name_terms(model_type)
+    expanded_terms = _expanded_model_terms(model_type)
+    dialect_terms = _name_terms(tool_dialect) if tool_dialect is not None else set()
+    model_version_terms = {
+        term for term in model_terms if any(character.isdigit() for character in term)
+    }
+    candidates: list[tuple[tuple[int, int, int, int, str], str]] = []
+
+    for parser in parsers:
+        key_terms = _name_terms(parser)
+        descriptor_terms = _name_terms(metadata.get(parser, parser))
+        parser_version_terms = {
+            term
+            for term in key_terms | descriptor_terms
+            if any(character.isdigit() for character in term)
+        }
+        if parser_version_terms and not (
+            model_version_terms & parser_version_terms
+        ):
+            continue
+        if not model_terms & descriptor_terms and not expanded_terms & key_terms:
+            continue
+        if dialect_terms and not dialect_terms & key_terms:
+            continue
+
+        compact_key = re.sub(r"[^a-z0-9]", "", parser.lower())
+        exact_dialect = int(compact_key in expanded_terms)
+        direct_matches = len(model_terms & descriptor_terms)
+        synonym_matches = len(expanded_terms & key_terms)
+        # Prefer a parser whose whole key names the output dialect (for example
+        # ``hermes``) over specialized variants that happen to share a family
+        # prefix. Shorter keys are the safer generic fallback.
+        rank = (
+            -exact_dialect,
+            -direct_matches,
+            -synonym_matches,
+            len(parser),
+            parser,
+        )
+        candidates.append((rank, parser))
+
+    if not candidates:
+        return None
+    return min(candidates)[1]
+
+
+def _option_value(
+    arguments: Sequence[str],
+    option: str,
+) -> tuple[bool, str | None]:
+    for index, argument in enumerate(arguments):
+        if argument.startswith(f"{option}="):
+            value = argument.partition("=")[2]
+            return True, value or None
+        if argument == option:
+            if index + 1 < len(arguments) and not arguments[index + 1].startswith("--"):
+                return True, arguments[index + 1]
+            return True, None
+    return False, None
+
+
+def resolve_model_parsers(
+    model: str,
+    passthrough: Sequence[str] = (),
+    *,
+    model_type: str | None = None,
+    profile: ModelProfile | None = None,
+    registry: ParserRegistry | None = None,
+    home: Path | None = None,
+    allow_remote_config: bool = False,
+) -> ParserResolution:
+    """Resolve parser flags through user, profile, auto-detected, then none."""
+
+    discovered = registry if registry is not None else discover_vllm_parser_registry()
+    effective_model_type = (
+        model_type
+        if model_type is not None
+        else read_model_type(model, allow_remote=allow_remote_config)
+    )
+
+    matched_profile = profile
+    if matched_profile is None:
+        try:
+            matched_profile = resolve_profile(served_model=model, home=home)
+        except ProfileError:
+            matched_profile = None
+
+    auto_tool = (
+        _best_parser_match(
+            effective_model_type,
+            discovered.tool_parsers,
+            discovered.tool_metadata,
+        )
+        if effective_model_type is not None
+        else None
+    )
+    effective_tool = (
+        matched_profile.tool_call_parser
+        if matched_profile is not None and matched_profile.tool_call_parser is not None
+        else auto_tool
+    )
+    auto_reasoning = (
+        _best_parser_match(
+            effective_model_type,
+            discovered.reasoning_parsers,
+            discovered.reasoning_metadata,
+            tool_dialect=effective_tool,
+        )
+        if effective_model_type is not None
+        else None
+    )
+
+    if matched_profile is not None and matched_profile.tool_call_parser is not None:
+        tool_parser = matched_profile.tool_call_parser
+        tool_source: ParserSource = "profile-pinned"
+    elif auto_tool is not None:
+        tool_parser = auto_tool
+        tool_source = "auto-detected"
+    else:
+        tool_parser = None
+        tool_source = "none"
+
+    if matched_profile is not None and matched_profile.reasoning_parser is not None:
+        reasoning_parser = matched_profile.reasoning_parser
+        reasoning_source: ParserSource = "profile-pinned"
+    elif auto_reasoning is not None:
+        reasoning_parser = auto_reasoning
+        reasoning_source = "auto-detected"
+    else:
+        reasoning_parser = None
+        reasoning_source = "none"
+
+    user_tool_supplied, user_tool = _option_value(passthrough, "--tool-call-parser")
+    if user_tool_supplied:
+        tool_parser = user_tool
+        tool_source = "user-supplied"
+
+    user_reasoning_supplied, user_reasoning = _option_value(
+        passthrough,
+        "--reasoning-parser",
+    )
+    if user_reasoning_supplied:
+        reasoning_parser = user_reasoning
+        reasoning_source = "user-supplied"
+
+    return ParserResolution(
+        model_type=effective_model_type,
+        registry=discovered,
+        tool_call_parser=tool_parser,
+        reasoning_parser=reasoning_parser,
+        tool_call_parser_source=tool_source,
+        reasoning_parser_source=reasoning_source,
     )

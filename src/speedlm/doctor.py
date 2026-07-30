@@ -24,6 +24,7 @@ from speedlm.profiles import (
     ModelProfile,
     ProfileConfig,
     ProfileError,
+    resolve_model_parsers,
     resolve_profile,
 )
 from speedlm.storage import resolve_layout
@@ -848,6 +849,77 @@ def check_model_pair(
         )
 
 
+def _parser_passthrough(config: object | None) -> tuple[str, ...]:
+    if config is None:
+        return ()
+    for name in ("vllm_args", "passthrough"):
+        value = config.get(name) if isinstance(config, Mapping) else getattr(config, name, None)
+        if isinstance(value, Sequence) and not isinstance(value, str):
+            return tuple(argument for argument in value if isinstance(argument, str))
+    return ()
+
+
+def check_parser_resolution(
+    config: object | None,
+    *,
+    home: Path | None = None,
+) -> Check:
+    """Report discovered parsers and the winning level of each override chain."""
+
+    model = _doctor_served_model(config)
+    passthrough = _parser_passthrough(config)
+    profile: ModelProfile | None
+    try:
+        profile = _resolve_doctor_profile(config, home=home)
+    except ProfileError:
+        profile = None
+
+    resolution = resolve_model_parsers(
+        model,
+        passthrough,
+        profile=profile,
+        home=home,
+    )
+    flags: list[str] = []
+    if resolution.tool_call_parser is not None:
+        flags.extend(
+            (
+                "--enable-auto-tool-choice",
+                "--tool-call-parser",
+                resolution.tool_call_parser,
+            )
+        )
+    if resolution.reasoning_parser is not None:
+        flags.extend(("--reasoning-parser", resolution.reasoning_parser))
+
+    discovered_tools = ", ".join(resolution.registry.tool_parsers) or "none"
+    discovered_reasoning = ", ".join(resolution.registry.reasoning_parsers) or "none"
+    tool_value = resolution.tool_call_parser or "none"
+    reasoning_value = resolution.reasoning_parser or "none"
+    return Check(
+        "parsers",
+        CheckStatus.PASS,
+        f"discovered tool=[{discovered_tools}], reasoning=[{discovered_reasoning}]; "
+        f"resolved tool={tool_value} ({resolution.tool_call_parser_source}), "
+        f"reasoning={reasoning_value} ({resolution.reasoning_parser_source})",
+        {
+            "model": model,
+            "model_type": resolution.model_type,
+            "discovered_tool_parsers": list(resolution.registry.tool_parsers),
+            "discovered_reasoning_parsers": list(
+                resolution.registry.reasoning_parsers
+            ),
+            "discovery_errors": list(resolution.registry.errors),
+            "tool_call_parser": resolution.tool_call_parser,
+            "tool_call_parser_source": resolution.tool_call_parser_source,
+            "reasoning_parser": resolution.reasoning_parser,
+            "reasoning_parser_source": resolution.reasoning_parser_source,
+            "enable_auto_tool_choice": resolution.tool_call_parser is not None,
+            "resolved_flags": flags,
+        },
+    )
+
+
 def plan_execution(
     gpu_probe: GPUProbe,
     *,
@@ -910,11 +982,13 @@ def run_doctor(
     layout = resolve_layout(home)
     gpu_probe = probe_gpu(timeout_seconds=timeout_seconds)
     model_pair = check_model_pair(config, home=layout.root)
+    parsers = check_parser_resolution(config, home=layout.root)
     checks = (
         check_python(),
         gpu_probe.check,
         check_cuda(gpu_probe, timeout_seconds=timeout_seconds),
         check_packages(),
+        parsers,
         check_disk(layout.root, minimum_free_gb=minimum_disk_free_gb),
         check_memory(),
         model_pair,

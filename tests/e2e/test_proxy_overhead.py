@@ -12,10 +12,8 @@ Two ordering rules apply to everything after the measured phases:
 
 * Measurement artifacts are written *before* any post-run assertion, so a
   failing check can never discard an H100 benchmark's data.
-* Capture completeness is asserted as a *ratio*, not an exact count.  The
-  trace store drops a capture rather than stalling a client request when it
-  cannot take its append lock, so a small shortfall under high concurrency is
-  expected behaviour; the exact shortfall is always reported in the artifact.
+* Capture completeness is exact. Every accepted gateway response must have
+  exactly one corresponding trace, including under peak concurrency.
 """
 
 from __future__ import annotations
@@ -50,10 +48,7 @@ CONCURRENCY_REPEATS = 4
 CONCURRENCY_LEVELS = (1, 4, 16, 32)
 REQUEST_TIMEOUT_SECONDS = 300.0
 
-# The trace store drops a capture instead of stalling a request when it cannot
-# acquire its bounded append lock.  Tolerate that at the margin, but still fail
-# on a systematic loss.
-MIN_CAPTURE_RATIO = 0.99
+MIN_CAPTURE_RATIO = 1.0
 
 PROMPT = (
     "Explain how a reverse proxy forwards an inference request to a model "
@@ -521,10 +516,8 @@ def _summary_text(results: dict[str, Any]) -> str:
             "gateway-direct for latency and direct-gateway for throughput.",
             "The performance assertion is that every concurrency level retains "
             "at least 50% of direct median throughput.",
-            "The capture assertion is a ratio, not an exact count: the trace "
-            "store drops a capture rather than stall a request when it cannot "
-            "take its bounded append lock, so the exact shortfall is reported "
-            "above instead of failing the run.",
+            "The capture assertion requires an exact one-to-one count for "
+            "every accepted gateway request.",
         ]
     )
     return "\n".join(lines) + "\n"
@@ -630,8 +623,7 @@ def test_proxy_overhead_benchmark() -> None:
             for payload in warmup_payloads:
                 _checked_json(client.post(gateway_chat_url, json=payload))
         # Avoid carrying asynchronous warmup capture I/O into the direct
-        # baseline.  A shortfall here is not fatal; it is accounted for in the
-        # final capture ratio.
+        # baseline.
         _wait_for_trace_count(traces_path, WARMUP_COUNT, timeout=30.0)
 
         nonstream_payloads = [
@@ -797,13 +789,9 @@ def test_proxy_overhead_benchmark() -> None:
         )
         print(summary, end="")
 
-        # Capture may legitimately drop at the margin (the trace store prefers
-        # serving over capturing when its append lock is contended), so assert
-        # a high ratio rather than an exact count.
-        assert capture_ratio >= MIN_CAPTURE_RATIO, (
-            f"capture is lossy beyond tolerance: {captured_trace_count}/"
-            f"{expected_captures} traces ({capture_ratio:.4%}), missing "
-            f"{missing_captures}; required >= {MIN_CAPTURE_RATIO:.2%}"
+        assert captured_trace_count == expected_captures, (
+            f"capture is not an exact bijection: {captured_trace_count}/"
+            f"{expected_captures} traces, missing {missing_captures}"
         )
 
         # Performance must fail only on the requested serialization signal.

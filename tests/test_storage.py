@@ -29,6 +29,7 @@ def test_resolve_layout_default(tmp_path: Path, monkeypatch: pytest.MonkeyPatch)
     layout = resolve_layout()
     assert layout.root == tmp_path.resolve()
     assert layout.traces_dir == tmp_path / "traces"
+    assert layout.exchanges_dir == tmp_path / "exchanges"
     assert layout.profiles_dir == tmp_path / "profiles"
     assert layout.runs_dir == tmp_path / "runs"
     # Should NOT create directories
@@ -44,6 +45,8 @@ def test_ensure_layout_creates_dirs(tmp_path: Path) -> None:
     layout = ensure_layout(tmp_path)
     assert layout.root.is_dir()
     assert layout.traces_dir.is_dir()
+    assert layout.exchanges_dir.is_dir()
+    assert layout.exchanges_dir.stat().st_mode & 0o777 == 0o700
     assert layout.profiles_dir.is_dir()
     assert layout.runs_dir.is_dir()
 
@@ -150,15 +153,17 @@ def test_read_jsonl_missing_file(tmp_path: Path) -> None:
 def test_read_jsonl_malformed_line(tmp_path: Path) -> None:
     path = tmp_path / "bad.jsonl"
     path.write_text('{"ok": true}\nNOT JSON\n{"also": true}\n', encoding="utf-8")
-    with pytest.raises(StorageError, match="line 2"):
+    with pytest.raises(StorageError, match="line 2") as exc_info:
         list(read_jsonl(path))
+    assert exc_info.value.line_number == 2
 
 
 def test_read_jsonl_non_object_line(tmp_path: Path) -> None:
     path = tmp_path / "non_obj.jsonl"
     path.write_text('{"ok": true}\n[1, 2, 3]\n', encoding="utf-8")
-    with pytest.raises(StorageError, match="line 2"):
+    with pytest.raises(StorageError, match="line 2") as exc_info:
         list(read_jsonl(path))
+    assert exc_info.value.line_number == 2
 
 
 def test_read_jsonl_skips_blank_lines(tmp_path: Path) -> None:

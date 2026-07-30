@@ -32,6 +32,10 @@ _THREAD_LOCKS_GUARD = threading.Lock()
 class StorageError(RuntimeError):
     """Raised for storage I/O errors."""
 
+    def __init__(self, message: str, *, line_number: int | None = None) -> None:
+        super().__init__(message)
+        self.line_number = line_number
+
 
 # ---------------------------------------------------------------------------
 # Layout
@@ -42,6 +46,7 @@ class StorageError(RuntimeError):
 class Layout:
     root: Path
     traces_dir: Path
+    exchanges_dir: Path
     profiles_dir: Path
     runs_dir: Path
 
@@ -57,16 +62,25 @@ def resolve_layout(home: Path | None = None) -> Layout:
     return Layout(
         root=home,
         traces_dir=home / "traces",
+        exchanges_dir=home / "exchanges",
         profiles_dir=home / "profiles",
         runs_dir=home / "runs",
     )
 
 
 def ensure_layout(home: Path | None = None) -> Layout:
-    """Like :func:`resolve_layout` but creates all four directories."""
+    """Like :func:`resolve_layout` but creates the storage directories."""
     layout = resolve_layout(home)
-    for dir_path in (layout.root, layout.traces_dir, layout.profiles_dir, layout.runs_dir):
+    for dir_path in (
+        layout.root,
+        layout.traces_dir,
+        layout.profiles_dir,
+        layout.runs_dir,
+    ):
         dir_path.mkdir(parents=True, exist_ok=True)
+    layout.exchanges_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with contextlib.suppress(OSError):
+        layout.exchanges_dir.chmod(0o700)
     return layout
 
 
@@ -268,11 +282,13 @@ def read_jsonl(path: Path) -> Iterator[dict[str, object]]:
                 obj = json.loads(line)
             except json.JSONDecodeError as exc:
                 raise StorageError(
-                    f"malformed JSON on line {line_no} in {path}: {exc}"
+                    f"malformed JSON on line {line_no} in {path}: {exc}",
+                    line_number=line_no,
                 ) from exc
             if not isinstance(obj, dict):
                 raise StorageError(
                     f"line {line_no} in {path} is not a JSON object"
-                    f" (got {type(obj).__name__})"
+                    f" (got {type(obj).__name__})",
+                    line_number=line_no,
                 )
             yield obj

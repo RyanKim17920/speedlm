@@ -4,10 +4,12 @@ import asyncio
 import contextlib
 import math
 import os
+import queue
 import signal
 import socket
 import sys
 import tempfile
+import threading
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from types import FrameType
@@ -29,6 +31,7 @@ DEFAULT_SHUTDOWN_TIMEOUT_SECONDS = 15.0
 LOG_TAIL_LINES = 20
 LOG_TAIL_MAX_BYTES = 64 * 1024
 LOOPBACK_HOST = "127.0.0.1"
+STDERR_MIRROR_QUEUE_CHUNKS = 64
 
 
 class ProcessError(RuntimeError):
@@ -98,6 +101,7 @@ class VLLMProcess:
         self._log_file: BinaryIO | None = None
         self._log_task: asyncio.Task[None] | None = None
         self._saved_log_tail: str | None = None
+        self._stderr_mirror: _StderrMirror | None = None
 
     @property
     def returncode(self) -> int | None:
@@ -123,6 +127,7 @@ class VLLMProcess:
         )
         self._log_file = cast(BinaryIO, log_file)
         self._saved_log_tail = None
+        self._stderr_mirror = _StderrMirror()
         child_env = os.environ.copy()
         child_env.setdefault("PYTHONUNBUFFERED", "1")
         child_env.update(self._env_overrides)
@@ -134,6 +139,9 @@ class VLLMProcess:
                 env=child_env,
             )
         except OSError as exc:
+            if self._stderr_mirror is not None:
+                self._stderr_mirror.close()
+                self._stderr_mirror = None
             log_file.close()
             self._log_file = None
             raise ProcessError(f"cannot launch {self.argv[0]!r}: {exc}") from exc
@@ -256,6 +264,9 @@ class VLLMProcess:
         if self._log_file is not None:
             self._log_file.close()
             self._log_file = None
+        if self._stderr_mirror is not None:
+            self._stderr_mirror.close()
+            self._stderr_mirror = None
         return returncode
 
     async def _capture_output(self, stream: asyncio.StreamReader) -> None:
@@ -264,7 +275,9 @@ class VLLMProcess:
             if log_file is not None:
                 log_file.write(chunk)
                 log_file.flush()
-            _write_stderr(chunk)
+            mirror = self._stderr_mirror
+            if mirror is not None:
+                mirror.submit(chunk)
 
     async def _finish_log_capture(self) -> None:
         task = self._log_task
@@ -377,6 +390,53 @@ def _validate_env_overrides(
                 "vLLM environment overrides must contain valid string names and values"
             )
     return result
+
+
+class _StderrMirror:
+    """Best-effort child-log mirroring that can never block the gateway loop."""
+
+    def __init__(self, *, queue_chunks: int = STDERR_MIRROR_QUEUE_CHUNKS) -> None:
+        if isinstance(queue_chunks, bool) or not isinstance(queue_chunks, int) or queue_chunks <= 0:
+            raise ValueError("stderr mirror queue size must be a positive integer")
+        self._queue: queue.Queue[bytes | None] = queue.Queue(maxsize=queue_chunks)
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name="speedlm-vllm-stderr-mirror",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def submit(self, data: bytes) -> None:
+        if self._stop.is_set():
+            return
+        try:
+            self._queue.put_nowait(data)
+        except queue.Full:
+            # The durable tempfile remains complete. Only the optional live
+            # mirror is dropped when a parent harness stops draining stderr.
+            return
+
+    def close(self) -> None:
+        if self._stop.is_set():
+            return
+        self._stop.set()
+        # A blocked writer may leave the queue full. Once that write returns,
+        # the stop event makes the worker exit without requiring a sentinel.
+        with contextlib.suppress(queue.Full):
+            self._queue.put_nowait(None)
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            data = self._queue.get()
+            if data is None:
+                return
+            try:
+                _write_stderr(data)
+            except Exception:
+                # Mirroring is optional and must never make the supervisor
+                # noisy or unhealthy when its inherited stderr disappears.
+                return
 
 
 def _process_tree_cpu_ticks(root_pid: int) -> dict[int, int]:

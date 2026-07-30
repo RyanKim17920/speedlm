@@ -29,8 +29,9 @@ export PATH="/admin/home/ryan.kim/speedlm/.preflight/venvs/vllm/bin:$PATH"
   echo "CUDA_VISIBLE_DEVICES: $CUDA_VISIBLE_DEVICES"
   echo "model: $SPEEDLM_AGENT_MODEL"
   echo "agent override: ${SPEEDLM_AGENT_CLI:-auto-discover}"
-  echo "tool-call parser: ${SPEEDLM_AGENT_TOOL_CALL_PARSER:-per-model default}"
-  echo "reasoning parser: ${SPEEDLM_AGENT_REASONING_PARSER:-per-model default}"
+  echo "parser selection: SpeedLM runtime discovery"
+  echo "max model length: ${SPEEDLM_AGENT_MAX_MODEL_LEN:-16384}"
+  echo "agent max output tokens: ${SPEEDLM_AGENT_MAX_OUTPUT_TOKENS:-1024}"
   echo "qwen bare mode: ${SPEEDLM_AGENT_QWEN_BARE:-0}"
   "$project_python" --version
   "$vllm_python" -c 'import importlib.metadata; print("vllm", importlib.metadata.version("vllm"))'

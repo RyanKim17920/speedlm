@@ -15,6 +15,7 @@ from speedlm.storage import (
     StorageError,
     _append_jsonl,
     _exclusive_file_lock,
+    atomic_write_json,
     atomic_write_text,
     read_jsonl,
 )
@@ -24,6 +25,14 @@ logger = logging.getLogger(__name__)
 
 _REDACTION_PLACEHOLDER_RE = re.compile(r"<REDACTED:([a-z0-9_]+)>")
 _PROVENANCE_TAGS = {"generated", "client_supplied"}
+DROP_REASONS = (
+    "lock_timeout",
+    "capture_error",
+    "body_overflow",
+    "redaction_failure",
+    "stream_observer_error",
+    "shutdown_pending",
+)
 
 # ── Exceptions ──────────────────────────────────────────────────────────────
 
@@ -75,9 +84,11 @@ class TraceRecord:
     seed: int
     prompt_tokens: int | None
     completion_tokens: int | None
+    tools: tuple[Mapping[str, Any], ...] = ()
     token_count_source: str = "measured"
     finish_reason: str | None = None
     stop_reason: int | str | None = None
+    exchange_id: str | None = None
 
     def __post_init__(self) -> None:
         _validate_record(
@@ -91,9 +102,11 @@ class TraceRecord:
             self.seed,
             self.prompt_tokens,
             self.completion_tokens,
+            self.tools,
             self.token_count_source,
             self.finish_reason,
             self.stop_reason,
+            self.exchange_id,
         )
 
     @property
@@ -105,7 +118,7 @@ class TraceRecord:
 
     def to_dict(self) -> dict[str, Any]:
         """Serialize to a JSON-friendly dict. Messages/tool_calls become lists."""
-        return {
+        result = {
             "id": self.id,
             "timestamp": self.timestamp,
             "model": self.model,
@@ -120,6 +133,11 @@ class TraceRecord:
             "finish_reason": self.finish_reason,
             "stop_reason": self.stop_reason,
         }
+        if self.tools:
+            result["tools"] = [dict(tool) for tool in self.tools]
+        if self.exchange_id is not None:
+            result["exchange_id"] = self.exchange_id
+        return result
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> TraceRecord:
@@ -134,13 +152,25 @@ class TraceRecord:
         missing = required_keys - set(data.keys())
         if missing:
             raise TraceError(f"missing required key: {sorted(missing)[0]}")
-        optional_keys = {"token_count_source", "finish_reason", "stop_reason"}
+        optional_keys = {
+            "exchange_id",
+            "finish_reason",
+            "stop_reason",
+            "token_count_source",
+            "tools",
+        }
         unknown = set(data.keys()) - required_keys - optional_keys
         if unknown:
             raise TraceError(f"unknown key: {sorted(unknown)[0]}")
 
         msgs = data["messages"]
         tcs = data["tool_calls"]
+        raw_tools = data.get("tools", ())
+        if not isinstance(raw_tools, (tuple, list)):
+            raise TraceError("tools must be a sequence")
+        for index, tool in enumerate(raw_tools):
+            if not isinstance(tool, Mapping):
+                raise TraceError(f"tools[{index}] must be a mapping")
         return cls(
             id=data["id"],
             timestamp=data["timestamp"],
@@ -152,6 +182,7 @@ class TraceRecord:
             seed=data["seed"],
             prompt_tokens=data["prompt_tokens"],
             completion_tokens=data["completion_tokens"],
+            tools=tuple(dict(tool) for tool in raw_tools),
             token_count_source=data.get(
                 "token_count_source",
                 "estimated"
@@ -167,6 +198,7 @@ class TraceRecord:
             ),
             finish_reason=data.get("finish_reason"),
             stop_reason=data.get("stop_reason"),
+            exchange_id=data.get("exchange_id"),
         )
 
 
@@ -181,9 +213,11 @@ def _validate_record(
     seed: int,
     prompt_tokens: int | None,
     completion_tokens: int | None,
+    tools: tuple[Mapping[str, Any], ...],
     token_count_source: str,
     finish_reason: str | None,
     stop_reason: int | str | None,
+    exchange_id: str | None,
 ) -> None:
     if not isinstance(rid, str) or not rid:
         raise TraceError("id must be a non-empty string")
@@ -216,6 +250,11 @@ def _validate_record(
     for i, tc in enumerate(tool_calls):
         if not isinstance(tc, Mapping):
             raise TraceError(f"tool_calls[{i}] must be a mapping")
+    if not isinstance(tools, (tuple, list)):
+        raise TraceError("tools must be a sequence")
+    for i, tool in enumerate(tools):
+        if not isinstance(tool, Mapping):
+            raise TraceError(f"tools[{i}] must be a mapping")
     if isinstance(temperature, bool) or not isinstance(temperature, (int, float)):
         raise TraceError("temperature must be a number (not bool)")
     if temperature < 0:
@@ -248,6 +287,10 @@ def _validate_record(
         and isinstance(stop_reason, int)
     ):
         raise TraceError("stop_reason must be a string, int, or None")
+    if exchange_id is not None and (
+        not isinstance(exchange_id, str) or not exchange_id
+    ):
+        raise TraceError("exchange_id must be a non-empty string or None")
 
 
 def estimate_message_tokens(
@@ -282,6 +325,11 @@ class TraceStats:
     estimated_tokens: int = 0
     redacted_records: int = 0
     redaction_counts: Mapping[str, int] = field(default_factory=dict)
+    total_dropped: int = 0
+    drops_by_reason: Mapping[str, int] = field(
+        default_factory=lambda: dict.fromkeys(DROP_REASONS, 0)
+    )
+    truncated_at_line: int | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -289,6 +337,21 @@ class TraceStats:
             "redaction_counts",
             MappingProxyType(dict(self.redaction_counts)),
         )
+        object.__setattr__(
+            self,
+            "drops_by_reason",
+            MappingProxyType(dict(self.drops_by_reason)),
+        )
+
+    @property
+    def dropped(self) -> int:
+        """Compatibility-friendly shorthand for the total dropped count."""
+        return self.total_dropped
+
+    @property
+    def drop_counts(self) -> Mapping[str, int]:
+        """Compatibility-friendly shorthand for the per-reason counters."""
+        return self.drops_by_reason
 
 
 @dataclass(frozen=True, slots=True)
@@ -385,6 +448,67 @@ class TraceStore:
     def path(self) -> Path:
         return self._path
 
+    @property
+    def stats_path(self) -> Path:
+        """Return the drop-counter sidecar adjacent to the trace JSONL file."""
+        return self._path.with_suffix(".stats.json")
+
+    def record_drop(self, reason: str) -> bool:
+        """Persist one dropped trace without ever propagating an I/O failure."""
+        if reason not in DROP_REASONS:
+            logger.warning("cannot count trace drop with unknown reason: %s", reason)
+            return False
+        try:
+            with _exclusive_file_lock(self.stats_path) as acquired:
+                if not acquired:
+                    return False
+                counts = self._read_drop_counts_unlocked()
+                counts[reason] += 1
+                atomic_write_json(
+                    self.stats_path,
+                    {
+                        "total_dropped": sum(counts.values()),
+                        "drops_by_reason": counts,
+                    },
+                )
+        except Exception as exc:
+            logger.warning(
+                "failed to persist trace drop counter for %s: %s",
+                reason,
+                exc,
+            )
+            return False
+        return True
+
+    def _read_drop_counts_unlocked(self) -> dict[str, int]:
+        counts = dict.fromkeys(DROP_REASONS, 0)
+        if not self.stats_path.exists():
+            return counts
+        raw = json.loads(self.stats_path.read_text(encoding="utf-8"))
+        if not isinstance(raw, Mapping):
+            raise ValueError("trace stats sidecar is not a JSON object")
+        raw_counts = raw.get("drops_by_reason", {})
+        if not isinstance(raw_counts, Mapping):
+            raise ValueError("trace stats sidecar has invalid drops_by_reason")
+        for reason in DROP_REASONS:
+            value = raw_counts.get(reason, 0)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"trace stats sidecar has invalid count for {reason}")
+            counts[reason] = value
+        return counts
+
+    def _read_drop_counts(self) -> dict[str, int]:
+        if not self.stats_path.exists():
+            return dict.fromkeys(DROP_REASONS, 0)
+        try:
+            with _exclusive_file_lock(self.stats_path) as acquired:
+                if not acquired:
+                    return dict.fromkeys(DROP_REASONS, 0)
+                return self._read_drop_counts_unlocked()
+        except Exception as exc:
+            logger.warning("failed to read trace drop counters: %s", exc)
+            return dict.fromkeys(DROP_REASONS, 0)
+
     def append(self, record: TraceRecord) -> RedactionReport | None:
         """Redact and append one record, dropping it if redaction fails.
 
@@ -401,15 +525,18 @@ class TraceStore:
                     "dropping trace after redaction failure (%s)",
                     type(exc).__name__,
                 )
+                self.record_drop("redaction_failure")
                 return None
             if not isinstance(redacted, Mapping):
                 logger.warning("dropping trace after redaction returned a non-mapping")
+                self.record_drop("redaction_failure")
                 return None
             trace_record = dict(redacted)
         else:
             report = RedactionReport({})
 
         if not _append_jsonl(self._path, trace_record):
+            self.record_drop("lock_timeout")
             return None
         return report
 
@@ -420,11 +547,8 @@ class TraceStore:
         """
         if not self._path.exists():
             return
-        try:
-            for raw in read_jsonl(self._path):
-                yield TraceRecord.from_dict(raw)
-        except (StorageError, TraceError):
-            return
+        for raw in read_jsonl(self._path):
+            yield TraceRecord.from_dict(raw)
 
     def stats(self) -> TraceStats:
         """Compute aggregate statistics over all records."""
@@ -437,28 +561,35 @@ class TraceStore:
         redaction_counts: Counter[str] = Counter()
         oldest: float | None = None
         newest: float | None = None
-        for rec in self.iter_records():
-            count += 1
-            record_tokens = _accounting_tokens(rec)
-            tokens += record_tokens
-            if rec.token_count_source == "measured" and rec.total_tokens is not None:
-                measured_tokens += record_tokens
-            else:
-                estimated_tokens += record_tokens
-                if rec.total_tokens is None:
-                    unknown_token_records += 1
-            record_redactions = Counter(
-                _REDACTION_PLACEHOLDER_RE.findall(
-                    json.dumps(rec.to_dict(), ensure_ascii=False)
+        truncated_at_line: int | None = None
+        try:
+            for rec in self.iter_records():
+                count += 1
+                record_tokens = _accounting_tokens(rec)
+                tokens += record_tokens
+                if rec.token_count_source == "measured" and rec.total_tokens is not None:
+                    measured_tokens += record_tokens
+                else:
+                    estimated_tokens += record_tokens
+                    if rec.total_tokens is None:
+                        unknown_token_records += 1
+                record_redactions = Counter(
+                    _REDACTION_PLACEHOLDER_RE.findall(
+                        json.dumps(rec.to_dict(), ensure_ascii=False)
+                    )
                 )
-            )
-            if record_redactions:
-                redacted_records += 1
-                redaction_counts.update(record_redactions)
-            if oldest is None or rec.timestamp < oldest:
-                oldest = rec.timestamp
-            if newest is None or rec.timestamp > newest:
-                newest = rec.timestamp
+                if record_redactions:
+                    redacted_records += 1
+                    redaction_counts.update(record_redactions)
+                if oldest is None or rec.timestamp < oldest:
+                    oldest = rec.timestamp
+                if newest is None or rec.timestamp > newest:
+                    newest = rec.timestamp
+        except StorageError as exc:
+            truncated_at_line = exc.line_number
+            if truncated_at_line is None:
+                raise
+        drops_by_reason = self._read_drop_counts()
         return TraceStats(
             count=count,
             tokens=tokens,
@@ -469,6 +600,9 @@ class TraceStore:
             estimated_tokens=estimated_tokens,
             redacted_records=redacted_records,
             redaction_counts=dict(sorted(redaction_counts.items())),
+            total_dropped=sum(drops_by_reason.values()),
+            drops_by_reason=drops_by_reason,
+            truncated_at_line=truncated_at_line,
         )
 
     def prune(self, *, now: float | None = None) -> int:

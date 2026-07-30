@@ -200,61 +200,16 @@ def _snapshot_for_model(model: str) -> Path:
     )
 
 
-def _model_parsers(model: str) -> tuple[str, str]:
-    """Return the ``(tool_call_parser, reasoning_parser)`` names for ``model``.
-
-    Verified against the pinned vLLM 0.25.1 registries in
-    ``/admin/home/ryan.kim/speedlm/.preflight/venvs/vllm``:
-
-    * ``vllm/tool_parsers/__init__.py`` registers ``"openai"`` ->
-      ``gptoss_tool_parser.GptOssToolParser`` and ``"hermes"`` ->
-      ``hermes_tool_parser.Hermes2ProToolParser``.
-    * ``vllm/reasoning/__init__.py`` registers ``"openai_gptoss"`` ->
-      ``gptoss_reasoning_parser.GptOssReasoningParser``.
-
-    ``vllm/parser/parser_manager.py::ParserManager.get_parser`` returns ``None``
-    when neither name is supplied, so a server started without these flags
-    cannot emit ``tool_calls`` at all, and for gpt-oss the Harmony ``final``
-    channel never lands in ``message.content`` -- responses come back empty.
-    ``ParserManager.get_tool_parser`` additionally ignores the tool parser
-    unless ``--enable-auto-tool-choice`` is passed.
-    """
-    lowered = model.lower()
-    if "gpt-oss" in lowered or "gpt_oss" in lowered:
-        return "openai", "openai_gptoss"
-    if "qwen" in lowered:
-        return "hermes", ""
-    return "", ""
-
-
-def _parser_args(model: str) -> list[str]:
-    """vLLM flags that make tool calling (and gpt-oss content) work at all.
-
-    Both names are overridable; set either env var to an empty string to omit
-    the corresponding flag entirely.
-    """
-    default_tool, default_reasoning = _model_parsers(model)
-    tool_parser = os.environ.get("SPEEDLM_AGENT_TOOL_CALL_PARSER", default_tool).strip()
-    reasoning_parser = os.environ.get("SPEEDLM_AGENT_REASONING_PARSER", default_reasoning).strip()
-    args: list[str] = []
-    if tool_parser:
-        args.extend(["--enable-auto-tool-choice", "--tool-call-parser", tool_parser])
-    if reasoning_parser:
-        args.extend(["--reasoning-parser", reasoning_parser])
-    return args
-
-
 def _default_vllm_args(model: str) -> list[str]:
     args = [
         "--max-model-len",
-        os.environ.get("SPEEDLM_AGENT_MAX_MODEL_LEN", "8192"),
+        os.environ.get("SPEEDLM_AGENT_MAX_MODEL_LEN", "16384"),
         "--gpu-memory-utilization",
         os.environ.get("SPEEDLM_AGENT_GPU_MEMORY_UTILIZATION", "0.90"),
         "--enforce-eager",
     ]
     if model.startswith("Qwen/Qwen3.5"):
         args.extend(["--gdn-prefill-backend", "triton"])
-    args.extend(_parser_args(model))
     return args
 
 
@@ -267,10 +222,6 @@ def _vllm_args(model: str) -> list[str]:
     except json.JSONDecodeError as exc:
         raise AssertionError("SPEEDLM_AGENT_VLLM_ARGS must be a JSON array") from exc
     assert isinstance(parsed, list) and all(isinstance(item, str) for item in parsed)
-    # A caller-supplied argv still needs the parser flags unless it sets them
-    # itself; without them this test can only ever measure a tool-less turn.
-    if "--tool-call-parser" not in parsed:
-        parsed.extend(_parser_args(model))
     return parsed
 
 
@@ -495,6 +446,13 @@ def _run_qwen_agent(
             "XDG_CONFIG_HOME": str(agent_home / "config"),
             "XDG_CACHE_HOME": str(agent_home / "cache"),
             "QWEN_CODE_SUPPRESS_YOLO_WARNING": "1",
+            # Qwen Code otherwise assumes a 65,536-token output budget for an
+            # unknown OpenAI-compatible model alias, which exceeds many valid
+            # vLLM context windows before the first agent turn can run.
+            "QWEN_CODE_MAX_OUTPUT_TOKENS": os.environ.get(
+                "SPEEDLM_AGENT_MAX_OUTPUT_TOKENS",
+                "1024",
+            ),
         }
     )
     timeout = _float_env("SPEEDLM_AGENT_SUBPROCESS_TIMEOUT", "420")
@@ -1137,7 +1095,7 @@ def test_agent_harness_full_circle() -> None:
                 f"CUDA_VISIBLE_DEVICES: {os.environ['CUDA_VISIBLE_DEVICES']}",
                 f"vllm_executable: {VLLM}",
                 f"tokenizer_snapshot: {snapshot}",
-                f"parser_args: {shlex.join(_parser_args(model)) or '<none>'}",
+                "parser_args: selected by SpeedLM runtime discovery",
                 "",
             ]
         ),

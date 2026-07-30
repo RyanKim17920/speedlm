@@ -1,16 +1,19 @@
 """Tests for speedlm.traces.store — TraceRecord, TraceStore, TraceStats."""
 from __future__ import annotations
 
+import multiprocessing
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from speedlm.config import TraceBufferConfig
-from speedlm.storage import _exclusive_file_lock
+from speedlm.storage import StorageError, _exclusive_file_lock
+from speedlm.traces.redact import RedactionReport
 from speedlm.traces.store import TraceError, TraceRecord, TraceStats, TraceStore
 
 # ── helpers ─────────────────────────────────────────────────────────────────
@@ -40,6 +43,10 @@ def _rec(
     )
 
 
+def _record_drop_in_process(path: str, reason: str) -> None:
+    TraceStore(Path(path)).record_drop(reason)
+
+
 # ── TraceRecord to_dict / from_dict ────────────────────────────────────────
 
 
@@ -62,6 +69,22 @@ class TestRecordRoundTrip:
         rec2 = TraceRecord.from_dict(d)
         assert isinstance(rec2.messages, tuple)
         assert isinstance(rec2.tool_calls, tuple)
+
+    def test_request_tool_schemas_round_trip(self) -> None:
+        tool = {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+        rec = replace(_rec(), tools=(tool,))
+
+        payload = rec.to_dict()
+        restored = TraceRecord.from_dict(payload)
+
+        assert payload["tools"] == [tool]
+        assert restored == rec
 
     def test_total_tokens(self) -> None:
         rec = _rec(prompt_tokens=200, completion_tokens=300)
@@ -221,6 +244,48 @@ class TestStoreStats:
         assert s.tokens == 350
         assert s.oldest == t0
         assert s.newest == t1
+
+    def test_malformed_jsonl_reports_truncation_line(self, tmp_path: Path) -> None:
+        store = TraceStore(tmp_path / "t.jsonl", redaction_enabled=False)
+        store.append(_rec())
+        with store.path.open("a", encoding="utf-8") as stream:
+            stream.write("NOT JSON\n")
+
+        stats = store.stats()
+
+        assert stats.count == 1
+        assert stats.truncated_at_line == 2
+        with pytest.raises(StorageError, match="line 2"):
+            list(store.iter_records())
+
+    def test_drop_counters_survive_across_processes(self, tmp_path: Path) -> None:
+        store = TraceStore(tmp_path / "traces.jsonl")
+        process = multiprocessing.get_context("spawn").Process(
+            target=_record_drop_in_process,
+            args=(str(store.path), "capture_error"),
+        )
+
+        process.start()
+        process.join(timeout=10)
+
+        assert process.exitcode == 0
+        stats = store.stats()
+        assert stats.total_dropped == 1
+        assert stats.drops_by_reason["capture_error"] == 1
+        assert store.stats_path.name == "traces.stats.json"
+
+    def test_redaction_failure_is_counted(self, tmp_path: Path) -> None:
+        class FailingRedactor:
+            def redact(self, value: Any) -> tuple[Any, RedactionReport]:
+                del value
+                raise RuntimeError("redactor unavailable")
+
+        store = TraceStore(tmp_path / "t.jsonl", redactor=FailingRedactor())
+
+        assert store.append(_rec()) is None
+        stats = store.stats()
+        assert stats.total_dropped == 1
+        assert stats.drops_by_reason["redaction_failure"] == 1
 
 
 # ── Prune by age ───────────────────────────────────────────────────────────
@@ -430,6 +495,9 @@ class TestStoreConcurrency:
         assert result is None
         assert elapsed < 1.0
         assert not path.exists()
+        stats = store.stats()
+        assert stats.total_dropped == 1
+        assert stats.drops_by_reason["lock_timeout"] == 1
 
 
 # ── Missing file behaviour ─────────────────────────────────────────────────

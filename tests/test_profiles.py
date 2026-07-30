@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+import speedlm.profiles as profiles_module
 from speedlm.config import SpeedLMConfig
 from speedlm.profiles import (
     BUILTIN_PROFILES,
@@ -12,8 +14,11 @@ from speedlm.profiles import (
     LLAMA_31_8B_EAGLE3_PROFILE,
     QWEN_35_9B_MTP_PROFILE,
     ModelProfile,
+    ParserRegistry,
     ProfileError,
+    discover_vllm_parser_registry,
     load_profiles,
+    resolve_model_parsers,
     resolve_profile,
 )
 
@@ -66,6 +71,215 @@ def test_profile_parser_fields_round_trip() -> None:
     assert profile.tool_call_parser == "openai"
     assert profile.reasoning_parser == "openai_gptoss"
     assert profile.to_dict() == data
+
+
+def test_parser_discovery_reads_lazy_maps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    tool_module = SimpleNamespace(
+        ToolParserManager=SimpleNamespace(
+            tool_parsers={},
+            lazy_parsers={
+                "openai": ("vllm.tool_parsers.gptoss_tool_parser", "GptOssToolParser"),
+                "hermes": ("vllm.tool_parsers.hermes_tool_parser", "Hermes2ProToolParser"),
+            },
+        )
+    )
+    reasoning_module = SimpleNamespace(
+        ReasoningParserManager=SimpleNamespace(
+            reasoning_parsers={},
+            lazy_parsers={
+                "openai_gptoss": (
+                    "vllm.reasoning.gptoss_reasoning_parser",
+                    "GptOssReasoningParser",
+                ),
+            },
+        )
+    )
+    modules = {
+        "vllm.tool_parsers": tool_module,
+        "vllm.reasoning": reasoning_module,
+    }
+    monkeypatch.setattr(
+        profiles_module.importlib,
+        "import_module",
+        modules.__getitem__,
+    )
+
+    registry = discover_vllm_parser_registry()
+
+    assert registry.tool_parsers == ("hermes", "openai")
+    assert registry.reasoning_parsers == ("openai_gptoss",)
+    assert "gptoss_tool_parser" in registry.tool_metadata["openai"]
+    assert registry.errors == ()
+
+
+def test_parser_discovery_reads_separate_vllm_environment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    environment = tmp_path / "vllm-env"
+    executable = environment / "bin" / "vllm"
+    executable.parent.mkdir(parents=True)
+    executable.write_text("#!/bin/sh\n", encoding="utf-8")
+    package = environment / "lib" / "python3.12" / "site-packages" / "vllm"
+    tool_package = package / "tool_parsers"
+    reasoning_package = package / "reasoning"
+    tool_package.mkdir(parents=True)
+    reasoning_package.mkdir(parents=True)
+    (tool_package / "__init__.py").write_text(
+        "_TOOL_PARSERS_TO_REGISTER = {\n"
+        "    'format_x': ('format_x_parser', 'FormatXParser'),\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (reasoning_package / "__init__.py").write_text(
+        "_REASONING_PARSERS_TO_REGISTER = {\n"
+        "    'reason_x': ('reason_x_parser', 'ReasonXParser'),\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(profiles_module.shutil, "which", lambda _name: str(executable))
+
+    registry = profiles_module._external_vllm_parser_registry()
+
+    assert registry is not None
+    assert registry.tool_parsers == ("format_x",)
+    assert registry.reasoning_parsers == ("reason_x",)
+    assert "FormatXParser" in registry.tool_metadata["format_x"]
+
+
+def test_parser_discovery_merges_partial_local_and_external_registries(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def local_registry(
+        module_name: str,
+        _manager_name: str,
+        _eager_attribute: str,
+    ) -> tuple[tuple[str, ...], dict[str, str]]:
+        if module_name == "vllm.tool_parsers":
+            return ("local_tool",), {"local_tool": "local_tool LocalToolParser"}
+        raise ImportError("reasoning package unavailable")
+
+    monkeypatch.setattr(profiles_module, "_manager_registry", local_registry)
+    monkeypatch.setattr(
+        profiles_module,
+        "_external_vllm_parser_registry",
+        lambda: ParserRegistry(
+            tool_parsers=("external_tool",),
+            reasoning_parsers=("external_reasoning",),
+        ),
+    )
+
+    registry = discover_vllm_parser_registry()
+
+    assert registry.tool_parsers == ("external_tool", "local_tool")
+    assert registry.reasoning_parsers == ("external_reasoning",)
+    assert registry.errors and "reasoning parsers" in registry.errors[0]
+
+
+@pytest.mark.parametrize(
+    ("model_type", "tool_parser", "reasoning_parser"),
+    [
+        ("gpt_oss", "openai", "openai_gptoss"),
+        ("qwen2", None, None),
+        ("qwen3", "qwen3_xml", "qwen3"),
+        ("llama", None, None),
+    ],
+)
+def test_model_type_resolves_against_discovered_parser_keys(
+    model_type: str,
+    tool_parser: str,
+    reasoning_parser: str | None,
+) -> None:
+    registry = ParserRegistry(
+        tool_parsers=(
+            "hermes",
+            "llama3_json",
+            "llama4_json",
+            "openai",
+            "qwen3_coder",
+            "qwen3_xml",
+        ),
+        reasoning_parsers=("openai_gptoss", "qwen3"),
+        tool_metadata={
+            "openai": "openai vllm.tool_parsers.gptoss_tool_parser.GptOssToolParser",
+        },
+    )
+
+    resolution = resolve_model_parsers(
+        "acme/not-a-builtin-profile",
+        model_type=model_type,
+        registry=registry,
+    )
+
+    assert resolution.tool_call_parser == tool_parser
+    assert resolution.reasoning_parser == reasoning_parser
+    expected_tool_source = "auto-detected" if tool_parser is not None else "none"
+    assert resolution.tool_call_parser_source == expected_tool_source
+    expected_reasoning_source = (
+        "auto-detected" if reasoning_parser is not None else "none"
+    )
+    assert resolution.reasoning_parser_source == expected_reasoning_source
+
+
+def test_non_builtin_local_model_uses_config_model_type(tmp_path: Path) -> None:
+    model = tmp_path / "custom-model"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5"}),
+        encoding="utf-8",
+    )
+    registry = ParserRegistry(
+        tool_parsers=("hermes", "qwen3_coder", "qwen3_xml"),
+        reasoning_parsers=("qwen3",),
+    )
+
+    resolution = resolve_model_parsers(str(model), registry=registry)
+
+    assert resolution.model_type == "qwen3_5"
+    assert resolution.tool_call_parser == "qwen3_xml"
+    assert resolution.tool_call_parser_source == "auto-detected"
+    assert resolution.reasoning_parser == "qwen3"
+
+
+def test_unknown_model_type_safely_resolves_no_parsers(tmp_path: Path) -> None:
+    model = tmp_path / "custom-model"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps({"model_type": "acme_transformer"}),
+        encoding="utf-8",
+    )
+
+    resolution = resolve_model_parsers(
+        str(model),
+        registry=ParserRegistry(
+            tool_parsers=("hermes", "openai"),
+            reasoning_parsers=("openai_gptoss",),
+        ),
+    )
+
+    assert resolution.tool_call_parser is None
+    assert resolution.reasoning_parser is None
+    assert resolution.tool_call_parser_source == "none"
+    assert resolution.reasoning_parser_source == "none"
+
+
+def test_profile_pins_override_auto_detection() -> None:
+    resolution = resolve_model_parsers(
+        GPT_OSS_EAGLE3_PROFILE.verifier_model,
+        model_type="gpt_oss",
+        profile=GPT_OSS_EAGLE3_PROFILE,
+        registry=ParserRegistry(
+            tool_parsers=("generic_gptoss",),
+            reasoning_parsers=("generic_gptoss",),
+        ),
+    )
+
+    assert resolution.tool_call_parser == "openai"
+    assert resolution.reasoning_parser == "openai_gptoss"
+    assert resolution.tool_call_parser_source == "profile-pinned"
+    assert resolution.reasoning_parser_source == "profile-pinned"
 
 
 @pytest.mark.parametrize(

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 
 import httpx
@@ -9,7 +9,9 @@ from starlette.responses import Response
 
 from speedlm.config import SamplingConfig
 from speedlm.gateway.activity import ActivityTracker
-from speedlm.gateway.capture import CaptureManager
+from speedlm.gateway.capture import CaptureAdapter, CaptureManager
+from speedlm.gateway.control import AdmissionGate
+from speedlm.gateway.exchange import ExchangeLedger
 from speedlm.gateway.proxy import GatewayProxy
 from speedlm.traces.store import TraceStore
 
@@ -20,14 +22,33 @@ def create_app(
     trace_store: TraceStore | None = None,
     sampling: SamplingConfig | None = None,
     activity: ActivityTracker | None = None,
+    admission: AdmissionGate | None = None,
     upstream_client: httpx.AsyncClient | None = None,
+    capture_adapters: Sequence[CaptureAdapter] | None = None,
+    exchange_ledger: ExchangeLedger | None = None,
+    capture_body_limit: int | None = None,
+    relay_queue_chunks: int | None = None,
+    detached_drain_timeout: float | None = None,
 ) -> FastAPI:
     """Create a fail-closed gateway using exactly one long-lived HTTP client."""
     tracker = activity or ActivityTracker()
     capture = (
-        CaptureManager(trace_store, defaults=sampling)
+        CaptureManager(
+            trace_store,
+            defaults=sampling,
+            adapters=capture_adapters,
+        )
         if trace_store is not None
         else None
+    )
+    ledger = (
+        exchange_ledger
+        if exchange_ledger is not None
+        else (
+            ExchangeLedger(trace_store.path.parent / "exchanges")
+            if trace_store is not None
+            else None
+        )
     )
     owns_client = upstream_client is None
     client = upstream_client or httpx.AsyncClient(
@@ -40,19 +61,29 @@ def create_app(
         client,
         upstream_base_url,
         activity=tracker,
+        admission=admission,
         capture=capture,
+        exchange_ledger=ledger,
+        capture_body_limit=capture_body_limit,
+        relay_queue_chunks=relay_queue_chunks,
+        detached_drain_timeout=detached_drain_timeout,
     )
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         del app
         try:
+            if ledger is not None:
+                await ledger.arecover_incomplete()
             yield
         finally:
+            await proxy.aclose()
             if capture is not None:
-                await capture.drain()
+                await capture.aclose()
             if owns_client:
                 await client.aclose()
+            if ledger is not None:
+                await ledger.aclose()
 
     app = FastAPI(
         docs_url=None,
@@ -61,7 +92,10 @@ def create_app(
         lifespan=lifespan,
     )
     app.state.activity = tracker
+    app.state.admission = admission
     app.state.capture = capture
+    app.state.exchange_ledger = ledger
+    app.state.proxy = proxy
     app.state.upstream_client = client
 
     @app.api_route(

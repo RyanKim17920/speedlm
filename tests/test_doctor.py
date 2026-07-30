@@ -10,8 +10,13 @@ from typing import Any
 import pytest
 
 import speedlm.doctor as doctor
+import speedlm.profiles as profiles
 from speedlm.config import SpeedLMConfig
-from speedlm.profiles import QWEN_35_9B_MTP_PROFILE, ModelProfile
+from speedlm.profiles import (
+    QWEN_35_9B_MTP_PROFILE,
+    ModelProfile,
+    ParserRegistry,
+)
 
 
 def _completed(
@@ -124,6 +129,7 @@ def test_healthy_gpu_defaults_to_idle_and_report_json(
         "gpu",
         "cuda",
         "packages",
+        "parsers",
         "disk",
         "memory",
         "model_pair",
@@ -314,6 +320,75 @@ def test_resolved_non_default_profile_is_validated() -> None:
     assert profile["chat_template_kind"] == "chatml"
     assert profile["tool_call_parser"] == "hermes"
     assert profile["reasoning_parser"] is None
+
+
+def test_parser_resolution_reports_discovery_and_override_chain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        profiles,
+        "discover_vllm_parser_registry",
+        lambda: ParserRegistry(
+            tool_parsers=("hermes", "openai"),
+            reasoning_parsers=("openai_gptoss", "qwen3"),
+        ),
+    )
+    config = SimpleNamespace(
+        model=doctor.PRIMARY_VERIFIER,
+        vllm_args=("--tool-call-parser", "custom"),
+    )
+
+    result = doctor.check_parser_resolution(config)
+
+    assert result.status is doctor.CheckStatus.PASS
+    assert "user-supplied" in result.detail
+    assert "profile-pinned" in result.detail
+    assert result.data is not None
+    assert result.data["discovered_tool_parsers"] == ["hermes", "openai"]
+    assert result.data["discovered_reasoning_parsers"] == [
+        "openai_gptoss",
+        "qwen3",
+    ]
+    assert result.data["tool_call_parser"] == "custom"
+    assert result.data["tool_call_parser_source"] == "user-supplied"
+    assert result.data["reasoning_parser"] == "openai_gptoss"
+    assert result.data["reasoning_parser_source"] == "profile-pinned"
+    assert result.data["resolved_flags"] == [
+        "--enable-auto-tool-choice",
+        "--tool-call-parser",
+        "custom",
+        "--reasoning-parser",
+        "openai_gptoss",
+    ]
+
+
+def test_parser_resolution_auto_detects_non_builtin_local_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = tmp_path / "custom-qwen"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps({"model_type": "qwen3"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        profiles,
+        "discover_vllm_parser_registry",
+        lambda: ParserRegistry(
+            tool_parsers=("openai", "qwen3_xml"),
+            reasoning_parsers=("openai_gptoss", "qwen3"),
+        ),
+    )
+
+    result = doctor.check_parser_resolution(SpeedLMConfig(model=str(model)))
+
+    assert result.data is not None
+    assert result.data["model_type"] == "qwen3"
+    assert result.data["tool_call_parser"] == "qwen3_xml"
+    assert result.data["tool_call_parser_source"] == "auto-detected"
+    assert result.data["reasoning_parser"] == "qwen3"
+    assert result.data["reasoning_parser_source"] == "auto-detected"
 
 
 def test_doctor_resolves_huggingface_cache_snapshot_path() -> None:

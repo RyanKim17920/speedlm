@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import time
 from collections.abc import Callable, Mapping
@@ -104,6 +105,12 @@ class AdmissionGate:
 
     def try_begin(self) -> bool:
         return self._activity.try_begin()
+
+    async def wait_to_begin(self, *, poll_interval_seconds: float = 0.01) -> None:
+        """Signal preemption, then wait transparently until serving reopens."""
+        _validate_timeout(poll_interval_seconds, name="admission poll interval")
+        while not self.try_begin():
+            await asyncio.sleep(poll_interval_seconds)
 
     def stop_admitting(self) -> None:
         self._activity.stop_admitting()

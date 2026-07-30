@@ -225,6 +225,20 @@ def test_trace_token_fidelity_measurement() -> None:
     gateway_log = artifact_dir / "gateway-and-vllm.log"
     gateway_port = _free_port()
     gateway_url = f"http://127.0.0.1:{gateway_port}"
+    raw_vllm_args = os.environ.get("SPEEDLM_E2E_VLLM_ARGS")
+    if raw_vllm_args is None:
+        vllm_args = [
+            "--max-model-len",
+            "4096",
+            "--gpu-memory-utilization",
+            "0.85",
+            "--enforce-eager",
+        ]
+    else:
+        vllm_args = json.loads(raw_vllm_args)
+        assert isinstance(vllm_args, list) and all(
+            isinstance(argument, str) for argument in vllm_args
+        ), "SPEEDLM_E2E_VLLM_ARGS must be a JSON array of strings"
     command = [
         str(SPEEDLM),
         "vllm",
@@ -234,11 +248,7 @@ def test_trace_token_fidelity_measurement() -> None:
         "127.0.0.1",
         "--port",
         str(gateway_port),
-        "--max-model-len",
-        "4096",
-        "--gpu-memory-utilization",
-        "0.85",
-        "--enforce-eager",
+        *vllm_args,
     ]
     (artifact_dir / "command.txt").write_text(
         " ".join(command) + "\n"

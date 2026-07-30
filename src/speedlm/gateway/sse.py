@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 _SUPPORTED_ENDPOINTS = {"/v1/chat/completions", "/v1/completions"}
@@ -23,6 +23,8 @@ class AssembledResponse:
     reasoning_field: str | None = None
     finish_reason: str | None = None
     stop_reason: int | str | None = None
+    choice_index: int = 0
+    choice_count: int = 1
 
 
 @dataclass(slots=True)
@@ -62,30 +64,40 @@ class _ToolCall:
         return result
 
 
+@dataclass(slots=True)
+class _Choice:
+    content: list[str] = field(default_factory=list)
+    reasoning: dict[str, list[str]] = field(default_factory=dict)
+    tool_calls: dict[int, _ToolCall] = field(default_factory=dict)
+    finish_reason: str | None = None
+    stop_reason: int | str | None = None
+    saw_choice: bool = False
+    valid: bool = True
+
+
 class SSEAssembler:
-    """Incrementally parse SSE while reconstructing the first OpenAI choice.
+    """Incrementally parse SSE while reconstructing OpenAI choices.
 
     ``feed`` never raises for malformed upstream data. The caller can therefore
     tee bytes through this parser without putting capture on the client path.
+
+    ``finish`` retains the original choice-zero behavior. New callers should use
+    ``finish_all`` to recover every returned choice, including interleaved
+    ``n > 1`` streams.
     """
 
     def __init__(self, endpoint: str) -> None:
         self._endpoint = endpoint
         self._line_buffer = bytearray()
         self._event_data: list[bytes] = []
-        self._content: list[str] = []
-        self._reasoning: dict[str, list[str]] = {}
-        self._tool_calls: dict[int, _ToolCall] = {}
+        self._choices: dict[int, _Choice] = {}
         self._id: str | None = None
         self._model: str | None = None
         self._created: float | None = None
         self._prompt_tokens: int | None = None
         self._completion_tokens: int | None = None
-        self._finish_reason: str | None = None
-        self._stop_reason: int | str | None = None
         self._done = False
         self._valid = endpoint in _SUPPORTED_ENDPOINTS
-        self._saw_choice = False
 
     @property
     def done(self) -> bool:
@@ -93,7 +105,13 @@ class SSEAssembler:
 
     @property
     def valid(self) -> bool:
-        return self._valid and self._saw_choice
+        choice = self._choices.get(0)
+        return (
+            self._valid
+            and choice is not None
+            and choice.saw_choice
+            and choice.valid
+        )
 
     def feed(self, chunk: bytes) -> None:
         if not chunk:
@@ -110,7 +128,34 @@ class SSEAssembler:
             self._consume_line(line)
 
     def finish(self) -> AssembledResponse:
-        """Consume a final unterminated event and return the assembled fields."""
+        """Return choice zero, preserving the original single-choice API."""
+        self._finish_events()
+        observed_count = sum(
+            choice.saw_choice and choice.valid for choice in self._choices.values()
+        )
+        return self._assemble_choice(
+            0,
+            self._choices.get(0, _Choice()),
+            choice_count=observed_count,
+        )
+
+    def finish_all(self) -> tuple[AssembledResponse, ...]:
+        """Consume the final event and return every observed choice by index."""
+        self._finish_events()
+        if not self._valid:
+            return ()
+        observed = [
+            (index, choice)
+            for index, choice in sorted(self._choices.items())
+            if choice.saw_choice and choice.valid
+        ]
+        choice_count = len(observed)
+        return tuple(
+            self._assemble_choice(index, choice, choice_count=choice_count)
+            for index, choice in observed
+        )
+
+    def _finish_events(self) -> None:
         if self._line_buffer:
             line = bytes(self._line_buffer)
             self._line_buffer.clear()
@@ -119,17 +164,25 @@ class SSEAssembler:
             self._consume_line(line)
         if self._event_data:
             self._consume_event()
-        reasoning_field = next(iter(self._reasoning), None)
+
+    def _assemble_choice(
+        self,
+        index: int,
+        choice: _Choice,
+        *,
+        choice_count: int,
+    ) -> AssembledResponse:
+        reasoning_field = next(iter(choice.reasoning), None)
         reasoning_parts = (
-            self._reasoning[reasoning_field] if reasoning_field is not None else []
+            choice.reasoning[reasoning_field] if reasoning_field is not None else []
         )
         return AssembledResponse(
             id=self._id,
             model=self._model,
             created=self._created,
-            content="".join(self._content) if self._content else None,
+            content="".join(choice.content) if choice.content else None,
             tool_calls=tuple(
-                call.to_dict() for _, call in sorted(self._tool_calls.items())
+                call.to_dict() for _, call in sorted(choice.tool_calls.items())
             ),
             prompt_tokens=self._prompt_tokens,
             completion_tokens=self._completion_tokens,
@@ -137,8 +190,10 @@ class SSEAssembler:
                 "".join(reasoning_parts) if reasoning_parts else None
             ),
             reasoning_field=reasoning_field,
-            finish_reason=self._finish_reason,
-            stop_reason=self._stop_reason,
+            finish_reason=choice.finish_reason,
+            stop_reason=choice.stop_reason,
+            choice_index=index,
+            choice_count=choice_count,
         )
 
     def _consume_line(self, line: bytes) -> None:
@@ -193,23 +248,27 @@ class SSEAssembler:
         if not isinstance(choices, list):
             return
         for choice in choices:
-            if not isinstance(choice, dict) or choice.get("index", 0) != 0:
+            if not isinstance(choice, dict):
                 continue
-            self._consume_finish_details(choice)
+            index = choice.get("index", 0)
+            if isinstance(index, bool) or not isinstance(index, int) or index < 0:
+                continue
+            assembled_choice = self._choices.setdefault(index, _Choice())
+            self._consume_finish_details(choice, assembled_choice)
             if self._endpoint == "/v1/completions":
                 text = choice.get("text")
                 if isinstance(text, str):
-                    self._saw_choice = True
-                    self._content.append(text)
+                    assembled_choice.saw_choice = True
+                    assembled_choice.content.append(text)
                 continue
             delta = choice.get("delta")
             if not isinstance(delta, dict):
                 continue
-            self._saw_choice = True
+            assembled_choice.saw_choice = True
             content = delta.get("content")
             if isinstance(content, str):
-                self._content.append(content)
-            self._consume_reasoning(delta)
+                assembled_choice.content.append(content)
+            self._consume_reasoning(delta, assembled_choice)
             tool_calls = delta.get("tool_calls")
             if not isinstance(tool_calls, list):
                 continue
@@ -219,30 +278,40 @@ class SSEAssembler:
                 index = raw_call.get("index", fallback_index)
                 if isinstance(index, bool) or not isinstance(index, int) or index < 0:
                     continue
-                self._tool_calls.setdefault(index, _ToolCall()).update(raw_call)
+                assembled_choice.tool_calls.setdefault(index, _ToolCall()).update(
+                    raw_call
+                )
 
-    def _consume_reasoning(self, delta: dict[str, Any]) -> None:
-        for field in _REASONING_FIELDS:
-            value = delta.get(field)
+    def _consume_reasoning(
+        self,
+        delta: dict[str, Any],
+        choice: _Choice,
+    ) -> None:
+        for field_name in _REASONING_FIELDS:
+            value = delta.get(field_name)
             if isinstance(value, str):
-                self._reasoning.setdefault(field, []).append(value)
+                choice.reasoning.setdefault(field_name, []).append(value)
 
-    def _consume_finish_details(self, choice: dict[str, Any]) -> None:
-        finish_reason = choice.get("finish_reason")
+    def _consume_finish_details(
+        self,
+        payload: dict[str, Any],
+        choice: _Choice,
+    ) -> None:
+        finish_reason = payload.get("finish_reason")
         if isinstance(finish_reason, str):
-            self._finish_reason = finish_reason
+            choice.finish_reason = finish_reason
         elif finish_reason is not None:
-            self._valid = False
+            choice.valid = False
 
-        stop_reason = choice.get("stop_reason")
+        stop_reason = payload.get("stop_reason")
         if (
             isinstance(stop_reason, str)
             or not isinstance(stop_reason, bool)
             and isinstance(stop_reason, int)
         ):
-            self._stop_reason = stop_reason
+            choice.stop_reason = stop_reason
         elif stop_reason is not None:
-            self._valid = False
+            choice.valid = False
 
     def _consume_usage(self, usage: Any) -> None:
         if usage is None:
@@ -270,60 +339,23 @@ class SSEAssembler:
             self._completion_tokens = completion_tokens
 
 
-def parse_json_response(body: bytes, endpoint: str) -> AssembledResponse | None:
-    """Parse a non-streaming OpenAI response, returning ``None`` fail-closed."""
+def parse_json_responses(
+    body: bytes,
+    endpoint: str,
+) -> tuple[AssembledResponse, ...]:
+    """Parse every choice in a non-streaming OpenAI response."""
     if endpoint not in _SUPPORTED_ENDPOINTS:
-        return None
+        return ()
     try:
         payload = json.loads(body)
     except (json.JSONDecodeError, UnicodeDecodeError):
-        return None
+        return ()
     if not isinstance(payload, dict):
-        return None
+        return ()
 
     choices = payload.get("choices")
     if not isinstance(choices, list):
-        return None
-    choice: dict[str, Any] | None = None
-    for candidate in choices:
-        if isinstance(candidate, dict) and candidate.get("index", 0) == 0:
-            choice = candidate
-            break
-    if choice is None:
-        return None
-
-    content: str | None
-    reasoning_content: str | None = None
-    reasoning_field: str | None = None
-    tool_calls: tuple[dict[str, Any], ...] = ()
-    if endpoint == "/v1/completions":
-        text = choice.get("text")
-        if not isinstance(text, str):
-            return None
-        content = text
-    else:
-        message = choice.get("message")
-        if not isinstance(message, dict):
-            return None
-        raw_content = message.get("content")
-        if raw_content is not None and not isinstance(raw_content, str):
-            return None
-        content = raw_content
-        for field in _REASONING_FIELDS:
-            raw_reasoning = message.get(field)
-            if raw_reasoning is None:
-                continue
-            if not isinstance(raw_reasoning, str):
-                return None
-            reasoning_content = raw_reasoning
-            reasoning_field = field
-            break
-        raw_tool_calls = message.get("tool_calls", [])
-        if not isinstance(raw_tool_calls, list) or not all(
-            isinstance(call, dict) for call in raw_tool_calls
-        ):
-            return None
-        tool_calls = tuple(dict(call) for call in raw_tool_calls)
+        return ()
 
     usage = payload.get("usage")
     prompt_tokens = _non_negative_int(usage, "prompt_tokens")
@@ -331,35 +363,98 @@ def parse_json_response(body: bytes, endpoint: str) -> AssembledResponse | None:
     response_id = payload.get("id")
     model = payload.get("model")
     created = payload.get("created")
-    finish_reason = choice.get("finish_reason")
-    if finish_reason is not None and not isinstance(finish_reason, str):
-        return None
-    stop_reason = choice.get("stop_reason")
-    if stop_reason is not None and not (
-        isinstance(stop_reason, str)
-        or not isinstance(stop_reason, bool)
-        and isinstance(stop_reason, int)
-    ):
-        return None
-    return AssembledResponse(
-        id=response_id if isinstance(response_id, str) and response_id else None,
-        model=model if isinstance(model, str) and model else None,
-        created=(
-            float(created)
-            if not isinstance(created, bool)
-            and isinstance(created, (int, float))
-            and created >= 0
-            else None
-        ),
-        content=content,
-        tool_calls=tool_calls,
-        prompt_tokens=prompt_tokens,
-        completion_tokens=completion_tokens,
-        reasoning_content=reasoning_content,
-        reasoning_field=reasoning_field,
-        finish_reason=finish_reason,
-        stop_reason=stop_reason,
-    )
+    assembled: list[AssembledResponse] = []
+    choice_count = sum(isinstance(candidate, dict) for candidate in choices)
+    for candidate in choices:
+        if not isinstance(candidate, dict):
+            continue
+        choice_index = candidate.get("index", 0)
+        if (
+            isinstance(choice_index, bool)
+            or not isinstance(choice_index, int)
+            or choice_index < 0
+        ):
+            continue
+
+        content: str | None
+        reasoning_content: str | None = None
+        reasoning_field: str | None = None
+        tool_calls: tuple[dict[str, Any], ...] = ()
+        if endpoint == "/v1/completions":
+            text = candidate.get("text")
+            if not isinstance(text, str):
+                continue
+            content = text
+        else:
+            message = candidate.get("message")
+            if not isinstance(message, dict):
+                continue
+            raw_content = message.get("content")
+            if raw_content is not None and not isinstance(raw_content, str):
+                continue
+            content = raw_content
+            malformed = False
+            for field_name in _REASONING_FIELDS:
+                raw_reasoning = message.get(field_name)
+                if raw_reasoning is None:
+                    continue
+                if not isinstance(raw_reasoning, str):
+                    malformed = True
+                    break
+                reasoning_content = raw_reasoning
+                reasoning_field = field_name
+                break
+            if malformed:
+                continue
+            raw_tool_calls = message.get("tool_calls", [])
+            if not isinstance(raw_tool_calls, list) or not all(
+                isinstance(call, dict) for call in raw_tool_calls
+            ):
+                continue
+            tool_calls = tuple(dict(call) for call in raw_tool_calls)
+
+        finish_reason = candidate.get("finish_reason")
+        if finish_reason is not None and not isinstance(finish_reason, str):
+            continue
+        stop_reason = candidate.get("stop_reason")
+        if stop_reason is not None and not (
+            isinstance(stop_reason, str)
+            or not isinstance(stop_reason, bool)
+            and isinstance(stop_reason, int)
+        ):
+            continue
+        assembled.append(
+            AssembledResponse(
+                id=response_id if isinstance(response_id, str) and response_id else None,
+                model=model if isinstance(model, str) and model else None,
+                created=(
+                    float(created)
+                    if not isinstance(created, bool)
+                    and isinstance(created, (int, float))
+                    and created >= 0
+                    else None
+                ),
+                content=content,
+                tool_calls=tool_calls,
+                prompt_tokens=prompt_tokens,
+                completion_tokens=completion_tokens,
+                reasoning_content=reasoning_content,
+                reasoning_field=reasoning_field,
+                finish_reason=finish_reason,
+                stop_reason=stop_reason,
+                choice_index=choice_index,
+                choice_count=choice_count,
+            )
+        )
+    return tuple(sorted(assembled, key=lambda response: response.choice_index))
+
+
+def parse_json_response(body: bytes, endpoint: str) -> AssembledResponse | None:
+    """Parse choice zero, preserving the original single-choice API."""
+    for response in parse_json_responses(body, endpoint):
+        if response.choice_index == 0:
+            return response
+    return None
 
 
 def _non_negative_int(value: Any, key: str) -> int | None:

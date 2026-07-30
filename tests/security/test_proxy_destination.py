@@ -8,10 +8,6 @@ import pytest
 from speedlm.gateway.proxy import _BLOCKED_V1_PATHS, _is_allowed_path
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="allowlist check runs before httpx removes dot segments",
-)
 def test_dot_segment_cannot_reach_blocked_admin_endpoint() -> None:
     client_path = "/v1/harmless/../sleep"
     forwarded = httpx.URL("http://127.0.0.1:8000").copy_with(path=client_path)
@@ -37,4 +33,3 @@ def test_blocked_paths_with_trailing_slashes_are_rejected(path: str) -> None:
 def test_unrelated_paths_outside_v1_are_rejected() -> None:
     assert not _is_allowed_path("/metrics")
     assert not _is_allowed_path("//attacker.example/v1/chat/completions")
-

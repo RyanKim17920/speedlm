@@ -315,7 +315,10 @@ def test_trace_import_round_trip_across_openai_and_proxy_formats(
 
     prepared_rows = [
         prepare_training_row(
-            training_row_from_trace(record),
+                training_row_from_trace(
+                    record,
+                    trust_untagged_assistant_messages=True,
+                ),
             template=ChatMLTemplate(),
             tokenizer=_CharacterTokenizer(),
             mask_policy=MaskPolicy.FINAL_SPAN,

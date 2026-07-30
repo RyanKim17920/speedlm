@@ -10,7 +10,10 @@ import pytest
 
 import speedlm.cli as cli
 import speedlm.doctor as doctor
+import speedlm.profiles as profiles
 from speedlm.cli import main
+from speedlm.profiles import ParserRegistry
+from speedlm.traces.store import TraceStore
 
 
 def _write_jsonl(path: Path, records: Sequence[dict]) -> None:
@@ -99,6 +102,25 @@ def test_traces_stats_empty(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cap
     assert code == 0
     out = capsys.readouterr()
     assert "count    : 0" in out.out
+    assert "dropped  : 0" in out.out
+    assert "truncated_at_line: -" in out.out
+
+
+def test_traces_stats_renders_drop_breakdown(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys,
+) -> None:
+    monkeypatch.setenv("SPEEDLM_HOME", str(tmp_path))
+    store = TraceStore(tmp_path / "traces" / "traces.jsonl")
+    assert store.record_drop("lock_timeout")
+
+    assert main(["traces", "stats"]) == 0
+
+    out = capsys.readouterr()
+    assert "dropped  : 1" in out.out
+    assert "  lock_timeout: 1" in out.out
+    assert "  capture_error: 0" in out.out
 
 
 def test_vllm_serve_passthrough(
@@ -113,6 +135,7 @@ def test_vllm_serve_passthrough(
         wrapper,
         passthrough,
         store,
+        exchange_ledger=None,
         enable_tuning=False,
         activity=None,
     ) -> int:
@@ -121,6 +144,7 @@ def test_vllm_serve_passthrough(
             wrapper=wrapper,
             passthrough=list(passthrough),
             store=store,
+            exchange_ledger=exchange_ledger,
         )
         return 0
 
@@ -144,6 +168,7 @@ def test_gpt_oss_profile_injects_parser_flags() -> None:
     passthrough = cli._profiled_vllm_passthrough("openai/gpt-oss-20b", [])
 
     assert passthrough == [
+        "--enable-auto-tool-choice",
         "--tool-call-parser",
         "openai",
         "--reasoning-parser",
@@ -178,29 +203,63 @@ def test_unprofiled_model_injects_no_parser_flags() -> None:
 def test_qwen_profile_injects_tool_call_parser() -> None:
     passthrough = cli._profiled_vllm_passthrough("Qwen/Qwen3.5-9B", [])
 
-    assert passthrough == ["--tool-call-parser", "hermes"]
+    assert passthrough == [
+        "--enable-auto-tool-choice",
+        "--tool-call-parser",
+        "hermes",
+    ]
 
 
-def test_vllm_serve_idle_tuning_fails_loudly(
+def test_user_supplied_auto_tool_choice_is_not_duplicated() -> None:
+    passthrough = cli._profiled_vllm_passthrough(
+        "Qwen/Qwen3.5-9B",
+        ["--enable-auto-tool-choice"],
+    )
+
+    assert passthrough.count("--enable-auto-tool-choice") == 1
+
+
+def test_user_tool_parser_on_unprofiled_model_gets_mandatory_flag() -> None:
+    passthrough = cli._profiled_vllm_passthrough(
+        "acme/unprofiled",
+        ["--tool-call-parser", "custom"],
+    )
+
+    assert passthrough == [
+        "--tool-call-parser",
+        "custom",
+        "--enable-auto-tool-choice",
+    ]
+
+
+def test_non_builtin_local_model_gets_auto_detected_parser_flags(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    capsys,
 ) -> None:
-    launched = False
+    model = tmp_path / "custom-qwen"
+    model.mkdir()
+    (model / "config.json").write_text(
+        json.dumps({"model_type": "qwen3_5"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        profiles,
+        "discover_vllm_parser_registry",
+        lambda: ParserRegistry(
+            tool_parsers=("hermes", "qwen3_coder", "qwen3_xml"),
+            reasoning_parsers=("qwen3",),
+        ),
+    )
 
-    async def fake_run(*_args, **_kwargs) -> int:
-        nonlocal launched
-        launched = True
-        return 0
+    passthrough = cli._profiled_vllm_passthrough(str(model), [])
 
-    monkeypatch.setenv("SPEEDLM_HOME", str(tmp_path))
-    monkeypatch.setattr(cli, "_run_vllm_gateway", fake_run)
-
-    code = main(["vllm", "serve", "my-model", "--enable-idle-tuning"])
-
-    assert code != 0
-    assert not launched
-    assert "--enable-idle-tuning is not available" in capsys.readouterr().err
+    assert passthrough == [
+        "--enable-auto-tool-choice",
+        "--tool-call-parser",
+        "qwen3_xml",
+        "--reasoning-parser",
+        "qwen3",
+    ]
 
 
 def test_vllm_readiness_error_is_preserved_and_runtime_record_removed(
@@ -262,6 +321,7 @@ def test_vllm_version_is_passthrough(
         wrapper,
         passthrough,
         store,
+        exchange_ledger=None,
         enable_tuning=False,
         activity=None,
     ) -> int:
@@ -289,6 +349,7 @@ def test_vllm_home_is_passthrough_without_changing_speedlm_home(
         wrapper,
         passthrough,
         store,
+        exchange_ledger=None,
         enable_tuning=False,
         activity=None,
     ) -> int:

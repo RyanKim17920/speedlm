@@ -326,10 +326,23 @@ def _stream_chat(
         for delta_content in [delta.get("content")]
         if isinstance(delta_content, str)
     )
+    reasoning_content = "".join(
+        delta_reasoning
+        for event in events
+        for choice in event.get("choices", [])
+        if isinstance(choice, dict)
+        for delta in [choice.get("delta")]
+        if isinstance(delta, dict)
+        for field in ("reasoning_content", "reasoning", "thinking")
+        for delta_reasoning in [delta.get(field)]
+        if isinstance(delta_reasoning, str)
+    )
     usage_events = [
         event["usage"] for event in events if isinstance(event.get("usage"), dict)
     ]
-    assert content.strip(), "stream contained no assistant content"
+    assert content.strip() or reasoning_content.strip(), (
+        "stream contained neither assistant content nor reasoning"
+    )
     assert usage_events, "stream_options.include_usage did not produce usage"
     usage = _json_object(usage_events[-1], "stream usage")
     assert isinstance(usage.get("prompt_tokens"), int) and usage["prompt_tokens"] > 0
@@ -350,6 +363,7 @@ def _stream_chat(
         "id": response_id,
         "model": model,
         "content": content,
+        "reasoning_content": reasoning_content or None,
         "usage": usage,
         "wire_chunk_count": len(chunks),
         "event_count": len(events),
@@ -581,6 +595,20 @@ def _verify_trace(
         _require(
             messages[-1].get("content") == expected_content,
             "trace assistant content differs from the response",
+        )
+    response_reasoning: object = response.get("reasoning_content")
+    choices = response.get("choices")
+    if isinstance(choices, list) and choices and isinstance(choices[0], Mapping):
+        message = choices[0].get("message")
+        if isinstance(message, Mapping):
+            for field in ("reasoning_content", "reasoning", "thinking"):
+                if isinstance(message.get(field), str):
+                    response_reasoning = message[field]
+                    break
+    if isinstance(response_reasoning, str) and response_reasoning:
+        _require(
+            messages[-1].get("reasoning_content") == response_reasoning,
+            "trace assistant reasoning differs from the response",
         )
     usage = response.get("usage")
     _require(isinstance(usage, dict), "response usage is missing")
