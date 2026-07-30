@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -14,6 +15,7 @@ from speedlm.training.backends.eagle3 import (
     ScratchQuotaExceeded,
     SpeculatorsPipelineConfig,
     TrainingError,
+    persist_training_output,
 )
 from speedlm.training.backends.speculators_runner import (
     ProcessResult,
@@ -817,3 +819,60 @@ def test_missing_input_ids_raises_named_error_with_row(
         backend.prepare(work, should_abort=lambda: False)
 
     assert raised.value.row_id == "0"
+
+
+def test_training_output_is_captured_to_the_run_directory(
+    tmp_path: Path,
+    pipeline: SpeculatorsPipelineConfig,
+) -> None:
+    """Training is ~22% of a cycle and left no evidence behind at all."""
+    runner = _FakeRunner()
+    backend, work = _backend(tmp_path, pipeline, runner)
+    prepared = backend.prepare(work, should_abort=lambda: False)
+    hidden = backend.extract(prepared, work, should_abort=lambda: False)
+
+    def train_effect(argv: tuple[str, ...], _abort: object) -> ProcessResult:
+        _FakeRunner._create_expected_output(argv)
+        return ProcessResult(argv, 0, "step 1 loss 0.5\n", "startup: loading verifier\n")
+
+    runner.effects.append(train_effect)
+    backend.train(hidden, work, should_abort=lambda: False)
+
+    logs = work / "training-logs"
+    assert (logs / "stdout.log").read_text(encoding="utf-8") == "step 1 loss 0.5\n"
+    assert (logs / "stderr.log").read_text(encoding="utf-8") == (
+        "startup: loading verifier\n"
+    )
+
+
+def test_training_output_is_captured_even_when_training_fails(
+    tmp_path: Path,
+    pipeline: SpeculatorsPipelineConfig,
+) -> None:
+    runner = _FakeRunner()
+    backend, work = _backend(tmp_path, pipeline, runner)
+    prepared = backend.prepare(work, should_abort=lambda: False)
+    hidden = backend.extract(prepared, work, should_abort=lambda: False)
+    runner.effects.append(
+        lambda argv, _abort: ProcessResult(argv, 9, "partial progress\n", "OOM\n")
+    )
+
+    with pytest.raises(TrainingError):
+        backend.train(hidden, work, should_abort=lambda: False)
+
+    logs = work / "training-logs"
+    assert (logs / "stdout.log").read_text(encoding="utf-8") == "partial progress\n"
+    assert (logs / "stderr.log").read_text(encoding="utf-8") == "OOM\n"
+
+
+def test_a_huge_training_log_is_bounded_and_keeps_both_ends() -> None:
+    result = ProcessResult(("train.py",), 0, "A" * 5_000 + "Z" * 5_000, "")
+    directory = Path(tempfile.mkdtemp())
+
+    persist_training_output(directory, result, max_bytes=1_000)
+
+    written = (directory / "training-logs" / "stdout.log").read_text(encoding="utf-8")
+    assert len(written.encode("utf-8")) < 1_200
+    assert written.startswith("A" * 500)
+    assert written.endswith("Z" * 500)
+    assert "9000 bytes elided" in written

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -47,6 +48,13 @@ from speedlm.tuner.eagle3 import (
     scratch_usage,
 )
 from speedlm.tuner.idle import TuningPreempted
+
+logger = logging.getLogger(__name__)
+
+#: Per-stream cap on the persisted training log.  Two mebibytes is far more
+#: than a Speculators run emits normally, and small enough that a pathological
+#: run cannot fill the scratch quota with its own diagnostics.
+MAX_TRAINING_LOG_BYTES = 2 * 1024 * 1024
 
 DEFAULT_SPECULATORS_REPO = Path(
     os.environ.get("SPEEDLM_SPECULATORS_REPO", "speculators")
@@ -723,6 +731,9 @@ class SpeculatorsTrainingProcess:
                 timeout_seconds=timeout_seconds,
                 should_abort=guard,
             )
+            # Persisted before the status check so a *failed* training run
+            # leaves the same evidence a successful one does.
+            persist_training_output(scratch, result)
             _success("Speculators training", result)
             checkpoint = destination / "checkpoint_best"
             if not checkpoint.is_dir():
@@ -1099,6 +1110,52 @@ def _pin_warm_start(
     except BaseException:
         _remove(destination)
         raise
+
+
+def persist_training_output(
+    run_dir: Path,
+    result: ProcessResult,
+    *,
+    max_bytes: int = MAX_TRAINING_LOG_BYTES,
+) -> Path | None:
+    """Write the training subprocess's streams under ``<run_dir>/training-logs``.
+
+    Training is the single longest stage of a cycle and its output was only
+    ever surfaced by attaching stderr to an exception -- so a *successful*
+    cycle discarded it entirely and there was no way to see how the ~180-210s
+    divided between engine/model startup and actual gradient steps.  Every
+    other stage leaves evidence in the run directory; this one now does too.
+
+    Each stream is capped at *max_bytes* with the head and tail kept and the
+    middle elided, because the two things worth reading in a training log are
+    the startup banner and whatever happened at the end, and because a long
+    run must not be able to fill the disk through its own logs.
+
+    Persisting is best effort and returns ``None`` on failure: losing
+    diagnostics must never be what fails a cycle that otherwise succeeded.
+    """
+    directory = run_dir / "training-logs"
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        for name, stream in (("stdout", result.stdout), ("stderr", result.stderr)):
+            (directory / f"{name}.log").write_text(
+                _bounded(stream or "", max_bytes), encoding="utf-8"
+            )
+    except OSError as exc:
+        logger.warning("could not persist training output to %s: %s", directory, exc)
+        return None
+    return directory
+
+
+def _bounded(text: str, max_bytes: int) -> str:
+    raw = text.encode("utf-8", errors="replace")
+    if len(raw) <= max_bytes:
+        return raw.decode("utf-8", errors="replace")
+    half = max_bytes // 2
+    elided = len(raw) - 2 * half
+    head = raw[:half].decode("utf-8", errors="replace")
+    tail = raw[-half:].decode("utf-8", errors="replace")
+    return f"{head}\n...[{elided} bytes elided]...\n{tail}"
 
 
 def _success(stage: str, result: ProcessResult) -> None:
