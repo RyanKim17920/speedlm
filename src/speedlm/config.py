@@ -281,7 +281,16 @@ class IdleTuningConfig:
     min_trace_records: int = 32
     poll_interval_seconds: float = 1.0
     held_out_fraction: float = 0.2
-    benchmark_repeats: int = 3
+    #: Scored suite passes per arm.  Five, not three, because the gate's
+    #: throughput regression guard is only as trustworthy as its standard
+    #: error: job 368670's pooled within-arm dispersion of 1.34 tok/s on a
+    #: ~76.7 tok/s mean puts the arm-to-arm standard error at 1.43% over three
+    #: repeats but 1.10% over five, which moves the -2.0% guard from 1.4 to 1.8
+    #: standard errors clear of zero.  The cost is four extra suite passes per
+    #: tuning cycle -- on job 368670 a pass took ~8s, so ~32s added to a ~275s
+    #: benchmark phase inside a ~1200s cycle (~3%).  Engine restarts, not
+    #: repeats, dominate that phase.
+    benchmark_repeats: int = 5
     speculators_repo: str | None = None
     training_python: str | None = None
     vllm_python: str | None = None

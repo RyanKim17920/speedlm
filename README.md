@@ -103,7 +103,7 @@ At minimum, an EAGLE-3 profile needs portable training locations:
     "training_python": "/path/to/training-venv/bin/python",
     "min_trace_records": 32,
     "held_out_fraction": 0.2,
-    "benchmark_repeats": 3
+    "benchmark_repeats": 5
   }
 }
 ```
