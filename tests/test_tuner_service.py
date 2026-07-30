@@ -13,6 +13,7 @@ from speedlm.config import SpeedLMConfig
 from speedlm.gateway.activity import ActivityTracker
 from speedlm.traces.store import TraceStats
 from speedlm.training.base import BackendInfo
+from speedlm.tuner.artifacts import ArtifactRegistry
 from speedlm.tuner.eagle3 import TraceSnapshot
 from speedlm.tuner.idle import ActivitySource, TuningPreempted
 from speedlm.tuner.orchestrator import (
@@ -26,6 +27,7 @@ from speedlm.tuner.service import (
     build_tuner_orchestrator,
     create_tuner_service,
 )
+from speedlm.tuner.state import TunerState, TunerStateMachine
 
 VERIFIER = "openai/gpt-oss-20b"
 DRAFT = "RedHatAI/gpt-oss-20b-speculator.eagle3"
@@ -217,6 +219,25 @@ class ExplodingRunner:
         return ()
 
 
+@dataclass
+class ShutdownSequenceRunner:
+    activity: ActivitySource
+    entered: Event = field(default_factory=Event)
+    events: list[str] = field(default_factory=list)
+
+    def run_once(self) -> CycleResult:
+        self.events.append("cycle_entered")
+        self.entered.set()
+        while self.activity.in_flight == 0:
+            time.sleep(0.001)
+        self.events.append("cycle_preempted")
+        return CycleResult(CycleOutcome.PREEMPTED)
+
+    def recover(self) -> tuple[str, ...]:
+        self.events.append("recovered")
+        return ()
+
+
 def _config() -> SpeedLMConfig:
     return SpeedLMConfig(
         model=VERIFIER,
@@ -385,6 +406,117 @@ def test_stop_mid_cycle_preempts_and_finishes_recovery(tmp_path: Path) -> None:
     assert runtime.calls[-2:] == ["restore", "wake"]
     state = (tmp_path / "runs" / "state.json").read_text(encoding="utf-8")
     assert '"state": "READY"' in state
+
+
+def test_worker_shutdown_preempts_then_recovers_before_stop_returns() -> None:
+    traces = FakeTraces(2)
+    activity = ActivityTracker()
+    created: list[ShutdownSequenceRunner] = []
+
+    def factory(cycle_activity: ActivitySource) -> ShutdownSequenceRunner:
+        runner = ShutdownSequenceRunner(cycle_activity)
+        created.append(runner)
+        return runner
+
+    service = TunerService(
+        _config(),
+        activity=activity,
+        traces=traces,
+        orchestrator_factory=factory,
+        enabled=True,
+        min_trace_records=2,
+        poll_interval_seconds=0.005,
+    )
+    service.start()
+    assert len(created) == 1
+    assert created[0].entered.wait(1.0)
+
+    service.stop(timeout_seconds=1.0)
+
+    assert not service.is_running
+    assert created[0].events == [
+        "recovered",
+        "cycle_entered",
+        "cycle_preempted",
+        "recovered",
+    ]
+    assert service.last_result == CycleResult(CycleOutcome.PREEMPTED)
+
+
+def test_startup_recovers_interrupted_state_before_trace_threshold(
+    tmp_path: Path,
+) -> None:
+    state = TunerStateMachine(tmp_path / "runs")
+    state.transition(TunerState.QUIESCING, reason="test crash")
+    state.transition(TunerState.SLEEPING, reason="test crash")
+    runtime = FakeRuntime()
+    service = create_tuner_service(
+        _config(),
+        activity=ActivityTracker(),
+        traces=FakeTraces(0),
+        backend=FakeBackend(),
+        gate=FakeGate(),
+        runtime=runtime,
+        enabled=True,
+        min_trace_records=2,
+        poll_interval_seconds=0.005,
+        home=tmp_path,
+        state=state,
+    )
+
+    service.start()
+    try:
+        _wait_until(lambda: state.state is TunerState.READY)
+        assert runtime.calls == ["restore", "wake"]
+        assert service.last_result is None
+    finally:
+        service.stop(timeout_seconds=1.0)
+
+
+def test_factory_uses_explicit_state_artifacts_and_work_root(
+    tmp_path: Path,
+) -> None:
+    state = TunerStateMachine(tmp_path / "durable-state")
+    artifacts = ArtifactRegistry(tmp_path / "durable-artifacts")
+    work_root = tmp_path / "cycle-work"
+    backend = FakeBackend()
+    gate = FakeGate()
+    runtime = FakeRuntime()
+    service = create_tuner_service(
+        _config(),
+        activity=ActivityTracker(),
+        traces=FakeTraces(2),
+        backend=backend,
+        gate=gate,
+        runtime=runtime,
+        enabled=True,
+        min_trace_records=2,
+        poll_interval_seconds=0.005,
+        home=tmp_path / "home",
+        state=state,
+        artifacts=artifacts,
+        work_root=work_root,
+        run_id_factory=lambda: "wired-cycle",
+    )
+
+    service.start()
+    try:
+        _wait_until(lambda: gate.calls == 1)
+    finally:
+        service.stop(timeout_seconds=1.0)
+
+    assert state.state is TunerState.READY
+    assert (work_root / "wired-cycle").is_dir()
+    published = list((tmp_path / "durable-artifacts" / "artifacts").iterdir())
+    assert len(published) == 1
+    assert (published[0] / "manifest.json").is_file()
+    assert runtime.calls == [
+        "quiesce",
+        "sleep",
+        "start_candidate",
+        "restore",
+        "wake",
+    ]
 
 
 def test_disabled_by_default_never_runs_a_cycle(tmp_path: Path) -> None:

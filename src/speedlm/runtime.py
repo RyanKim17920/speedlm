@@ -152,6 +152,18 @@ class GatewayRuntimeRecord:
                 f"cannot write gateway runtime record {self._path}: {exc}"
             ) from exc
 
+    def update_child_pid(self, child_pid: int | None) -> None:
+        """Atomically refresh the replaceable child pid while retaining ownership."""
+        self._record = GatewayRecord(
+            pid=self._record.pid,
+            host=self._record.host,
+            port=self._record.port,
+            model=self._record.model,
+            child_pid=child_pid,
+            started_at=self._record.started_at,
+        )
+        self.write()
+
     def remove(self) -> bool:
         """Delete the record iff it still names this process.
 

@@ -329,6 +329,7 @@ class TunerService:
 
     def _run(self) -> None:
         try:
+            self._recover_serving("service startup")
             while not self._stop_requested.is_set():
                 self._poll_once()
                 self._stop_requested.wait(self._poll_interval_seconds)

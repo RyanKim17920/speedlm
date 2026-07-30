@@ -75,6 +75,31 @@ class ServiceRecoveryError(RuntimeError):
     """Raised when both an operation and its serving recovery fail."""
 
 
+class AdmissionGate:
+    """Thread-safe admission control shared by the gateway and tuner.
+
+    A request attempted while the gate is closed updates the shared activity
+    watermark. That is what preempts an idle cycle even though the request
+    cannot yet be forwarded to the sleeping child.
+    """
+
+    def __init__(self, activity: ActivityTracker) -> None:
+        self._activity = activity
+
+    @property
+    def is_admitting(self) -> bool:
+        return self._activity.is_admitting
+
+    def try_begin(self) -> bool:
+        return self._activity.try_begin()
+
+    def stop_admitting(self) -> None:
+        self._activity.stop_admitting()
+
+    def start_admitting(self) -> None:
+        self._activity.start_admitting()
+
+
 class _Deadline:
     def __init__(
         self,
