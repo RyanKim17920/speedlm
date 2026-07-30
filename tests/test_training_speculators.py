@@ -265,7 +265,6 @@ def test_pipeline_uses_exact_stage_argv_and_separate_draft(
             "3",
             "9",
             "15",
-            "--no-include-last-layer",
             "--",
             "--port",
             "8123",
@@ -309,10 +308,13 @@ def test_hidden_state_server_caps_context_at_configured_sequence_length(
     assert argv[argv.index("--max-model-len") + 1] == "2048"
 
 
-def test_hidden_state_server_emits_only_the_configured_layers(
+def test_hidden_state_server_requests_the_configured_aux_layers_verbatim(
     tmp_path: Path,
     pipeline: SpeculatorsPipelineConfig,
 ) -> None:
+    # launch_vllm.py appends the verifier's final layer on top of these, which
+    # training slices back off as the regression target. Passing
+    # --no-include-last-layer would starve the draft's input_norm of one layer.
     pipeline = replace(pipeline, target_layer_ids=(1, 4, 8))
     runner = _FakeRunner()
     backend, work = _backend(tmp_path, pipeline, runner)
@@ -323,7 +325,8 @@ def test_hidden_state_server_emits_only_the_configured_layers(
     argv = runner.start_calls[0]
     separator = argv.index("--")
     start = argv.index("--target-layer-ids")
-    assert argv[start + 1 : separator] == ("1", "4", "8", "--no-include-last-layer")
+    assert argv[start + 1 : separator] == ("1", "4", "8")
+    assert "--no-include-last-layer" not in argv
 
 
 def test_failing_stage_raises_typed_error_with_actual_stderr(

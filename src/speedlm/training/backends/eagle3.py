@@ -551,7 +551,10 @@ class SpeculatorsHiddenStateExtractor:
                     str(destination),
                     "--target-layer-ids",
                     *(str(layer) for layer in layers),
-                    "--no-include-last-layer",
+                    # launch_vllm.py appends the verifier's final layer to this
+                    # list; training slices it back off as the regression target
+                    # (hidden_states[:, :-1] are the aux layers), so the server
+                    # must emit len(layers) + 1 layers, not len(layers).
                     "--",
                     "--port",
                     str(self.config.port),
