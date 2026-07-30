@@ -7,6 +7,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import time
 import urllib.error
 import urllib.request
@@ -46,9 +47,11 @@ from speedlm.tuner.eagle3 import (
 )
 from speedlm.tuner.idle import TuningPreempted
 
-DEFAULT_SPECULATORS_REPO = Path("/admin/home/ryan.kim/speedlm/.preflight/speculators")
+DEFAULT_SPECULATORS_REPO = Path(
+    os.environ.get("SPEEDLM_SPECULATORS_REPO", "speculators")
+)
 DEFAULT_SPECULATORS_PYTHON = Path(
-    "/admin/home/ryan.kim/speedlm/.preflight/venvs/speculators/bin/python"
+    os.environ.get("SPEEDLM_TRAINING_PYTHON", sys.executable)
 )
 _ZERO_MASK = re.compile(
     r"(?:all[- ]zero|no trainable|nonzero loss|loss[- ]mask tokens)",

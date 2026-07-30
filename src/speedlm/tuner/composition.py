@@ -88,6 +88,11 @@ def build_tuning_launch_plan(
         for argument in passthrough
         if argument != "--enable-sleep-mode"
     ]
+    if config.model_alias and not _has_option(
+        base_passthrough,
+        "--served-model-name",
+    ):
+        base_passthrough.extend(("--served-model-name", config.model_alias))
 
     def argv_factory(draft: DraftReference) -> list[str]:
         speculative = profile.speculative_config()
