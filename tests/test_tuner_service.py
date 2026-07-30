@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import logging
 import time
 from collections.abc import Callable
@@ -9,6 +10,7 @@ from threading import Event, Lock
 
 import pytest
 
+import speedlm.tuner.service as service_module
 from speedlm.config import SpeedLMConfig
 from speedlm.gateway.activity import ActivityTracker
 from speedlm.traces.store import TraceStats
@@ -550,6 +552,92 @@ def test_two_idle_periods_do_not_reuse_the_same_trace_watermark(
         assert gate.calls == 1
     finally:
         service.stop(timeout_seconds=1.0)
+
+
+def test_scheduler_status_persists_lifecycle_attempt_and_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    lifecycles: list[str] = []
+    real_atomic_write = service_module.atomic_write_json
+
+    def capture_status(path: Path, value: object) -> None:
+        real_atomic_write(path, value)
+        if path.name == "scheduler.json" and isinstance(value, dict):
+            lifecycle = value.get("lifecycle")
+            if isinstance(lifecycle, str):
+                lifecycles.append(lifecycle)
+
+    monkeypatch.setattr(service_module, "atomic_write_json", capture_status)
+    service, _, gate, _, _ = _service(tmp_path, traces=FakeTraces(2))
+    status_path = tmp_path / "runs" / "scheduler.json"
+
+    service.start()
+    try:
+        _wait_until(lambda: gate.calls == 1)
+        _wait_until(
+            lambda: json.loads(status_path.read_text(encoding="utf-8"))[
+                "last_result"
+            ]
+            is not None
+        )
+        running = json.loads(status_path.read_text(encoding="utf-8"))
+        assert running["enabled"] is True
+        assert running["lifecycle"] == "running"
+        assert running["last_watermark"] == {
+            "count": 2,
+            "tokens": 20,
+            "oldest": 1.0,
+            "newest": 2.0,
+            "unknown_token_records": 0,
+        }
+        assert running["last_result"]["outcome"] == "rejected"
+        assert running["last_error"] is None
+        assert isinstance(running["last_attempt_at"], float)
+        assert isinstance(running["last_result_at"], float)
+    finally:
+        service.stop(timeout_seconds=1.0)
+
+    stopped = json.loads(status_path.read_text(encoding="utf-8"))
+    assert stopped["lifecycle"] == "stopped"
+    transitions = [
+        lifecycle
+        for index, lifecycle in enumerate(lifecycles)
+        if index == 0 or lifecycle != lifecycles[index - 1]
+    ]
+    assert transitions == ["stopped", "startup", "running", "stopping", "stopped"]
+
+
+def test_scheduler_status_persists_cycle_error(tmp_path: Path) -> None:
+    traces = FakeTraces(2)
+    runner = ExplodingRunner()
+    runs = tmp_path / "runs"
+    runs.mkdir()
+    service = TunerService(
+        _config(),
+        activity=ActivityTracker(),
+        traces=traces,
+        orchestrator_factory=lambda cycle_activity: _runner_for(
+            cycle_activity,
+            runner,
+        ),
+        enabled=True,
+        min_trace_records=2,
+        poll_interval_seconds=0.005,
+        status_path=runs / "scheduler.json",
+    )
+
+    service.start()
+    try:
+        _wait_until(lambda: service.last_error == "training exploded")
+    finally:
+        service.stop(timeout_seconds=1.0)
+
+    status = json.loads((runs / "scheduler.json").read_text(encoding="utf-8"))
+    assert status["last_watermark"]["count"] == 2
+    assert status["last_result"] is None
+    assert status["last_error"] == "training exploded"
+    assert isinstance(status["last_error_at"], float)
 
 
 def test_factory_resolves_profile_before_creating_durable_state(

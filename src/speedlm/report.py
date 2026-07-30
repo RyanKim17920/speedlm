@@ -51,6 +51,7 @@ CONFIG_FILE_NAME: Final = "config.json"
 GATEWAY_FILE_NAME: Final = "gateway.json"
 ACTIVE_FILE_NAME: Final = "active.json"
 STATE_FILE_NAME: Final = "state.json"
+SCHEDULER_FILE_NAME: Final = "scheduler.json"
 EVENTS_FILE_NAME: Final = "events.jsonl"
 DECISION_FILE_NAME: Final = "decision.json"
 
@@ -461,6 +462,97 @@ def read_tuner_status(layout: Layout) -> TunerStatus:
 
 
 # ---------------------------------------------------------------------------
+# status: scheduler
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class SchedulerStatus:
+    """Durable lifecycle and latest-cycle snapshot for the tuner scheduler."""
+
+    present: bool
+    detail: str
+    enabled: bool | None = None
+    lifecycle: str | None = None
+    last_watermark: Mapping[str, object] | None = None
+    last_result: Mapping[str, object] | None = None
+    last_error: str | None = None
+    created_at: float | None = None
+    updated_at: float | None = None
+    lifecycle_changed_at: float | None = None
+    last_attempt_at: float | None = None
+    last_result_at: float | None = None
+    last_error_at: float | None = None
+    source_path: Path | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "present": self.present,
+            "detail": self.detail,
+            "enabled": self.enabled,
+            "lifecycle": self.lifecycle,
+            "last_watermark": (
+                dict(self.last_watermark) if self.last_watermark is not None else None
+            ),
+            "last_result": (
+                dict(self.last_result) if self.last_result is not None else None
+            ),
+            "last_error": self.last_error,
+            "created_at": self.created_at,
+            "updated_at": self.updated_at,
+            "lifecycle_changed_at": self.lifecycle_changed_at,
+            "last_attempt_at": self.last_attempt_at,
+            "last_result_at": self.last_result_at,
+            "last_error_at": self.last_error_at,
+            "source_path": str(self.source_path) if self.source_path is not None else None,
+        }
+
+
+def read_scheduler_status(layout: Layout) -> SchedulerStatus:
+    """Read ``<runs>/scheduler.json`` written by :class:`TunerService`."""
+    path = layout.runs_dir / SCHEDULER_FILE_NAME
+    if not path.exists():
+        return SchedulerStatus(
+            present=False,
+            detail=f"no scheduler status ({path} does not exist)",
+        )
+    try:
+        record = _read_json_object(path)
+    except ReportError as exc:
+        return SchedulerStatus(
+            present=False,
+            detail=f"scheduler status is unreadable: {exc}",
+            source_path=path,
+        )
+    enabled = record.get("enabled")
+    lifecycle = _optional_str(record.get("lifecycle"))
+    if not isinstance(enabled, bool) or lifecycle is None:
+        return SchedulerStatus(
+            present=False,
+            detail=f"scheduler status at {path} has no usable lifecycle",
+            source_path=path,
+        )
+    watermark = record.get("last_watermark")
+    result = record.get("last_result")
+    return SchedulerStatus(
+        present=True,
+        detail=f"{lifecycle} ({'enabled' if enabled else 'disabled'})",
+        enabled=enabled,
+        lifecycle=lifecycle,
+        last_watermark=watermark if isinstance(watermark, dict) else None,
+        last_result=result if isinstance(result, dict) else None,
+        last_error=_optional_str(record.get("last_error")),
+        created_at=_optional_float(record.get("created_at")),
+        updated_at=_optional_float(record.get("updated_at")),
+        lifecycle_changed_at=_optional_float(record.get("lifecycle_changed_at")),
+        last_attempt_at=_optional_float(record.get("last_attempt_at")),
+        last_result_at=_optional_float(record.get("last_result_at")),
+        last_error_at=_optional_float(record.get("last_error_at")),
+        source_path=path,
+    )
+
+
+# ---------------------------------------------------------------------------
 # status: model pair
 # ---------------------------------------------------------------------------
 
@@ -594,6 +686,7 @@ class StatusReport:
     active_draft: ActiveDraftStatus
     traces: TraceStatus
     tuner: TunerStatus
+    scheduler: SchedulerStatus
     models: ModelPairStatus
     generated_at: float
 
@@ -606,6 +699,7 @@ class StatusReport:
             "active_draft": self.active_draft.to_dict(),
             "traces": self.traces.to_dict(),
             "tuner": self.tuner.to_dict(),
+            "scheduler": self.scheduler.to_dict(),
             "models": self.models.to_dict(),
             "profile": dict(self.models.profile),
         }
@@ -644,6 +738,20 @@ class StatusReport:
             if self.tuner.reason is not None:
                 lines.append(f"  reason     : {self.tuner.reason}")
 
+        lines.append(f"scheduler    : {self.scheduler.detail}")
+        if self.scheduler.present:
+            if self.scheduler.last_result is not None:
+                outcome = _optional_str(self.scheduler.last_result.get("outcome"))
+                if outcome is not None:
+                    lines.append(f"  last cycle : {outcome}")
+            if self.scheduler.last_error is not None:
+                lines.append(f"  last error : {self.scheduler.last_error}")
+            if self.scheduler.updated_at is not None:
+                lines.append(
+                    f"  updated    : "
+                    f"{_format_timestamp(self.scheduler.updated_at, now=now)}"
+                )
+
         lines.append(f"verifier     : {self.models.verifier}")
         lines.append(f"draft        : {self.models.draft}")
         lines.append(f"  source     : {self.models.detail}")
@@ -665,6 +773,7 @@ def build_status_report(
         active_draft=read_active_draft(layout),
         traces=read_trace_status(layout),
         tuner=read_tuner_status(layout),
+        scheduler=read_scheduler_status(layout),
         models=read_model_pair(layout, served_model=gateway.model),
         generated_at=time.time() if now is None else now,
     )

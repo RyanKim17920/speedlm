@@ -12,7 +12,7 @@ from typing import Protocol
 
 from speedlm.config import SpeedLMConfig
 from speedlm.profiles import ModelProfile, resolve_profile
-from speedlm.storage import ensure_layout
+from speedlm.storage import atomic_write_json, ensure_layout, resolve_layout
 from speedlm.traces.store import TraceStats
 from speedlm.training.base import SpeculatorBackend
 from speedlm.tuner.artifacts import ArtifactRegistry
@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_MIN_TRACE_RECORDS = 32
+SCHEDULER_STATUS_FILE = "scheduler.json"
 
 
 class TunerServiceConfigurationError(ValueError):
@@ -75,6 +76,15 @@ class _TraceWatermark:
             newest=stats.newest,
             unknown_token_records=stats.unknown_token_records,
         )
+
+    def to_dict(self) -> dict[str, int | float | None]:
+        return {
+            "count": self.count,
+            "tokens": self.tokens,
+            "oldest": self.oldest,
+            "newest": self.newest,
+            "unknown_token_records": self.unknown_token_records,
+        }
 
 
 class _PreemptibleActivitySource:
@@ -170,8 +180,10 @@ def create_tuner_service(
     artifacts: ArtifactRegistry | None = None,
     work_root: Path | None = None,
     clock: Callable[[], float] = time.monotonic,
+    wall_clock: Callable[[], float] = time.time,
     timeouts: OrchestratorTimeouts | None = None,
     run_id_factory: Callable[[], str] | None = None,
+    status_path: Path | None = None,
 ) -> TunerService:
     """Create the production service while retaining every effect seam.
 
@@ -206,6 +218,12 @@ def create_tuner_service(
         min_trace_records=min_trace_records,
         poll_interval_seconds=poll_interval_seconds,
         clock=clock,
+        wall_clock=wall_clock,
+        status_path=(
+            resolve_layout(home).runs_dir / SCHEDULER_STATUS_FILE
+            if status_path is None
+            else status_path
+        ),
     )
 
 
@@ -223,6 +241,8 @@ class TunerService:
         min_trace_records: int = DEFAULT_MIN_TRACE_RECORDS,
         poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], float] = time.time,
+        status_path: Path | None = None,
     ) -> None:
         if enabled is None:
             enabled = getattr(config, "tuning_enabled", False)
@@ -254,10 +274,23 @@ class TunerService:
         )
         self._orchestrator = orchestrator_factory(self._activity)
         self._lock = Lock()
+        self._status_write_lock = Lock()
         self._thread: Thread | None = None
         self._last_attempted: _TraceWatermark | None = None
+        self._last_status_watermark: _TraceWatermark | None = None
         self._last_result: CycleResult | None = None
+        self._last_status_result: CycleResult | None = None
         self._last_error: str | None = None
+        self._status_path = status_path
+        self._wall_clock = wall_clock
+        created_at = self._wall_clock()
+        self._created_at = created_at
+        self._lifecycle = "stopped"
+        self._lifecycle_changed_at = created_at
+        self._last_attempt_at: float | None = None
+        self._last_result_at: float | None = None
+        self._last_error_at: float | None = None
+        self._persist_scheduler_status()
 
     @property
     def enabled(self) -> bool:
@@ -289,6 +322,7 @@ class TunerService:
 
         if not self._enabled:
             logger.info("idle tuner is disabled")
+            self._set_lifecycle("stopped")
             return
         with self._lock:
             if self._thread is not None and self._thread.is_alive():
@@ -300,7 +334,16 @@ class TunerService:
                 daemon=False,
             )
             self._thread = thread
+        self._set_lifecycle("startup")
+        try:
             thread.start()
+        except BaseException as exc:
+            with self._lock:
+                if self._thread is thread:
+                    self._thread = None
+            self._record_error(exc)
+            self._set_lifecycle("stopped")
+            raise
 
     def stop(self, *, timeout_seconds: float | None = None) -> None:
         """Preempt any active cycle, restore serving, and join the watcher."""
@@ -313,9 +356,11 @@ class TunerService:
             raise ValueError("timeout_seconds must be a positive number or None")
 
         self._stop_requested.set()
+        self._set_lifecycle("stopping")
         with self._lock:
             thread = self._thread
         if thread is None or thread is current_thread():
+            self._set_lifecycle("stopped")
             return
 
         thread.join(timeout_seconds)
@@ -330,11 +375,13 @@ class TunerService:
     def _run(self) -> None:
         try:
             self._recover_serving("service startup")
+            self._set_lifecycle("running")
             while not self._stop_requested.is_set():
                 self._poll_once()
                 self._stop_requested.wait(self._poll_interval_seconds)
         finally:
             self._recover_serving("service shutdown")
+            self._set_lifecycle("stopped")
 
     def _poll_once(self) -> None:
         if not self._idle.should_tune or self._stop_requested.is_set():
@@ -354,6 +401,7 @@ class TunerService:
         ):
             return
 
+        self._record_attempt(watermark)
         try:
             result = self._orchestrator.run_once()
         except Exception as exc:
@@ -381,12 +429,89 @@ class TunerService:
     def _record_result(self, result: CycleResult) -> None:
         with self._lock:
             self._last_result = result
+            self._last_status_result = result
             self._last_error = result.error
+            now = self._wall_clock()
+            self._last_result_at = now
+            self._last_error_at = now if result.error is not None else None
+        self._persist_scheduler_status()
 
-    def _record_error(self, error: Exception) -> None:
+    def _record_error(self, error: BaseException) -> None:
         with self._lock:
             self._last_result = None
             self._last_error = str(error)
+            self._last_error_at = self._wall_clock()
+        self._persist_scheduler_status()
+
+    def _record_attempt(self, watermark: _TraceWatermark) -> None:
+        with self._lock:
+            self._last_status_watermark = watermark
+            self._last_attempt_at = self._wall_clock()
+        self._persist_scheduler_status()
+
+    def _set_lifecycle(self, lifecycle: str) -> None:
+        if self._status_path is None:
+            with self._lock:
+                self._lifecycle = lifecycle
+                self._lifecycle_changed_at = self._wall_clock()
+            return
+        with self._status_write_lock:
+            with self._lock:
+                self._lifecycle = lifecycle
+                self._lifecycle_changed_at = self._wall_clock()
+                payload = self._scheduler_payload_locked(self._wall_clock())
+            self._write_scheduler_status(payload)
+
+    def _persist_scheduler_status(self) -> None:
+        if self._status_path is None:
+            return
+        with self._status_write_lock:
+            with self._lock:
+                payload = self._scheduler_payload_locked(self._wall_clock())
+            self._write_scheduler_status(payload)
+
+    def _scheduler_payload_locked(self, now: float) -> dict[str, object]:
+        result = self._last_status_result
+        return {
+            "schema_version": 1,
+            "enabled": self._enabled,
+            "lifecycle": self._lifecycle,
+            "created_at": self._created_at,
+            "updated_at": now,
+            "lifecycle_changed_at": self._lifecycle_changed_at,
+            "last_attempt_at": self._last_attempt_at,
+            "last_result_at": self._last_result_at,
+            "last_error_at": self._last_error_at,
+            "last_watermark": (
+                self._last_status_watermark.to_dict()
+                if self._last_status_watermark is not None
+                else None
+            ),
+            "last_result": (
+                {
+                    "outcome": result.outcome.value,
+                    "artifact_id": result.artifact_id,
+                    "error": result.error,
+                    "decision_path": (
+                        str(result.decision_path)
+                        if result.decision_path is not None
+                        else None
+                    ),
+                }
+                if result is not None
+                else None
+            ),
+            "last_error": self._last_error,
+        }
+
+    def _write_scheduler_status(self, payload: Mapping[str, object]) -> None:
+        path = self._status_path
+        if path is None:
+            return
+        try:
+            atomic_write_json(path, payload)
+        except OSError as exc:
+            logger.warning("could not persist idle tuner scheduler status: %s", exc)
 
     def _recover_serving(self, context: str) -> None:
         try:

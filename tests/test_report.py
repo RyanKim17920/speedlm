@@ -134,6 +134,7 @@ def test_status_json_shape_fresh(home: Path) -> None:
         "active_draft",
         "traces",
         "tuner",
+        "scheduler",
         "models",
         "profile",
     }
@@ -141,6 +142,7 @@ def test_status_json_shape_fresh(home: Path) -> None:
     assert payload["active_draft"]["present"] is False
     assert payload["traces"]["count"] == 0
     assert payload["tuner"]["present"] is False
+    assert payload["scheduler"]["present"] is False
     assert payload["models"]["configured"] is False
     assert payload["models"]["verifier"]
     assert isinstance(payload["profile"], dict)
@@ -201,6 +203,62 @@ def test_status_with_active_draft_and_tuner_state(home: Path) -> None:
     assert report.tuner.state == "TRAINING"
     assert "TRAINING" in text
     assert "idle window" in text
+
+
+def test_status_reports_durable_scheduler_lifecycle_and_last_cycle(
+    home: Path,
+) -> None:
+    runs = home / "runs"
+    runs.mkdir(parents=True)
+    (runs / "scheduler.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "enabled": True,
+                "lifecycle": "stopped",
+                "created_at": 800.0,
+                "updated_at": 990.0,
+                "lifecycle_changed_at": 990.0,
+                "last_attempt_at": 900.0,
+                "last_result_at": 950.0,
+                "last_error_at": None,
+                "last_watermark": {
+                    "count": 40,
+                    "tokens": 400,
+                    "oldest": 100.0,
+                    "newest": 899.0,
+                    "unknown_token_records": 0,
+                },
+                "last_result": {
+                    "outcome": "promoted",
+                    "artifact_id": "artifact-1",
+                    "error": None,
+                    "decision_path": "runs/run-1/decision.json",
+                },
+                "last_error": None,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    report = build_status_report(now=1_000.0)
+    payload = report.to_dict()["scheduler"]
+    text = report.render_text()
+
+    assert report.scheduler.present is True
+    assert report.scheduler.enabled is True
+    assert report.scheduler.lifecycle == "stopped"
+    assert report.scheduler.last_watermark == {
+        "count": 40,
+        "tokens": 400,
+        "oldest": 100.0,
+        "newest": 899.0,
+        "unknown_token_records": 0,
+    }
+    assert isinstance(payload, dict)
+    assert payload["last_result"]["outcome"] == "promoted"
+    assert "scheduler    : stopped (enabled)" in text
+    assert "last cycle : promoted" in text
 
 
 def test_status_gateway_running_and_stale(home: Path) -> None:
