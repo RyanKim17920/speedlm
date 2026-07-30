@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 from pathlib import Path
 from typing import Any
 
@@ -18,8 +19,7 @@ def _parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = _parser().parse_args()
-    from datasets import load_from_disk
-
+    load_from_disk = importlib.import_module("datasets").load_from_disk
     dataset: Any = load_from_disk(str(args.dataset))
     if len(dataset) != args.expected_rows:
         raise SystemExit(
