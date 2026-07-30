@@ -551,6 +551,7 @@ class SpeculatorsHiddenStateExtractor:
                     str(destination),
                     "--target-layer-ids",
                     *(str(layer) for layer in layers),
+                    "--no-include-last-layer",
                     "--",
                     "--port",
                     str(self.config.port),
