@@ -7,6 +7,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from speedlm.gate.metrics import (
+    COUNTER_NAMES,
     AcceptanceStatus,
     CounterResetError,
     MetricsSnapshot,
@@ -14,14 +15,9 @@ from speedlm.gate.metrics import (
     parse_metrics,
 )
 
-RESET_COUNTERS = {
-    "generated_tokens_total": "generated_tokens",
-    "prompt_tokens_total": "prompt_tokens",
-    "vllm:speculated_tokens_total": "drafted_tokens",
-    "vllm:accepted_tokens_total": "accepted_tokens",
-    "vllm:accept_token_count_total": "draft_accept_count",
-    "vllm:reject_token_count_total": "draft_reject_count",
-}
+RESET_COUNTERS = {prom: field for field, prom in COUNTER_NAMES.items()}
+GENERATED_TOKENS = COUNTER_NAMES["generated_tokens"]
+DECODE_TIME = COUNTER_NAMES["decode_time_seconds"]
 
 
 def _metric(name: str, value: float) -> str:
@@ -61,9 +57,9 @@ def test_monotonic_counters_have_non_negative_deltas(
     before_generated: float,
     increment: float,
 ) -> None:
-    before = parse_metrics(_metric("generated_tokens_total", before_generated))
+    before = parse_metrics(_metric(GENERATED_TOKENS, before_generated))
     after = parse_metrics(
-        _metric("generated_tokens_total", before_generated + increment)
+        _metric(GENERATED_TOKENS, before_generated + increment)
     )
 
     delta = compute_delta(before, after)
@@ -76,9 +72,9 @@ def test_monotonic_counters_have_non_negative_deltas(
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "src/speedlm/gate/metrics.py:80 and :254 encode absent draft counters as "
-        "numeric 0.0 even though AcceptanceStatus.UNAVAILABLE exists; minimal "
-        "input is an empty metrics scrape"
+        "src/speedlm/gate/metrics.py encodes absent draft counters as numeric 0.0 "
+        "even though AcceptanceStatus.UNAVAILABLE exists; the availability flag "
+        "carries the distinction instead"
     ),
 )
 def test_absent_draft_counters_are_unavailable_not_zero() -> None:
@@ -91,15 +87,9 @@ def test_absent_draft_counters_are_unavailable_not_zero() -> None:
     assert delta.acceptance_rate is AcceptanceStatus.UNAVAILABLE
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "src/speedlm/gate/metrics.py:228 omits time_per_output_token_ns from reset checks"
-    ),
-)
 def test_time_sum_counter_reset_is_detected() -> None:
-    before = parse_metrics("time_per_output_token_ns_sum 1\n")
-    after = parse_metrics("time_per_output_token_ns_sum 0\n")
+    before = parse_metrics(_metric(DECODE_TIME, 1.0))
+    after = parse_metrics(_metric(DECODE_TIME, 0.0))
 
-    with pytest.raises(CounterResetError, match="time_per_output_token_ns"):
+    with pytest.raises(CounterResetError, match="decode_time_seconds"):
         compute_delta(before, after)

@@ -1,122 +1,194 @@
-"""Tests for gate/metrics.py — no GPU, no network, fake Prometheus fixtures."""
+"""Tests for gate/metrics.py — no GPU, no network.
+
+The fixtures under ``tests/data/`` are verbatim excerpts of real vLLM
+``/metrics`` responses captured from the vendored runtime.  Parsing those
+files, rather than hand-written Prometheus text, is what keeps
+:data:`speedlm.gate.metrics.COUNTER_NAMES` honest: a synthetic fixture can
+agree with a parser that agrees with nothing vLLM actually emits.
+"""
+
+from pathlib import Path
+
+import pytest
 
 from speedlm.gate.metrics import (
+    COUNTER_NAMES,
     CounterResetError,
-    MetricsSnapshot,
     compute_delta,
     parse_metrics,
 )
 
+DATA_DIR = Path(__file__).parent / "data"
+REAL_BEFORE = (DATA_DIR / "vllm_metrics_before.prom").read_text()
+REAL_AFTER = (DATA_DIR / "vllm_metrics_after.prom").read_text()
+
+# Values read straight out of the captured fixtures.
+_AFTER_DRAFTS = 33.0
+_AFTER_DRAFT_TOKENS = 99.0
+_AFTER_ACCEPTED = 78.0
+_AFTER_GENERATED = 112.0
+_AFTER_PROMPT = 41.0
+_AFTER_DECODE_SECONDS = 1.7592467290814966
+
+
 # ---------------------------------------------------------------------------
-# Fake Prometheus text fixtures
+# Synthetic fixtures — same counter names as the real capture, chosen values.
 # ---------------------------------------------------------------------------
 
-METRICS_STOCK = """\
-# HELP generated_tokens_total Total number of generated tokens.
-# TYPE generated_tokens_total counter
-generated_tokens_total 1000
-# HELP prompt_tokens_total Total number of prompt tokens.
-# TYPE prompt_tokens_total counter
-prompt_tokens_total 5000
-# HELP time_per_output_token_ns_sum Sum of time per output token in ns.
-# TYPE time_per_output_token_ns_sum counter
-time_per_output_token_ns_sum 20000000000
-"""
+def _exposition(**counters: float) -> str:
+    return "".join(
+        f'{COUNTER_NAMES[field]}{{engine="0",model_name="m"}} {value}\n'
+        for field, value in counters.items()
+    )
 
-METRICS_CANDIDATE_BEFORE = """\
-generated_tokens_total 1000
-prompt_tokens_total 5000
-time_per_output_token_ns_sum 10000000000
-vllm:speculated_tokens_total 800
-vllm:accepted_tokens_total 600
-vllm:accept_token_count_total 150
-vllm:reject_token_count_total 50
-"""
 
-METRICS_CANDIDATE_AFTER = """\
-generated_tokens_total 3000
-prompt_tokens_total 15000
-time_per_output_token_ns_sum 50000000000
-vllm:speculated_tokens_total 2800
-vllm:accepted_tokens_total 2100
-vllm:accept_token_count_total 500
-vllm:reject_token_count_total 200
-"""
+METRICS_NO_SPEC = _exposition(
+    generated_tokens=1000,
+    prompt_tokens=5000,
+    decode_time_seconds=20.0,
+)
 
-METRICS_ACCEPTANCE_ABSENT = """\
-generated_tokens_total 1000
-prompt_tokens_total 5000
-time_per_output_token_ns_sum 20000000000
-"""
+METRICS_SPEC_BEFORE = _exposition(
+    generated_tokens=1000,
+    prompt_tokens=5000,
+    decode_time_seconds=10.0,
+    drafted_tokens=800,
+    accepted_tokens=600,
+    num_drafts=200,
+)
 
-METRICS_AFTER_RESET = """\
-generated_tokens_total 500
-prompt_tokens_total 1000
-time_per_output_token_ns_sum 10000000000
-vllm:speculated_tokens_total 100
-vllm:accepted_tokens_total 50
-vllm:accept_token_count_total 10
-vllm:reject_token_count_total 5
-"""
+METRICS_SPEC_AFTER = _exposition(
+    generated_tokens=3000,
+    prompt_tokens=15000,
+    decode_time_seconds=50.0,
+    drafted_tokens=2800,
+    accepted_tokens=2100,
+    num_drafts=700,
+)
+
+METRICS_SPEC_RESET = _exposition(
+    generated_tokens=500,
+    prompt_tokens=1000,
+    decode_time_seconds=10.0,
+    drafted_tokens=100,
+    accepted_tokens=50,
+    num_drafts=25,
+)
+
+
+# ---------------------------------------------------------------------------
+# Regression tests — the parser must agree with real vLLM output
+# ---------------------------------------------------------------------------
+
+def test_parses_real_vllm_capture_with_labels() -> None:
+    """A real labelled /metrics body must yield real numbers, not zeros.
+
+    This is the regression guard for the shipped bug: the parser expected
+    counter names (``vllm:accept_token_count_total`` and friends) that vLLM
+    never emits, so every scrape parsed to an all-zero snapshot and the gate
+    rejected every candidate with ``acceptance_unavailable``.
+    """
+    snap = parse_metrics(REAL_AFTER)
+
+    assert snap.has_draft_counters is True
+    assert snap.drafted_tokens == _AFTER_DRAFT_TOKENS
+    assert snap.accepted_tokens == _AFTER_ACCEPTED
+    assert snap.num_drafts == _AFTER_DRAFTS
+    assert snap.generated_tokens == _AFTER_GENERATED
+    assert snap.prompt_tokens == _AFTER_PROMPT
+    assert snap.decode_time_seconds == pytest.approx(_AFTER_DECODE_SECONDS)
+
+
+def test_real_capture_yields_nonzero_acceptance_and_throughput() -> None:
+    delta = compute_delta(parse_metrics(REAL_BEFORE), parse_metrics(REAL_AFTER))
+
+    assert delta.acceptance_available is True
+    assert delta.acceptance_rate == pytest.approx(
+        _AFTER_ACCEPTED / _AFTER_DRAFT_TOKENS
+    )
+    # vLLM's definition: 1 + accepted / drafts.
+    assert delta.mean_accepted_length == pytest.approx(
+        1.0 + _AFTER_ACCEPTED / _AFTER_DRAFTS
+    )
+    assert delta.output_tok_per_sec == pytest.approx(
+        _AFTER_GENERATED / _AFTER_DECODE_SECONDS
+    )
+    assert delta.acceptance_rate > 0.0
+    assert delta.output_tok_per_sec > 0.0
+
+
+def test_every_configured_counter_appears_in_the_real_capture() -> None:
+    """Each name the gate scrapes for must exist in real vLLM output."""
+    missing = [
+        prom_name
+        for prom_name in COUNTER_NAMES.values()
+        if prom_name not in REAL_AFTER
+    ]
+    assert missing == []
+
+
+def test_per_pos_counter_is_not_mistaken_for_the_accepted_counter() -> None:
+    text = (
+        'vllm:spec_decode_num_accepted_tokens_per_pos_total'
+        '{engine="0",position="0"} 900\n'
+        'vllm:spec_decode_num_accepted_tokens_total{engine="0"} 78\n'
+    )
+    assert parse_metrics(text).accepted_tokens == 78.0
+
+
+def test_counters_are_summed_across_engines() -> None:
+    text = (
+        'vllm:generation_tokens_total{engine="0"} 100\n'
+        'vllm:generation_tokens_total{engine="1"} 40\n'
+    )
+    assert parse_metrics(text).generated_tokens == 140.0
 
 
 # ---------------------------------------------------------------------------
 # Tests — parse_metrics
 # ---------------------------------------------------------------------------
 
-def test_parse_stock_metrics() -> None:
-    snap = parse_metrics(METRICS_STOCK)
+def test_parse_without_spec_decode_counters() -> None:
+    snap = parse_metrics(METRICS_NO_SPEC)
     assert snap.generated_tokens == 1000.0
     assert snap.prompt_tokens == 5000.0
-    assert snap.time_per_output_token_ns == 20_000_000_000.0
-    assert snap.has_draft_counters is False
-
-
-def test_parse_candidate_metrics() -> None:
-    snap = parse_metrics(METRICS_CANDIDATE_AFTER)
-    assert snap.generated_tokens == 3000.0
-    assert snap.drafted_tokens == 2800.0
-    assert snap.accepted_tokens == 2100.0
-    assert snap.draft_accept_count == 500.0
-    assert snap.draft_reject_count == 200.0
-    assert snap.has_draft_counters is True
-    assert abs(snap.acceptance_rate - 500 / (500 + 200)) < 1e-9
-
-
-def test_parse_acceptance_absent() -> None:
-    snap = parse_metrics(METRICS_ACCEPTANCE_ABSENT)
+    assert snap.decode_time_seconds == 20.0
     assert snap.has_draft_counters is False
     assert snap.drafted_tokens == 0.0
     assert snap.accepted_tokens == 0.0
 
 
+def test_parse_spec_decode_counters() -> None:
+    snap = parse_metrics(METRICS_SPEC_AFTER)
+    assert snap.has_draft_counters is True
+    assert snap.drafted_tokens == 2800.0
+    assert snap.accepted_tokens == 2100.0
+    assert snap.num_drafts == 700.0
+    assert snap.acceptance_rate == pytest.approx(2100 / 2800)
+    assert snap.mean_accepted_length == pytest.approx(1 + 2100 / 700)
+
+
 def test_parse_tpot_and_throughput() -> None:
-    snap = parse_metrics(METRICS_CANDIDATE_AFTER)
-    tpot_ms = snap.tpot_ms
-    assert tpot_ms > 0
-    tok_per_sec = snap.output_tok_per_sec
-    assert tok_per_sec > 0
-
-
-def test_parse_mean_accepted_length() -> None:
-    snap = parse_metrics(METRICS_CANDIDATE_AFTER)
-    mean_len = snap.mean_accepted_length
-    assert abs(mean_len - 2100 / 500) < 1e-9
+    snap = parse_metrics(METRICS_SPEC_AFTER)
+    assert snap.tpot_ms == pytest.approx(50.0 / 3000 * 1000)
+    assert snap.output_tok_per_sec == pytest.approx(3000 / 50.0)
 
 
 def test_parse_empty_text() -> None:
     snap = parse_metrics("")
     assert snap.generated_tokens == 0.0
     assert snap.has_draft_counters is False
+    assert snap.acceptance_rate == 0.0
+    assert snap.output_tok_per_sec == 0.0
 
 
 def test_parse_with_gauge_lines() -> None:
-    text = """\
-generated_tokens_total 100
-vllm:num_requests_running 5
-vllm:num_requests_swapped 0
-vllm:num_requests_waiting 12
-"""
+    text = (
+        'vllm:generation_tokens_total{engine="0"} 100\n'
+        'vllm:num_requests_running{engine="0"} 5\n'
+        'vllm:num_requests_swapped{engine="0"} 0\n'
+        'vllm:num_requests_waiting{engine="0"} 12\n'
+    )
     snap = parse_metrics(text)
     assert snap.generated_tokens == 100.0
     assert snap.num_requests_running == 5.0
@@ -129,26 +201,22 @@ vllm:num_requests_waiting 12
 # ---------------------------------------------------------------------------
 
 def test_compute_delta_basic() -> None:
-    before = parse_metrics(METRICS_CANDIDATE_BEFORE)
-    after = parse_metrics(METRICS_CANDIDATE_AFTER)
-    delta = compute_delta(before, after)
+    delta = compute_delta(
+        parse_metrics(METRICS_SPEC_BEFORE),
+        parse_metrics(METRICS_SPEC_AFTER),
+    )
 
     assert delta.reset_detected is False
     assert delta.acceptance_available is True
-    assert delta.drafted_tokens == 2800 - 800
-    assert delta.accepted_tokens == 2100 - 600
-
-    # delta_accept = 500-150=350, delta_reject = 200-50=150
-    assert abs(delta.acceptance_rate - 350 / (350 + 150)) < 1e-9
-
-    # Mean accepted length
-    assert abs(delta.mean_accepted_length - (2100 - 600) / (500 - 150)) < 1e-9
+    assert delta.drafted_tokens == 2000.0
+    assert delta.accepted_tokens == 1500.0
+    assert delta.acceptance_rate == pytest.approx(1500 / 2000)
+    assert delta.mean_accepted_length == pytest.approx(1 + 1500 / 500)
 
 
-def test_compute_delta_acceptance_unavailable() -> None:
-    before = parse_metrics(METRICS_ACCEPTANCE_ABSENT)
-    after = parse_metrics(METRICS_ACCEPTANCE_ABSENT)
-    delta = compute_delta(before, after)
+def test_compute_delta_acceptance_unavailable_when_counters_absent() -> None:
+    snap = parse_metrics(METRICS_NO_SPEC)
+    delta = compute_delta(snap, snap)
 
     assert delta.reset_detected is False
     assert delta.acceptance_available is False
@@ -156,58 +224,36 @@ def test_compute_delta_acceptance_unavailable() -> None:
     assert delta.acceptance_rate == 0.0
 
 
-def test_compute_delta_counter_reset_raises() -> None:
-    before = parse_metrics(METRICS_CANDIDATE_AFTER)
-    after = parse_metrics(METRICS_AFTER_RESET)
+def test_compute_delta_acceptance_unavailable_when_no_drafting_happened() -> None:
+    """Present-but-idle counters are not a measured zero-percent acceptance."""
+    snap = parse_metrics(METRICS_SPEC_AFTER)
+    delta = compute_delta(snap, snap)
 
-    err = None
-    try:
-        compute_delta(before, after)
-    except CounterResetError as exc:
-        err = exc
-    assert err is not None
-    assert "generated_tokens" in str(err)
+    assert delta.acceptance_available is False
+    assert delta.acceptance_rate == 0.0
+
+
+def test_compute_delta_counter_reset_raises() -> None:
+    with pytest.raises(CounterResetError, match="generated_tokens"):
+        compute_delta(
+            parse_metrics(METRICS_SPEC_AFTER),
+            parse_metrics(METRICS_SPEC_RESET),
+        )
 
 
 def test_compute_delta_counter_reset_draft() -> None:
-    """Draft counter reset also raises CounterResetError."""
-    before = parse_metrics(METRICS_CANDIDATE_AFTER)
-    after = parse_metrics(METRICS_ACCEPTANCE_ABSENT)
-    err = None
-    try:
-        compute_delta(before, after)
-    except CounterResetError as exc:
-        err = exc
-    assert err is not None
+    with pytest.raises(CounterResetError):
+        compute_delta(
+            parse_metrics(METRICS_SPEC_AFTER),
+            parse_metrics(METRICS_NO_SPEC),
+        )
 
 
 def test_compute_delta_tpot_and_throughput() -> None:
-    before = parse_metrics(METRICS_CANDIDATE_BEFORE)
-    after = parse_metrics(METRICS_CANDIDATE_AFTER)
-    delta = compute_delta(before, after)
-
-    # delta_gen = 2000, delta_tpot_ns = 40e9
-    expected_tpot_ms = (40_000_000_000 / 2000) / 1_000_000
-    assert abs(delta.tpot_ms - expected_tpot_ms) < 1e-6
-
-    # tok_per_sec = 2000 / (40e9 / 1e9) = 2000 / 40 = 50
-    assert abs(delta.output_tok_per_sec - 50.0) < 1e-6
-
-
-def test_compute_delta_zero_tokens() -> None:
-    """When no tokens generated, TPOT and throughput are 0."""
-    before = MetricsSnapshot()
-    after = MetricsSnapshot()
-    delta = compute_delta(before, after)
-    assert delta.tpot_ms == 0.0
-    assert delta.output_tok_per_sec == 0.0
-
-
-def test_metrics_delta_is_frozen() -> None:
-    """MetricsDelta instances are immutable."""
-    import dataclasses
-    before = MetricsSnapshot()
-    after = MetricsSnapshot()
-    delta = compute_delta(before, after)
-    # Frozen dataclasses are immutable by construction
-    assert dataclasses.is_dataclass(delta)
+    delta = compute_delta(
+        parse_metrics(METRICS_SPEC_BEFORE),
+        parse_metrics(METRICS_SPEC_AFTER),
+    )
+    # delta_gen = 2000 tokens over delta_decode = 40 s.
+    assert delta.tpot_ms == pytest.approx(40.0 / 2000 * 1000)
+    assert delta.output_tok_per_sec == pytest.approx(2000 / 40.0)
