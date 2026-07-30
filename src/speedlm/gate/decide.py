@@ -71,6 +71,10 @@ class Decision:
     candidate_avg_acceptance: float
     stock_avg_tok_per_sec: float
     candidate_avg_tok_per_sec: float
+    #: Unscored suite passes run per arm before the measurement window opened.
+    #: Reported so a reader can tell steady state from cold start; these passes
+    #: are deliberately absent from ``num_repeats`` and ``per_repeat``.
+    warmup_repeats: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -81,6 +85,7 @@ class Decision:
             "min_acceptance_delta_pp": self.min_acceptance_delta_pp,
             "min_throughput_delta_pct": self.min_throughput_delta_pct,
             "num_repeats": self.num_repeats,
+            "warmup_repeats": self.warmup_repeats,
             "per_repeat": [
                 {
                     "repeat_index": r.repeat_index,
@@ -123,6 +128,7 @@ def _make_reject(
     cand_acc: float,
     stock_tps: float,
     cand_tps: float,
+    warmup_repeats: int,
 ) -> Decision:
     return Decision(
         verdict=Verdict.REJECT,
@@ -137,6 +143,7 @@ def _make_reject(
         candidate_avg_acceptance=cand_acc,
         stock_avg_tok_per_sec=stock_tps,
         candidate_avg_tok_per_sec=cand_tps,
+        warmup_repeats=warmup_repeats,
     )
 
 
@@ -152,6 +159,7 @@ def decide_promotion(
     promotion_config: PromotionConfig,
     *,
     max_output_mismatches: int = 0,
+    warmup_repeats: int = 0,
 ) -> Decision:
     """Decide whether to promote the candidate head.
 
@@ -162,6 +170,8 @@ def decide_promotion(
         candidate_replay: Replay results for candidate endpoint.
         promotion_config: Thresholds from config.
         max_output_mismatches: Allowed output mismatches (default 0).
+        warmup_repeats: Unscored warmup passes each arm ran before the
+            measurement window opened, recorded in the decision for audit.
 
     Returns:
         A :class:`Decision` with verdict, reason, and per-repeat data.
@@ -223,6 +233,7 @@ def decide_promotion(
             cand_acc=c_acc,
             stock_tps=s_tps,
             cand_tps=c_tps,
+            warmup_repeats=warmup_repeats,
         )
 
     # --- Validation: acceptance unavailable ---
@@ -238,6 +249,7 @@ def decide_promotion(
             cand_acc=c_acc,
             stock_tps=s_tps,
             cand_tps=c_tps,
+            warmup_repeats=warmup_repeats,
         )
 
     # --- Validation: too few repeats ---
@@ -253,6 +265,7 @@ def decide_promotion(
             cand_acc=c_acc,
             stock_tps=s_tps,
             cand_tps=c_tps,
+            warmup_repeats=warmup_repeats,
         )
 
     # --- Validation: high invalid rate ---
@@ -271,6 +284,7 @@ def decide_promotion(
             cand_acc=c_acc,
             stock_tps=s_tps,
             cand_tps=c_tps,
+            warmup_repeats=warmup_repeats,
         )
 
     # --- Validation: output mismatch ---
@@ -286,6 +300,7 @@ def decide_promotion(
             cand_acc=c_acc,
             stock_tps=s_tps,
             cand_tps=c_tps,
+            warmup_repeats=warmup_repeats,
         )
 
     # --- Validation: throughput unavailable ---
@@ -301,6 +316,7 @@ def decide_promotion(
             cand_acc=c_acc,
             stock_tps=s_tps,
             cand_tps=c_tps,
+            warmup_repeats=warmup_repeats,
         )
 
     # --- Compute deltas ---
@@ -321,6 +337,7 @@ def decide_promotion(
             cand_acc=c_acc,
             stock_tps=s_tps,
             cand_tps=c_tps,
+            warmup_repeats=warmup_repeats,
         )
 
     # --- Threshold: throughput ---
@@ -336,6 +353,7 @@ def decide_promotion(
             cand_acc=c_acc,
             stock_tps=s_tps,
             cand_tps=c_tps,
+            warmup_repeats=warmup_repeats,
         )
 
     # --- Both thresholds met: PROMOTE ---
@@ -352,4 +370,5 @@ def decide_promotion(
         candidate_avg_acceptance=c_acc,
         stock_avg_tok_per_sec=s_tps,
         candidate_avg_tok_per_sec=c_tps,
+        warmup_repeats=warmup_repeats,
     )

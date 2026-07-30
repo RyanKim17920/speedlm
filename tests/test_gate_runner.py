@@ -591,3 +591,18 @@ def test_warmup_repeats_must_be_a_non_negative_integer(tmp_path: Path) -> None:
             warmup_repeats=-1,
             training_context_hashes=frozenset(),
         )
+
+
+def test_decision_records_the_warmup_it_excluded(tmp_path: Path) -> None:
+    runner, _, _, _ = _runner(tmp_path, scrapes=_normal_scrapes())
+
+    result = runner.benchmark(
+        tmp_path / "candidate",
+        timeout_seconds=30,
+        should_abort=lambda: False,
+    )
+
+    assert result.decision is not None
+    assert result.decision.warmup_repeats == 1
+    assert result.decision.to_dict()["warmup_repeats"] == 1
+    assert result.decision.to_dict()["num_repeats"] == 3

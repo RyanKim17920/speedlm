@@ -329,6 +329,7 @@ class BenchmarkGateRunner:
                     stock_replay,
                     candidate_replay,
                     self._config.promotion,
+                    warmup_repeats=_warmup_runs(stock_warmup, candidate_warmup),
                 ),
             )
         except BenchmarkAborted as exc:
@@ -459,6 +460,16 @@ def _safe_delta(before: MetricsSnapshot, after: MetricsSnapshot) -> MetricsDelta
             tpot_ms=0.0,
             output_tok_per_sec=0.0,
         )
+
+
+def _warmup_runs(
+    stock: ReplayResult | None,
+    candidate: ReplayResult | None,
+) -> int:
+    """Warmup passes both arms actually completed, as observed."""
+    if stock is None or candidate is None:
+        return 0
+    return min(stock.num_runs, candidate.num_runs)
 
 
 def _warmup_dict(result: ReplayResult | None) -> dict[str, object] | None:

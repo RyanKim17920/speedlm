@@ -984,6 +984,13 @@ def parse_decision(record: Mapping[str, Any], *, source: Path) -> Decision:
         min_acceptance_delta_pp=_require_float(record, "min_acceptance_delta_pp", source),
         min_throughput_delta_pct=_require_float(record, "min_throughput_delta_pct", source),
         num_repeats=_require_int(record, "num_repeats", source),
+        # Optional: decisions written before the gate warmed its arms have no
+        # warmup field, and zero is the truth for those runs.
+        warmup_repeats=(
+            _require_int(record, "warmup_repeats", source)
+            if "warmup_repeats" in record
+            else 0
+        ),
         per_repeat=tuple(per_repeat),
         stock_avg_acceptance=_require_float(record, "stock_avg_acceptance", source),
         candidate_avg_acceptance=_require_float(record, "candidate_avg_acceptance", source),

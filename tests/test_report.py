@@ -37,6 +37,7 @@ def _decision_dict(
     acceptance_delta_pp: float | None = 6.0,
     throughput_delta_pct: float | None = 12.0,
     num_repeats: int = 3,
+    warmup_repeats: int = 1,
     per_repeat: list[dict[str, Any]] | None = None,
     stock_acc: float = 0.62,
     cand_acc: float = 0.68,
@@ -64,6 +65,7 @@ def _decision_dict(
         "min_acceptance_delta_pp": 1.0,
         "min_throughput_delta_pct": 2.0,
         "num_repeats": num_repeats,
+        "warmup_repeats": warmup_repeats,
         "per_repeat": per_repeat,
         "stock_avg_acceptance": stock_acc,
         "candidate_avg_acceptance": cand_acc,
@@ -685,3 +687,13 @@ def test_gain_decision_to_dict_includes_mtime(home: Path) -> None:
     payload = json.loads(build_gain_report(now=1_000.0).to_json())
     assert "source_mtime" in payload
     assert payload["source_mtime"] is not None
+
+
+def test_decision_without_warmup_field_reads_back_as_zero(home: Path) -> None:
+    payload = _decision_dict()
+    del payload["warmup_repeats"]
+    path = _write_decision(home, payload)
+
+    decision = load_decision(path)
+
+    assert decision.warmup_repeats == 0
