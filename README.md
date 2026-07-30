@@ -139,18 +139,23 @@ quantum itself — one accepted token in ~1155, or 0.087 pp. The 1.0 pp default 
 about twelve accepted tokens, a ~2% relative lift in acceptance.
 
 `min_throughput_delta_pct` is a **regression guard**, and is negative on
-purpose: it asks only that the candidate not be visibly slower. Throughput is
-timing, and timing is noisy. Across job 368670's scored repeats the within-arm
-standard deviation was 1.80 tok/s (stock) and 0.58 tok/s (candidate) on a ~76.7
-tok/s mean, giving a 1.43% standard error on the arm-to-arm delta at three
-repeats and 1.10% at the default five. A *positive* throughput bar below the
-one-sided 95% minimum detectable effect (~3.0% at three repeats, ~2.1% at five)
-cannot be earned on merit — it is cleared by whichever way the noise fell. Job
-368670 is the worked example: it measured +0.96%, and the same data reads
-−0.78% if you drop its first scored repeat. −2.0% sits ~1.8 standard errors
-below zero at five repeats, so ordinary jitter does not trip it, while the real
-regression this gate has already caught — job 368648's un-warmed candidate arm
-at −19.2% — is more than sixteen standard errors past it.
+purpose: it asks only that the candidate not be visibly slower. The gate
+compares the **replay** statistic (`replay_per_repeat_mean`), so every number
+below is replay-derived unless labelled Prometheus; the Prometheus decode rate
+is recorded alongside for diagnosis but is not what the gate reads. Throughput
+is timing, and timing is noisy. Across job 368670's scored repeats the
+within-arm replay standard deviation was 1.80 tok/s (stock) and 0.58 tok/s
+(candidate) on a ~76.7 tok/s mean, giving a 1.43% standard error on the
+arm-to-arm delta at three repeats and 1.10% at the default five. A *positive*
+throughput bar below the one-sided 95% minimum detectable effect (~3.0% at three
+repeats, ~2.1% at five) cannot be earned on merit — it is cleared by whichever
+way the noise fell. Job 368670 is the worked example: its replay delta was
++0.96% (the Prometheus delta coincidentally agreed at +0.96%), and the same data
+reads −0.78% if you drop its first scored repeat. −2.0% sits ~1.8 standard
+errors below zero at five repeats, so ordinary jitter does not trip it, while
+the real regression this gate has already caught — job 368648's un-warmed
+candidate arm at −17.5% replay (−19.2% on the Prometheus decode rate) — is
+~16 standard errors past it.
 
 Both values are configurable. Setting them to `0.0` / `0.0` reduces the gate to
 "not measurably worse", which promotes on noise indefinitely; that is the exact

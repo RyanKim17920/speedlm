@@ -239,22 +239,28 @@ class PromotionConfig:
     better head clears it.
 
     ``min_throughput_delta_pct`` is a **regression guard**, deliberately
-    negative.  Throughput *is* timing, and it is noisy: across the three scored
-    repeats of job 368670 the within-arm standard deviation was 1.80 tok/s
-    (stock) and 0.58 tok/s (candidate), pooled 1.34 tok/s on a ~76.7 tok/s
-    mean, giving a standard error on the arm-to-arm delta of 1.43% at three
-    repeats.  The one-sided 95% minimum detectable effect is ~3.0%, so any
-    *positive* threshold below that cannot be earned on merit -- it is cleared
-    by whichever way the timing noise happened to fall.  Job 368670 is the
-    worked example: it measured +0.96% (t=0.67, p~0.28) and would have promoted
-    under the old ``2.0`` bar roughly one run in seven by chance alone; drop its
-    first scored repeat and the same data reads -0.78%.  Requiring throughput to
-    *prove* an improvement is therefore not achievable at this sample size, so
-    the gate instead requires only that throughput not visibly regress.  ``-2.0``
-    sits ~1.8 standard errors below zero at five repeats (SE 1.10%), so ordinary
-    jitter does not trip it, while the real regression this gate has already
-    caught -- the un-warmed candidate arm of job 368648, at -19.2% -- is more
-    than sixteen standard errors past it.
+    negative.  It is applied to the *replay* statistic
+    (``replay_per_repeat_mean``, see ``GATING_THROUGHPUT_STATISTIC``), so every
+    figure quoted below is replay-derived unless explicitly labelled Prometheus;
+    the Prometheus decode rate is recorded alongside it for diagnosis but is not
+    what the gate compares.  Throughput *is* timing, and it is noisy: across the
+    three scored repeats of job 368670 the within-arm **replay** standard
+    deviation was 1.80 tok/s (stock) and 0.58 tok/s (candidate), pooled
+    1.34 tok/s on a ~76.7 tok/s mean, giving a standard error on the arm-to-arm
+    delta of 1.43% at three repeats.  The one-sided 95% minimum detectable
+    effect is ~3.0%, so any *positive* threshold below that cannot be earned on
+    merit -- it is cleared by whichever way the timing noise happened to fall.
+    Job 368670 is the worked example: its **replay** delta was +0.96%
+    (t=0.67, p~0.28) -- the Prometheus delta happened to agree at +0.96% -- and
+    it would have promoted under the old ``2.0`` bar roughly one run in seven by
+    chance alone; drop its first scored repeat and the same data reads -0.78%.
+    Requiring throughput to *prove* an improvement is therefore not achievable
+    at this sample size, so the gate instead requires only that throughput not
+    visibly regress.  ``-2.0`` sits ~1.8 standard errors below zero at five
+    repeats (SE 1.10%), so ordinary jitter does not trip it, while the real
+    regression this gate has already caught -- the un-warmed candidate arm of
+    job 368648, at **-17.5% replay** (-19.2% on the Prometheus decode rate) --
+    is still ~16 standard errors past it.
 
     Both values remain fully configurable via ``promotion`` in ``config.json``;
     these are defaults, not policy.  Note that setting them to ``0.0``/``0.0``
@@ -283,7 +289,7 @@ class IdleTuningConfig:
     held_out_fraction: float = 0.2
     #: Scored suite passes per arm.  Five, not three, because the gate's
     #: throughput regression guard is only as trustworthy as its standard
-    #: error: job 368670's pooled within-arm dispersion of 1.34 tok/s on a
+    #: error: job 368670's pooled within-arm replay dispersion of 1.34 tok/s on a
     #: ~76.7 tok/s mean puts the arm-to-arm standard error at 1.43% over three
     #: repeats but 1.10% over five, which moves the -2.0% guard from 1.4 to 1.8
     #: standard errors clear of zero.  The cost is four extra suite passes per
