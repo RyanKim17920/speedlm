@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from threading import Barrier, Thread
 
 import pytest
 
@@ -11,10 +12,12 @@ from speedlm.gateway.control import (
     VLLM_SLEEP_ENDPOINT,
     VLLM_SLEEP_LEVEL,
     VLLM_WAKE_ENDPOINT,
+    AdmissionGate,
     ControlAborted,
     ControlTimeout,
     RuntimeController,
 )
+from speedlm.tuner.idle import IdleDetector
 from speedlm.tuner.orchestrator import RuntimeController as RuntimeControllerProtocol
 
 
@@ -153,6 +156,65 @@ def quiesce(rig: Rig) -> None:
 def test_controller_implements_tuner_protocol() -> None:
     controller: RuntimeControllerProtocol = make_rig().controller
     assert controller is not None
+
+
+def test_admission_close_and_begin_are_one_atomic_decision() -> None:
+    for _ in range(100):
+        activity = ActivityTracker()
+        admission = AdmissionGate(activity)
+        barrier = Barrier(3)
+        admitted: list[bool] = []
+
+        def close_gate(
+            current_barrier: Barrier = barrier,
+            current_admission: AdmissionGate = admission,
+        ) -> None:
+            current_barrier.wait()
+            current_admission.stop_admitting()
+
+        def begin_request(
+            current_barrier: Barrier = barrier,
+            current_admission: AdmissionGate = admission,
+            results: list[bool] = admitted,
+        ) -> None:
+            current_barrier.wait()
+            results.append(current_admission.try_begin())
+
+        close_thread = Thread(target=close_gate)
+        begin_thread = Thread(target=begin_request)
+        close_thread.start()
+        begin_thread.start()
+        barrier.wait()
+        close_thread.join()
+        begin_thread.join()
+
+        assert admitted in ([False], [True])
+        assert not admission.is_admitting
+        assert activity.in_flight == int(admitted[0])
+        if admitted[0]:
+            activity.end()
+        assert activity.in_flight == 0
+
+
+def test_rejected_request_updates_watermark_and_preempts_idle_guard() -> None:
+    clock = FakeClock()
+    activity = ActivityTracker(clock=clock)
+    admission = AdmissionGate(activity)
+    detector = IdleDetector(
+        activity,
+        threshold_seconds=1.0,
+        clock=clock,
+    )
+    clock.now = 2.0
+    guard = detector.arm()
+    admission.stop_admitting()
+    clock.now = 3.0
+
+    assert not admission.try_begin()
+
+    assert activity.in_flight == 0
+    assert activity.last_activity == 3.0
+    assert guard.is_preempted
 
 
 def test_quiesce_stops_admission_and_waits_for_in_flight_to_reach_zero() -> None:

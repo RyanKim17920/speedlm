@@ -199,7 +199,12 @@ def _runner(
     scrapes: list[str],
     replay: FakeReplayExecutor | None = None,
     trace_source: FakeTraceSource | None = None,
-    training_context_hashes: set[str] | frozenset[str] | None = frozenset(),
+    training_context_hashes: (
+        set[str]
+        | frozenset[str]
+        | Callable[[], set[str] | frozenset[str]]
+        | None
+    ) = frozenset(),
     clock: Callable[[], float] | None = None,
 ) -> tuple[BenchmarkGateRunner, FakeEndpoint, FakeReplayExecutor, FakeTraceSource]:
     endpoint = FakeEndpoint()
@@ -403,3 +408,42 @@ def test_gate_fails_loudly_on_training_suite_overlap(tmp_path: Path) -> None:
 
     assert endpoint.activations == []
     assert replay.calls == 0
+
+
+def test_gate_resolves_callable_training_hashes_for_each_benchmark(
+    tmp_path: Path,
+) -> None:
+    context_hash = FrozenContext.from_trace(_trace()).context_hash
+    current_hashes: set[str] = set()
+    provider_calls = 0
+
+    def training_hashes() -> set[str]:
+        nonlocal provider_calls
+        provider_calls += 1
+        return set(current_hashes)
+
+    runner, endpoint, replay, _ = _runner(
+        tmp_path,
+        scrapes=_normal_scrapes(),
+        training_context_hashes=training_hashes,
+    )
+    assert provider_calls == 0
+
+    first = runner.benchmark(
+        tmp_path / "candidate-a",
+        timeout_seconds=30,
+        should_abort=lambda: False,
+    )
+    current_hashes.add(context_hash)
+
+    with pytest.raises(SuiteError, match="context leakage detected"):
+        runner.benchmark(
+            tmp_path / "candidate-b",
+            timeout_seconds=30,
+            should_abort=lambda: False,
+        )
+
+    assert first.decision is not None
+    assert provider_calls == 2
+    assert endpoint.activations == ["stock", tmp_path / "candidate-a"]
+    assert replay.calls == 2
