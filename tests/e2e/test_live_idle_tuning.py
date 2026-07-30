@@ -201,7 +201,11 @@ def _post_chat(
         "temperature": config.sampling.temperature,
         "top_p": config.sampling.top_p,
         "seed": config.sampling.seed,
-        "max_tokens": 32,
+        # Reasoning models spend their opening tokens on the analysis channel, so
+        # a tight cap truncates every reply mid-thought and never reaches a final
+        # answer. Budget enough room to stop naturally while staying well inside
+        # the tuner's training sequence length.
+        "max_tokens": 512,
     }
     started = time.monotonic()
     response = httpx.post(
@@ -216,6 +220,10 @@ def _post_chat(
     assert isinstance(body, dict), body
     choices = body.get("choices")
     assert isinstance(choices, list) and choices, body
+    assert isinstance(choices[0], dict), body
+    # A truncated reply is unrealistic production traffic and trains the draft on
+    # a sentence the target never finished, so require a natural stop.
+    assert choices[0].get("finish_reason") == "stop", body
     usage = body.get("usage")
     assert isinstance(usage, dict), body
     assert isinstance(usage.get("prompt_tokens"), int) and usage["prompt_tokens"] > 0
