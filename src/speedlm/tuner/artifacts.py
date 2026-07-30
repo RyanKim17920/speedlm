@@ -207,6 +207,13 @@ class ArtifactRegistry:
         committed = False
         try:
             shutil.copytree(source, temp_path, dirs_exist_ok=True, symlinks=False)
+            # copytree's trailing copystat stamps the source's mode onto
+            # temp_path, so a sealed 0555 draft would leave the temp tree
+            # read-only and the manifest sidecar below could never be created.
+            # Restoring owner-write cannot change the artifact ID (mode is not
+            # an input to hash_directory) and cannot change the published
+            # permissions (_make_tree_read_only re-seals before the rename).
+            _make_tree_writable(temp_path)
             copied_hash = hash_directory(temp_path)
             if copied_hash != artifact_id:
                 raise ArtifactError(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import stat
 from pathlib import Path
 
 import pytest
@@ -42,6 +43,21 @@ def test_publish_is_content_addressed_and_promote_is_gate_guarded(tmp_path: Path
 
     assert registry.active() is not None
     assert registry.active().artifact_id == artifact.artifact_id  # type: ignore[union-attr]
+
+
+def test_publish_accepts_a_sealed_read_only_source_tree(tmp_path: Path) -> None:
+    source = _source(tmp_path / "candidate", "sealed")
+    for entry in sorted(source.rglob("*"), reverse=True):
+        entry.chmod(0o555 if entry.is_dir() else 0o444)
+    source.chmod(0o555)
+    registry = ArtifactRegistry(tmp_path / "registry", clock=lambda: 1.0)
+
+    artifact = registry.publish(source, _spec())
+
+    assert artifact.path.is_dir()
+    assert stat.S_IMODE(artifact.path.stat().st_mode) == 0o550
+    assert stat.S_IMODE((artifact.path / "config.json").stat().st_mode) == 0o440
+    assert stat.S_IMODE((artifact.path / "weights").stat().st_mode) == 0o550
 
 
 def test_rollback_restores_previous_active(tmp_path: Path) -> None:
