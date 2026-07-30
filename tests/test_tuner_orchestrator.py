@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 import json
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -26,11 +27,13 @@ from speedlm.tuner.eagle3 import (
 from speedlm.tuner.idle import IdleDetector
 from speedlm.tuner.orchestrator import (
     DECISION_FILE_NAME,
+    METRICS_DIR_NAME,
     CycleOutcome,
     DecisionPersistError,
     GateResult,
     TunerOrchestrator,
     write_decision,
+    write_metrics_bodies,
 )
 from speedlm.tuner.state import TunerState, TunerStateMachine
 
@@ -188,6 +191,7 @@ class FakeRuntime:
 class FakeGate:
     passed: bool
     decision: Decision | None = None
+    metrics_bodies: dict[str, str] = field(default_factory=dict)
 
     def benchmark(
         self,
@@ -199,6 +203,7 @@ class FakeGate:
         return GateResult(
             self.passed,
             "thresholds met" if self.passed else "regression",
+            metrics_bodies=dict(self.metrics_bodies),
             decision=self.decision,
         )
 
@@ -387,6 +392,7 @@ def _orchestrator(
     gate_passed: bool = True,
     backend: SpeculatorBackend | None = None,
     decision: Decision | None = None,
+    metrics_bodies: dict[str, str] | None = None,
     work_root: Path | None = None,
 ) -> tuple[TunerOrchestrator, TunerStateMachine, ArtifactRegistry, FakeRuntime]:
     activity = activity or FakeActivity()
@@ -399,7 +405,7 @@ def _orchestrator(
         backend=backend or FakeBackend(),
         artifacts=artifacts,
         runtime=runtime,
-        gate=FakeGate(gate_passed, decision),
+        gate=FakeGate(gate_passed, decision, metrics_bodies or {}),
         work_root=work_root or (tmp_path / "work"),
         run_id_factory=lambda: "run-1",
     )
@@ -648,3 +654,47 @@ def test_scratch_quota_exceeded(tmp_path: Path) -> None:
         assert exc.used_bytes > exc.quota_bytes
     else:
         raise AssertionError("expected scratch quota failure")
+
+
+def test_gate_metrics_bodies_are_persisted_beside_the_decision(tmp_path: Path) -> None:
+    orchestrator, _, _, _ = _orchestrator(
+        tmp_path,
+        gate_passed=False,
+        decision=_real_decision(promote=False),
+        metrics_bodies={
+            "stock-before": "vllm:generation_tokens_total 1\n",
+            "candidate-after": "vllm:generation_tokens_total 9\n",
+        },
+    )
+
+    result = orchestrator.run_once()
+
+    assert result.decision_path is not None
+    metrics_dir = result.decision_path.parent / METRICS_DIR_NAME
+    assert sorted(path.name for path in metrics_dir.iterdir()) == [
+        "candidate-after.prom.gz",
+        "stock-before.prom.gz",
+    ]
+    body = gzip.decompress((metrics_dir / "stock-before.prom.gz").read_bytes())
+    assert body.decode("utf-8") == "vllm:generation_tokens_total 1\n"
+
+
+def test_gate_metrics_bodies_are_persisted_without_a_decision(tmp_path: Path) -> None:
+    work_root = tmp_path / "work"
+    orchestrator, _, _, _ = _orchestrator(
+        tmp_path,
+        gate_passed=False,
+        decision=None,
+        metrics_bodies={"stock-before": "vllm:generation_tokens_total 1\n"},
+        work_root=work_root,
+    )
+
+    result = orchestrator.run_once()
+
+    assert result.decision_path is None
+    assert (work_root / "run-1" / METRICS_DIR_NAME / "stock-before.prom.gz").is_file()
+
+
+def test_unsafe_metrics_label_is_refused(tmp_path: Path) -> None:
+    with pytest.raises(DecisionPersistError, match="unsafe label"):
+        write_metrics_bodies(tmp_path, {"../escape": "body"})

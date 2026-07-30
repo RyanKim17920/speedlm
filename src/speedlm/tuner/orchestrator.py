@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import gzip
+import re
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -10,7 +12,7 @@ from pathlib import Path
 from typing import Final, Protocol
 
 from speedlm.gate.decide import Decision
-from speedlm.storage import atomic_write_json
+from speedlm.storage import atomic_write_bytes, atomic_write_json
 from speedlm.training.base import SpeculatorBackend
 from speedlm.training.masking import FinalAssistantMaskError
 from speedlm.tuner.artifacts import ArtifactRegistry, ArtifactSpec
@@ -24,6 +26,13 @@ DraftReference = Path | str
 #: :data:`speedlm.report.DECISION_FILE_NAME`, which is what ``speedlm gain``
 #: looks for underneath the runs directory.
 DECISION_FILE_NAME: Final = "decision.json"
+
+#: Directory, inside a run directory, holding the verbatim Prometheus bodies
+#: the gate scraped.  It sits next to ``decision.json`` so a decision and the
+#: evidence behind it are always found together.
+METRICS_DIR_NAME: Final = "gate-metrics"
+
+_SAFE_LABEL: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 
 class DecisionPersistError(RuntimeError):
@@ -86,6 +95,50 @@ def write_decision(run_dir: Path, decision: Decision) -> Path:
     except OSError as exc:
         raise DecisionPersistError(f"cannot write gate decision {path}: {exc}") from exc
     return path
+
+
+def write_metrics_bodies(
+    run_dir: Path,
+    bodies: Mapping[str, str],
+) -> tuple[Path, ...]:
+    """Persist each raw ``/metrics`` body under ``<run_dir>/gate-metrics``.
+
+    Bodies are gzipped: a vLLM exposition is several hundred kilobytes of
+    repetitive text, and keeping it compressed is what makes retaining it on
+    every cycle affordable.
+
+    Raises:
+        DecisionPersistError: If a label is unusable as a file name or a body
+            cannot be written.  Evidence that silently fails to land is the
+            same blindness this write exists to remove.
+    """
+    if not bodies:
+        return ()
+    directory = run_dir / METRICS_DIR_NAME
+    written: list[Path] = []
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise DecisionPersistError(
+            f"cannot create gate metrics directory {directory}: {exc}"
+        ) from exc
+    for label in sorted(bodies):
+        if not _SAFE_LABEL.match(label):
+            raise DecisionPersistError(
+                f"refusing to persist gate metrics under unsafe label {label!r}"
+            )
+        path = directory / f"{label}.prom.gz"
+        try:
+            atomic_write_bytes(
+                path,
+                gzip.compress(bodies[label].encode("utf-8"), mtime=0),
+            )
+        except OSError as exc:
+            raise DecisionPersistError(
+                f"cannot write gate metrics {path}: {exc}"
+            ) from exc
+        written.append(path)
+    return tuple(written)
 
 
 class BenchmarkGate(Protocol):
@@ -369,7 +422,12 @@ class TunerOrchestrator:
         fail-closed — the exception propagates, the cycle rolls back and
         restores serving — because an unrecorded benchmark is exactly the
         blindness this write exists to remove.
+
+        The raw metrics bodies are written first and unconditionally: a
+        benchmark that aborted before producing a decision still scraped
+        counters, and that partial evidence is worth keeping.
         """
+        write_metrics_bodies(run_dir, gate_result.metrics_bodies)
         if gate_result.decision is None:
             return None
         return write_decision(run_dir, gate_result.decision)

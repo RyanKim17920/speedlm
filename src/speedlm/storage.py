@@ -141,6 +141,22 @@ def atomic_write_text(path: Path, text: str) -> None:
         raise
 
 
+def atomic_write_bytes(path: Path, payload: bytes) -> None:
+    """Atomically write *payload* to *path* via same-dir tmp + rename."""
+    tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
+    try:
+        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(str(tmp), str(path))
+    except BaseException:
+        with contextlib.suppress(OSError):
+            tmp.unlink(missing_ok=True)
+        raise
+
+
 def atomic_write_json(path: Path, obj: object) -> None:
     """Serialize *obj* to pretty JSON and write atomically."""
     text = json.dumps(obj, indent=2, sort_keys=True) + "\n"
