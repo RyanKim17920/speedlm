@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import builtins
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -437,17 +438,71 @@ def test_an_unconfigured_verifier_revision_is_resolved_once() -> None:
     assert seen == ["acme/verifier"]
 
 
-def test_an_unresolvable_verifier_revision_fails_closed() -> None:
+def test_an_unresolvable_verifier_revision_degrades_to_unpinned() -> None:
+    """Pinning is provenance, not a precondition; it must not block startup."""
+
     def resolver(_model: str) -> str:
         raise ConnectionError("hub unreachable")
 
-    with pytest.raises(ProductionTuningError, match="cannot resolve a revision"):
-        resolve_verifier_revision("acme/verifier", None, resolver=resolver)
+    assert resolve_verifier_revision("acme/verifier", None, resolver=resolver) is None
 
 
-def test_an_empty_verifier_revision_fails_closed() -> None:
-    with pytest.raises(ProductionTuningError, match="empty revision"):
+def test_an_empty_verifier_revision_degrades_to_unpinned() -> None:
+    assert (
         resolve_verifier_revision("acme/verifier", None, resolver=lambda _model: "")
+        is None
+    )
+
+
+def test_resolution_prefers_the_local_hub_cache_over_the_hub(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    refs = (
+        tmp_path / "hub" / "models--openai--gpt-oss-20b" / "refs"
+    )
+    refs.mkdir(parents=True)
+    (refs / "main").write_text(
+        "6cee5e81ee83917806bbde320786a8fb61efebee\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    monkeypatch.setattr(
+        composition,
+        "_hub_revision",
+        lambda _model: pytest.fail("must not query the Hub when the cache answers"),
+    )
+
+    assert (
+        resolve_verifier_revision("openai/gpt-oss-20b", None)
+        == "6cee5e81ee83917806bbde320786a8fb61efebee"
+    )
+
+
+def test_composition_starts_when_huggingface_hub_is_unimportable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The heavy stack is installed out-of-band and may simply be absent.
+
+    Reproduces job 368708: ``No module named 'huggingface_hub'`` on the
+    startup path turned an undeclared dependency into a refusal to serve.
+    """
+    monkeypatch.setenv("HF_HOME", str(tmp_path))
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    monkeypatch.setattr(
+        composition.Path, "home", classmethod(lambda _cls: tmp_path / "nowhere")
+    )
+    real_import = builtins.__import__
+
+    def blocked(name: str, *args: object, **kwargs: object) -> object:
+        if name == "huggingface_hub" or name.startswith("huggingface_hub."):
+            raise ImportError("No module named 'huggingface_hub'")
+        return real_import(name, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(builtins, "__import__", blocked)
+
+    assert resolve_verifier_revision("openai/gpt-oss-20b", None) is None
 
 
 def test_a_local_verifier_path_is_its_own_pin(tmp_path: Path) -> None:

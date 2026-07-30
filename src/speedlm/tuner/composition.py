@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
+import os
 from collections.abc import Callable, Sequence
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass
@@ -40,6 +42,8 @@ from speedlm.tuner.artifacts import ArtifactRegistry
 from speedlm.tuner.service import TunerService, create_tuner_service
 from speedlm.tuner.state import TunerStateMachine
 
+logger = logging.getLogger(__name__)
+
 DraftReference = Path | str
 AbortCheck = Callable[[], bool]
 
@@ -52,9 +56,9 @@ def resolve_verifier_revision(
     verifier_model: str,
     configured: str | None,
     *,
-    resolver: Callable[[str], str] | None = None,
+    resolver: Callable[[str], str | None] | None = None,
 ) -> str | None:
-    """Return the immutable revision the cycle must pin the verifier to.
+    """Return the immutable revision to pin the verifier to, or ``None``.
 
     Nothing pinned the verifier before this: the pipeline left
     ``verifier_revision`` at ``None`` and the backend passed the bare model
@@ -62,42 +66,102 @@ def resolve_verifier_revision(
     trained and what it was benchmarked against, with no artifact field that
     would show it had happened.
 
-    Resolution is fail-closed.  An unpinnable verifier is an unreproducible
-    cycle, and a cycle that cannot be reproduced cannot justify promoting a
-    draft, so composition refuses to start rather than training against a
-    moving target.  The one exception is a verifier given as a local
-    filesystem path: there is no Hub revision to resolve, and the path is the
-    pin.
+    Resolution is *best effort*, deliberately.  Pinning is a reproducibility
+    improvement, not a safety-critical precondition, so it must never be able
+    to stop the service from starting.  An unresolvable revision costs one
+    provenance field -- recorded as a null ``verifier_revision`` in the
+    artifact manifest, so a reader can see the cycle was unpinned rather than
+    assume it was pinned -- and nothing else.
+
+    Resolution prefers the local Hub cache over any network call.  The cache
+    ref is authoritative for what this host will actually load, it is readable
+    without importing ``huggingface_hub`` (which is part of the out-of-band GPU
+    stack, not a declared dependency of this wrapper), and it works under
+    ``HF_HUB_OFFLINE``.  A Hub lookup is only the fallback, and is imported
+    lazily so a host without the heavy stack still starts.  A verifier given
+    as a local filesystem path is exempt: the path is its own pin.
 
     Args:
         verifier_model: Hub repo id or local path from the resolved profile.
         configured: ``tuning.verifier_revision``, when the operator pinned one
             explicitly -- for example to reproduce an archived run.
-        resolver: Seam for tests; defaults to a Hub metadata lookup.
+        resolver: Seam for tests; defaults to cache-first resolution.
     """
     if configured is not None:
         return configured
     if Path(verifier_model).exists():
         return None
-    lookup = resolver if resolver is not None else _hub_revision
+    lookup = resolver if resolver is not None else _resolve_revision
     try:
         revision = lookup(verifier_model)
-    except Exception as exc:
-        raise ProductionTuningError(
-            f"cannot resolve a revision for verifier {verifier_model!r}: {exc}; "
-            "set tuning.verifier_revision to pin it explicitly"
-        ) from exc
-    if not isinstance(revision, str) or not revision:
-        raise ProductionTuningError(
-            f"verifier {verifier_model!r} resolved to an empty revision; "
-            "set tuning.verifier_revision to pin it explicitly"
+    except Exception:
+        logger.warning(
+            "could not resolve a revision for verifier %r; the cycle will run "
+            "unpinned and the manifest will record a null verifier_revision",
+            verifier_model,
+            exc_info=True,
         )
+        return None
+    if not isinstance(revision, str) or not revision:
+        logger.warning(
+            "verifier %r resolved to no revision; the cycle will run unpinned "
+            "and the manifest will record a null verifier_revision",
+            verifier_model,
+        )
+        return None
+    logger.info("pinned verifier %r to revision %s", verifier_model, revision)
     return revision
 
 
-def _hub_revision(verifier_model: str) -> str:
-    from huggingface_hub import HfApi  # type: ignore[import-not-found]
+def _resolve_revision(verifier_model: str) -> str | None:
+    """Resolve from the local Hub cache first, then fall back to the Hub."""
+    cached = cached_hub_revision(verifier_model)
+    if cached is not None:
+        return cached
+    return _hub_revision(verifier_model)
 
+
+def cached_hub_revision(repo_id: str, *, ref: str = "main") -> str | None:
+    """Return the commit a locally cached Hub ref points at, if any.
+
+    This reads ``<cache>/models--<org>--<name>/refs/<ref>`` directly rather
+    than calling into ``huggingface_hub``.  The layout is the on-disk contract
+    every cached download already writes, and reading it keeps the startup
+    path free of an undeclared import.
+    """
+    folder = "models--" + repo_id.replace("/", "--")
+    for root in _hub_cache_roots():
+        try:
+            revision = (root / folder / "refs" / ref).read_text(
+                encoding="utf-8"
+            ).strip()
+        except OSError:
+            continue
+        if revision:
+            return revision
+    return None
+
+
+def _hub_cache_roots() -> tuple[Path, ...]:
+    roots: list[Path] = []
+    hub_cache = os.environ.get("HF_HUB_CACHE")
+    if hub_cache:
+        roots.append(Path(hub_cache))
+    hf_home = os.environ.get("HF_HOME")
+    if hf_home:
+        roots.append(Path(hf_home) / "hub")
+    roots.append(Path.home() / ".cache" / "huggingface" / "hub")
+    return tuple(roots)
+
+
+def _hub_revision(verifier_model: str) -> str | None:
+    try:
+        from huggingface_hub import HfApi  # type: ignore[import-not-found]
+    except ImportError:
+        # The heavy runtime stack is installed out-of-band on the GPU host and
+        # is deliberately not a declared dependency (see pyproject.toml), so
+        # its absence is an ordinary configuration, not a startup failure.
+        return None
     return str(HfApi().model_info(verifier_model).sha)
 
 
@@ -432,5 +496,7 @@ __all__ = [
     "ProductionTuningError",
     "TuningLaunchPlan",
     "build_tuning_launch_plan",
+    "cached_hub_revision",
     "create_production_tuner",
+    "resolve_verifier_revision",
 ]
