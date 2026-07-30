@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Sequence
 from contextlib import asynccontextmanager
 
 import httpx
@@ -29,6 +29,7 @@ def create_app(
     capture_body_limit: int | None = None,
     relay_queue_chunks: int | None = None,
     detached_drain_timeout: float | None = None,
+    before_shutdown: Callable[[], Awaitable[None]] | None = None,
 ) -> FastAPI:
     """Create a fail-closed gateway using exactly one long-lived HTTP client."""
     tracker = activity or ActivityTracker()
@@ -77,13 +78,17 @@ def create_app(
                 await ledger.arecover_incomplete()
             yield
         finally:
-            await proxy.aclose()
-            if capture is not None:
-                await capture.aclose()
-            if owns_client:
-                await client.aclose()
-            if ledger is not None:
-                await ledger.aclose()
+            try:
+                if before_shutdown is not None:
+                    await before_shutdown()
+            finally:
+                await proxy.aclose()
+                if capture is not None:
+                    await capture.aclose()
+                if owns_client:
+                    await client.aclose()
+                if ledger is not None:
+                    await ledger.aclose()
 
     app = FastAPI(
         docs_url=None,

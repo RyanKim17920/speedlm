@@ -377,8 +377,14 @@ class GatewayProxy:
     async def handle(self, request: Request) -> Response:
         activity_started = False
         if self._admission is not None:
-            if not self._admission.try_begin():
-                await self._admission.wait_to_begin()
+            if (
+                not self._admission.try_begin()
+                and not await self._admission.wait_to_begin()
+            ):
+                return PlainTextResponse(
+                    "Gateway shutting down",
+                    status_code=503,
+                )
             activity_started = True
         path = request.url.path
         if not _is_allowed_path(path, method=request.method):

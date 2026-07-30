@@ -7,6 +7,7 @@ import contextlib
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
+from threading import Lock
 from typing import Final, Protocol
 
 from speedlm.gateway.activity import ActivityTracker
@@ -98,25 +99,47 @@ class AdmissionGate:
 
     def __init__(self, activity: ActivityTracker) -> None:
         self._activity = activity
+        self._lock = Lock()
+        self._closed = False
 
     @property
     def is_admitting(self) -> bool:
-        return self._activity.is_admitting
+        with self._lock:
+            return not self._closed and self._activity.is_admitting
+
+    @property
+    def is_closed(self) -> bool:
+        with self._lock:
+            return self._closed
 
     def try_begin(self) -> bool:
-        return self._activity.try_begin()
+        with self._lock:
+            return not self._closed and self._activity.try_begin()
 
-    async def wait_to_begin(self, *, poll_interval_seconds: float = 0.01) -> None:
-        """Signal preemption, then wait transparently until serving reopens."""
+    async def wait_to_begin(self, *, poll_interval_seconds: float = 0.01) -> bool:
+        """Wait for normal reopening, or return false after terminal shutdown."""
         _validate_timeout(poll_interval_seconds, name="admission poll interval")
-        while not self.try_begin():
+        while True:
+            if self.try_begin():
+                return True
+            if self.is_closed:
+                return False
             await asyncio.sleep(poll_interval_seconds)
 
     def stop_admitting(self) -> None:
-        self._activity.stop_admitting()
+        with self._lock:
+            self._activity.stop_admitting()
 
     def start_admitting(self) -> None:
-        self._activity.start_admitting()
+        with self._lock:
+            if not self._closed:
+                self._activity.start_admitting()
+
+    def close(self) -> None:
+        """Permanently reject queued/new requests during gateway shutdown."""
+        with self._lock:
+            self._closed = True
+            self._activity.stop_admitting()
 
 
 class _Deadline:

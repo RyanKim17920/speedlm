@@ -390,6 +390,32 @@ def test_non_streaming_passthrough_preserves_body_and_status(tmp_path: Path) -> 
     asyncio.run(scenario())
 
 
+def test_lifespan_runs_tuner_shutdown_before_proxy_capture_cleanup() -> None:
+    async def scenario() -> None:
+        events: list[str] = []
+
+        async def before_shutdown() -> None:
+            events.append("tuner.stopped")
+
+        app = create_app(
+            "http://upstream",
+            before_shutdown=before_shutdown,
+        )
+        original_close = app.state.proxy.aclose
+
+        async def tracked_close() -> None:
+            events.append("proxy.closed")
+            await original_close()
+
+        app.state.proxy.aclose = tracked_close
+        async with app.router.lifespan_context(app):
+            pass
+
+        assert events == ["tuner.stopped", "proxy.closed"]
+
+    asyncio.run(scenario())
+
+
 def test_streaming_passes_early_chunk_before_upstream_finishes() -> None:
     async def scenario() -> None:
         client, upstream, state, gateway = await _clients()
