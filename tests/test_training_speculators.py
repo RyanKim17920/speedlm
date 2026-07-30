@@ -9,6 +9,7 @@ import pytest
 
 from speedlm.training.backends.eagle3 import (
     Eagle3Backend,
+    EmptySpeculatorsDatasetError,
     FinalAssistantMaskError,
     ScratchQuotaExceeded,
     SpeculatorsPipelineConfig,
@@ -142,10 +143,13 @@ def _backend(
     runner: _FakeRunner,
     *,
     should_be_healthy: bool = True,
+    records: Sequence[Mapping[str, object]] | None = None,
 ) -> tuple[Eagle3Backend, Path]:
     traces = tmp_path / "traces.jsonl"
+    if records is None:
+        records = [{"messages": [{"role": "assistant", "content": "ok"}]}]
     traces.write_text(
-        json.dumps({"messages": [{"role": "assistant", "content": "ok"}]}) + "\n",
+        "".join(json.dumps(record) + "\n" for record in records),
         encoding="utf-8",
     )
     backend = Eagle3Backend.from_speculators(
@@ -180,7 +184,7 @@ def test_pipeline_uses_exact_stage_argv_and_separate_draft(
             "--model",
             pipeline.verifier_model,
             "--data",
-            str(prepared.snapshot.path),
+            str(work / "speculators-conversations.jsonl"),
             "--output",
             str(work / "training-rows"),
             "--seq-length",
@@ -546,3 +550,120 @@ def test_local_warm_start_is_pinned_with_resolved_verifier(
     value = json.loads((pinned / "config.json").read_text(encoding="utf-8"))
     assert value["speculators_config"]["verifier"]["name_or_path"] == str(verifier)
     assert (pinned / "model.safetensors").is_symlink()
+
+
+def _rendered(work: Path) -> list[dict[str, object]]:
+    text = (work / "speculators-conversations.jsonl").read_text(encoding="utf-8")
+    return [json.loads(line) for line in text.splitlines() if line.strip()]
+
+
+def test_prepare_renders_top_level_conversations_instead_of_messages(
+    tmp_path: Path,
+    pipeline: SpeculatorsPipelineConfig,
+) -> None:
+    runner = _FakeRunner()
+    backend, work = _backend(
+        tmp_path,
+        pipeline,
+        runner,
+        records=[
+            {
+                "id": "trace-1",
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "ok"},
+                ],
+            }
+        ],
+    )
+
+    backend.prepare(work, should_abort=lambda: False)
+
+    rendered = _rendered(work)
+    assert [record["id"] for record in rendered] == ["trace-1"]
+    assert "messages" not in rendered[0]
+    assert rendered[0]["conversations"] == [
+        {"role": "user", "content": "hi"},
+        {"role": "assistant", "content": "ok"},
+    ]
+
+
+def test_prepare_preserves_tools_tool_calls_and_reasoning(
+    tmp_path: Path,
+    pipeline: SpeculatorsPipelineConfig,
+) -> None:
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "description": "look something up",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        }
+    ]
+    tool_calls = [
+        {
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": "lookup", "arguments": '{"query": "x"}'},
+        }
+    ]
+    runner = _FakeRunner()
+    backend, work = _backend(
+        tmp_path,
+        pipeline,
+        runner,
+        records=[
+            {
+                "id": "trace-2",
+                "tools": tools,
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "look it up"}]},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "reasoning_content": "consider the tool",
+                        "tool_calls": tool_calls,
+                    },
+                    {"role": "tool", "tool_call_id": "call-1", "content": "found"},
+                    {"role": "assistant", "content": "done"},
+                ],
+            }
+        ],
+    )
+
+    backend.prepare(work, should_abort=lambda: False)
+
+    record = _rendered(work)[0]
+    assert record["tools"] == tools
+    turns = record["conversations"]
+    assert turns[0]["content"] == "look it up"
+    assert turns[1]["tool_calls"] == tool_calls
+    assert turns[1]["thinking"] == "consider the tool"
+    assert turns[1]["reasoning_content"] == "consider the tool"
+    assert turns[2] == {"role": "tool", "content": "found", "tool_call_id": "call-1"}
+
+
+def test_prepare_without_convertible_records_raises_named_error(
+    tmp_path: Path,
+    pipeline: SpeculatorsPipelineConfig,
+) -> None:
+    runner = _FakeRunner()
+    backend, work = _backend(
+        tmp_path,
+        pipeline,
+        runner,
+        records=[
+            {"id": "trace-3", "messages": [{"role": "user", "content": "hi"}]},
+            {"id": "trace-4", "messages": []},
+        ],
+    )
+
+    with pytest.raises(EmptySpeculatorsDatasetError) as raised:
+        backend.prepare(work, should_abort=lambda: False)
+
+    assert raised.value.source.name == "traces.jsonl"
+    assert "Speculators conversation" in str(raised.value)
+    assert not (work / "speculators-conversations.jsonl").exists()
+    assert not runner.run_calls
