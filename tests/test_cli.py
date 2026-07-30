@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import logging
 import signal
 from collections.abc import Sequence
 from pathlib import Path
@@ -759,3 +760,26 @@ def test_traces_import_mixed_token_sources_and_proxy_capture(
         line for line in out.splitlines() if line.startswith("estimated:")
     )
     assert int(estimated_line.split(":", 1)[1]) > 0
+
+
+def test_the_package_logger_is_raised_to_info(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Our own INFO records are the only account of a background cycle.
+
+    basicConfig pins the root at WARNING so vLLM's thousands of INFO lines
+    stay out, but that silently discarded ours too -- the leased/buffered
+    counts, the retention pass and the pinned revision never reached the run
+    artifacts, so landed features could not be confirmed from a run.
+    """
+    monkeypatch.setenv("SPEEDLM_HOME", str(tmp_path))
+    logging.getLogger("speedlm").setLevel(logging.NOTSET)
+
+    main(["traces", "stats"])
+
+    assert logging.getLogger("speedlm").level == logging.INFO
+    assert logging.getLogger().level == logging.WARNING
+    assert logging.getLogger("speedlm.training.split").isEnabledFor(logging.INFO)
+    assert logging.getLogger("speedlm.tuner.service").isEnabledFor(logging.INFO)
+    assert not logging.getLogger("vllm").isEnabledFor(logging.INFO)

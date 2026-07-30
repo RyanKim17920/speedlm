@@ -911,6 +911,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         format="[speedlm] %(levelname)s: %(message)s",
         force=True,
     )
+    # WARNING is the right default for the libraries we sit on top of -- vLLM
+    # alone is thousands of INFO lines -- but it silently discarded our own.
+    # The whole package emits six INFO records, and they are the only account
+    # of what a background tuning cycle did: which revision it pinned, how
+    # many records it leased out of how many exist, how a cycle ended, and
+    # whether retention ran.  None of that reached the run artifacts, so
+    # landed features could not be confirmed from a run.
+    logging.getLogger("speedlm").setLevel(logging.INFO)
     parser = _build_parser()
 
     if argv is None:
