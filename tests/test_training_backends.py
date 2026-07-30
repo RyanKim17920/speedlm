@@ -124,13 +124,14 @@ def _pipeline(tmp_path: Path) -> SpeculatorsPipelineConfig:
 class _CapturingRunner:
     def __init__(self) -> None:
         self.argv: tuple[str, ...] = ()
+        self.stdout = "/data/hf-cache/hub/models--openai--gpt-oss-20b/snapshots/abc\n"
 
     def run(self, argv: Sequence[str], **_kwargs: object) -> ProcessResult:
         self.argv = tuple(argv)
         return ProcessResult(
             argv=tuple(argv),
             returncode=0,
-            stdout="/data/hf-cache/hub/models--openai--gpt-oss-20b/snapshots/abc\n",
+            stdout=self.stdout,
             stderr="",
         )
 
@@ -215,16 +216,27 @@ def test_a_pinned_revision_resolves_the_partial_offline_cache(tmp_path: Path) ->
     ]
 
 
-def test_a_pinned_revision_is_never_stricter_than_the_unpinned_path() -> None:
-    """Reproduces job 368710: the pin alone raised IncompleteSnapshotError.
+def test_an_unsatisfiable_pin_reports_unresolved_rather_than_redownloading() -> None:
+    """Reproduces job 368719: revision=None is not the unpinned path.
 
-    Whatever the pinned call rejects, the unpinned call must still be tried --
-    a pin is provenance, and it must not shrink the set of caches that load.
+    The unpinned path never called snapshot_download at all, so retrying with
+    revision=None does not reproduce it -- the completeness check still runs,
+    against main.  Resolution must instead say it could not satisfy the pin.
     """
     path, calls = _run_resolve_script(
         ["-", "openai/gpt-oss-20b", "6cee5e81", "*.json"],
         incomplete_for_revision=True,
     )
 
-    assert path == "/data/hf-cache/hub/snapshots/resolved"
-    assert [call["revision"] for call in calls] == ["6cee5e81", None]
+    assert path == "SPEEDLM_UNRESOLVED"
+    assert [call["revision"] for call in calls] == ["6cee5e81"]
+
+
+def test_an_unsatisfiable_pin_falls_back_to_the_bare_repo_id(tmp_path: Path) -> None:
+    """A pin must not stop a cycle the unpinned path would have run."""
+    pipeline = _pipeline(tmp_path)
+    runner = _CapturingRunner()
+    runner.stdout = "SPEEDLM_UNRESOLVED\n"
+    resolver = _Resolver(pipeline, runner, _State())
+
+    assert resolver.verifier(lambda: False, tmp_path) == "openai/gpt-oss-20b"

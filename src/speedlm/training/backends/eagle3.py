@@ -93,9 +93,20 @@ _ROW_ID = re.compile(
 #: IncompleteSnapshotError (job 368710).
 #:
 #: ``allow_patterns`` narrows completeness to the files training actually
-#: reads, and the fallback drops to the unpinned call so a pinned cycle can
-#: never resolve *less* than an unpinned one would.
-_RESOLVE_MODEL = """
+#: reads.  It is a real narrowing but not a guarantee: huggingface_hub matches
+#: patterns with ``fnmatch``, whose ``*`` crosses ``/``, so ``*.json`` also
+#: claims ``original/config.json`` in an auxiliary directory a minimal cache
+#: never pulled (job 368719).
+#:
+#: The guarantee is the fallback, and it is *not* another download.  The
+#: unpinned path never called ``snapshot_download`` at all -- it handed the
+#: bare repo id downstream and let the loader resolve it -- so an unpinned
+#: call cannot be reproduced by passing ``revision=None``, which still runs
+#: the completeness check against ``main``.  When the cache cannot satisfy the
+#: pin, resolution reports that and the caller falls back to exactly what an
+#: unpinned cycle did.
+_UNRESOLVED_SNAPSHOT = "SPEEDLM_UNRESOLVED"
+_RESOLVE_MODEL = f"""
 import sys
 from huggingface_hub import snapshot_download
 from huggingface_hub.errors import IncompleteSnapshotError
@@ -105,8 +116,8 @@ patterns = sys.argv[3:] or None
 try:
     path = snapshot_download(repo_id=repo, revision=revision, allow_patterns=patterns)
 except IncompleteSnapshotError as error:
-    print(f"SPEEDLM_INCOMPLETE_SNAPSHOT={error}", file=sys.stderr)
-    path = snapshot_download(repo_id=repo)
+    print(f"SPEEDLM_INCOMPLETE_SNAPSHOT={{error}}", file=sys.stderr)
+    path = "{_UNRESOLVED_SNAPSHOT}"
 print(path)
 """.strip()
 _AUDIT_MASKS = """
@@ -358,7 +369,22 @@ class _Resolver:
         paths = [line.strip() for line in result.stdout.splitlines() if line.strip()]
         if not paths:
             raise TrainingError(f"{stage} returned no snapshot path", stderr=result.stderr)
-        return paths[-1]
+        resolved = paths[-1]
+        if resolved == _UNRESOLVED_SNAPSHOT:
+            # The pin could not be satisfied from the cache.  Degrade to the
+            # pre-pin behaviour -- hand the bare repo id downstream and let the
+            # loader resolve it, which is what a cycle did before revisions
+            # were pinned at all.  A pin is provenance; it must not be able to
+            # stop a cycle the unpinned path would have run.
+            logger.warning(
+                "%s could not satisfy revision %s from the cache; continuing "
+                "unpinned with %r",
+                stage,
+                revision,
+                model,
+            )
+            return model
+        return resolved
 
 
 class FilesystemTraceSnapshotLeaser:
