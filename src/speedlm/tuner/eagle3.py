@@ -296,10 +296,14 @@ class Eagle3Adapter:
         names the verifier but not *which* verifier, and a cycle trained
         against a silently updated upstream model is indistinguishable from
         one that was not.
+
+        The field is always present, null included.  Resolution is best
+        effort, so an absent key would be ambiguous between "this build does
+        not record revisions" and "this cycle could not be pinned"; an
+        explicit null says the cycle ran unpinned and says it in the artifact.
         """
         params = dict(self.config.training_params)
-        if self.config.verifier_revision is not None:
-            params["verifier_revision"] = self.config.verifier_revision
+        params["verifier_revision"] = self.config.verifier_revision
         return BackendInfo(
             verifier_model=self.config.verifier_model,
             draft_model=self.config.draft_model,

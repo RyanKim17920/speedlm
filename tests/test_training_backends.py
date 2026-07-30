@@ -83,8 +83,12 @@ def test_describe_carries_the_pinned_verifier_revision_into_the_manifest() -> No
     assert info.training_params["epochs"] == 1
 
 
-def test_describe_omits_the_revision_when_the_verifier_is_a_local_path() -> None:
+def test_describe_records_an_unresolved_revision_as_null() -> None:
+    """An absent key cannot be told apart from an unpinned cycle; null can."""
     backend = object.__new__(Eagle3Backend)
     backend.config = Eagle3Config(mask_policy=MaskPolicy.FINAL_TURN_ALL_CHANNELS)
 
-    assert "verifier_revision" not in backend.describe().training_params
+    params = backend.describe().training_params
+
+    assert "verifier_revision" in params
+    assert params["verifier_revision"] is None
