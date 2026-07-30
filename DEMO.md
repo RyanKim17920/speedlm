@@ -303,7 +303,16 @@ Then the design point: the gate is **fail-closed**. It rejects on unavailable ac
 counters, on a vLLM counter reset mid-window, on invalid responses (>10%), on any output
 mismatch between arms, on fewer than 3 repeats, and on either threshold being missed. Only
 `both_thresholds_met` promotes. Defaults: `min_acceptance_delta_pp = 1.0`,
-`min_throughput_delta_pct = 2.0`.
+`min_throughput_delta_pct = -2.0`.
+
+Those two are not symmetric and that is deliberate. Acceptance is the promotion
+criterion — it is measured off deterministic counters with no timing component,
+so its noise floor is one accepted token in ~1155 (0.087 pp) and a 1.0 pp bar is
+a real, resolvable lift. Throughput is a regression guard, negative on purpose:
+the arm-to-arm standard error is ~1.1% at five repeats, so demanding a *positive*
+throughput delta smaller than the ~2.1% detection limit would mean promoting
+whenever the noise happened to fall the right way. See README's *Promotion
+thresholds* for the full derivation.
 
 ---
 

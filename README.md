@@ -33,8 +33,9 @@ by a particular deployment. The tuner explicitly refuses a missing
 - **Gate** — a frozen held-out suite is replayed against the stock and candidate
   drafts. The decision is fail-closed: unavailable acceptance metrics, counter
   resets, invalid responses, output mismatches, or either improvement threshold
-  being missed all reject the candidate. Only a candidate with improved
-  acceptance and throughput is promoted.
+  being missed all reject the candidate. Only a candidate with **measurably
+  improved acceptance** and no throughput regression is promoted — see
+  [Promotion thresholds](#promotion-thresholds).
 - **Doctor** — `speedlm.doctor` implements read-only checks for Python, GPU,
   CUDA, pinned packages, disk, memory, and verifier/draft compatibility, and
   produces an execution plan.
@@ -112,6 +113,54 @@ Custom profiles live in `$SPEEDLM_HOME/profiles`; production composition is
 selected by speculative method, not by model name. EAGLE-3 is the first
 production-wired training method. Native MTP remains fail-closed until its
 training and artifact contract is validated.
+
+### Promotion thresholds
+
+```json
+{
+  "promotion": {
+    "min_acceptance_delta_pp": 1.0,
+    "min_throughput_delta_pct": -2.0
+  }
+}
+```
+
+The two knobs are not symmetric, and the defaults are derived from the measured
+dispersion of live gate runs rather than picked round.
+
+`min_acceptance_delta_pp` is the **promotion criterion**. Raising draft
+acceptance is the entire point of idle tuning, so a candidate that does not
+measurably improve acceptance is not worth shipping however good its clock
+looks. Acceptance comes from vLLM's `spec_decode` counters over a deterministic
+greedy replay of a frozen suite, so it carries no timing component: on job
+368670 the two arms produced byte-identical counters (1155 drafted, 730
+accepted, delta exactly 0.0 pp). The noise floor is therefore the counter
+quantum itself — one accepted token in ~1155, or 0.087 pp. The 1.0 pp default is
+about twelve accepted tokens, a ~2% relative lift in acceptance.
+
+`min_throughput_delta_pct` is a **regression guard**, and is negative on
+purpose: it asks only that the candidate not be visibly slower. Throughput is
+timing, and timing is noisy. Across job 368670's scored repeats the within-arm
+standard deviation was 1.80 tok/s (stock) and 0.58 tok/s (candidate) on a ~76.7
+tok/s mean, giving a 1.43% standard error on the arm-to-arm delta at three
+repeats and 1.10% at the default five. A *positive* throughput bar below the
+one-sided 95% minimum detectable effect (~3.0% at three repeats, ~2.1% at five)
+cannot be earned on merit — it is cleared by whichever way the noise fell. Job
+368670 is the worked example: it measured +0.96%, and the same data reads
+−0.78% if you drop its first scored repeat. −2.0% sits ~1.8 standard errors
+below zero at five repeats, so ordinary jitter does not trip it, while the real
+regression this gate has already caught — job 368648's un-warmed candidate arm
+at −19.2% — is more than sixteen standard errors past it.
+
+Both values are configurable. Setting them to `0.0` / `0.0` reduces the gate to
+"not measurably worse", which promotes on noise indefinitely; that is the exact
+failure mode this gate exists to prevent, and it is not a supported production
+configuration.
+
+`benchmark_repeats` defaults to 5 (floor 3). Each extra repeat is one more
+held-out suite pass per arm — roughly 8s each on job 368670's hardware, against
+a ~275s benchmark phase dominated by vLLM engine restarts — so precision here
+is cheap.
 
 The managed child is launched with vLLM sleep support on a private loopback
 port. Once the gateway is idle, it atomically closes admission, drains accepted
