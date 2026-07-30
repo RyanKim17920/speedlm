@@ -265,9 +265,12 @@ def test_pipeline_uses_exact_stage_argv_and_separate_draft(
             "3",
             "9",
             "15",
+            "--no-include-last-layer",
             "--",
             "--port",
             "8123",
+            "--max-model-len",
+            "4096",
             "--max-num-seqs",
             "1",
             "--enforce-eager",
@@ -289,6 +292,38 @@ def test_pipeline_uses_exact_stage_argv_and_separate_draft(
     assert draft != trained.checkpoint_best
     assert not (draft / "optimizer_state_dict.pt").exists()
     assert runner.started[0].terminated == 1
+
+
+def test_hidden_state_server_caps_context_at_configured_sequence_length(
+    tmp_path: Path,
+    pipeline: SpeculatorsPipelineConfig,
+) -> None:
+    pipeline = replace(pipeline, sequence_length=2048)
+    runner = _FakeRunner()
+    backend, work = _backend(tmp_path, pipeline, runner)
+
+    prepared = backend.prepare(work, should_abort=lambda: False)
+    backend.extract(prepared, work, should_abort=lambda: False)
+
+    argv = runner.start_calls[0]
+    assert argv[argv.index("--max-model-len") + 1] == "2048"
+
+
+def test_hidden_state_server_emits_only_the_configured_layers(
+    tmp_path: Path,
+    pipeline: SpeculatorsPipelineConfig,
+) -> None:
+    pipeline = replace(pipeline, target_layer_ids=(1, 4, 8))
+    runner = _FakeRunner()
+    backend, work = _backend(tmp_path, pipeline, runner)
+
+    prepared = backend.prepare(work, should_abort=lambda: False)
+    backend.extract(prepared, work, should_abort=lambda: False)
+
+    argv = runner.start_calls[0]
+    separator = argv.index("--")
+    start = argv.index("--target-layer-ids")
+    assert argv[start + 1 : separator] == ("1", "4", "8", "--no-include-last-layer")
 
 
 def test_failing_stage_raises_typed_error_with_actual_stderr(
