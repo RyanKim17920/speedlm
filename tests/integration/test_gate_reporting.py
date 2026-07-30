@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gzip
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -179,7 +180,8 @@ class _Replay:
     ) -> ReplayResult:
         assert endpoint_url == "http://fake-endpoint"
         assert sampling == SamplingConfig()
-        assert repeats == 3
+        # One unscored warmup pass per arm, then the scored repeats.
+        assert repeats in (1, 3)
         assert timeout_seconds > 0 and not should_abort()
         request = RequestResult(
             context_hash=suite.contexts[0].context_hash,
@@ -296,3 +298,15 @@ def test_gate_decision_persistence_is_reported_as_measured_gain(
     assert report.source_path == result.decision_path
     assert "not measured" not in rendered
     assert "tok/s" in rendered
+
+    # The evidence behind the reported rates lands next to the decision, so the
+    # numbers stay auditable from artifacts alone.
+    metrics_dir = result.decision_path.parent / "gate-metrics"
+    assert sorted(path.name for path in metrics_dir.iterdir()) == [
+        "candidate-after.prom.gz",
+        "candidate-before.prom.gz",
+        "stock-after.prom.gz",
+        "stock-before.prom.gz",
+    ]
+    body = gzip.decompress((metrics_dir / "candidate-after.prom.gz").read_bytes())
+    assert "vllm:spec_decode_num_accepted_tokens_total" in body.decode("utf-8")
