@@ -56,6 +56,23 @@ ACTIVE_PREEMPTIBLE_STATES = frozenset(
 COMPLETE_OUTCOMES = frozenset({"promoted", "rejected"})
 FAILED_OUTCOMES = frozenset({"failed", "final_assistant_mask_error"})
 
+# Verdicts reached by actually comparing the two arms.  Anything else means the
+# gate rejected for want of data, which is a legitimate runtime outcome but not
+# a passing end-to-end run: it proves the lifecycle turned over without proving
+# the gate can measure.
+MEASURED_REASONS = frozenset(
+    {
+        "both_thresholds_met",
+        "acceptance_below_threshold",
+        "throughput_below_threshold",
+        "output_mismatch",
+    }
+)
+# Escape hatch for deliberately exercising an unmeasurable gate (e.g. a build
+# with speculative decoding switched off).  Off by default so the silent
+# zero-sample rejection that shipped cannot pass again.
+ALLOW_UNMEASURED_GATE = os.environ.get("SPEEDLM_E2E_ALLOW_UNMEASURED_GATE") == "1"
+
 JsonObject = dict[str, Any]
 
 
@@ -293,6 +310,43 @@ def _scheduler_result_after(
     return None
 
 
+def _assert_gate_measured_something(decision: JsonObject) -> None:
+    """Fail unless the gate reached its verdict by comparing real samples.
+
+    A terminal `rejected` outcome is not on its own evidence that the gate
+    works: the gate can reject because it collected nothing.  That is what
+    shipped -- `num_repeats: 0`, `per_repeat: []`, both arms at 0.0 tok/s,
+    `reason: acceptance_unavailable` -- while the lifecycle test passed.
+    """
+    reason = decision.get("reason")
+    num_repeats = decision.get("num_repeats")
+    per_repeat = decision.get("per_repeat")
+
+    assert isinstance(per_repeat, list), decision
+    assert isinstance(num_repeats, int) and not isinstance(num_repeats, bool), decision
+    assert num_repeats == len(per_repeat), decision
+
+    if reason not in MEASURED_REASONS:
+        if ALLOW_UNMEASURED_GATE:
+            return
+        raise AssertionError(
+            "the gate returned a verdict without comparing the two arms "
+            f"(reason={reason!r}, num_repeats={num_repeats}); set "
+            "SPEEDLM_E2E_ALLOW_UNMEASURED_GATE=1 only when that is expected. "
+            f"decision={decision}"
+        )
+
+    assert num_repeats > 0, decision
+    assert decision.get("acceptance_delta_pp") is not None, decision
+    assert decision.get("throughput_delta_pct") is not None, decision
+    for arm in ("stock_avg_acceptance", "candidate_avg_acceptance"):
+        value = decision.get(arm)
+        assert isinstance(value, (int, float)) and value > 0.0, decision
+    for arm in ("stock_avg_tok_per_sec", "candidate_avg_tok_per_sec"):
+        value = decision.get(arm)
+        assert isinstance(value, (int, float)) and value > 0.0, decision
+
+
 def _copy_profile(profile: Path | None, home: Path) -> None:
     if profile is None:
         return
@@ -499,6 +553,10 @@ def test_live_idle_tuning_preempts_then_completes() -> None:
         assert isinstance(artifact_id, str) and artifact_id, terminal
         assert isinstance(decision_path, str) and Path(decision_path).is_file(), terminal
         assert (home / "runs" / "artifacts" / artifact_id / "manifest.json").is_file()
+        decision = _read_object(Path(decision_path))
+        assert decision is not None, decision_path
+        _write_json(artifact_dir / "terminal-decision.json", decision)
+        _assert_gate_measured_something(decision)
         if terminal["outcome"] == "promoted":
             active = _read_object(home / "runs" / "active.json")
             assert active is not None and active.get("artifact_id") == artifact_id
