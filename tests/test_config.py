@@ -210,7 +210,38 @@ def test_redaction_enabled_requires_bool(value: object) -> None:
 def test_promotion_defaults() -> None:
     pc = PromotionConfig()
     assert pc.min_acceptance_delta_pp == 1.0
-    assert pc.min_throughput_delta_pct == 2.0
+    # Negative by design: throughput is a regression guard, not the promotion
+    # criterion.  Requiring a *positive* throughput delta is unachievable at
+    # the gate's sample size (one-sided 95% MDE ~3.0% at three repeats against
+    # a measured 1.43% standard error), so it would be cleared by noise rather
+    # than by merit.  See PromotionConfig's docstring for the derivation.
+    assert pc.min_throughput_delta_pct == -2.0
+
+
+def test_promotion_rejects_a_zeroed_gate_being_mistaken_for_a_default() -> None:
+    """A 0.0/0.0 gate is loadable but is emphatically not what ships."""
+    zeroed = PromotionConfig(min_acceptance_delta_pp=0.0, min_throughput_delta_pct=0.0)
+    default = PromotionConfig()
+    assert zeroed != default
+    assert default.min_acceptance_delta_pp > 0.0
+
+
+def test_promotion_accepts_a_negative_throughput_regression_floor() -> None:
+    pc = PromotionConfig(min_throughput_delta_pct=-5.0)
+    assert pc.min_throughput_delta_pct == -5.0
+
+
+def test_promotion_rejects_a_non_finite_throughput_floor() -> None:
+    with pytest.raises(ConfigError):
+        PromotionConfig(min_throughput_delta_pct=float("nan"))
+    with pytest.raises(ConfigError):
+        PromotionConfig(min_throughput_delta_pct=float("-inf"))
+
+
+def test_promotion_still_rejects_a_negative_acceptance_bar() -> None:
+    """Acceptance must improve; a negative bar would license a regression."""
+    with pytest.raises(ConfigError):
+        PromotionConfig(min_acceptance_delta_pp=-0.5)
 
 
 def test_idle_tuning_config_round_trip_without_machine_specific_paths() -> None:

@@ -353,7 +353,10 @@ def _delta(*, acceptance_rate: float, output_tok_per_sec: float) -> MetricsDelta
 
 def _real_decision(*, promote: bool) -> Decision:
     """Produce a genuine :class:`Decision` from the real gate logic."""
-    candidate_acceptance = 0.78 if promote else 0.61
+    # The reject arm mirrors the real failure this gate exists to catch: a
+    # candidate whose acceptance did not move (0.0 pp, below the 1.0 pp bar)
+    # while throughput drifted up by an amount well inside timing noise.
+    candidate_acceptance = 0.78 if promote else 0.60
     candidate_tps = 130.0 if promote else 101.0
     decision = decide_promotion(
         _delta(acceptance_rate=0.60, output_tok_per_sec=100.0),
@@ -364,6 +367,24 @@ def _real_decision(*, promote: bool) -> Decision:
     )
     expected = Verdict.PROMOTE if promote else Verdict.REJECT
     assert decision.verdict is expected, decision
+    return decision
+
+
+def _real_throughput_regression_decision() -> Decision:
+    """A genuine reject that trips the *throughput* guard, not the acceptance bar.
+
+    Acceptance clears its bar comfortably (+18 pp) while throughput drops by
+    the -19.2% actually observed on job 368648's un-warmed candidate arm, so
+    only the regression guard can be responsible for the reject.
+    """
+    decision = decide_promotion(
+        _delta(acceptance_rate=0.60, output_tok_per_sec=100.0),
+        _delta(acceptance_rate=0.78, output_tok_per_sec=80.8),
+        _replay(completion_tokens=100, latency_s=1.0),
+        _replay(completion_tokens=81, latency_s=1.0),
+        PromotionConfig(),
+    )
+    assert decision.verdict is Verdict.REJECT, decision
     return decision
 
 
@@ -630,7 +651,7 @@ def test_rejected_decision_keeps_its_reason_through_the_round_trip(
 ) -> None:
     home = tmp_path / "home"
     monkeypatch.setenv("SPEEDLM_HOME", str(home))
-    decision = _real_decision(promote=False)
+    decision = _real_throughput_regression_decision()
     assert decision.reason is Reason.THROUGHPUT_BELOW_THRESHOLD
     orchestrator, _, _, _ = _orchestrator(
         tmp_path, gate_passed=False, decision=decision, work_root=home / "runs"

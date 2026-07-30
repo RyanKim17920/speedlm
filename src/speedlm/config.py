@@ -64,6 +64,15 @@ def _validate_float_gte(value: Any, name: str, minimum: float) -> float:
     return float(value)
 
 
+def _validate_float(value: Any, name: str) -> float:
+    """Validate a finite numeric value with no bound on either side."""
+    if _is_bool(value) or not isinstance(value, (int, float)):
+        raise ConfigError(f"{name} must be numeric, got {type(value).__name__!r}")
+    if not math.isfinite(value):
+        raise ConfigError(f"{name} must be finite, got {value}")
+    return float(value)
+
+
 def _validate_int_gte(value: Any, name: str, minimum: int) -> int:
     if _is_bool(value) or not isinstance(value, int):
         raise ConfigError(f"{name} must be an int, got {type(value).__name__!r}")
@@ -211,12 +220,58 @@ class RedactionConfig:
 
 @dataclass(frozen=True, slots=True)
 class PromotionConfig:
+    """Bars a candidate draft head must clear before it is promoted.
+
+    The two knobs play *different* roles, and the defaults are derived from the
+    measured dispersion of the live gate, not chosen for symmetry.
+
+    ``min_acceptance_delta_pp`` is the **promotion criterion**.  Improving draft
+    acceptance is the entire point of idle tuning, so a candidate that does not
+    measurably raise acceptance is not worth shipping however good its clock
+    looks.  Acceptance is read from vLLM's ``spec_decode`` counters over a
+    deterministic, greedy replay of a fixed held-out suite, so the same suite
+    replayed against two arms has *no* timing component and no measured noise:
+    on job 368670 the two arms produced byte-identical draft/accept counters
+    (1155 drafted, 730 accepted, delta 0.0 pp).  The noise floor is therefore
+    the counter quantum itself -- one accepted token out of ~1155 drafted, or
+    0.087 pp.  ``1.0`` pp is ~12 accepted tokens, a ~2% relative lift in
+    acceptance: comfortably resolvable, and small enough that a genuinely
+    better head clears it.
+
+    ``min_throughput_delta_pct`` is a **regression guard**, deliberately
+    negative.  Throughput *is* timing, and it is noisy: across the three scored
+    repeats of job 368670 the within-arm standard deviation was 1.80 tok/s
+    (stock) and 0.58 tok/s (candidate), pooled 1.34 tok/s on a ~76.7 tok/s
+    mean, giving a standard error on the arm-to-arm delta of 1.43% at three
+    repeats.  The one-sided 95% minimum detectable effect is ~3.0%, so any
+    *positive* threshold below that cannot be earned on merit -- it is cleared
+    by whichever way the timing noise happened to fall.  Job 368670 is the
+    worked example: it measured +0.96% (t=0.67, p~0.28) and would have promoted
+    under the old ``2.0`` bar roughly one run in seven by chance alone; drop its
+    first scored repeat and the same data reads -0.78%.  Requiring throughput to
+    *prove* an improvement is therefore not achievable at this sample size, so
+    the gate instead requires only that throughput not visibly regress.  ``-2.0``
+    sits ~1.8 standard errors below zero at five repeats (SE 1.10%), so ordinary
+    jitter does not trip it, while the real regression this gate has already
+    caught -- the un-warmed candidate arm of job 368648, at -19.2% -- is more
+    than sixteen standard errors past it.
+
+    Both values remain fully configurable via ``promotion`` in ``config.json``;
+    these are defaults, not policy.  Note that setting them to ``0.0``/``0.0``
+    reduces the gate to "not measurably worse", which promotes on noise
+    indefinitely -- see DEMO.md on why lowering the gate is the failure mode
+    this system exists to prevent.
+    """
+
     min_acceptance_delta_pp: float = 1.0
-    min_throughput_delta_pct: float = 2.0
+    #: Negative by design: a floor on regression, not a required speedup.
+    min_throughput_delta_pct: float = -2.0
 
     def __post_init__(self) -> None:
         _validate_float_gte(self.min_acceptance_delta_pp, "min_acceptance_delta_pp", 0)
-        _validate_float_gte(self.min_throughput_delta_pct, "min_throughput_delta_pct", 0)
+        # No lower bound of zero here: a negative value is the intended
+        # regression-guard form ("reject anything more than N% slower").
+        _validate_float(self.min_throughput_delta_pct, "min_throughput_delta_pct")
 
 
 @dataclass(frozen=True, slots=True)
