@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -140,6 +141,98 @@ def test_launch_plan_selects_the_promoted_artifact(
     assert _speculative_config(plan.argv_factory(plan.active_draft))["model"] == str(
         artifact.path
     )
+
+
+def test_launch_plan_rejects_profile_for_a_different_verifier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    config = replace(_config(tmp_path, profile), model="acme/different-verifier")
+    monkeypatch.setattr(composition, "resolve_profile", lambda *_args, **_kwargs: profile)
+
+    with pytest.raises(ProductionTuningError, match="does not match served model"):
+        build_tuning_launch_plan(
+            config,
+            passthrough=(),
+            child_port=8_765,
+            home=tmp_path / "home",
+        )
+
+
+def test_launch_plan_accepts_cache_snapshot_path_for_profile_verifier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    snapshot_model = (
+        tmp_path
+        / "hub"
+        / "models--acme--verifier-that-is-not-a-builtin"
+        / "snapshots"
+        / "revision"
+    )
+    config = replace(_config(tmp_path, profile), model=str(snapshot_model))
+    monkeypatch.setattr(composition, "resolve_profile", lambda *_args, **_kwargs: profile)
+
+    plan = build_tuning_launch_plan(
+        config,
+        passthrough=(),
+        child_port=8_765,
+        home=tmp_path / "home",
+    )
+
+    assert plan.argv_factory(plan.active_draft)[2] == str(snapshot_model)
+
+
+def test_launch_plan_rejects_active_artifact_for_a_different_model_pair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    config = _config(tmp_path, profile)
+    home = tmp_path / "home"
+    registry = ArtifactRegistry(ensure_layout(home).runs_dir, clock=lambda: 1.0)
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    (candidate / "model.safetensors").write_bytes(b"stale")
+    artifact = registry.publish(
+        candidate,
+        ArtifactSpec(
+            verifier_model="acme/old-verifier",
+            draft_model="acme/old-draft",
+            base_draft="acme/old-draft",
+            trace_hash="old-traces",
+            training_params={},
+        ),
+    )
+    registry.promote(artifact.artifact_id, gate_passed=True)
+    monkeypatch.setattr(composition, "resolve_profile", lambda *_args, **_kwargs: profile)
+
+    with pytest.raises(ProductionTuningError, match="belongs to verifier/draft"):
+        build_tuning_launch_plan(
+            config,
+            passthrough=(),
+            child_port=8_765,
+            home=home,
+        )
+
+
+def test_launch_plan_rejects_conflicting_served_model_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    config = replace(_config(tmp_path, profile), model_alias="expected-alias")
+    monkeypatch.setattr(composition, "resolve_profile", lambda *_args, **_kwargs: profile)
+
+    with pytest.raises(ProductionTuningError, match="must match configured model alias"):
+        build_tuning_launch_plan(
+            config,
+            passthrough=("--served-model-name", "different-alias"),
+            child_port=8_765,
+            home=tmp_path / "home",
+        )
 
 
 @pytest.mark.parametrize(

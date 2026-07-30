@@ -21,7 +21,11 @@ from speedlm.gateway.control import (
 from speedlm.gateway.process import LOOPBACK_HOST, build_vllm_argv
 from speedlm.gateway.supervisor import ThreadsafeProcessControl
 from speedlm.gateway.vllm_http import VLLMControlClient
-from speedlm.profiles import ModelProfile, resolve_profile
+from speedlm.profiles import (
+    ModelProfile,
+    canonical_verifier_reference,
+    resolve_profile,
+)
 from speedlm.storage import ensure_layout
 from speedlm.traces.store import TraceStore
 from speedlm.training import check_prepared_dataset
@@ -62,6 +66,13 @@ def build_tuning_launch_plan(
         served_model=config.model,
         home=home,
     )
+    if canonical_verifier_reference(
+        profile.verifier_model
+    ) != canonical_verifier_reference(config.model):
+        raise ProductionTuningError(
+            f"profile {profile.name!r} verifier {profile.verifier_model!r} does not "
+            f"match served model {config.model!r}"
+        )
     if profile.speculative_method != "eagle3":
         raise ProductionTuningError(
             f"idle tuning backend {profile.speculative_method!r} is not yet "
@@ -80,6 +91,15 @@ def build_tuning_launch_plan(
     layout = ensure_layout(home)
     artifacts = ArtifactRegistry(layout.runs_dir)
     active = artifacts.active()
+    if active is not None and (
+        active.manifest.verifier_model != profile.verifier_model
+        or active.manifest.draft_model != profile.draft_model
+    ):
+        raise ProductionTuningError(
+            f"active artifact {active.artifact_id} belongs to verifier/draft "
+            f"{active.manifest.verifier_model!r}/{active.manifest.draft_model!r}, "
+            f"not {profile.verifier_model!r}/{profile.draft_model!r}"
+        )
     active_draft: DraftReference = (
         active.path if active is not None else profile.draft_model
     )
@@ -88,10 +108,16 @@ def build_tuning_launch_plan(
         for argument in passthrough
         if argument != "--enable-sleep-mode"
     ]
-    if config.model_alias and not _has_option(
+    alias_supplied, supplied_alias = _option_value(
         base_passthrough,
         "--served-model-name",
-    ):
+    )
+    if alias_supplied and supplied_alias != config.alias:
+        raise ProductionTuningError(
+            f"--served-model-name must match configured model alias "
+            f"{config.alias!r}, got {supplied_alias!r}"
+        )
+    if config.model_alias and not alias_supplied:
         base_passthrough.extend(("--served-model-name", config.model_alias))
 
     def argv_factory(draft: DraftReference) -> list[str]:
@@ -321,6 +347,20 @@ def _has_option(arguments: Sequence[str], option: str) -> bool:
         argument == option or argument.startswith(f"{option}=")
         for argument in arguments
     )
+
+
+def _option_value(
+    arguments: Sequence[str],
+    option: str,
+) -> tuple[bool, str | None]:
+    for index, argument in enumerate(arguments):
+        if argument.startswith(f"{option}="):
+            return True, argument.partition("=")[2] or None
+        if argument == option:
+            if index + 1 < len(arguments) and not arguments[index + 1].startswith("--"):
+                return True, arguments[index + 1]
+            return True, None
+    return False, None
 
 
 __all__ = [

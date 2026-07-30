@@ -412,14 +412,7 @@ def _match_profile(
     if by_name is not None:
         return by_name
 
-    verifier_reference = name_or_verifier
-    for part in Path(name_or_verifier).parts:
-        if not part.startswith("models--"):
-            continue
-        repository_parts = part.removeprefix("models--").split("--")
-        if all(repository_parts):
-            verifier_reference = "/".join(repository_parts)
-            break
+    verifier_reference = canonical_verifier_reference(name_or_verifier)
 
     verifier_matches = [
         profile
@@ -433,6 +426,18 @@ def _match_profile(
             "set config.profile explicitly"
         )
     return verifier_matches[0] if verifier_matches else None
+
+
+def canonical_verifier_reference(model: str) -> str:
+    """Return the repository ID embedded in a Hugging Face cache path."""
+
+    for part in Path(model).parts:
+        if not part.startswith("models--"):
+            continue
+        repository_parts = part.removeprefix("models--").split("--")
+        if all(repository_parts):
+            return "/".join(repository_parts)
+    return model
 
 
 def resolve_profile(
