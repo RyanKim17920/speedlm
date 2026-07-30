@@ -327,7 +327,7 @@ def test_create_production_tuner_assembles_profile_bound_collaborators(
 
     def build_pipeline(**kwargs: object) -> object:
         captured["pipeline"] = kwargs
-        return SimpleNamespace()
+        return SimpleNamespace(gpu_memory_utilization=0.80)
 
     def build_backend(_pipeline: object, **kwargs: object) -> object:
         captured["backend"] = kwargs
@@ -394,6 +394,9 @@ def test_create_production_tuner_assembles_profile_bound_collaborators(
     assert pipeline["learning_rate"] == config.tuning.learning_rate
     assert captured["backend"] == {"trace_leaser": split}
     assert captured["runtime"]["active_draft"] == "acme/active-draft"
+    # The post-sleep memory precondition must demand exactly what the
+    # hidden-state engine will be launched with, or it is decorative.
+    assert captured["runtime"]["gpu_memory"].required_fraction == 0.80
     assert captured["gate"]["stock_draft"] == "acme/active-draft"
     assert captured["gate"]["suite_dir"]() == split.suite_dir
     assert captured["gate"]["training_context_hashes"]() == frozenset({"train-hash"})

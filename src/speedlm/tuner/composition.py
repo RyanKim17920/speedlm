@@ -16,6 +16,8 @@ from speedlm.gateway.capture import CaptureManager
 from speedlm.gateway.control import (
     AdmissionGate,
     ControlAborted,
+    GPUMemoryPrecondition,
+    NvidiaSmiMemoryProbe,
     RuntimeController,
 )
 from speedlm.gateway.process import LOOPBACK_HOST, build_vllm_argv
@@ -200,6 +202,12 @@ def create_production_tuner(
         process=process,
         active_draft=active_draft,
         capture_barrier=_CaptureBarrier(capture, loop),
+        # The hidden-state engine started right after sleep is launched with
+        # exactly this utilization, so it is also exactly what must be free.
+        gpu_memory=GPUMemoryPrecondition(
+            probe=NvidiaSmiMemoryProbe(),
+            required_fraction=pipeline.gpu_memory_utilization,
+        ),
     )
     endpoint = _DraftEndpoint(
         url=child_url,
