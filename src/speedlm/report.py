@@ -29,7 +29,13 @@ from typing import Any, Final
 
 from speedlm.config import ConfigError, SpeedLMConfig, load_config
 from speedlm.doctor import PRIMARY_VERIFIER
-from speedlm.gate.decide import Decision, Reason, RepeatSummary, Verdict
+from speedlm.gate.decide import (
+    LEGACY_THROUGHPUT_STATISTIC,
+    Decision,
+    Reason,
+    RepeatSummary,
+    Verdict,
+)
 from speedlm.profiles import ModelProfile, ProfileError, resolve_profile
 from speedlm.storage import Layout, resolve_layout
 from speedlm.traces.store import TraceStore
@@ -996,7 +1002,61 @@ def parse_decision(record: Mapping[str, Any], *, source: Path) -> Decision:
         candidate_avg_acceptance=_require_float(record, "candidate_avg_acceptance", source),
         stock_avg_tok_per_sec=_require_float(record, "stock_avg_tok_per_sec", source),
         candidate_avg_tok_per_sec=_require_float(record, "candidate_avg_tok_per_sec", source),
+        **_parse_throughput_statistic(record, source, measured=measured),
     )
+
+
+def _parse_throughput_statistic(
+    record: Mapping[str, Any],
+    source: Path,
+    *,
+    measured: bool,
+) -> dict[str, Any]:
+    """Recover which statistic a persisted decision was actually gated on.
+
+    Records written before the gate pinned its statistic carry no
+    ``throughput_statistic`` key.  Their ``throughput_delta_pct`` came from the
+    Prometheus decode window, and their ``*_avg_tok_per_sec`` pair came from it
+    too -- which is why averaging their ``per_repeat`` column does not
+    reproduce it.  Labelling them :data:`LEGACY_THROUGHPUT_STATISTIC` and
+    mirroring those values into the Prometheus fields keeps an old record
+    honest instead of silently reattributing it to the current statistic.
+    """
+    if "throughput_statistic" not in record:
+        prom_delta = _parse_delta(
+            record, "throughput_delta_pct", source, measured=measured
+        )
+        return {
+            "throughput_statistic": LEGACY_THROUGHPUT_STATISTIC,
+            "stock_prometheus_decode_tok_per_sec": _require_float(
+                record, "stock_avg_tok_per_sec", source
+            ),
+            "candidate_prometheus_decode_tok_per_sec": _require_float(
+                record, "candidate_avg_tok_per_sec", source
+            ),
+            "prometheus_throughput_delta_pct": prom_delta,
+        }
+
+    statistic = record["throughput_statistic"]
+    if not isinstance(statistic, str) or not statistic:
+        raise ReportError(f"{source}: 'throughput_statistic' must be a non-empty string")
+    raw_delta = record.get("prometheus_throughput_delta_pct")
+    if raw_delta is not None and not isinstance(raw_delta, (int, float)):
+        raise ReportError(
+            f"{source}: 'prometheus_throughput_delta_pct' must be a number or null"
+        )
+    return {
+        "throughput_statistic": statistic,
+        "stock_prometheus_decode_tok_per_sec": _require_float(
+            record, "stock_prometheus_decode_tok_per_sec", source
+        ),
+        "candidate_prometheus_decode_tok_per_sec": _require_float(
+            record, "candidate_prometheus_decode_tok_per_sec", source
+        ),
+        "prometheus_throughput_delta_pct": (
+            None if raw_delta is None else float(raw_delta)
+        ),
+    }
 
 
 def load_decision(path: Path) -> Decision:
