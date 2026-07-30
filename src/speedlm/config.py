@@ -220,6 +220,66 @@ class PromotionConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class IdleTuningConfig:
+    """Production composition settings for the opt-in idle tuner."""
+
+    min_trace_records: int = 32
+    poll_interval_seconds: float = 1.0
+    held_out_fraction: float = 0.2
+    benchmark_repeats: int = 3
+    speculators_repo: str | None = None
+    training_python: str | None = None
+    vllm_python: str | None = None
+    prepared_validator_script: str | None = None
+    sequence_length: int = 16_384
+    learning_rate: float = 1e-5
+    epochs: int = 1
+    concurrency: int = 8
+    training_port: int = 8_131
+    scratch_quota_bytes: int = 5 * 1024 * 1024 * 1024
+    shutdown_timeout_seconds: float = 30.0
+
+    def __post_init__(self) -> None:
+        _validate_int_gte(self.min_trace_records, "tuning.min_trace_records", 2)
+        _validate_float_gte(
+            self.poll_interval_seconds,
+            "tuning.poll_interval_seconds",
+            0.001,
+        )
+        if (
+            isinstance(self.held_out_fraction, bool)
+            or not isinstance(self.held_out_fraction, (int, float))
+            or not 0 < self.held_out_fraction < 1
+        ):
+            raise ConfigError("tuning.held_out_fraction must be in (0, 1)")
+        _validate_int_gte(self.benchmark_repeats, "tuning.benchmark_repeats", 3)
+        for name, value in (
+            ("speculators_repo", self.speculators_repo),
+            ("training_python", self.training_python),
+            ("vllm_python", self.vllm_python),
+            ("prepared_validator_script", self.prepared_validator_script),
+        ):
+            if value is not None and (not isinstance(value, str) or not value):
+                raise ConfigError(f"tuning.{name} must be a non-empty string or null")
+        _validate_int_gte(self.sequence_length, "tuning.sequence_length", 1)
+        if (
+            isinstance(self.learning_rate, bool)
+            or not isinstance(self.learning_rate, (int, float))
+            or not 0 < self.learning_rate <= 1e-5
+        ):
+            raise ConfigError("tuning.learning_rate must be in (0, 1e-5]")
+        _validate_int_gte(self.epochs, "tuning.epochs", 1)
+        _validate_int_gte(self.concurrency, "tuning.concurrency", 1)
+        _validate_port(self.training_port, "tuning")
+        _validate_int_gte(self.scratch_quota_bytes, "tuning.scratch_quota_bytes", 1)
+        _validate_float_gte(
+            self.shutdown_timeout_seconds,
+            "tuning.shutdown_timeout_seconds",
+            0.001,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class SpeedLMConfig:
     model: str
     model_alias: str = ""
@@ -229,6 +289,7 @@ class SpeedLMConfig:
     buffer: TraceBufferConfig = field(default_factory=TraceBufferConfig)
     redaction: RedactionConfig = field(default_factory=RedactionConfig)
     promotion: PromotionConfig = field(default_factory=PromotionConfig)
+    tuning: IdleTuningConfig = field(default_factory=IdleTuningConfig)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
     idle_threshold_seconds: float = 300.0
     startup_timeout_seconds: float = field(default_factory=startup_timeout_seconds)
@@ -326,6 +387,23 @@ class SpeedLMConfig:
             "min_acceptance_delta_pp": self.promotion.min_acceptance_delta_pp,
             "min_throughput_delta_pct": self.promotion.min_throughput_delta_pct,
         }
+        result["tuning"] = {
+            "min_trace_records": self.tuning.min_trace_records,
+            "poll_interval_seconds": self.tuning.poll_interval_seconds,
+            "held_out_fraction": self.tuning.held_out_fraction,
+            "benchmark_repeats": self.tuning.benchmark_repeats,
+            "speculators_repo": self.tuning.speculators_repo,
+            "training_python": self.tuning.training_python,
+            "vllm_python": self.tuning.vllm_python,
+            "prepared_validator_script": self.tuning.prepared_validator_script,
+            "sequence_length": self.tuning.sequence_length,
+            "learning_rate": self.tuning.learning_rate,
+            "epochs": self.tuning.epochs,
+            "concurrency": self.tuning.concurrency,
+            "training_port": self.tuning.training_port,
+            "scratch_quota_bytes": self.tuning.scratch_quota_bytes,
+            "shutdown_timeout_seconds": self.tuning.shutdown_timeout_seconds,
+        }
         result["sampling"] = {
             "temperature": self.sampling.temperature,
             "top_p": self.sampling.top_p,
@@ -349,6 +427,7 @@ class SpeedLMConfig:
             "buffer",
             "redaction",
             "promotion",
+            "tuning",
             "sampling",
             "idle_threshold_seconds",
             "startup_timeout_seconds",
@@ -379,6 +458,27 @@ class SpeedLMConfig:
         promotion_data = _nested(
             data, "promotion", {"min_acceptance_delta_pp", "min_throughput_delta_pct"}
         )
+        tuning_data = _nested(
+            data,
+            "tuning",
+            {
+                "min_trace_records",
+                "poll_interval_seconds",
+                "held_out_fraction",
+                "benchmark_repeats",
+                "speculators_repo",
+                "training_python",
+                "vllm_python",
+                "prepared_validator_script",
+                "sequence_length",
+                "learning_rate",
+                "epochs",
+                "concurrency",
+                "training_port",
+                "scratch_quota_bytes",
+                "shutdown_timeout_seconds",
+            },
+        )
         sampling_data = _nested(data, "sampling", {"temperature", "top_p", "seed"})
 
         return cls(
@@ -390,6 +490,7 @@ class SpeedLMConfig:
             buffer=TraceBufferConfig(**buffer_data),
             redaction=RedactionConfig(**redaction_data),
             promotion=PromotionConfig(**promotion_data),
+            tuning=IdleTuningConfig(**tuning_data),
             sampling=SamplingConfig(**sampling_data),
             idle_threshold_seconds=data.get("idle_threshold_seconds", 300.0),
             startup_timeout_seconds=data.get(

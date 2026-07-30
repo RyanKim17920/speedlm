@@ -6,6 +6,7 @@ import pytest
 
 from speedlm.config import (
     ConfigError,
+    IdleTuningConfig,
     PromotionConfig,
     RedactionConfig,
     SamplingConfig,
@@ -210,6 +211,36 @@ def test_promotion_defaults() -> None:
     pc = PromotionConfig()
     assert pc.min_acceptance_delta_pp == 1.0
     assert pc.min_throughput_delta_pct == 2.0
+
+
+def test_idle_tuning_config_round_trip_without_machine_specific_paths() -> None:
+    tuning = IdleTuningConfig(
+        min_trace_records=64,
+        speculators_repo="/opt/speculators",
+        training_python="/opt/training/bin/python",
+        held_out_fraction=0.25,
+    )
+    config = SpeedLMConfig(model="org/model", tuning=tuning)
+
+    restored = SpeedLMConfig.from_dict(config.to_dict())
+
+    assert restored.tuning == tuning
+    assert restored.tuning.speculators_repo == "/opt/speculators"
+
+
+@pytest.mark.parametrize(
+    "tuning",
+    [
+        {"min_trace_records": 1},
+        {"held_out_fraction": 0},
+        {"benchmark_repeats": 2},
+        {"speculators_repo": ""},
+        {"learning_rate": 1e-4},
+    ],
+)
+def test_invalid_idle_tuning_config_is_rejected(tuning: dict[str, object]) -> None:
+    with pytest.raises(ConfigError):
+        SpeedLMConfig.from_dict({"model": "org/model", "tuning": tuning})
 
 
 # ---------------------------------------------------------------------------
