@@ -354,6 +354,23 @@ def _assert_gate_measured_something(decision: JsonObject) -> None:
     assert any(v > 0.0 for v in acceptances if isinstance(v, (int, float))), decision
 
 
+def _collect_gate_metrics(run_dir: Path, artifact_dir: Path) -> None:
+    """Copy the gate's raw Prometheus bodies out with the run's artifacts.
+
+    Without these the reported acceptance and throughput can only be taken on
+    trust: they are deltas, and the counters behind them live nowhere else once
+    the child vLLM exits.
+    """
+    source = run_dir / "gate-metrics"
+    assert source.is_dir(), f"gate left no raw metrics under {source}"
+    bodies = sorted(source.glob("*.prom.gz"))
+    assert bodies, f"gate metrics directory {source} is empty"
+    destination = artifact_dir / "gate-metrics"
+    destination.mkdir(parents=True, exist_ok=True)
+    for body in bodies:
+        shutil.copy2(body, destination / body.name)
+
+
 def _copy_profile(profile: Path | None, home: Path) -> None:
     if profile is None:
         return
@@ -564,6 +581,7 @@ def test_live_idle_tuning_preempts_then_completes() -> None:
         assert decision is not None, decision_path
         _write_json(artifact_dir / "terminal-decision.json", decision)
         _assert_gate_measured_something(decision)
+        _collect_gate_metrics(Path(decision_path).parent, artifact_dir)
         if terminal["outcome"] == "promoted":
             active = _read_object(home / "runs" / "active.json")
             assert active is not None and active.get("artifact_id") == artifact_id
