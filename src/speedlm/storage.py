@@ -273,13 +273,37 @@ def append_jsonl(path: Path, obj: object) -> None:
     _append_jsonl(path, obj)
 
 
-def read_jsonl(path: Path) -> Iterator[dict[str, object]]:
-    """Yield JSON objects from *path*.
+def count_jsonl(path: Path) -> int:
+    """Return the number of non-blank lines in *path* without parsing them.
+
+    This is the cheap cursor primitive behind incremental record selection:
+    callers that only need to know *where* the tail of a file starts must not
+    pay to deserialize the head.  A missing file counts as empty.
+    """
+    try:
+        fd = os.open(str(path), os.O_RDONLY)
+    except FileNotFoundError:
+        return 0
+    except OSError as exc:
+        raise StorageError(f"cannot open JSONL file: {path}") from exc
+
+    with os.fdopen(fd, "r", encoding="utf-8") as f:
+        return sum(1 for raw_line in f if raw_line.strip())
+
+
+def read_jsonl(path: Path, *, skip: int = 0) -> Iterator[dict[str, object]]:
+    """Yield JSON objects from *path*, skipping the first *skip* of them.
 
     Blank lines are silently skipped.  Malformed lines or lines that are
     not JSON objects raise ``StorageError`` with the 1-based line number.
     A missing file raises ``StorageError``.
+
+    Skipped records are never deserialized, so reading the tail of a large
+    file costs one pass of line splitting rather than one JSON parse per
+    record.
     """
+    if isinstance(skip, bool) or not isinstance(skip, int) or skip < 0:
+        raise StorageError("skip must be a non-negative integer")
     try:
         fd = os.open(str(path), os.O_RDONLY)
     except FileNotFoundError:
@@ -289,10 +313,14 @@ def read_jsonl(path: Path) -> Iterator[dict[str, object]]:
 
     with os.fdopen(fd, "r", encoding="utf-8") as f:
         line_no = 0
+        remaining_skip = skip
         for raw_line in f:
             line_no += 1
             line = raw_line.strip()
             if not line:
+                continue
+            if remaining_skip:
+                remaining_skip -= 1
                 continue
             try:
                 obj = json.loads(line)

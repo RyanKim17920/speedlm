@@ -291,6 +291,22 @@ class IdleTuningConfig:
     #: benchmark phase inside a ~1200s cycle (~3%).  Engine restarts, not
     #: repeats, dominate that phase.
     benchmark_repeats: int = 5
+    #: How many of the newest trace records one cycle may train on.
+    #:
+    #: Trace selection is a sliding window, not a full rescan: without a bound
+    #: every cycle re-extracted and re-trained on the entire corpus, which is
+    #: why cycle 1 and cycle 2 of the archived runs produced byte-identical
+    #: trace snapshots while the watermark advanced by a single record.  The
+    #: window is what makes a cycle cost O(recent traffic) instead of
+    #: O(everything ever captured).
+    #:
+    #: 256 is chosen against ``min_trace_records`` (32): eight arming
+    #: thresholds of history is enough that the per-cycle training
+    #: distribution is a stable sample of recent traffic rather than a
+    #: high-variance snapshot, while still bounding hidden-state extraction --
+    #: the stage the window actually pays for -- to a fixed ceiling.  Set to
+    #: null to restore the unbounded full-corpus scan.
+    training_window_records: int | None = 256
     speculators_repo: str | None = None
     training_python: str | None = None
     vllm_python: str | None = None
@@ -317,6 +333,12 @@ class IdleTuningConfig:
         ):
             raise ConfigError("tuning.held_out_fraction must be in (0, 1)")
         _validate_int_gte(self.benchmark_repeats, "tuning.benchmark_repeats", 3)
+        if self.training_window_records is not None:
+            _validate_int_gte(
+                self.training_window_records,
+                "tuning.training_window_records",
+                self.min_trace_records,
+            )
         for name, value in (
             ("speculators_repo", self.speculators_repo),
             ("training_python", self.training_python),
@@ -456,6 +478,7 @@ class SpeedLMConfig:
             "poll_interval_seconds": self.tuning.poll_interval_seconds,
             "held_out_fraction": self.tuning.held_out_fraction,
             "benchmark_repeats": self.tuning.benchmark_repeats,
+            "training_window_records": self.tuning.training_window_records,
             "speculators_repo": self.tuning.speculators_repo,
             "training_python": self.tuning.training_python,
             "vllm_python": self.tuning.vllm_python,
@@ -530,6 +553,7 @@ class SpeedLMConfig:
                 "poll_interval_seconds",
                 "held_out_fraction",
                 "benchmark_repeats",
+                "training_window_records",
                 "speculators_repo",
                 "training_python",
                 "vllm_python",

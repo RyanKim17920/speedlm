@@ -25,6 +25,23 @@ class _TraceSource:
         yield from self.records
 
 
+class _CursorTraceSource:
+    """Trace source that reports how much of the corpus a lease deserialized."""
+
+    def __init__(self, path: Path, records: tuple[TraceRecord, ...]) -> None:
+        self.path = path
+        self.records = records
+        self.deserialized = 0
+
+    def count_records(self) -> int:
+        return len(self.records)
+
+    def iter_records(self, *, start: int = 0) -> Iterator[TraceRecord]:
+        for record in self.records[start:]:
+            self.deserialized += 1
+            yield record
+
+
 def _record(identifier: str, prompt: str) -> TraceRecord:
     return TraceRecord(
         id=identifier,
@@ -178,6 +195,101 @@ def test_timeout_during_copy_removes_partial_snapshot_and_suite(
     assert not (tmp_path / "cycle" / "snapshot").exists()
     assert not (tmp_path / "cycle" / "held-out").exists()
     assert leaser.training_context_hashes == frozenset()
+
+
+def test_window_leases_only_the_newest_records_and_reads_nothing_older(
+    tmp_path: Path,
+) -> None:
+    """A cycle must cost one window, not one corpus.
+
+    This is the regression that matters: under the old full-rescan leaser
+    every record in the buffer was deserialized and every non-held-out record
+    landed in the training snapshot, so a corpus that had grown by one trace
+    was re-extracted and re-trained from row zero.
+    """
+    records = tuple(_record(f"trace-{index}", f"prompt-{index}") for index in range(20))
+    source = _CursorTraceSource(tmp_path / "traces.jsonl", records)
+    leaser = HeldOutTraceSnapshotLeaser(
+        source,  # type: ignore[arg-type]
+        held_out_fraction=0.4,
+        scratch_quota_bytes=1_000_000,
+        training_window_records=6,
+    )
+
+    _lease(leaser, tmp_path / "cycle" / "snapshot")
+
+    window_ids = {record.id for record in records[-6:]}
+    stale = {BenchmarkSuite._record_hash(record) for record in records[:-6]}
+    training = _snapshot_records(tmp_path / "cycle" / "snapshot")
+
+    # Only the tail was ever deserialized.
+    assert source.deserialized == 6
+    assert len(training) <= 6
+    assert {record.id for record in training} <= window_ids
+    # No record older than the window reached training or the suite.
+    assert {BenchmarkSuite._record_hash(rec) for rec in training}.isdisjoint(stale)
+    suite = load_suite(leaser.suite_dir)
+    assert {ctx.context_hash for ctx in suite.contexts}.isdisjoint(stale)
+
+
+def test_window_lease_is_deterministic_for_an_unchanged_buffer(tmp_path: Path) -> None:
+    records = tuple(_record(f"trace-{index}", f"prompt-{index}") for index in range(20))
+
+    def build() -> HeldOutTraceSnapshotLeaser:
+        return HeldOutTraceSnapshotLeaser(
+            _CursorTraceSource(tmp_path / "traces.jsonl", records),  # type: ignore[arg-type]
+            held_out_fraction=0.4,
+            scratch_quota_bytes=1_000_000,
+            training_window_records=6,
+        )
+
+    first = build()
+    second = build()
+    first_snapshot = first.lease_snapshot(
+        tmp_path / "a" / "snapshot", timeout_seconds=30, should_abort=lambda: False
+    )
+    second_snapshot = second.lease_snapshot(
+        tmp_path / "b" / "snapshot", timeout_seconds=30, should_abort=lambda: False
+    )
+
+    assert first_snapshot.content_hash == second_snapshot.content_hash
+    assert load_suite(first.suite_dir) == load_suite(second.suite_dir)
+
+
+def test_a_benchmarked_context_is_never_trained_on_by_a_later_cycle(
+    tmp_path: Path,
+) -> None:
+    """The window can shrink the held-out reservation; the ledger must not."""
+    records = tuple(_record(f"trace-{index}", f"prompt-{index}") for index in range(12))
+    leaser = HeldOutTraceSnapshotLeaser(
+        _CursorTraceSource(tmp_path / "traces.jsonl", records),  # type: ignore[arg-type]
+        held_out_fraction=0.4,
+        scratch_quota_bytes=1_000_000,
+        training_window_records=10,
+    )
+
+    _lease(leaser, tmp_path / "cycle-1" / "snapshot")
+    benchmarked = leaser.benchmarked_context_hashes
+    assert benchmarked
+
+    _lease(leaser, tmp_path / "cycle-2" / "snapshot")
+    later_training = {
+        BenchmarkSuite._record_hash(record)
+        for record in _snapshot_records(tmp_path / "cycle-2" / "snapshot")
+    }
+
+    assert later_training.isdisjoint(benchmarked)
+    assert benchmarked <= leaser.benchmarked_context_hashes
+
+
+def test_window_must_be_at_least_two_records(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="training_window_records"):
+        HeldOutTraceSnapshotLeaser(
+            _CursorTraceSource(tmp_path / "traces.jsonl", ()),  # type: ignore[arg-type]
+            held_out_fraction=0.4,
+            scratch_quota_bytes=1_000_000,
+            training_window_records=1,
+        )
 
 
 def test_split_requires_two_unique_contexts(tmp_path: Path) -> None:

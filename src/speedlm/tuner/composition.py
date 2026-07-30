@@ -172,6 +172,7 @@ def create_production_tuner(
         traces,
         held_out_fraction=tuning.held_out_fraction,
         scratch_quota_bytes=tuning.scratch_quota_bytes,
+        training_window_records=tuning.training_window_records,
     )
     pipeline = SpeculatorsPipelineConfig(
         prepared_validator_script=_validator_script(config),

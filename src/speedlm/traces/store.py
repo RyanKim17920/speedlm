@@ -17,6 +17,7 @@ from speedlm.storage import (
     _exclusive_file_lock,
     atomic_write_json,
     atomic_write_text,
+    count_jsonl,
     read_jsonl,
 )
 from speedlm.traces.redact import RedactionReport, Redactor
@@ -540,14 +541,28 @@ class TraceStore:
             return None
         return report
 
-    def iter_records(self) -> Iterator[TraceRecord]:
-        """Yield records from the JSONL file.
+    def count_records(self) -> int:
+        """Return how many records the buffer holds, without deserializing any.
+
+        This is the cursor a consumer needs to address the *tail* of the
+        buffer.  It is deliberately parse-free: the point of an incremental
+        consumer is that the records it does not want cost it nothing.
+        """
+        return count_jsonl(self._path)
+
+    def iter_records(self, *, start: int = 0) -> Iterator[TraceRecord]:
+        """Yield records from the JSONL file, beginning at offset *start*.
+
+        ``start`` is a record offset, not a byte offset, and counts blank
+        lines out the same way :meth:`count_records` does, so
+        ``iter_records(start=count_records() - n)`` yields exactly the newest
+        ``n`` records.  Records before *start* are never deserialized.
 
         A missing or empty file yields nothing (not an error).
         """
         if not self._path.exists():
             return
-        for raw in read_jsonl(self._path):
+        for raw in read_jsonl(self._path, skip=start):
             yield TraceRecord.from_dict(raw)
 
     def stats(self) -> TraceStats:
