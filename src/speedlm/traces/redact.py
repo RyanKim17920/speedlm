@@ -242,8 +242,26 @@ class Redactor:
 
     def redact_text(self, text: str) -> tuple[str, RedactionReport]:
         """Redact one text value using the same policy and reporting API."""
-        redacted, report = self.redact(text)
-        return redacted, report
+        try:
+            parsed = json.loads(text)
+        except (json.JSONDecodeError, TypeError):
+            redacted, report = self.redact(text)
+            return redacted, report
+        context = _RedactionContext(counts=Counter(), placeholders={})
+        redacted, changed = self._walk(
+            parsed,
+            context,
+            field_name=None,
+            allow_entropy=False,
+        )
+        return (
+            (
+                json.dumps(redacted, ensure_ascii=False, separators=(",", ":"))
+                if changed
+                else text
+            ),
+            RedactionReport(context.counts),
+        )
 
     def _walk(
         self,
@@ -251,6 +269,7 @@ class Redactor:
         context: _RedactionContext,
         *,
         field_name: str | None,
+        allow_entropy: bool = True,
     ) -> tuple[Any, bool]:
         if isinstance(value, str):
             category = self._sensitive_field_category(field_name)
@@ -260,7 +279,11 @@ class Redactor:
                 json_result = self._redact_json_arguments(value, context)
                 if json_result is not None:
                     return json_result
-            redacted = self._redact_string(value, context)
+            redacted = self._redact_string(
+                value,
+                context,
+                allow_entropy=allow_entropy,
+            )
             return redacted, redacted != value
 
         if isinstance(value, Mapping):
@@ -276,6 +299,7 @@ class Redactor:
                     item,
                     context,
                     field_name=key if isinstance(key, str) else None,
+                    allow_entropy=allow_entropy,
                 )
                 result[redacted_key] = child
                 changed = changed or key_changed or child_changed
@@ -285,7 +309,12 @@ class Redactor:
             changed = False
             result_list: list[Any] = []
             for item in value:
-                child, child_changed = self._walk(item, context, field_name=None)
+                child, child_changed = self._walk(
+                    item,
+                    context,
+                    field_name=None,
+                    allow_entropy=allow_entropy,
+                )
                 result_list.append(child)
                 changed = changed or child_changed
             return (result_list, True) if changed else (value, False)
@@ -294,7 +323,12 @@ class Redactor:
             changed = False
             result_tuple: list[Any] = []
             for item in value:
-                child, child_changed = self._walk(item, context, field_name=None)
+                child, child_changed = self._walk(
+                    item,
+                    context,
+                    field_name=None,
+                    allow_entropy=allow_entropy,
+                )
                 result_tuple.append(child)
                 changed = changed or child_changed
             return (tuple(result_tuple), True) if changed else (value, False)
@@ -310,7 +344,12 @@ class Redactor:
             parsed = json.loads(value)
         except (json.JSONDecodeError, TypeError):
             return None
-        redacted, changed = self._walk(parsed, context, field_name=None)
+        redacted, changed = self._walk(
+            parsed,
+            context,
+            field_name=None,
+            allow_entropy=False,
+        )
         if not changed:
             return value, False
         return (
@@ -350,12 +389,18 @@ class Redactor:
         normalized = normalized.casefold().replace("-", "_")
         return _SENSITIVE_FIELD_CATEGORIES.get(normalized)
 
-    def _redact_string(self, text: str, context: _RedactionContext) -> str:
+    def _redact_string(
+        self,
+        text: str,
+        context: _RedactionContext,
+        *,
+        allow_entropy: bool = True,
+    ) -> str:
         protected_spans = tuple(match.span() for match in _PLACEHOLDER_RE.finditer(text))
         view = self._normalized_view(text)
         matches = self._collect_direct_matches(text, view, protected_spans)
         matches.extend(self._collect_decoded_matches(text, protected_spans))
-        if self.policy.entropy_enabled:
+        if self.policy.entropy_enabled and allow_entropy:
             matches.extend(self._collect_entropy_matches(text, protected_spans))
 
         selected = self._non_overlapping(matches)

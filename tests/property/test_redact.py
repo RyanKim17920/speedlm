@@ -4,7 +4,6 @@ import json
 import string
 from typing import Any
 
-import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -144,15 +143,6 @@ def test_arbitrary_unicode_never_raises(text: str) -> None:
     assert isinstance(redacted, str)
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "src/speedlm/traces/redact.py:395 reclassifies an existing provider "
-        "placeholder by assignment-field context; "
-        "'api_key=ghp_abcdefghijklmnopqrstuvwxyz1234567890' changes from "
-        "<REDACTED:github_token> to <REDACTED:api_key> on the second pass"
-    ),
-)
 def test_provider_secret_assignment_redaction_is_idempotent() -> None:
     secret = "ghp_abcdefghijklmnopqrstuvwxyz1234567890"
     redactor = Redactor()
