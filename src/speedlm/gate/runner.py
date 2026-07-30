@@ -175,12 +175,19 @@ class BenchmarkGateRunner:
         metrics_source: MetricsSource,
         replay_executor: ReplayExecutor | None = None,
         repeats: int = 3,
+        warmup_repeats: int = 1,
         held_out_fraction: float = 0.2,
         training_context_hashes: TrainingHashes | None = None,
         clock: Clock = time.monotonic,
     ) -> None:
         if isinstance(repeats, bool) or not isinstance(repeats, int) or repeats < 3:
             raise ValueError("repeats must be an integer >= 3")
+        if (
+            isinstance(warmup_repeats, bool)
+            or not isinstance(warmup_repeats, int)
+            or warmup_repeats < 0
+        ):
+            raise ValueError("warmup_repeats must be an integer >= 0")
         if (
             isinstance(held_out_fraction, bool)
             or not isinstance(held_out_fraction, (int, float))
@@ -197,6 +204,7 @@ class BenchmarkGateRunner:
             model=config.alias,
         )
         self._repeats = repeats
+        self._warmup_repeats = warmup_repeats
         self._held_out_fraction = float(held_out_fraction)
         self._training_context_hashes = training_context_hashes
         self._clock = clock
@@ -257,6 +265,16 @@ class BenchmarkGateRunner:
                     should_abort=should_abort,
                 ),
             )
+            # Warm the freshly restarted engine before the measurement window
+            # opens.  Activation restarts vLLM, so the first suite pass pays
+            # one-time JIT compilation of the speculative-decoding kernels; that
+            # cost belongs to neither arm's steady state.  The warmup runs
+            # *before* the pre-scrape, which keeps it out of the Prometheus
+            # window as well as out of ``per_repeat``.
+            stock_warmup = stage(
+                "stock warmup",
+                lambda available: self._warmup(suite, available, should_abort),
+            )
             stock_before = stage(
                 "stock metrics pre-scrape",
                 lambda available: self._scrape(available, should_abort),
@@ -281,6 +299,10 @@ class BenchmarkGateRunner:
                     timeout_seconds=available,
                     should_abort=should_abort,
                 ),
+            )
+            candidate_warmup = stage(
+                "candidate warmup",
+                lambda available: self._warmup(suite, available, should_abort),
             )
             candidate_before = stage(
                 "candidate metrics pre-scrape",
@@ -334,6 +356,13 @@ class BenchmarkGateRunner:
                 "requested_repeats": self._repeats,
                 "stock_runs": stock_replay.num_runs,
                 "candidate_runs": candidate_replay.num_runs,
+                # Unscored, but not invisible: the warmup pass is reported so a
+                # reader can see what was excluded and how slow it was.
+                "warmup": {
+                    "requested_repeats": self._warmup_repeats,
+                    "stock": _warmup_dict(stock_warmup),
+                    "candidate": _warmup_dict(candidate_warmup),
+                },
                 "stock": _delta_dict(stock_delta),
                 "candidate": _delta_dict(candidate_delta),
             },
@@ -385,14 +414,31 @@ class BenchmarkGateRunner:
         suite: BenchmarkSuite,
         timeout_seconds: float,
         should_abort: AbortCheck,
+        *,
+        repeats: int | None = None,
     ) -> ReplayResult:
         return self._replay_executor.replay(
             suite,
             self._endpoint.url,
             self._config.sampling,
-            repeats=self._repeats,
+            repeats=self._repeats if repeats is None else repeats,
             timeout_seconds=timeout_seconds,
             should_abort=should_abort,
+        )
+
+    def _warmup(
+        self,
+        suite: BenchmarkSuite,
+        timeout_seconds: float,
+        should_abort: AbortCheck,
+    ) -> ReplayResult | None:
+        if self._warmup_repeats <= 0:
+            return None
+        return self._replay(
+            suite,
+            timeout_seconds,
+            should_abort,
+            repeats=self._warmup_repeats,
         )
 
 
@@ -413,6 +459,15 @@ def _safe_delta(before: MetricsSnapshot, after: MetricsSnapshot) -> MetricsDelta
             tpot_ms=0.0,
             output_tok_per_sec=0.0,
         )
+
+
+def _warmup_dict(result: ReplayResult | None) -> dict[str, object] | None:
+    if result is None:
+        return None
+    return {
+        "num_runs": result.num_runs,
+        "tok_per_sec": [run.output_tok_per_sec for run in result.run_results],
+    }
 
 
 def _delta_dict(delta: MetricsDelta) -> dict[str, object]:
