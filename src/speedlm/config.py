@@ -307,6 +307,10 @@ class IdleTuningConfig:
     #: the stage the window actually pays for -- to a fixed ceiling.  Set to
     #: null to restore the unbounded full-corpus scan.
     training_window_records: int | None = 256
+    #: Immutable commit SHA of the verifier the cycle trains and benchmarks
+    #: against.  Left null it is resolved from the Hub once per composition and
+    #: pinned for the process; set it explicitly to reproduce an archived run.
+    verifier_revision: str | None = None
     speculators_repo: str | None = None
     training_python: str | None = None
     vllm_python: str | None = None
@@ -340,6 +344,7 @@ class IdleTuningConfig:
                 self.min_trace_records,
             )
         for name, value in (
+            ("verifier_revision", self.verifier_revision),
             ("speculators_repo", self.speculators_repo),
             ("training_python", self.training_python),
             ("vllm_python", self.vllm_python),
@@ -479,6 +484,7 @@ class SpeedLMConfig:
             "held_out_fraction": self.tuning.held_out_fraction,
             "benchmark_repeats": self.tuning.benchmark_repeats,
             "training_window_records": self.tuning.training_window_records,
+            "verifier_revision": self.tuning.verifier_revision,
             "speculators_repo": self.tuning.speculators_repo,
             "training_python": self.tuning.training_python,
             "vllm_python": self.tuning.vllm_python,
@@ -554,6 +560,7 @@ class SpeedLMConfig:
                 "held_out_fraction",
                 "benchmark_repeats",
                 "training_window_records",
+                "verifier_revision",
                 "speculators_repo",
                 "training_python",
                 "vllm_python",

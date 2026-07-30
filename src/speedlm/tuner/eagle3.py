@@ -289,12 +289,22 @@ class Eagle3Adapter:
         self._clock = clock
 
     def describe(self) -> BackendInfo:
-        """Return backend-neutral metadata for orchestration and provenance."""
+        """Return backend-neutral metadata for orchestration and provenance.
+
+        The pinned verifier revision travels with the training parameters so
+        it lands in the published artifact manifest.  Without it the manifest
+        names the verifier but not *which* verifier, and a cycle trained
+        against a silently updated upstream model is indistinguishable from
+        one that was not.
+        """
+        params = dict(self.config.training_params)
+        if self.config.verifier_revision is not None:
+            params["verifier_revision"] = self.config.verifier_revision
         return BackendInfo(
             verifier_model=self.config.verifier_model,
             draft_model=self.config.draft_model,
             from_pretrained=self.config.from_pretrained,
-            training_params=self.config.training_params,
+            training_params=params,
         )
 
     def prepare(self, work_dir: Path, *, should_abort: AbortCheck) -> PreparedData:

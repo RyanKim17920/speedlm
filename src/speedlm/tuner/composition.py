@@ -48,6 +48,59 @@ class ProductionTuningError(RuntimeError):
     """Raised before serving when an opt-in production contract is incomplete."""
 
 
+def resolve_verifier_revision(
+    verifier_model: str,
+    configured: str | None,
+    *,
+    resolver: Callable[[str], str] | None = None,
+) -> str | None:
+    """Return the immutable revision the cycle must pin the verifier to.
+
+    Nothing pinned the verifier before this: the pipeline left
+    ``verifier_revision`` at ``None`` and the backend passed the bare model
+    string through, so an upstream Hub change silently altered both what was
+    trained and what it was benchmarked against, with no artifact field that
+    would show it had happened.
+
+    Resolution is fail-closed.  An unpinnable verifier is an unreproducible
+    cycle, and a cycle that cannot be reproduced cannot justify promoting a
+    draft, so composition refuses to start rather than training against a
+    moving target.  The one exception is a verifier given as a local
+    filesystem path: there is no Hub revision to resolve, and the path is the
+    pin.
+
+    Args:
+        verifier_model: Hub repo id or local path from the resolved profile.
+        configured: ``tuning.verifier_revision``, when the operator pinned one
+            explicitly -- for example to reproduce an archived run.
+        resolver: Seam for tests; defaults to a Hub metadata lookup.
+    """
+    if configured is not None:
+        return configured
+    if Path(verifier_model).exists():
+        return None
+    lookup = resolver if resolver is not None else _hub_revision
+    try:
+        revision = lookup(verifier_model)
+    except Exception as exc:
+        raise ProductionTuningError(
+            f"cannot resolve a revision for verifier {verifier_model!r}: {exc}; "
+            "set tuning.verifier_revision to pin it explicitly"
+        ) from exc
+    if not isinstance(revision, str) or not revision:
+        raise ProductionTuningError(
+            f"verifier {verifier_model!r} resolved to an empty revision; "
+            "set tuning.verifier_revision to pin it explicitly"
+        )
+    return revision
+
+
+def _hub_revision(verifier_model: str) -> str:
+    from huggingface_hub import HfApi  # type: ignore[import-not-found]
+
+    return str(HfApi().model_info(verifier_model).sha)
+
+
 @dataclass(frozen=True, slots=True)
 class TuningLaunchPlan:
     profile: ModelProfile
@@ -183,6 +236,9 @@ def create_production_tuner(
             Path(tuning.vllm_python) if tuning.vllm_python is not None else None
         ),
         verifier_model=profile.verifier_model,
+        verifier_revision=resolve_verifier_revision(
+            profile.verifier_model, tuning.verifier_revision
+        ),
         warm_start_model=profile.draft_model,
         target_layer_ids=profile.target_layer_ids or (),
         sequence_length=min(tuning.sequence_length, profile.max_seq_len),

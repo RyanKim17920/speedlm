@@ -20,6 +20,7 @@ from speedlm.tuner.composition import (
     ProductionTuningError,
     build_tuning_launch_plan,
     create_production_tuner,
+    resolve_verifier_revision,
 )
 
 
@@ -64,6 +65,7 @@ def _config(tmp_path: Path, profile: ModelProfile) -> SpeedLMConfig:
             concurrency=3,
             training_port=9_123,
             scratch_quota_bytes=100_000,
+            verifier_revision="6cee5e81ee83917806bbde320786a8fb61efebee",
         ),
     )
 
@@ -385,9 +387,12 @@ def test_create_production_tuner_assembles_profile_bound_collaborators(
     assert captured["split"] == {
         "held_out_fraction": config.tuning.held_out_fraction,
         "scratch_quota_bytes": config.tuning.scratch_quota_bytes,
+        "training_window_records": config.tuning.training_window_records,
     }
     pipeline = captured["pipeline"]
     assert pipeline["verifier_model"] == profile.verifier_model
+    # An unpinned verifier is an unreproducible cycle.
+    assert pipeline["verifier_revision"] == "6cee5e81ee83917806bbde320786a8fb61efebee"
     assert pipeline["warm_start_model"] == profile.draft_model
     assert pipeline["target_layer_ids"] == profile.target_layer_ids
     assert pipeline["sequence_length"] == profile.max_seq_len
@@ -406,3 +411,54 @@ def test_create_production_tuner_assembles_profile_bound_collaborators(
     assert captured["service"]["state"] is state
     assert captured["service"]["artifacts"] is artifacts
     assert captured["service"]["enabled"] is True
+
+
+def test_configured_verifier_revision_is_pinned_verbatim() -> None:
+    assert (
+        resolve_verifier_revision(
+            "acme/verifier",
+            "6cee5e81ee83917806bbde320786a8fb61efebee",
+            resolver=lambda _model: pytest.fail("must not query the Hub"),
+        )
+        == "6cee5e81ee83917806bbde320786a8fb61efebee"
+    )
+
+
+def test_an_unconfigured_verifier_revision_is_resolved_once() -> None:
+    seen: list[str] = []
+
+    def resolver(model: str) -> str:
+        seen.append(model)
+        return "6cee5e81ee83917806bbde320786a8fb61efebee"
+
+    revision = resolve_verifier_revision("acme/verifier", None, resolver=resolver)
+
+    assert revision == "6cee5e81ee83917806bbde320786a8fb61efebee"
+    assert seen == ["acme/verifier"]
+
+
+def test_an_unresolvable_verifier_revision_fails_closed() -> None:
+    def resolver(_model: str) -> str:
+        raise ConnectionError("hub unreachable")
+
+    with pytest.raises(ProductionTuningError, match="cannot resolve a revision"):
+        resolve_verifier_revision("acme/verifier", None, resolver=resolver)
+
+
+def test_an_empty_verifier_revision_fails_closed() -> None:
+    with pytest.raises(ProductionTuningError, match="empty revision"):
+        resolve_verifier_revision("acme/verifier", None, resolver=lambda _model: "")
+
+
+def test_a_local_verifier_path_is_its_own_pin(tmp_path: Path) -> None:
+    local = tmp_path / "verifier"
+    local.mkdir()
+
+    assert (
+        resolve_verifier_revision(
+            str(local),
+            None,
+            resolver=lambda _model: pytest.fail("must not query the Hub"),
+        )
+        is None
+    )

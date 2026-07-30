@@ -64,3 +64,27 @@ def test_eagle3_backend_satisfies_protocol_and_declares_distillation_contract() 
     assert config.effective_training_params["draft_vocabulary"] == "reduced_d2t_t2d"
     assert config.effective_training_params["num_speculative_steps"] == 3
     assert config.effective_training_params["ttt_loss_reduction"] == "sum"
+
+
+def test_describe_carries_the_pinned_verifier_revision_into_the_manifest() -> None:
+    """The manifest must say *which* verifier, not merely which repo."""
+    backend = object.__new__(Eagle3Backend)
+    backend.config = Eagle3Config(
+        mask_policy=MaskPolicy.FINAL_TURN_ALL_CHANNELS,
+        verifier_revision="6cee5e81ee83917806bbde320786a8fb61efebee",
+        training_params={"epochs": 1},
+    )
+
+    info = backend.describe()
+
+    assert info.training_params["verifier_revision"] == (
+        "6cee5e81ee83917806bbde320786a8fb61efebee"
+    )
+    assert info.training_params["epochs"] == 1
+
+
+def test_describe_omits_the_revision_when_the_verifier_is_a_local_path() -> None:
+    backend = object.__new__(Eagle3Backend)
+    backend.config = Eagle3Config(mask_policy=MaskPolicy.FINAL_TURN_ALL_CHANNELS)
+
+    assert "verifier_revision" not in backend.describe().training_params
