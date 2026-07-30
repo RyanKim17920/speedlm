@@ -16,6 +16,11 @@ from speedlm.gateway.control import (
     AdmissionGate,
     ControlAborted,
     ControlTimeout,
+    DeviceMemory,
+    GPUMemoryNotReleased,
+    GPUMemoryPrecondition,
+    GPUMemoryProbeError,
+    NvidiaSmiMemoryProbe,
     RuntimeController,
 )
 from speedlm.tuner.idle import IdleDetector
@@ -145,7 +150,11 @@ class Rig:
     clock: FakeClock
 
 
-def make_rig(*, active_draft: Path | str = "base-draft") -> Rig:
+def make_rig(
+    *,
+    active_draft: Path | str = "base-draft",
+    gpu_memory: GPUMemoryPrecondition | None = None,
+) -> Rig:
     clock = FakeClock()
     activity = ActivityTracker(clock=clock)
     admission = FakeAdmission()
@@ -161,6 +170,7 @@ def make_rig(*, active_draft: Path | str = "base-draft") -> Rig:
         sleeper=clock.sleep,
         poll_interval_seconds=0.1,
         recovery_timeout_seconds=5.0,
+        gpu_memory=gpu_memory,
     )
     return Rig(controller, activity, admission, http, process, clock)
 
@@ -544,3 +554,233 @@ def test_every_method_rejects_non_positive_timeout_without_stopping_child(
 
     assert rig.process.running
     assert rig.process.calls == []
+
+
+GIB = 1024 * 1024 * 1024
+MIB = 1024 * 1024
+
+
+@dataclass
+class FakeMemoryProbe:
+    """Replay a scripted sequence of device-memory readings."""
+
+    readings: list[tuple[DeviceMemory, ...]]
+    error: Exception | None = None
+    reads: int = 0
+
+    def read(self) -> tuple[DeviceMemory, ...]:
+        self.reads += 1
+        if self.error is not None:
+            raise self.error
+        return self.readings[min(self.reads - 1, len(self.readings) - 1)]
+
+
+def device(free_gib: float, *, index: int = 0, total_gib: float = 80.0) -> DeviceMemory:
+    return DeviceMemory(
+        index=index,
+        free_bytes=int(free_gib * GIB),
+        total_bytes=int(total_gib * GIB),
+    )
+
+
+def precondition(
+    probe: FakeMemoryProbe,
+    *,
+    required_fraction: float = 0.80,
+    timeout_seconds: float = 3.0,
+) -> GPUMemoryPrecondition:
+    return GPUMemoryPrecondition(
+        probe=probe,
+        required_fraction=required_fraction,
+        timeout_seconds=timeout_seconds,
+        poll_interval_seconds=0.5,
+    )
+
+
+def test_sleep_waits_until_the_engine_actually_releases_device_memory() -> None:
+    # Level-1 sleep offloads weights but frees the CUDA pool asynchronously,
+    # so /is_sleeping can be true while the device is still occupied.
+    probe = FakeMemoryProbe(
+        readings=[
+            (device(1.13),),
+            (device(40.0),),
+            (device(79.0),),
+        ]
+    )
+    rig = make_rig(gpu_memory=precondition(probe))
+    quiesce(rig)
+
+    rig.controller.sleep(timeout_seconds=2.0, should_abort=lambda: False)
+
+    assert probe.reads == 3
+    assert rig.clock.now == pytest.approx(1.0)
+    assert rig.process.calls == []
+    assert rig.process.running
+
+
+def test_sleep_fails_closed_when_device_memory_is_never_released() -> None:
+    # Removing the precondition makes this sleep succeed and the cycle proceed
+    # straight into the child-side CUDA OOM this check exists to prevent.
+    probe = FakeMemoryProbe(readings=[(device(1.13),)])
+    rig = make_rig(gpu_memory=precondition(probe))
+    quiesce(rig)
+
+    with pytest.raises(GPUMemoryNotReleased) as excinfo:
+        rig.controller.sleep(timeout_seconds=2.0, should_abort=lambda: False)
+
+    message = str(excinfo.value)
+    assert "GPU memory was not released within 3s" in message
+    assert "device 0 has 1.13 GiB free of 80.00 GiB" in message
+    assert "needs 64.00 GiB (gpu_memory_utilization=0.8)" in message
+    # A cycle that cannot get memory rolls back like any other cycle failure.
+    assert rig.process.calls[-1].draft == "base-draft"
+    assert rig.process.running
+    assert rig.admission.admitting
+
+
+def test_sleep_reports_the_worst_device_of_several() -> None:
+    probe = FakeMemoryProbe(
+        readings=[(device(79.0, index=0), device(2.0, index=1))]
+    )
+    rig = make_rig(gpu_memory=precondition(probe))
+    quiesce(rig)
+
+    with pytest.raises(GPUMemoryNotReleased, match="device 1 has 2.00 GiB free"):
+        rig.controller.sleep(timeout_seconds=2.0, should_abort=lambda: False)
+
+
+def test_memory_requirement_is_derived_from_each_device_total() -> None:
+    check = precondition(FakeMemoryProbe(readings=[]), required_fraction=0.5)
+
+    assert check.required_bytes(device(0.0, total_gib=80.0)) == 40 * GIB
+    assert check.required_bytes(device(0.0, total_gib=24.0)) == 12 * GIB
+
+
+def test_sleep_fails_closed_when_device_memory_cannot_be_observed() -> None:
+    probe = FakeMemoryProbe(readings=[], error=GPUMemoryProbeError("nvidia-smi failed"))
+    rig = make_rig(gpu_memory=precondition(probe))
+    quiesce(rig)
+
+    with pytest.raises(GPUMemoryProbeError, match="nvidia-smi failed"):
+        rig.controller.sleep(timeout_seconds=2.0, should_abort=lambda: False)
+
+    assert rig.process.running
+    assert rig.admission.admitting
+
+
+def test_memory_wait_aborts_on_preemption_and_restores_service() -> None:
+    probe = FakeMemoryProbe(readings=[(device(1.13),)])
+    rig = make_rig(gpu_memory=precondition(probe))
+    quiesce(rig)
+
+    with pytest.raises(ControlAborted, match="gpu memory release aborted"):
+        rig.controller.sleep(timeout_seconds=2.0, should_abort=lambda: probe.reads >= 2)
+
+    assert rig.process.running
+    assert rig.admission.admitting
+
+
+@pytest.mark.parametrize(
+    ("fraction", "timeout", "interval"),
+    [(0.0, 1.0, 1.0), (1.5, 1.0, 1.0), (0.8, 0.0, 1.0), (0.8, 1.0, 0.0)],
+)
+def test_precondition_rejects_nonsensical_configuration(
+    fraction: float, timeout: float, interval: float
+) -> None:
+    with pytest.raises(ValueError):
+        GPUMemoryPrecondition(
+            probe=FakeMemoryProbe(readings=[]),
+            required_fraction=fraction,
+            timeout_seconds=timeout,
+            poll_interval_seconds=interval,
+        )
+
+
+@dataclass(frozen=True)
+class FakeCompleted:
+    returncode: int
+    stdout: str = ""
+    stderr: str = ""
+
+
+def stub_nvidia_smi(
+    monkeypatch: pytest.MonkeyPatch,
+    result: FakeCompleted | Exception,
+) -> list[list[str]]:
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_: object) -> FakeCompleted:
+        commands.append(command)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    monkeypatch.setattr("speedlm.gateway.control.subprocess.run", fake_run)
+    return commands
+
+
+NVIDIA_SMI_TWO_GPUS = (
+    "0, GPU-aaaa, 81559, 1156\n"
+    "1, GPU-bbbb, 81559, 81000\n"
+)
+
+
+def test_nvidia_smi_probe_parses_mib_rows_into_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands = stub_nvidia_smi(monkeypatch, FakeCompleted(0, NVIDIA_SMI_TWO_GPUS))
+
+    devices = NvidiaSmiMemoryProbe(environ={}).read()
+
+    assert commands[0][0] == "nvidia-smi"
+    assert devices == (
+        DeviceMemory(index=0, free_bytes=1156 * MIB, total_bytes=81559 * MIB),
+        DeviceMemory(index=1, free_bytes=81000 * MIB, total_bytes=81559 * MIB),
+    )
+
+
+@pytest.mark.parametrize("visible", ["1", "GPU-bbbb", " 1 "])
+def test_nvidia_smi_probe_honours_cuda_visible_devices(
+    monkeypatch: pytest.MonkeyPatch, visible: str
+) -> None:
+    stub_nvidia_smi(monkeypatch, FakeCompleted(0, NVIDIA_SMI_TWO_GPUS))
+
+    devices = NvidiaSmiMemoryProbe(environ={"CUDA_VISIBLE_DEVICES": visible}).read()
+
+    assert [item.index for item in devices] == [1]
+
+
+@pytest.mark.parametrize(
+    ("environ", "match"),
+    [
+        ({"CUDA_VISIBLE_DEVICES": "7"}, "matches no device"),
+        ({"CUDA_VISIBLE_DEVICES": ""}, "exposes no devices"),
+    ],
+)
+def test_nvidia_smi_probe_refuses_unresolvable_visible_devices(
+    monkeypatch: pytest.MonkeyPatch, environ: dict[str, str], match: str
+) -> None:
+    stub_nvidia_smi(monkeypatch, FakeCompleted(0, NVIDIA_SMI_TWO_GPUS))
+
+    with pytest.raises(GPUMemoryProbeError, match=match):
+        NvidiaSmiMemoryProbe(environ=environ).read()
+
+
+@pytest.mark.parametrize(
+    ("result", "match"),
+    [
+        (FileNotFoundError("nvidia-smi"), "not installed"),
+        (OSError("permission denied"), "could not execute"),
+        (FakeCompleted(9, "", "driver not loaded"), "driver not loaded"),
+        (FakeCompleted(0, ""), "reported no GPUs"),
+        (FakeCompleted(0, "0, GPU-aaaa, lots, 1156\n"), "unparsable"),
+        (FakeCompleted(0, "0, GPU-aaaa, 81559\n"), "unparsable"),
+    ],
+)
+def test_nvidia_smi_probe_reports_unusable_readings_as_probe_errors(
+    monkeypatch: pytest.MonkeyPatch, result: FakeCompleted | Exception, match: str
+) -> None:
+    stub_nvidia_smi(monkeypatch, result)
+
+    with pytest.raises(GPUMemoryProbeError, match=match):
+        NvidiaSmiMemoryProbe(environ={}).read()
