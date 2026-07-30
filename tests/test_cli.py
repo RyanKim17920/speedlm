@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import signal
 from collections.abc import Sequence
 from pathlib import Path
 
@@ -138,6 +139,7 @@ def test_vllm_serve_passthrough(
         exchange_ledger=None,
         enable_tuning=False,
         activity=None,
+        serve_config=None,
     ) -> int:
         received.update(
             model=model,
@@ -198,6 +200,26 @@ def test_unprofiled_model_injects_no_parser_flags() -> None:
     passthrough = ["--tensor-parallel-size", "2"]
 
     assert cli._profiled_vllm_passthrough("acme/unprofiled", passthrough) == passthrough
+
+
+def test_explicit_profile_for_different_model_is_rejected() -> None:
+    profile = profiles.ModelProfile(
+        name="other-model",
+        verifier_model="acme/other-model",
+        draft_model=None,
+        speculative_method="mtp",
+        num_speculative_tokens=1,
+        target_layer_ids=None,
+        chat_template_kind="auto",
+        max_seq_len=1024,
+    )
+
+    with pytest.raises(cli.ProfileError, match="does not match served model"):
+        cli._profiled_vllm_passthrough(
+            "acme/served-model",
+            [],
+            profile=profile,
+        )
 
 
 def test_qwen_profile_injects_tool_call_parser() -> None:
@@ -308,6 +330,58 @@ def test_vllm_readiness_error_is_preserved_and_runtime_record_removed(
     assert not (tmp_path / "gateway.json").exists()
 
 
+def test_vllm_signal_handlers_cover_child_startup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    installed = False
+    callback = None
+    instances = []
+
+    class StartingVLLMProcess:
+        pid = 4321
+
+        def __init__(self, *_args, **_kwargs) -> None:
+            self.shutdown_called = False
+            instances.append(self)
+
+        async def start(self) -> None:
+            assert installed
+            assert callback is not None
+            callback(signal.SIGTERM)
+
+        async def shutdown(self) -> None:
+            self.shutdown_called = True
+
+    @contextlib.contextmanager
+    def fake_forwarded(_child, on_signal):
+        nonlocal installed, callback
+        installed = True
+        callback = on_signal
+        try:
+            yield
+        finally:
+            installed = False
+
+    monkeypatch.setenv("SPEEDLM_HOME", str(tmp_path))
+    monkeypatch.setattr(cli, "VLLMProcess", StartingVLLMProcess)
+    monkeypatch.setattr(cli, "reserve_loopback_port", lambda: 8123)
+    monkeypatch.setattr(cli, "forwarded_signals", fake_forwarded)
+
+    result = asyncio.run(
+        cli._run_vllm_gateway(
+            "my-model",
+            wrapper=cli.WrapperConfig(host="127.0.0.1", port=8100),
+            passthrough=[],
+            store=cli.TraceStore(tmp_path / "traces" / "traces.jsonl"),
+        )
+    )
+
+    assert result == 128 + signal.SIGTERM
+    assert instances[0].shutdown_called
+    assert not (tmp_path / "gateway.json").exists()
+
+
 def test_vllm_version_is_passthrough(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -324,6 +398,7 @@ def test_vllm_version_is_passthrough(
         exchange_ledger=None,
         enable_tuning=False,
         activity=None,
+        serve_config=None,
     ) -> int:
         received["passthrough"] = list(passthrough)
         return 0
@@ -352,6 +427,7 @@ def test_vllm_home_is_passthrough_without_changing_speedlm_home(
         exchange_ledger=None,
         enable_tuning=False,
         activity=None,
+        serve_config=None,
     ) -> int:
         received["passthrough"] = list(passthrough)
         return 0

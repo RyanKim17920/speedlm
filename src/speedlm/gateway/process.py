@@ -334,8 +334,9 @@ def forwarded_signals(
 
     def handler(signum: int, frame: FrameType | None) -> None:
         del frame
-        child.forward_signal(signum)
         on_signal(signum)
+        if child.pid is not None:
+            child.forward_signal(signum)
 
     for signum in (signal.SIGINT, signal.SIGTERM):
         previous[signum] = signal.getsignal(signum)

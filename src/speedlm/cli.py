@@ -5,18 +5,29 @@ import asyncio
 import contextlib
 import logging
 import os
+import signal
 import sys
-from collections.abc import Iterator, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from dataclasses import replace
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 import uvicorn
 
 from speedlm import __version__
-from speedlm.config import ConfigError, SamplingConfig, WrapperConfig, load_config
+from speedlm.config import (
+    ConfigError,
+    SamplingConfig,
+    SpeedLMConfig,
+    WrapperConfig,
+    load_config,
+)
 from speedlm.doctor import CheckStatus, run_doctor
 from speedlm.gateway.activity import ActivityTracker
 from speedlm.gateway.app import create_app
+from speedlm.gateway.control import AdmissionGate
+from speedlm.gateway.exchange import ExchangeLedger
 from speedlm.gateway.process import (
     LOOPBACK_HOST,
     ProcessError,
@@ -25,19 +36,30 @@ from speedlm.gateway.process import (
     forwarded_signals,
     reserve_loopback_port,
 )
-from speedlm.profiles import ProfileError, resolve_profile
+from speedlm.gateway.supervisor import ThreadsafeProcessControl, VLLMSupervisor
+from speedlm.gateway.vllm_http import VLLMControlClient
+from speedlm.profiles import (
+    ModelProfile,
+    ProfileError,
+    canonical_verifier_reference,
+    resolve_model_parsers,
+    resolve_profile,
+)
 from speedlm.report import ReportError, build_gain_report, build_status_report
 from speedlm.runtime import gateway_runtime_record
 from speedlm.storage import StorageError, ensure_layout, resolve_layout
 from speedlm.traces.normalize import NormalizeError, normalize_file
-from speedlm.traces.store import TraceError, TraceStore
+from speedlm.traces.store import DROP_REASONS, TraceError, TraceStore
+from speedlm.tuner.artifacts import ArtifactError
+from speedlm.tuner.composition import (
+    ProductionTuningError,
+    build_tuning_launch_plan,
+    create_production_tuner,
+)
+from speedlm.tuner.service import TunerServiceStartupError, TunerServiceStopError
 
 logger = logging.getLogger("speedlm.cli")
 
-_IDLE_TUNING_UNAVAILABLE = (
-    "--enable-idle-tuning is not available: production tuner collaborators "
-    "are not fully wired"
-)
 _COMMANDS = frozenset({"vllm", "traces", "status", "gain", "doctor"})
 
 
@@ -57,12 +79,14 @@ def _build_parser() -> argparse.ArgumentParser:
 
     serve_parser = vllm_sub.add_parser("serve", help="Launch vLLM with SpeedLM proxy")
     serve_parser.add_argument("model", help="Model name or path")
-    serve_parser.add_argument("--host", default="127.0.0.1", help="Wrapper listen host")
-    serve_parser.add_argument("--port", type=int, default=8100, help="Wrapper listen port")
+    serve_parser.add_argument("--host", default=None, help="Wrapper listen host")
+    serve_parser.add_argument("--port", type=int, default=None, help="Wrapper listen port")
+    serve_parser.add_argument("--config", default=None, help="SpeedLM JSON config")
+    serve_parser.add_argument("--profile", default=None, help="Model profile override")
     serve_parser.add_argument(
         "--enable-idle-tuning",
-        action="store_true",
-        default=False,
+        action=argparse.BooleanOptionalAction,
+        default=None,
         help="Start the idle auto-tuner in the background",
     )
 
@@ -115,28 +139,86 @@ def _build_parser() -> argparse.ArgumentParser:
 
 def _cmd_vllm_serve(
     model: str,
-    host: str,
-    port: int,
+    host: str | None,
+    port: int | None,
     passthrough: list[str],
-    enable_tuning: bool = False,
+    enable_tuning: bool | None = None,
+    config_path: str | None = None,
+    profile: str | None = None,
 ) -> int:
-    if enable_tuning:
-        sys.stderr.write(f"[speedlm] error: {_IDLE_TUNING_UNAVAILABLE}\n")
-        return 1
     try:
-        wrapper = WrapperConfig(host=host, port=port)
         layout = ensure_layout()
-        store = TraceStore(layout.traces_dir / "traces.jsonl")
-        return asyncio.run(
+        candidate_config_path = (
+            Path(config_path) if config_path is not None else layout.root / "config.json"
+        )
+        config = (
+            load_config(candidate_config_path)
+            if config_path is not None or candidate_config_path.exists()
+            else SpeedLMConfig(model=model)
+        )
+        if config.model != model:
+            raise ConfigError(
+                f"serve model {model!r} does not match config model {config.model!r}"
+            )
+        if profile is not None:
+            config = replace(config, profile=profile)
+        effective_tuning = (
+            config.tuning_enabled if enable_tuning is None else enable_tuning
+        )
+        if effective_tuning and (
+            config.tuning.speculators_repo is None
+            or config.tuning.training_python is None
+        ):
+            raise ConfigError(
+                "idle tuning requires tuning.speculators_repo and "
+                "tuning.training_python in the SpeedLM config"
+            )
+        config = replace(
+            config,
+            tuning_enabled=effective_tuning,
+            wrapper=WrapperConfig(
+                host=config.wrapper.host if host is None else host,
+                port=config.wrapper.port if port is None else port,
+            ),
+        )
+        store = TraceStore.from_config(
+            layout.traces_dir / "traces.jsonl",
+            config.buffer,
+            redaction=config.redaction,
+        )
+        exchange_ledger = ExchangeLedger(layout.exchanges_dir)
+        gateway = (
             _run_vllm_gateway(
                 model,
-                wrapper=wrapper,
+                wrapper=config.wrapper,
                 passthrough=passthrough,
                 store=store,
-                enable_tuning=enable_tuning,
+                exchange_ledger=exchange_ledger,
+                enable_tuning=True,
+                tuning_config=config,
+                serve_config=config,
+            )
+            if effective_tuning
+            else _run_vllm_gateway(
+                model,
+                wrapper=config.wrapper,
+                passthrough=passthrough,
+                store=store,
+                exchange_ledger=exchange_ledger,
+                enable_tuning=False,
+                serve_config=config,
             )
         )
-    except (ConfigError, ProcessError, OSError, RuntimeError) as exc:
+        return asyncio.run(gateway)
+    except (
+        ConfigError,
+        ProcessError,
+        ProfileError,
+        ProductionTuningError,
+        ArtifactError,
+        OSError,
+        RuntimeError,
+    ) as exc:
         sys.stderr.write(f"[speedlm] error: {exc}\n")
         return 1
 
@@ -152,24 +234,80 @@ class _GatewayServer(uvicorn.Server):
 def _profiled_vllm_passthrough(
     model: str,
     passthrough: Sequence[str],
+    *,
+    profile: ModelProfile | None = None,
+    home: Path | None = None,
 ) -> list[str]:
-    effective = list(passthrough)
-    try:
-        profile = resolve_profile(served_model=model)
-    except ProfileError:
-        return effective
-
-    for option, value in (
-        ("--tool-call-parser", profile.tool_call_parser),
-        ("--reasoning-parser", profile.reasoning_parser),
-    ):
-        supplied = any(
-            argument == option or argument.startswith(f"{option}=")
-            for argument in passthrough
+    if profile is not None and canonical_verifier_reference(
+        profile.verifier_model
+    ) != canonical_verifier_reference(model):
+        raise ProfileError(
+            f"profile {profile.name!r} verifier {profile.verifier_model!r} does not "
+            f"match served model {model!r}"
         )
-        if value is not None and not supplied:
+    effective = list(passthrough)
+    resolution = resolve_model_parsers(
+        model,
+        passthrough,
+        profile=profile,
+        home=home,
+        allow_remote_config=True,
+    )
+
+    if resolution.tool_call_parser is not None and not any(
+        argument == "--enable-auto-tool-choice"
+        or argument.startswith("--enable-auto-tool-choice=")
+        for argument in passthrough
+    ):
+        effective.append("--enable-auto-tool-choice")
+
+    for option, value, source in (
+        (
+            "--tool-call-parser",
+            resolution.tool_call_parser,
+            resolution.tool_call_parser_source,
+        ),
+        (
+            "--reasoning-parser",
+            resolution.reasoning_parser,
+            resolution.reasoning_parser_source,
+        ),
+    ):
+        if value is not None and source != "user-supplied":
             effective.extend((option, value))
     return effective
+
+
+def _configured_model_alias(
+    config: SpeedLMConfig,
+    passthrough: Sequence[str],
+) -> list[str]:
+    effective = list(passthrough)
+    supplied, value = _option_value(passthrough, "--served-model-name")
+    if supplied:
+        if value != config.alias:
+            raise ConfigError(
+                f"--served-model-name must match configured model alias "
+                f"{config.alias!r}, got {value!r}"
+            )
+        return effective
+    if config.model_alias:
+        effective.extend(("--served-model-name", config.model_alias))
+    return effective
+
+
+def _option_value(
+    arguments: Sequence[str],
+    option: str,
+) -> tuple[bool, str | None]:
+    for index, argument in enumerate(arguments):
+        if argument.startswith(f"{option}="):
+            return True, argument.partition("=")[2] or None
+        if argument == option:
+            if index + 1 < len(arguments) and not arguments[index + 1].startswith("--"):
+                return True, arguments[index + 1]
+            return True, None
+    return False, None
 
 
 async def _run_vllm_gateway(
@@ -178,24 +316,58 @@ async def _run_vllm_gateway(
     wrapper: WrapperConfig,
     passthrough: Sequence[str],
     store: TraceStore,
+    exchange_ledger: ExchangeLedger | None = None,
     enable_tuning: bool = False,
     activity: ActivityTracker | None = None,
+    tuning_config: SpeedLMConfig | None = None,
+    serve_config: SpeedLMConfig | None = None,
 ) -> int:
     if enable_tuning:
-        raise RuntimeError(_IDLE_TUNING_UNAVAILABLE)
+        if tuning_config is None:
+            raise ProductionTuningError(
+                "idle tuning requires a validated SpeedLM config"
+            )
+        return await _run_tuned_vllm_gateway(
+            model,
+            wrapper=wrapper,
+            passthrough=passthrough,
+            store=store,
+            exchange_ledger=exchange_ledger,
+            config=tuning_config,
+            activity=activity,
+        )
 
     tracker = activity or ActivityTracker()
+    config = serve_config or SpeedLMConfig(model=model, wrapper=wrapper)
+    layout = ensure_layout()
+    explicit_profile = (
+        resolve_profile(
+            {"model": model, "profile": config.profile},
+            served_model=model,
+            home=layout.root,
+        )
+        if config.profile is not None
+        else None
+    )
+    configured_passthrough = _configured_model_alias(config, passthrough)
 
     child_port = reserve_loopback_port()
     child_url = f"http://{LOOPBACK_HOST}:{child_port}"
     child = VLLMProcess(
         build_vllm_argv(
             model,
-            _profiled_vllm_passthrough(model, passthrough),
+            _profiled_vllm_passthrough(
+                model,
+                configured_passthrough,
+                profile=explicit_profile,
+                home=layout.root,
+            ),
             host=LOOPBACK_HOST,
             port=child_port,
         ),
         health_url=f"{child_url}/health",
+        startup_timeout=config.startup_timeout_seconds,
+        startup_stall_timeout=config.startup_stall_seconds,
     )
     sys.stderr.write(
         f"[speedlm] launching vLLM on {LOOPBACK_HOST}:{child_port}; "
@@ -203,7 +375,7 @@ async def _run_vllm_gateway(
     )
     received_signal: int | None = None
     server: _GatewayServer | None = None
-    tuner_service: object | None = None
+    child_started = False
 
     def on_signal(signum: int) -> None:
         nonlocal received_signal
@@ -213,23 +385,26 @@ async def _run_vllm_gateway(
                 server.force_exit = True
             server.should_exit = True
 
-    await child.start()
-
     # The runtime record is what makes this gateway visible to `speedlm status`.
     # It lands in SPEEDLM_HOME (the same home `_cmd_vllm_serve` just ensured) and
     # is entered on a stack so it is removed *after* the child is reaped, and so
     # a SIGTERM arriving before uvicorn owns the signals still cleans it up.
     record_stack = contextlib.ExitStack()
-    record_stack.enter_context(
+    runtime_record = record_stack.enter_context(
         gateway_runtime_record(
             host=wrapper.host,
             port=wrapper.port,
             model=model,
-            child_pid=child.pid,
+            child_pid=None,
         )
     )
     try:
         with forwarded_signals(child, on_signal):
+            await child.start()
+            child_started = True
+            runtime_record.update_child_pid(child.pid)
+            if received_signal is not None:
+                return 128 + received_signal
             try:
                 await child.wait_ready()
             except ProcessError:
@@ -242,6 +417,8 @@ async def _run_vllm_gateway(
             app = create_app(
                 child_url,
                 trace_store=store,
+                sampling=config.sampling,
+                exchange_ledger=exchange_ledger,
                 activity=tracker,
             )
             server = _GatewayServer(
@@ -265,11 +442,11 @@ async def _run_vllm_gateway(
 
             server_task = asyncio.create_task(serve())
             child_task = asyncio.create_task(child.wait())
-            done, _ = await asyncio.wait(
+            runtime_done, _ = await asyncio.wait(
                 {server_task, child_task},
                 return_when=asyncio.FIRST_COMPLETED,
             )
-            if child_task in done:
+            if child_task in runtime_done:
                 child_code = child_task.result()
                 server.should_exit = True
                 await server_task
@@ -285,16 +462,287 @@ async def _run_vllm_gateway(
                 return 128 + received_signal
             return server_code
     finally:
-        # Stop tuner service before tearing down vLLM
-        if tuner_service is not None:
-            try:
-                tuner_service.stop(timeout_seconds=10.0)  # type: ignore[attr-defined]
-            except Exception as exc:
-                logger.warning("idle tuner stop failed: %s", exc)
         try:
-            await child.shutdown()
+            if child_started:
+                await child.shutdown()
         finally:
             record_stack.close()
+
+
+async def _run_tuned_vllm_gateway(
+    model: str,
+    *,
+    wrapper: WrapperConfig,
+    passthrough: Sequence[str],
+    store: TraceStore,
+    exchange_ledger: ExchangeLedger | None,
+    config: SpeedLMConfig,
+    activity: ActivityTracker | None,
+) -> int:
+    tracker = activity or ActivityTracker()
+    admission = AdmissionGate(tracker)
+    admission.hold()
+    child_port = reserve_loopback_port()
+    child_url = f"http://{LOOPBACK_HOST}:{child_port}"
+    layout = ensure_layout()
+    explicit_profile = resolve_profile(
+        {"model": model, "profile": config.profile},
+        served_model=model,
+        home=layout.root,
+    )
+    configured_passthrough = _configured_model_alias(config, passthrough)
+    effective_passthrough = _profiled_vllm_passthrough(
+        model,
+        configured_passthrough,
+        profile=explicit_profile,
+        home=layout.root,
+    )
+    launch = build_tuning_launch_plan(
+        config,
+        passthrough=effective_passthrough,
+        child_port=child_port,
+        home=layout.root,
+    )
+    record_stack = contextlib.ExitStack()
+    runtime_record = record_stack.enter_context(
+        gateway_runtime_record(
+            host=wrapper.host,
+            port=wrapper.port,
+            model=model,
+            child_pid=None,
+        )
+    )
+
+    def process_factory(argv: Sequence[str], *, health_url: str) -> VLLMProcess:
+        return VLLMProcess(
+            argv,
+            health_url=health_url,
+            startup_timeout=config.startup_timeout_seconds,
+            startup_stall_timeout=config.startup_stall_seconds,
+            env_overrides={"VLLM_SERVER_DEV_MODE": "1"},
+        )
+
+    supervisor = VLLMSupervisor(
+        argv_factory=launch.argv_factory,
+        health_url=f"{child_url}/health",
+        process_factory=process_factory,
+        on_pid_changed=runtime_record.update_child_pid,
+    )
+    server: _GatewayServer | None = None
+    service = None
+    http: VLLMControlClient | None = None
+    received_signal: int | None = None
+    graceful_shutdown_task: asyncio.Task[None] | None = None
+    service_stop_task: asyncio.Task[None] | None = None
+    server_task: asyncio.Task[int] | None = None
+    child_task: asyncio.Task[int] | None = None
+    shutdown_requested = asyncio.Event()
+
+    def on_signal(signum: int) -> None:
+        nonlocal received_signal, graceful_shutdown_task
+        received_signal = signum
+        shutdown_requested.set()
+        if graceful_shutdown_task is None:
+            graceful_shutdown_task = asyncio.create_task(
+                stop_tuner_then_server(),
+                name="speedlm-tuned-graceful-shutdown",
+            )
+        elif server is not None:
+            server.force_exit = True
+            server.should_exit = True
+
+    async def stop_tuner() -> None:
+        nonlocal service_stop_task
+        if service_stop_task is None:
+            service_stop_task = asyncio.create_task(
+                stop_tuner_effects(),
+                name="speedlm-tuner-stop",
+            )
+        await asyncio.shield(service_stop_task)
+
+    async def stop_tuner_effects() -> None:
+        admission.close()
+        if service is not None:
+            try:
+                await asyncio.to_thread(
+                    service.stop,
+                    timeout_seconds=config.tuning.shutdown_timeout_seconds,
+                )
+            except TunerServiceStopError:
+                logger.warning(
+                    "idle tuner exceeded the graceful shutdown deadline; "
+                    "waiting for its serving-recovery contract to finish"
+                )
+                await asyncio.to_thread(service.stop, timeout_seconds=None)
+
+    async def stop_tuner_then_server() -> None:
+        await stop_tuner()
+        if server is not None:
+            server.should_exit = True
+
+    try:
+        with _shutdown_signals(on_signal):
+            await supervisor.start(launch.active_draft)
+            if shutdown_requested.is_set():
+                return 128 + (received_signal or signal.SIGTERM)
+            readiness_task = asyncio.create_task(
+                supervisor.wait_ready(timeout=config.startup_timeout_seconds)
+            )
+            startup_signal_task = asyncio.create_task(shutdown_requested.wait())
+            done, _ = await asyncio.wait(
+                {readiness_task, startup_signal_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if startup_signal_task in done:
+                readiness_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await readiness_task
+                return 128 + (received_signal or signal.SIGTERM)
+            startup_signal_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await startup_signal_task
+            await readiness_task
+            if shutdown_requested.is_set():
+                return 128 + (received_signal or signal.SIGTERM)
+            http = VLLMControlClient(child_url, model=config.alias)
+            try:
+                await asyncio.to_thread(
+                    http.wait_ready,
+                    timeout_seconds=config.startup_timeout_seconds,
+                    should_abort=shutdown_requested.is_set,
+                )
+            except Exception:
+                if shutdown_requested.is_set():
+                    return 128 + (received_signal or signal.SIGTERM)
+                raise
+            if shutdown_requested.is_set():
+                return 128 + (received_signal or signal.SIGTERM)
+            app = create_app(
+                child_url,
+                trace_store=store,
+                sampling=config.sampling,
+                exchange_ledger=exchange_ledger,
+                activity=tracker,
+                admission=admission,
+                before_shutdown=stop_tuner,
+            )
+            capture = app.state.capture
+            if capture is None:
+                raise ProductionTuningError("semantic capture is required for idle tuning")
+            loop = asyncio.get_running_loop()
+            service = create_production_tuner(
+                config,
+                profile=launch.profile,
+                active_draft=launch.active_draft,
+                activity=tracker,
+                admission=admission,
+                traces=store,
+                capture=capture,
+                process=ThreadsafeProcessControl(supervisor, loop),
+                http=http,
+                child_url=child_url,
+                loop=loop,
+                home=layout.root,
+            )
+            server = _GatewayServer(
+                uvicorn.Config(
+                    app,
+                    host=wrapper.host,
+                    port=wrapper.port,
+                    log_level="info",
+                    lifespan="on",
+                )
+            )
+
+            async def serve() -> int:
+                if server is None:
+                    raise RuntimeError("gateway server was not initialized")
+                try:
+                    await server.serve()
+                except SystemExit as exc:
+                    return exc.code if isinstance(exc.code, int) else 1
+                return 0 if server.started else 1
+
+            server_task = asyncio.create_task(serve())
+            while not server.started:
+                if server_task.done():
+                    return server_task.result()
+                if shutdown_requested.is_set():
+                    await stop_tuner_then_server()
+                    return 128 + (received_signal or signal.SIGTERM)
+                await asyncio.sleep(0.01)
+
+            service.start(paused=True)
+            try:
+                await asyncio.to_thread(
+                    service.wait_started,
+                    timeout_seconds=config.startup_timeout_seconds,
+                )
+            except TunerServiceStartupError:
+                if shutdown_requested.is_set():
+                    return 128 + (received_signal or signal.SIGTERM)
+                raise
+            if shutdown_requested.is_set():
+                return 128 + (received_signal or signal.SIGTERM)
+            admission.release()
+            service.activate()
+            child_task = asyncio.create_task(supervisor.wait())
+            runtime_done, _ = await asyncio.wait(
+                {server_task, child_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if child_task in runtime_done:
+                child_code = child_task.result()
+                await stop_tuner_then_server()
+                await server_task
+                if received_signal is not None:
+                    return 128 + received_signal
+                return _shell_exit_code(child_code)
+            server_code = server_task.result()
+            child_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await child_task
+            if received_signal is not None:
+                return 128 + received_signal
+            return server_code
+    finally:
+        admission.close()
+        if graceful_shutdown_task is not None:
+            with contextlib.suppress(asyncio.CancelledError):
+                await graceful_shutdown_task
+        await stop_tuner_then_server()
+        if server_task is not None and not server_task.done():
+            with contextlib.suppress(asyncio.CancelledError):
+                await server_task
+        if child_task is not None and not child_task.done():
+            child_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await child_task
+        if http is not None:
+            http.close()
+        try:
+            await supervisor.shutdown()
+        finally:
+            record_stack.close()
+
+
+@contextlib.contextmanager
+def _shutdown_signals(
+    on_signal: Callable[[int], None],
+) -> Iterator[None]:
+    previous: dict[signal.Signals, Any] = {}
+
+    def handler(signum: int, _frame: object) -> None:
+        on_signal(signum)
+
+    for signum in (signal.SIGINT, signal.SIGTERM):
+        previous[signum] = signal.getsignal(signum)
+        signal.signal(signum, handler)
+    try:
+        yield
+    finally:
+        for restored_signal, old_handler in previous.items():
+            signal.signal(restored_signal, old_handler)
 
 
 def _shell_exit_code(returncode: int) -> int:
@@ -375,6 +823,13 @@ def _cmd_traces_stats(store: str | None) -> int:
             f"tokens   : {stats.tokens}",
             f"measured : {stats.measured_tokens}",
             f"estimated: {stats.estimated_tokens}",
+            f"dropped  : {stats.total_dropped}",
+            *(
+                f"  {reason}: {stats.drops_by_reason.get(reason, 0)}"
+                for reason in DROP_REASONS
+            ),
+            "truncated_at_line: "
+            f"{stats.truncated_at_line if stats.truncated_at_line is not None else '-'}",
             f"oldest   : {oldest_str}",
             f"newest   : {newest_str}",
             f"store    : {store_path}",
@@ -454,6 +909,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     logging.basicConfig(
         level=logging.WARNING,
         format="[speedlm] %(levelname)s: %(message)s",
+        force=True,
     )
     parser = _build_parser()
 
@@ -488,13 +944,21 @@ def main(argv: Sequence[str] | None = None) -> int:
             serve_argv = argv[argv.index("vllm") + 2:]
             sub = argparse.ArgumentParser(prog="speedlm vllm serve")
             sub.add_argument("model")
-            sub.add_argument("--host", default="127.0.0.1")
-            sub.add_argument("--port", type=int, default=8100)
-            sub.add_argument("--enable-idle-tuning", action="store_true", default=False)
+            sub.add_argument("--host", default=None)
+            sub.add_argument("--port", type=int, default=None)
+            sub.add_argument("--config", default=None)
+            sub.add_argument("--profile", default=None)
+            sub.add_argument(
+                "--enable-idle-tuning",
+                action=argparse.BooleanOptionalAction,
+                default=None,
+            )
             s_args, s_unknown = sub.parse_known_args(serve_argv)
             return _cmd_vllm_serve(
                 s_args.model, s_args.host, s_args.port, s_unknown,
                 enable_tuning=getattr(s_args, "enable_idle_tuning", False),
+                config_path=s_args.config,
+                profile=s_args.profile,
             )
 
     # ---- traces ----
