@@ -339,12 +339,19 @@ def _assert_gate_measured_something(decision: JsonObject) -> None:
     assert num_repeats > 0, decision
     assert decision.get("acceptance_delta_pp") is not None, decision
     assert decision.get("throughput_delta_pct") is not None, decision
-    for arm in ("stock_avg_acceptance", "candidate_avg_acceptance"):
-        value = decision.get(arm)
-        assert isinstance(value, (int, float)) and value > 0.0, decision
+    # Throughput is measured whenever the arms ran at all, so require it on
+    # both.  Acceptance may legitimately be a measured zero for one arm (a head
+    # whose every draft is rejected), but not for both -- that is the all-zero
+    # signature of a scrape that matched nothing.
     for arm in ("stock_avg_tok_per_sec", "candidate_avg_tok_per_sec"):
         value = decision.get(arm)
         assert isinstance(value, (int, float)) and value > 0.0, decision
+    acceptances = [
+        decision.get("stock_avg_acceptance"),
+        decision.get("candidate_avg_acceptance"),
+    ]
+    assert all(isinstance(v, (int, float)) for v in acceptances), decision
+    assert any(v > 0.0 for v in acceptances if isinstance(v, (int, float))), decision
 
 
 def _copy_profile(profile: Path | None, home: Path) -> None:
