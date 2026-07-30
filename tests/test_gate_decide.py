@@ -1,7 +1,10 @@
 """Tests for gate/decide.py — no GPU, no network."""
 
+import pytest
+
 from speedlm.config import PromotionConfig
 from speedlm.gate.decide import (
+    GATING_THROUGHPUT_STATISTIC,
     Decision,
     Reason,
     Verdict,
@@ -96,13 +99,30 @@ def _pcfg(*, acc_pp: float = 1.0, throughput_pct: float = 2.0) -> PromotionConfi
     )
 
 
+#: Completion tokens per synthetic request.  Large enough that any throughput
+#: these helpers are asked for is representable exactly.
+_RUN_COMPLETION_TOKENS = 1000
+
+
 def _valid_run(tps: float = 100.0) -> RunResults:
-    """A single run with one valid request."""
+    """A single run with one valid request at *exactly* ``tps`` tokens/second.
+
+    The gating throughput statistic is the mean of these per-repeat figures, so
+    the helper has to reproduce the requested rate exactly.  The previous form
+    fixed latency at 0.1 s and rounded completion tokens to a whole number,
+    which quantised every request to the nearest 10 tok/s -- fine when the
+    gate read throughput from the injected Prometheus delta, silently wrong
+    now that it reads it from here.
+    """
+    if tps <= 0:
+        return _make_run([
+            _make_request_result("same output", latency_s=1.0, completion_tokens=0),
+        ])
     return _make_run([
         _make_request_result(
             "same output",
-            latency_s=0.1,
-            completion_tokens=int(tps * 0.1),
+            latency_s=_RUN_COMPLETION_TOKENS / tps,
+            completion_tokens=_RUN_COMPLETION_TOKENS,
         ),
     ])
 
@@ -180,11 +200,15 @@ def test_reject_when_only_throughput_clears() -> None:
 
 
 def test_zero_stock_throughput_is_unmeasured_not_a_threshold_miss() -> None:
-    """A zero denominator cannot honestly produce a throughput delta."""
+    """A zero denominator cannot honestly produce a throughput delta.
+
+    The denominator that matters is the *gating* statistic's -- the replayed
+    per-repeat stock throughput -- not the Prometheus window's.
+    """
     dec = decide_promotion(
-        _make_delta(acceptance_rate=0.6, output_tok_per_sec=0.0),
+        _make_delta(acceptance_rate=0.6, output_tok_per_sec=100.0),
         _make_delta(acceptance_rate=0.7, output_tok_per_sec=100.0),
-        _valid_runs_with_tps(100.0),
+        _valid_runs_with_tps(0.0),
         _valid_runs_with_tps(100.0),
         _pcfg(),
     )
@@ -192,6 +216,30 @@ def test_zero_stock_throughput_is_unmeasured_not_a_threshold_miss() -> None:
     assert dec.verdict is Verdict.REJECT
     assert dec.reason is Reason.THROUGHPUT_UNAVAILABLE
     _assert_unmeasured_deltas(dec)
+
+
+def test_unusable_prometheus_throughput_does_not_veto_a_good_candidate() -> None:
+    """The diagnostic statistic is diagnostic: a zero there is not a rejection.
+
+    Acceptance still comes from the Prometheus counters, so a genuinely broken
+    scrape is caught by ``ACCEPTANCE_UNAVAILABLE``.  A missing *decode-time*
+    series is a reporting gap in a number that no longer gates.
+    """
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.60, output_tok_per_sec=0.0),
+        _make_delta(acceptance_rate=0.65, output_tok_per_sec=0.0),
+        _valid_runs_with_tps(100.0),
+        _valid_runs_with_tps(100.0),
+        PromotionConfig(),
+    )
+
+    assert dec.verdict is Verdict.PROMOTE
+    assert dec.reason is Reason.BOTH_THRESHOLDS_MET
+    assert dec.throughput_delta_pct == pytest.approx(0.0)
+    # The unmeasurable diagnostic is reported as unmeasured, not as a zero.
+    assert dec.prometheus_throughput_delta_pct is None
+    assert dec.throughput_statistic_gap_pp is None
+    assert dec.to_dict()["prometheus_throughput_delta_pct"] is None
 
 
 def test_reject_on_counter_reset() -> None:
@@ -580,3 +628,206 @@ def test_acceptance_is_checked_before_throughput_under_shipped_defaults() -> Non
     # The throughput number is still reported so the operator sees both facts.
     assert dec.throughput_delta_pct is not None
     assert abs(dec.throughput_delta_pct + 50.0) < 1e-9
+
+
+# ---------------------------------------------------------------------------
+# One statistic gates, and the record says which
+# ---------------------------------------------------------------------------
+
+#: Job 368689's five scored repeats, verbatim from its ``decision.json``
+#: (``log_artifacts/live-idle-thresholds-20260730T213537Z``).
+_J368689_STOCK_PER_REPEAT = (
+    76.34386880491071,
+    76.62329517682556,
+    76.52287914081516,
+    70.62018912755627,
+    73.71546413567889,
+)
+_J368689_CANDIDATE_PER_REPEAT = (
+    74.66176429606165,
+    75.091991116685,
+    74.66711484793703,
+    71.74390864075151,
+    74.85118171837253,
+)
+#: The same run's Prometheus decode-time window: 1315 generated tokens over
+#: 15.785 s (stock) and 16.304 s (candidate) of ``request_decode_time_seconds``.
+#: A different denominator from the replay figures above -- decode only, no
+#: prefill and no client time -- hence a different, larger, delta.
+_J368689_STOCK_PROM_TPS = 83.3062096100477
+_J368689_CANDIDATE_PROM_TPS = 80.65669725058713
+#: Both arms produced byte-identical spec_decode counters: 1925 drafted,
+#: 915 accepted, so acceptance did not move at all.
+_J368689_ACCEPTANCE = 915.0 / 1925.0
+
+
+def _replay_with_per_repeat_tps(values: tuple[float, ...]) -> ReplayResult:
+    return _make_replay([_valid_run(tps=v) for v in values])
+
+
+def _decide_368689(
+    *,
+    stock_acc: float = _J368689_ACCEPTANCE,
+    cand_acc: float = _J368689_ACCEPTANCE,
+    pcfg: PromotionConfig | None = None,
+) -> Decision:
+    """Replay job 368689's real measurement through the real gate."""
+    return decide_promotion(
+        _make_delta(
+            acceptance_rate=stock_acc, output_tok_per_sec=_J368689_STOCK_PROM_TPS
+        ),
+        _make_delta(
+            acceptance_rate=cand_acc, output_tok_per_sec=_J368689_CANDIDATE_PROM_TPS
+        ),
+        _replay_with_per_repeat_tps(_J368689_STOCK_PER_REPEAT),
+        _replay_with_per_repeat_tps(_J368689_CANDIDATE_PER_REPEAT),
+        pcfg if pcfg is not None else PromotionConfig(),
+        warmup_repeats=1,
+    )
+
+
+def test_decision_names_the_statistic_that_gates() -> None:
+    """The record must not leave a reader guessing which number is the bar."""
+    dec = _decide_368689()
+
+    assert dec.throughput_statistic == GATING_THROUGHPUT_STATISTIC
+    assert dec.throughput_statistic == "replay_per_repeat_mean"
+    assert dec.to_dict()["throughput_statistic"] == "replay_per_repeat_mean"
+
+
+def test_reported_averages_are_exactly_the_per_repeat_means() -> None:
+    """``*_avg_tok_per_sec`` must be reproducible by hand from ``per_repeat``.
+
+    Job 368689's record was not: its averages came from the Prometheus window
+    while its ``per_repeat`` array came from replay timing, so averaging the
+    published column did not reproduce the published mean.  That is exactly
+    how the two statistics got confused.
+    """
+    dec = _decide_368689()
+
+    stock_column = [r.stock_tok_per_sec for r in dec.per_repeat]
+    cand_column = [r.candidate_tok_per_sec for r in dec.per_repeat]
+
+    assert stock_column == pytest.approx(list(_J368689_STOCK_PER_REPEAT))
+    assert cand_column == pytest.approx(list(_J368689_CANDIDATE_PER_REPEAT))
+    assert dec.stock_avg_tok_per_sec == pytest.approx(
+        sum(stock_column) / len(stock_column)
+    )
+    assert dec.candidate_avg_tok_per_sec == pytest.approx(
+        sum(cand_column) / len(cand_column)
+    )
+    # ...and the gating delta is the delta of those two published means.
+    assert dec.throughput_delta_pct == pytest.approx(
+        (dec.candidate_avg_tok_per_sec - dec.stock_avg_tok_per_sec)
+        / dec.stock_avg_tok_per_sec
+        * 100.0
+    )
+
+
+def test_job_368689_reproduces_both_statistics_and_their_gap() -> None:
+    """Pin the real numbers, including the disagreement between them."""
+    dec = _decide_368689()
+
+    assert dec.num_repeats == 5
+    assert dec.warmup_repeats == 1
+    # Gating statistic: the replayed per-repeat means.
+    assert dec.stock_avg_tok_per_sec == pytest.approx(74.7651, abs=1e-3)
+    assert dec.candidate_avg_tok_per_sec == pytest.approx(74.2032, abs=1e-3)
+    assert dec.throughput_delta_pct == pytest.approx(-0.7516, abs=1e-3)
+    # Diagnostic statistic: the Prometheus decode-time window.
+    assert dec.stock_prometheus_decode_tok_per_sec == pytest.approx(
+        _J368689_STOCK_PROM_TPS
+    )
+    assert dec.candidate_prometheus_decode_tok_per_sec == pytest.approx(
+        _J368689_CANDIDATE_PROM_TPS
+    )
+    assert dec.prometheus_throughput_delta_pct == pytest.approx(-3.1805, abs=1e-3)
+    # The gap is published, not left for a reader to rediscover by hand.
+    assert dec.throughput_statistic_gap_pp == pytest.approx(2.4289, abs=1e-3)
+    assert dec.to_dict()["throughput_statistic_gap_pp"] == pytest.approx(
+        2.4289, abs=1e-3
+    )
+
+
+def test_job_368689_rejects_on_acceptance_under_shipped_defaults() -> None:
+    """The verdict the live run actually reached, for the reason it reached it."""
+    dec = _decide_368689()
+
+    assert dec.verdict is Verdict.REJECT
+    assert dec.reason is Reason.ACCEPTANCE_BELOW_THRESHOLD
+    assert dec.acceptance_delta_pp == pytest.approx(0.0)
+
+
+def test_job_368689_throughput_guard_follows_the_replay_statistic() -> None:
+    """The crux: the two statistics fall on opposite sides of the -2.0 bar.
+
+    Job 368689's replay delta is -0.75% (inside the guard) while its Prometheus
+    delta is -3.18% (outside it).  With acceptance cleared so the throughput
+    guard is the deciding bar, the verdict must follow the statistic the
+    threshold was calibrated on -- the replay one -- and promote.
+    """
+    dec = _decide_368689(
+        stock_acc=_J368689_ACCEPTANCE,
+        cand_acc=_J368689_ACCEPTANCE + 0.02,
+    )
+
+    assert dec.throughput_delta_pct is not None
+    assert dec.prometheus_throughput_delta_pct is not None
+    # Precondition: the two really do straddle the shipped threshold.
+    assert dec.throughput_delta_pct > PromotionConfig().min_throughput_delta_pct
+    assert dec.prometheus_throughput_delta_pct < PromotionConfig().min_throughput_delta_pct
+
+    assert dec.verdict is Verdict.PROMOTE
+    assert dec.reason is Reason.BOTH_THRESHOLDS_MET
+
+
+def test_a_real_regression_is_caught_on_either_statistic() -> None:
+    """The guard is not weakened by the switch.
+
+    Job 368648's un-warmed candidate arm measured -19.2% on the Prometheus
+    window and -17.5% on the replay per-repeat means.  Both are an order of
+    magnitude past the -2.0 bar, so the regression this gate exists to catch
+    is caught whichever statistic gates.
+    """
+    stock = (59.6422,) * 3
+    candidate = (49.2089,) * 3
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.60, output_tok_per_sec=85.1899),
+        _make_delta(acceptance_rate=0.65, output_tok_per_sec=68.8334),
+        _replay_with_per_repeat_tps(stock),
+        _replay_with_per_repeat_tps(candidate),
+        PromotionConfig(),
+    )
+
+    assert dec.verdict is Verdict.REJECT
+    assert dec.reason is Reason.THROUGHPUT_BELOW_THRESHOLD
+    assert dec.throughput_delta_pct == pytest.approx(-17.4931, abs=1e-3)
+    assert dec.prometheus_throughput_delta_pct == pytest.approx(-19.2000, abs=1e-3)
+
+
+def test_job_368670_agreed_and_still_rejects_on_acceptance() -> None:
+    """The calibration run: there the two statistics agreed to 0.001 pp.
+
+    368670 is where ``min_throughput_delta_pct`` came from -- its pooled sd of
+    1.338 tok/s sits on a 76.31 tok/s mean, which is the *replay* mean, not its
+    82.92 tok/s Prometheus figure.  That provenance is why the replay statistic
+    is the one that gates.
+    """
+    stock = (74.2624, 76.9898, 77.6637)
+    candidate = (77.6678, 76.5205, 76.9296)
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=_J368670_ACCEPTANCE, output_tok_per_sec=82.92028682232012),
+        _make_delta(acceptance_rate=_J368670_ACCEPTANCE, output_tok_per_sec=83.71705649227111),
+        _replay_with_per_repeat_tps(stock),
+        _replay_with_per_repeat_tps(candidate),
+        PromotionConfig(),
+    )
+
+    assert dec.stock_avg_tok_per_sec == pytest.approx(76.3053, abs=1e-3)
+    assert dec.throughput_delta_pct == pytest.approx(0.9620, abs=1e-3)
+    assert dec.prometheus_throughput_delta_pct == pytest.approx(0.9609, abs=1e-3)
+    # The two statistics can agree closely; the gap is not a constant offset.
+    assert dec.throughput_statistic_gap_pp == pytest.approx(0.0, abs=0.01)
+
+    assert dec.verdict is Verdict.REJECT
+    assert dec.reason is Reason.ACCEPTANCE_BELOW_THRESHOLD

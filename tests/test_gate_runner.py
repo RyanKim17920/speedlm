@@ -305,7 +305,11 @@ def test_counter_reset_is_an_invalid_measurement(tmp_path: Path) -> None:
     assert result.passed is False
     assert result.decision is not None
     assert result.decision.reason is Reason.COUNTER_RESET
-    assert result.decision.stock_avg_tok_per_sec == 0.0
+    # The reset zeroes the *Prometheus* window, which is the diagnostic
+    # statistic.  The replay-derived gating figures survive it, so they keep
+    # reporting what the arms actually did.
+    assert result.decision.stock_prometheus_decode_tok_per_sec == 0.0
+    assert result.decision.stock_avg_tok_per_sec > 0.0
     assert result.metrics["stock"]["reset_detected"] is True
 
 
