@@ -19,6 +19,7 @@ from speedlm.training.backends.speculators_runner import (
     ProcessResult,
     RunningProcess,
 )
+from speedlm.training.check_prepared_dataset import _column
 from speedlm.tuner.idle import TuningPreempted
 
 
@@ -667,3 +668,25 @@ def test_prepare_without_convertible_records_raises_named_error(
     assert "Speculators conversation" in str(raised.value)
     assert not (work / "speculators-conversations.jsonl").exists()
     assert not runner.run_calls
+
+
+class _FakeTensor:
+    """Stand in for the torch tensors ``load_from_disk`` returns."""
+
+    def __init__(self, values: Sequence[object]) -> None:
+        self._values = list(values)
+
+    def tolist(self) -> list[object]:
+        return list(self._values)
+
+
+def test_prepared_columns_accept_torch_formatted_sequences() -> None:
+    assert _column(_FakeTensor([1, 2, 3])) == [1, 2, 3]
+    assert _column([1, 2, 3]) == [1, 2, 3]
+    assert _column((1, 2, 3)) == [1, 2, 3]
+
+
+def test_prepared_columns_reject_missing_and_scalar_values() -> None:
+    assert _column(None) is None
+    assert _column("101") is None
+    assert _column(7) is None
