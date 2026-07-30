@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import errno
 import json
 import stat
 from pathlib import Path
 
 import pytest
 
+from speedlm.tuner import artifacts
 from speedlm.tuner.artifacts import ArtifactError, ArtifactRegistry, ArtifactSpec
 
 
@@ -86,6 +88,45 @@ def test_atomic_publish_crash_never_exposes_partial_artifact(tmp_path: Path) -> 
     artifact_entries = list((tmp_path / "registry" / "artifacts").iterdir())
     assert artifact_entries == []
     assert not registry.active_path.exists()
+
+
+def test_publish_failure_message_carries_the_underlying_cause(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def refuse(path: Path, payload: object) -> None:
+        del payload
+        raise PermissionError(errno.EACCES, "Permission denied", str(path))
+
+    monkeypatch.setattr(artifacts, "atomic_write_json", refuse)
+    registry = ArtifactRegistry(tmp_path / "registry")
+
+    with pytest.raises(ArtifactError) as caught:
+        registry.publish(_source(tmp_path / "candidate", "data"), _spec())
+
+    assert "PermissionError" in str(caught.value)
+    assert "Permission denied" in str(caught.value)
+    assert isinstance(caught.value.__cause__, PermissionError)
+
+
+def test_artifact_changed_while_publishing_propagates_uncaught(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real = artifacts.hash_directory
+    seen: list[Path] = []
+
+    def drifting(path: Path) -> str:
+        seen.append(path)
+        return real(path) if len(seen) == 1 else "f" * 64
+
+    monkeypatch.setattr(artifacts, "hash_directory", drifting)
+    registry = ArtifactRegistry(tmp_path / "registry")
+
+    with pytest.raises(ArtifactError, match="artifact changed while publishing"):
+        registry.publish(_source(tmp_path / "candidate", "data"), _spec())
+
+    assert list((tmp_path / "registry" / "artifacts").iterdir()) == []
 
 
 def test_active_pointer_swap_is_valid_json(tmp_path: Path) -> None:

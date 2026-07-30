@@ -238,9 +238,9 @@ class ArtifactRegistry:
             except FileExistsError:
                 return self.get(artifact_id)
         except (OSError, ValueError, TypeError) as exc:
-            if isinstance(exc, ArtifactError):
-                raise
-            raise ArtifactError(f"cannot publish artifact {artifact_id}") from exc
+            # ArtifactError subclasses RuntimeError and so is never caught here;
+            # "artifact changed while publishing" propagates uncaught.
+            raise ArtifactError(f"cannot publish artifact {artifact_id}: {exc!r}") from exc
         finally:
             if not committed and temp_path.exists():
                 _make_tree_writable(temp_path)
