@@ -64,7 +64,11 @@ _SPECULATORS_ROLES = {
     "tool": "tool",
 }
 _ZERO_MASK = re.compile(
-    r"(?:all[- ]zero|no trainable|nonzero loss|loss[- ]mask tokens)",
+    # A row the validator rejects for carrying no usable sequence supervises
+    # nothing, exactly like an all-zero mask, so route it to the named error
+    # with row identity instead of losing it in a generic raise.
+    r"(?:all[- ]zero|no trainable|nonzero loss|loss[- ]mask tokens"
+    r"|no input_ids|empty input_ids)",
     re.IGNORECASE,
 )
 _ROW_ID = re.compile(

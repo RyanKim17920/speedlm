@@ -690,3 +690,30 @@ def test_prepared_columns_reject_missing_and_scalar_values() -> None:
     assert _column(None) is None
     assert _column("101") is None
     assert _column(7) is None
+
+
+def test_missing_input_ids_raises_named_error_with_row(
+    tmp_path: Path,
+    pipeline: SpeculatorsPipelineConfig,
+) -> None:
+    runner = _FakeRunner()
+    runner.effects.extend(
+        [
+            lambda argv, _abort: (
+                _FakeRunner._create_expected_output(argv)
+                or ProcessResult(argv, 0, "", "")
+            ),
+            lambda argv, _abort: ProcessResult(
+                argv,
+                1,
+                "",
+                "row 0 has no input_ids sequence\n",
+            ),
+        ]
+    )
+    backend, work = _backend(tmp_path, pipeline, runner)
+
+    with pytest.raises(FinalAssistantMaskError) as raised:
+        backend.prepare(work, should_abort=lambda: False)
+
+    assert raised.value.row_id == "0"
