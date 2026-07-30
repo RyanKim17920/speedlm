@@ -404,6 +404,32 @@ def test_a_failing_retention_pass_does_not_fail_the_cycle(tmp_path: Path) -> Non
         service.stop(timeout_seconds=1.0)
 
 
+def test_a_no_op_retention_pass_is_still_recorded(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Logging only when dropped > 0 made a no-op pass invisible.
+
+    "retention never ran" and "retention ran and dropped nothing" produced
+    identical artifacts, so the feature could not be confirmed from a run.
+    """
+    traces = FakeTraces(2)
+    service, _, gate, _, _ = _service(tmp_path, traces=traces)
+    with caplog.at_level(logging.INFO, logger="speedlm.tuner.service"):
+        service.start()
+        try:
+            _wait_until(lambda: gate.calls == 1)
+            _wait_until(lambda: traces.prunes >= 1)
+            _wait_until(
+                lambda: any(
+                    record.getMessage() == "trace retention pass dropped 0 record(s)"
+                    for record in caplog.records
+                )
+            )
+        finally:
+            service.stop(timeout_seconds=1.0)
+
+
 def test_retention_does_not_run_when_no_cycle_was_attempted(tmp_path: Path) -> None:
     traces = FakeTraces(1)
     service, _, gate, _, _ = _service(tmp_path, traces=traces)

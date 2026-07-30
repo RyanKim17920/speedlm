@@ -519,8 +519,11 @@ class TunerService:
         except Exception:
             logger.warning("trace retention pass failed", exc_info=True)
             return
-        if dropped:
-            logger.info("trace retention dropped %d record(s)", dropped)
+        # Logged unconditionally.  A pass that logged only when it dropped
+        # something was invisible exactly when it mattered -- "retention never
+        # ran" and "retention ran and had nothing to drop" produced identical
+        # artifacts, so the feature could not be confirmed from a run at all.
+        logger.info("trace retention pass dropped %d record(s)", dropped)
 
     def _record_result(self, result: CycleResult) -> None:
         with self._lock:
