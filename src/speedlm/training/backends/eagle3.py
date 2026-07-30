@@ -617,6 +617,7 @@ class SpeculatorsHiddenStateExtractor:
                 should_abort=guard,
             )
             _success("offline hidden-state generation", generated)
+            _check_hidden_state_layers(destination, len(layers), generated)
             return destination
         except BaseException:
             _remove(destination)
@@ -1152,6 +1153,65 @@ def _copy(
             _abort(guard, "draft materialization")
             output_file.write(chunk)
             _abort(guard, "draft materialization")
+
+
+def _check_hidden_state_layers(
+    destination: Path,
+    layer_count: int,
+    generated: ProcessResult,
+) -> None:
+    """Fail at EXTRACTING when the emitted layer count breaks the contract.
+
+    launch_vllm.py appends the verifier's final layer to --target-layer-ids,
+    so each hs_*.safetensors must carry len(target_layer_ids) + 1 layers.
+    Training slices the final layer back off as the regression target; a
+    mismatch otherwise surfaces ~100s later as an opaque Dynamo broadcast
+    error against a flattened hidden size.
+    """
+    expected = layer_count + 1
+    shards = sorted(destination.glob("hs_*.safetensors"))
+    if not shards:
+        raise TrainingError(
+            f"hidden-state extraction emitted no shards: {destination}",
+            stderr=generated.stderr,
+        )
+    for shard in shards:
+        shape = _safetensors_shape(shard, "hidden_states", generated)
+        if len(shape) != 3 or shape[1] != expected:
+            raise TrainingError(
+                "hidden-state layer count breaks the EAGLE-3 contract: "
+                f"{shard.name} has shape {shape}, expected "
+                f"[sequence_length, {expected}, hidden_size] for "
+                f"{layer_count} aux layers plus the verifier's final layer",
+                stderr=generated.stderr,
+            )
+
+
+def _safetensors_shape(
+    path: Path,
+    tensor: str,
+    generated: ProcessResult,
+) -> list[int]:
+    """Read one tensor's shape from a safetensors header, without torch."""
+    try:
+        with path.open("rb") as handle:
+            length = int.from_bytes(handle.read(8), "little")
+            header = json.loads(handle.read(length).decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise TrainingError(
+            f"cannot read hidden-state header: {path}: {exc!r}",
+            stderr=generated.stderr,
+        ) from exc
+    entry = header.get(tensor) if isinstance(header, dict) else None
+    shape = entry.get("shape") if isinstance(entry, dict) else None
+    if not isinstance(shape, list) or not all(
+        isinstance(value, int) and not isinstance(value, bool) for value in shape
+    ):
+        raise TrainingError(
+            f"hidden-state shard has no usable {tensor} shape: {path}",
+            stderr=generated.stderr,
+        )
+    return shape
 
 
 def _remove(path: Path) -> None:

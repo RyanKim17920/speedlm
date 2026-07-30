@@ -36,12 +36,39 @@ class _FakeProcess:
 RunEffect = Callable[[tuple[str, ...], Callable[[], bool]], ProcessResult]
 
 
+def _write_hidden_state_shard(path: Path, layers: int, *, tokens: int = 4) -> None:
+    """Write a minimal safetensors shard shaped [tokens, layers, hidden]."""
+    hidden = 8
+    payload = b"\0" * (tokens * layers * hidden * 2)
+    header = json.dumps(
+        {
+            "hidden_states": {
+                "dtype": "BF16",
+                "shape": [tokens, layers, hidden],
+                "data_offsets": [0, len(payload)],
+            },
+            "token_ids": {
+                "dtype": "I64",
+                "shape": [tokens],
+                "data_offsets": [len(payload), len(payload) + tokens * 8],
+            },
+        }
+    ).encode("utf-8")
+    with path.open("wb") as handle:
+        handle.write(len(header).to_bytes(8, "little"))
+        handle.write(header)
+        handle.write(payload)
+        handle.write(b"\0" * (tokens * 8))
+
+
 class _FakeRunner:
     def __init__(self) -> None:
         self.run_calls: list[tuple[str, ...]] = []
         self.start_calls: list[tuple[str, ...]] = []
         self.effects: list[RunEffect] = []
         self.started: list[_FakeProcess] = []
+        # target_layer_ids=(3, 9, 15) plus the verifier's appended final layer.
+        self.hidden_state_layers = 4
 
     def run(
         self,
@@ -59,7 +86,7 @@ class _FakeRunner:
             return self.effects.pop(0)(command, should_abort)
         if should_abort():
             raise TuningPreempted("fake subprocess observed abort")
-        self._create_expected_output(command)
+        self._create_expected_output(command, self.hidden_state_layers)
         return ProcessResult(command, 0, "", "")
 
     def start(
@@ -105,11 +132,13 @@ class _FakeRunner:
         )
 
     @staticmethod
-    def _create_expected_output(command: tuple[str, ...]) -> None:
+    def _create_expected_output(command: tuple[str, ...], layers: int = 4) -> None:
         script = Path(command[1]).name if len(command) > 1 else ""
         if script in {"prepare_data.py", "data_generation_offline.py"}:
             output = Path(command[command.index("--output") + 1])
             output.mkdir(parents=True, exist_ok=True)
+            if script == "data_generation_offline.py":
+                _write_hidden_state_shard(output / "hs_0.safetensors", layers)
         if script == "train.py":
             output = Path(command[command.index("--save-path") + 1]) / "checkpoint_best"
             output.mkdir(parents=True)
@@ -327,6 +356,39 @@ def test_hidden_state_server_requests_the_configured_aux_layers_verbatim(
     start = argv.index("--target-layer-ids")
     assert argv[start + 1 : separator] == ("1", "4", "8")
     assert "--no-include-last-layer" not in argv
+
+
+def test_wrong_hidden_state_layer_count_fails_at_extraction(
+    tmp_path: Path,
+    pipeline: SpeculatorsPipelineConfig,
+) -> None:
+    # A short shard used to survive extraction and only blow up ~100s later
+    # inside Dynamo as an opaque broadcast error over the flattened hidden size.
+    runner = _FakeRunner()
+    runner.hidden_state_layers = 3
+    backend, work = _backend(tmp_path, pipeline, runner)
+    prepared = backend.prepare(work, should_abort=lambda: False)
+
+    with pytest.raises(TrainingError) as raised:
+        backend.extract(prepared, work, should_abort=lambda: False)
+
+    assert "hidden-state layer count breaks the EAGLE-3 contract" in str(raised.value)
+    assert "expected [sequence_length, 4, hidden_size]" in str(raised.value)
+
+
+def test_correct_hidden_state_layer_count_passes_extraction(
+    tmp_path: Path,
+    pipeline: SpeculatorsPipelineConfig,
+) -> None:
+    runner = _FakeRunner()
+    backend, work = _backend(tmp_path, pipeline, runner)
+    prepared = backend.prepare(work, should_abort=lambda: False)
+
+    destination = backend.extract(prepared, work, should_abort=lambda: False)
+
+    assert sorted(path.name for path in destination.glob("hs_*.safetensors")) == [
+        "hs_0.safetensors"
+    ]
 
 
 def test_failing_stage_raises_typed_error_with_actual_stderr(
