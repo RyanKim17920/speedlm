@@ -190,10 +190,19 @@ class FakeTraces:
     def __init__(self, count: int) -> None:
         self._count = count
         self._lock = Lock()
+        self.prunes = 0
+        self.prune_error: Exception | None = None
 
     def set_count(self, count: int) -> None:
         with self._lock:
             self._count = count
+
+    def prune(self) -> int:
+        with self._lock:
+            self.prunes += 1
+        if self.prune_error is not None:
+            raise self.prune_error
+        return 0
 
     def stats(self) -> TraceStats:
         with self._lock:
@@ -340,6 +349,69 @@ def test_not_enough_traces_does_not_start_a_cycle(tmp_path: Path) -> None:
         assert gate.calls == 0
         assert backend.calls == []
         assert service.is_running
+    finally:
+        service.stop(timeout_seconds=1.0)
+
+
+def test_a_completed_cycle_applies_trace_retention(tmp_path: Path) -> None:
+    """TraceStore.prune had no production caller, so the corpus grew forever."""
+    traces = FakeTraces(2)
+    service, _, gate, _, _ = _service(tmp_path, traces=traces)
+    service.start()
+    try:
+        _wait_until(lambda: gate.calls == 1)
+        _wait_until(lambda: traces.prunes >= 1)
+    finally:
+        service.stop(timeout_seconds=1.0)
+
+
+def test_retention_never_runs_while_a_cycle_is_in_flight(tmp_path: Path) -> None:
+    """Pruning is only safe because it happens strictly after the cycle."""
+    traces = FakeTraces(2)
+    backend = FakeBackend()
+    observed: list[int] = []
+
+    original = backend.validate
+
+    def recording_validate(*args: object, **kwargs: object) -> None:
+        observed.append(traces.prunes)
+        original(*args, **kwargs)  # type: ignore[arg-type]
+
+    backend.validate = recording_validate  # type: ignore[method-assign, assignment]
+
+    service, _, gate, _, _ = _service(tmp_path, traces=traces, backend=backend)
+    service.start()
+    try:
+        _wait_until(lambda: gate.calls == 1)
+        _wait_until(lambda: traces.prunes >= 1)
+    finally:
+        service.stop(timeout_seconds=1.0)
+
+    assert observed == [0]
+
+
+def test_a_failing_retention_pass_does_not_fail_the_cycle(tmp_path: Path) -> None:
+    traces = FakeTraces(2)
+    traces.prune_error = OSError("disk on fire")
+    service, _, gate, _, _ = _service(tmp_path, traces=traces)
+    service.start()
+    try:
+        _wait_until(lambda: gate.calls == 1)
+        _wait_until(lambda: traces.prunes >= 1)
+        time.sleep(0.04)
+        assert service.last_error is None
+    finally:
+        service.stop(timeout_seconds=1.0)
+
+
+def test_retention_does_not_run_when_no_cycle_was_attempted(tmp_path: Path) -> None:
+    traces = FakeTraces(1)
+    service, _, gate, _, _ = _service(tmp_path, traces=traces)
+    service.start()
+    try:
+        time.sleep(0.05)
+        assert gate.calls == 0
+        assert traces.prunes == 0
     finally:
         service.stop(timeout_seconds=1.0)
 

@@ -47,9 +47,11 @@ class TunerServiceStartupError(RuntimeError):
 
 
 class TraceStatsSource(Protocol):
-    """Trace-buffer surface used by the scheduling policy."""
+    """Trace-buffer surface used by the scheduling policy and by retention."""
 
     def stats(self) -> TraceStats: ...
+
+    def prune(self) -> int: ...
 
 
 class CycleRunner(Protocol):
@@ -475,6 +477,7 @@ class TunerService:
 
         if result.outcome is not CycleOutcome.NOT_IDLE:
             self._last_attempted = watermark
+        self._prune_traces()
         self._record_result(result)
         if result.outcome in {
             CycleOutcome.FAILED,
@@ -487,6 +490,37 @@ class TunerService:
             logger.info("idle tuning cycle preempted by serving activity")
         elif result.outcome is not CycleOutcome.NOT_IDLE:
             logger.info("idle tuning cycle completed: %s", result.outcome.value)
+
+    def _prune_traces(self) -> None:
+        """Apply the buffer's retention policy between cycles.
+
+        ``TraceStore.prune`` has existed since the buffer was written and was
+        never called outside tests, so the trace corpus grew without bound and
+        every cycle paid for all of it.  The retention policy itself is not
+        new -- it is ``buffer.max_age_days`` and ``buffer.max_tokens``, already
+        carried by the store -- only the call is.
+
+        This runs on the tuner thread strictly *after* ``run_once`` returns, so
+        there is by construction no cycle in flight whose records could be
+        pulled out from under it.  The held-out suite is equally safe: it is
+        persisted as its own frozen contexts under the run directory and the
+        training snapshot is a copy, so neither depends on the source buffer
+        surviving.
+
+        Retention is best effort.  A pruning failure must not fail a cycle
+        that has already produced a real measurement, so it is logged and
+        swallowed; ``prune`` itself is already atomic and leaves the file
+        untouched when it cannot rewrite it.
+        """
+        if self._stop_requested.is_set():
+            return
+        try:
+            dropped = self._traces.prune()
+        except Exception:
+            logger.warning("trace retention pass failed", exc_info=True)
+            return
+        if dropped:
+            logger.info("trace retention dropped %d record(s)", dropped)
 
     def _record_result(self, result: CycleResult) -> None:
         with self._lock:
