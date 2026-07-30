@@ -75,6 +75,9 @@ def test_split_is_deterministic_and_persists_the_same_suite(tmp_path: Path) -> N
     first = _leaser(tmp_path, records)
     second = _leaser(tmp_path, records)
 
+    with pytest.raises(Eagle3Error, match="suite has not been frozen"):
+        _ = first.suite_dir
+
     first_snapshot = first.lease_snapshot(
         tmp_path / "cycle-a" / "snapshot",
         timeout_seconds=30,
