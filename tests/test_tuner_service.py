@@ -26,6 +26,7 @@ from speedlm.tuner.orchestrator import (
 from speedlm.tuner.service import (
     TunerService,
     TunerServiceConfigurationError,
+    TunerServiceStartupError,
     build_tuner_orchestrator,
     create_tuner_service,
 )
@@ -238,6 +239,21 @@ class ShutdownSequenceRunner:
     def recover(self) -> tuple[str, ...]:
         self.events.append("recovered")
         return ()
+
+
+@dataclass
+class StartupRunner:
+    recovery_errors: tuple[str, ...] = ()
+    recovered: Event = field(default_factory=Event)
+    calls: int = 0
+
+    def run_once(self) -> CycleResult:
+        self.calls += 1
+        return CycleResult(CycleOutcome.REJECTED)
+
+    def recover(self) -> tuple[str, ...]:
+        self.recovered.set()
+        return self.recovery_errors
 
 
 def _config() -> SpeedLMConfig:
@@ -473,6 +489,52 @@ def test_startup_recovers_interrupted_state_before_trace_threshold(
         assert service.last_result is None
     finally:
         service.stop(timeout_seconds=1.0)
+
+
+def test_paused_startup_exposes_recovery_barrier_before_polling() -> None:
+    runner = StartupRunner()
+    service = TunerService(
+        _config(),
+        activity=ActivityTracker(),
+        traces=FakeTraces(2),
+        orchestrator_factory=lambda _activity: runner,
+        enabled=True,
+        min_trace_records=2,
+        poll_interval_seconds=0.005,
+    )
+
+    service.start(paused=True)
+    try:
+        service.wait_started(timeout_seconds=1.0)
+        time.sleep(0.03)
+        assert runner.recovered.is_set()
+        assert runner.calls == 0
+
+        service.activate()
+        _wait_until(lambda: runner.calls == 1)
+    finally:
+        service.stop(timeout_seconds=1.0)
+
+
+def test_startup_recovery_error_fails_barrier_closed() -> None:
+    runner = StartupRunner(recovery_errors=("restore failed",))
+    service = TunerService(
+        _config(),
+        activity=ActivityTracker(),
+        traces=FakeTraces(2),
+        orchestrator_factory=lambda _activity: runner,
+        enabled=True,
+        min_trace_records=2,
+        poll_interval_seconds=0.005,
+    )
+
+    service.start(paused=True)
+    with pytest.raises(TunerServiceStartupError, match="restore failed"):
+        service.wait_started(timeout_seconds=1.0)
+
+    assert runner.calls == 0
+    assert not service.is_running
+    service.stop(timeout_seconds=1.0)
 
 
 def test_factory_uses_explicit_state_artifacts_and_work_root(

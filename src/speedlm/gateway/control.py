@@ -101,11 +101,16 @@ class AdmissionGate:
         self._activity = activity
         self._lock = Lock()
         self._closed = False
+        self._held = False
 
     @property
     def is_admitting(self) -> bool:
         with self._lock:
-            return not self._closed and self._activity.is_admitting
+            return (
+                not self._closed
+                and not self._held
+                and self._activity.is_admitting
+            )
 
     @property
     def is_closed(self) -> bool:
@@ -114,7 +119,11 @@ class AdmissionGate:
 
     def try_begin(self) -> bool:
         with self._lock:
-            return not self._closed and self._activity.try_begin()
+            return (
+                not self._closed
+                and not self._held
+                and self._activity.try_begin()
+            )
 
     async def wait_to_begin(self, *, poll_interval_seconds: float = 0.01) -> bool:
         """Wait for normal reopening, or return false after terminal shutdown."""
@@ -132,7 +141,21 @@ class AdmissionGate:
 
     def start_admitting(self) -> None:
         with self._lock:
+            if not self._closed and not self._held:
+                self._activity.start_admitting()
+
+    def hold(self) -> None:
+        """Keep admission closed across tuner recovery start/stop calls."""
+        with self._lock:
             if not self._closed:
+                self._held = True
+                self._activity.stop_admitting()
+
+    def release(self) -> None:
+        """Release a startup hold after durable serving recovery completes."""
+        with self._lock:
+            if not self._closed:
+                self._held = False
                 self._activity.start_admitting()
 
     def close(self) -> None:

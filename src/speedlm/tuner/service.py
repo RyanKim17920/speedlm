@@ -42,6 +42,10 @@ class TunerServiceStopError(RuntimeError):
     """Raised when a tuner worker does not stop within the requested timeout."""
 
 
+class TunerServiceStartupError(RuntimeError):
+    """Raised when startup serving recovery fails or does not complete."""
+
+
 class TraceStatsSource(Protocol):
     """Trace-buffer surface used by the scheduling policy."""
 
@@ -266,6 +270,8 @@ class TunerService:
         self._min_trace_records = min_trace_records
         self._poll_interval_seconds = float(poll_interval_seconds)
         self._stop_requested = Event()
+        self._startup_complete = Event()
+        self._activation_requested = Event()
         self._activity = _PreemptibleActivitySource(activity, self._stop_requested)
         self._idle = IdleDetector(
             self._activity,
@@ -281,6 +287,7 @@ class TunerService:
         self._last_result: CycleResult | None = None
         self._last_status_result: CycleResult | None = None
         self._last_error: str | None = None
+        self._startup_error: str | None = None
         self._status_path = status_path
         self._wall_clock = wall_clock
         created_at = self._wall_clock()
@@ -317,9 +324,11 @@ class TunerService:
 
         return self._orchestrator
 
-    def start(self) -> None:
+    def start(self, *, paused: bool = False) -> None:
         """Start the watcher once; disabled services remain inert."""
 
+        if not isinstance(paused, bool):
+            raise ValueError("paused must be boolean")
         if not self._enabled:
             logger.info("idle tuner is disabled")
             self._set_lifecycle("stopped")
@@ -328,6 +337,12 @@ class TunerService:
             if self._thread is not None and self._thread.is_alive():
                 return
             self._stop_requested.clear()
+            self._startup_complete.clear()
+            self._startup_error = None
+            if paused:
+                self._activation_requested.clear()
+            else:
+                self._activation_requested.set()
             thread = Thread(
                 target=self._run,
                 name="speedlm-idle-tuner",
@@ -341,9 +356,39 @@ class TunerService:
             with self._lock:
                 if self._thread is thread:
                     self._thread = None
+                self._startup_error = str(exc)
             self._record_error(exc)
             self._set_lifecycle("stopped")
+            self._startup_complete.set()
             raise
+
+    def activate(self) -> None:
+        """Allow polling after an externally held admission gate is released."""
+        self._activation_requested.set()
+
+    def wait_started(self, *, timeout_seconds: float | None = None) -> None:
+        """Wait until startup recovery has completed successfully."""
+        if timeout_seconds is not None and (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or timeout_seconds <= 0
+        ):
+            raise ValueError("timeout_seconds must be a positive number or None")
+        if not self._startup_complete.wait(timeout_seconds):
+            raise TunerServiceStartupError(
+                f"tuner startup recovery did not finish within {timeout_seconds} seconds"
+            )
+        with self._lock:
+            error = self._startup_error
+            lifecycle = self._lifecycle
+        if error is not None:
+            raise TunerServiceStartupError(
+                f"tuner startup recovery failed: {error}"
+            )
+        if lifecycle != "running":
+            raise TunerServiceStartupError(
+                f"tuner stopped during startup recovery (lifecycle={lifecycle})"
+            )
 
     def stop(self, *, timeout_seconds: float | None = None) -> None:
         """Preempt any active cycle, restore serving, and join the watcher."""
@@ -356,6 +401,7 @@ class TunerService:
             raise ValueError("timeout_seconds must be a positive number or None")
 
         self._stop_requested.set()
+        self._activation_requested.set()
         self._set_lifecycle("stopping")
         with self._lock:
             thread = self._thread
@@ -374,14 +420,30 @@ class TunerService:
 
     def _run(self) -> None:
         try:
-            self._recover_serving("service startup")
+            try:
+                errors = self._orchestrator.recover()
+                if errors:
+                    raise TunerServiceStartupError("; ".join(errors))
+            except Exception as exc:
+                logger.exception("idle tuner could not recover serving during startup")
+                with self._lock:
+                    self._startup_error = str(exc)
+                self._record_error(exc)
+                return
             self._set_lifecycle("running")
+            self._startup_complete.set()
+            while (
+                not self._stop_requested.is_set()
+                and not self._activation_requested.wait(self._poll_interval_seconds)
+            ):
+                pass
             while not self._stop_requested.is_set():
                 self._poll_once()
                 self._stop_requested.wait(self._poll_interval_seconds)
         finally:
             self._recover_serving("service shutdown")
             self._set_lifecycle("stopped")
+            self._startup_complete.set()
 
     def _poll_once(self) -> None:
         if not self._idle.should_tune or self._stop_requested.is_set():

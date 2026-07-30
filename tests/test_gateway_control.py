@@ -233,6 +233,23 @@ def test_rejected_request_updates_watermark_and_preempts_idle_guard() -> None:
     assert guard.is_preempted
 
 
+def test_startup_hold_cannot_be_reopened_by_runtime_recovery() -> None:
+    activity = ActivityTracker()
+    admission = AdmissionGate(activity)
+
+    admission.hold()
+    admission.start_admitting()
+
+    assert not admission.is_admitting
+    assert not admission.try_begin()
+
+    admission.release()
+
+    assert admission.is_admitting
+    assert admission.try_begin()
+    activity.end()
+
+
 def test_quiesce_stops_admission_and_waits_for_in_flight_to_reach_zero() -> None:
     rig = make_rig()
     rig.activity.begin()
