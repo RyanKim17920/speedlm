@@ -8,7 +8,7 @@ import signal
 import socket
 import sys
 import tempfile
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from types import FrameType
 from typing import BinaryIO, cast
@@ -77,6 +77,7 @@ class VLLMProcess:
         health_url: str,
         startup_timeout: float | None = None,
         startup_stall_timeout: float | None = None,
+        env_overrides: Mapping[str, str] | None = None,
     ) -> None:
         if not argv:
             raise ValueError("argv must not be empty")
@@ -90,6 +91,7 @@ class VLLMProcess:
             if startup_stall_timeout is None
             else startup_stall_timeout
         )
+        self._env_overrides = _validate_env_overrides(env_overrides)
         _validate_duration(self.startup_timeout, "startup timeout")
         _validate_duration(self.startup_stall_timeout, "startup stall timeout")
         self._process: asyncio.subprocess.Process | None = None
@@ -123,6 +125,7 @@ class VLLMProcess:
         self._saved_log_tail = None
         child_env = os.environ.copy()
         child_env.setdefault("PYTHONUNBUFFERED", "1")
+        child_env.update(self._env_overrides)
         try:
             self._process = await asyncio.create_subprocess_exec(
                 *self.argv,
@@ -355,6 +358,25 @@ def _write_stderr(data: bytes) -> None:
         return
     sys.stderr.write(data.decode("utf-8", errors="replace"))
     sys.stderr.flush()
+
+
+def _validate_env_overrides(
+    overrides: Mapping[str, str] | None,
+) -> dict[str, str]:
+    result = dict(overrides or {})
+    for key, value in result.items():
+        if (
+            not isinstance(key, str)
+            or not key
+            or "=" in key
+            or "\0" in key
+            or not isinstance(value, str)
+            or "\0" in value
+        ):
+            raise ValueError(
+                "vLLM environment overrides must contain valid string names and values"
+            )
+    return result
 
 
 def _process_tree_cpu_ticks(root_pid: int) -> dict[int, int]:

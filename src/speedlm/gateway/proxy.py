@@ -26,6 +26,22 @@ _HOP_BY_HOP = {
 }
 _CAPTURE_ENDPOINTS = {"/v1/chat/completions", "/v1/completions"}
 _BLOCKED_V1_PATHS = {
+    "/collective_rpc",
+    "/finish_weight_update",
+    "/get_world_size",
+    "/init_weight_transfer_engine",
+    "/is_paused",
+    "/is_sleeping",
+    "/pause",
+    "/reset_encoder_cache",
+    "/reset_mm_cache",
+    "/reset_prefix_cache",
+    "/resume",
+    "/server_info",
+    "/sleep",
+    "/start_weight_update",
+    "/update_weights",
+    "/wake_up",
     "/v1/load_lora_adapter",
     "/v1/unload_lora_adapter",
     "/v1/reset_prefix_cache",
