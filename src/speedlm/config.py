@@ -372,6 +372,12 @@ class IdleTuningConfig:
     scratch_quota_bytes: int = 5 * 1024 * 1024 * 1024
     shutdown_timeout_seconds: float = 30.0
     val_loss_prefilter: ValLossPreFilterConfig = field(default_factory=ValLossPreFilterConfig)
+    #: In-place draft weight hot-swap.  When enabled, the controller attempts
+    #: to swap the drafter's weights via collective-RPC instead of restarting
+    #: the entire vLLM process for each candidate.  Requires VLLM_SERVER_DEV_MODE=1
+    #: and that the new draft has identical architecture, shapes, and quantization.
+    #: Defaults to DISABLED pending GPU validation of cudagraph-pointer stability.
+    draft_hot_swap_enabled: bool = False
 
     def __post_init__(self) -> None:
         _validate_int_gte(self.min_trace_records, "tuning.min_trace_records", 2)
@@ -427,6 +433,11 @@ class IdleTuningConfig:
             "tuning.shutdown_timeout_seconds",
             0.001,
         )
+        if not isinstance(self.draft_hot_swap_enabled, bool):
+            raise ConfigError(
+                "tuning.draft_hot_swap_enabled must be a bool, "
+                f"got {type(self.draft_hot_swap_enabled).__name__!r}"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -555,6 +566,7 @@ class SpeedLMConfig:
             "training_port": self.tuning.training_port,
             "scratch_quota_bytes": self.tuning.scratch_quota_bytes,
             "shutdown_timeout_seconds": self.tuning.shutdown_timeout_seconds,
+            "draft_hot_swap_enabled": self.tuning.draft_hot_swap_enabled,
         }
         result["sampling"] = {
             "temperature": self.sampling.temperature,
@@ -631,6 +643,7 @@ class SpeedLMConfig:
                 "training_port",
                 "scratch_quota_bytes",
                 "shutdown_timeout_seconds",
+                "draft_hot_swap_enabled",
                 "val_loss_prefilter",
             },
         )

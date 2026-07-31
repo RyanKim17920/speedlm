@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
 import subprocess
 import time
@@ -14,6 +15,8 @@ from threading import Lock
 from typing import Final, Protocol
 
 from speedlm.gateway.activity import ActivityTracker
+
+logger = logging.getLogger(__name__)
 
 AbortCheck = Callable[[], bool]
 CaptureBarrier = Callable[[float, AbortCheck], None]
@@ -95,6 +98,34 @@ class ChildProcessControl(Protocol):
         timeout_seconds: float,
     ) -> None:
         """Restart the child configured with *draft*."""
+
+
+class DraftSwapHTTP(Protocol):
+    """Hot-swap draft weights in a live vLLM engine without restarting.
+
+    The implementation pauses generation, sends a collective-RPC to the
+    drafter worker to swap weights in place via the layerwise reload helpers,
+    and resumes generation.  Requires ``VLLM_SERVER_DEV_MODE=1`` so that the
+    ``/pause`` and ``/resume`` endpoints are available.
+    """
+
+    def hot_swap_draft(
+        self,
+        weights_path: str,
+        *,
+        timeout_seconds: float,
+    ) -> None:
+        """Swap the drafter's weights from *weights_path* in place.
+
+        Raises on shape mismatch, RPC failure, or timeout.
+        """
+
+
+# vLLM dev-mode endpoints for pause/resume (VLLM_SERVER_DEV_MODE=1).
+# Mounted under the same origin as the health/completions endpoints.
+VLLM_PAUSE_ENDPOINT: Final = "/pause"
+VLLM_RESUME_ENDPOINT: Final = "/resume"
+VLLM_RPC_ENDPOINT: Final = "/rpc"
 
 
 class ControlAborted(RuntimeError):
@@ -417,6 +448,7 @@ class RuntimeController:
         recovery_timeout_seconds: float = DEFAULT_RECOVERY_TIMEOUT_SECONDS,
         capture_barrier: CaptureBarrier | None = None,
         gpu_memory: GPUMemoryPrecondition | None = None,
+        draft_swap_http: DraftSwapHTTP | None = None,
     ) -> None:
         if not str(active_draft):
             raise ValueError("active draft must be non-empty")
@@ -436,6 +468,7 @@ class RuntimeController:
         self._gpu_memory = gpu_memory
         self._admissions_stopped = False
         self._sleeping = False
+        self._draft_swap_http: DraftSwapHTTP | None = draft_swap_http
 
     def quiesce(
         self,
@@ -513,15 +546,32 @@ class RuntimeController:
         timeout_seconds: float,
         should_abort: AbortCheck,
     ) -> None:
-        """Replace the sleeping child with a candidate EAGLE-3 draft."""
+        """Replace the sleeping child with a candidate EAGLE-3 draft.
+
+        If a ``draft_swap_http`` endpoint is configured and the engine is not
+        sleeping, attempts an in-place hot-swap of the draft weights before
+        falling back to a full restart.  Any hot-swap failure is logged and
+        falls through to the restart path.
+        """
         deadline = self._deadline(timeout_seconds, "candidate start")
         try:
             self._check_abort(should_abort, "candidate start")
             deadline.check()
             if self._sleeping or self._running_draft != draft_directory:
-                self._restart_and_wait(draft_directory, deadline)
-                self._running_draft = draft_directory
-                self._sleeping = False
+                # Try hot-swap when engine is awake and draft actually changed.
+                if (
+                    not self._sleeping
+                    and self._running_draft != draft_directory
+                    and self._draft_swap_http is not None
+                ):
+                    self._try_hot_swap(draft_directory, deadline)
+                if self._running_draft != draft_directory:
+                    self._restart_and_wait(draft_directory, deadline)
+                    self._running_draft = draft_directory
+                    self._sleeping = False
+                else:
+                    self._http.wait_ready(timeout_seconds=deadline.remaining())
+                    deadline.check()
             else:
                 self._http.wait_ready(timeout_seconds=deadline.remaining())
                 deadline.check()
@@ -624,6 +674,34 @@ class RuntimeController:
         deadline.check()
         self._http.wait_ready(timeout_seconds=deadline.remaining())
         deadline.check()
+
+    def _try_hot_swap(
+        self, draft_directory: DraftReference, deadline: _Deadline
+    ) -> None:
+        """Attempt an in-place draft weight hot-swap.
+
+        On any failure (shape mismatch, RPC error, missing endpoint) falls
+        through silently so the caller retries with a full restart.
+        """
+        swap_http = self._draft_swap_http
+        if swap_http is None or self._sleeping:
+            return
+        try:
+            deadline.check()
+            swap_http.hot_swap_draft(
+                str(draft_directory),
+                timeout_seconds=deadline.remaining(),
+            )
+            deadline.check()
+            self._running_draft = draft_directory
+            self._sleeping = False
+            logger.info("hot-swap succeeded for draft %s", draft_directory)
+        except Exception as exc:
+            logger.warning(
+                "hot-swap failed (%s); falling back to full restart: %s",
+                type(exc).__name__,
+                exc,
+            )
 
     def _recover_or_raise(self, operation: str, error: Exception) -> None:
         try:
