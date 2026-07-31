@@ -132,16 +132,16 @@ class TestCompareLayerwise:
         layers = compare_layerwise({}, {0: torch.ones(2, 2)})
         assert len(layers) == 1
         assert layers[0].shape_match is False
-        assert layers[0].captured_shape == []
-        assert layers[0].offline_shape == [2, 2]
+        assert layers[0].captured_shape == ()
+        assert layers[0].offline_shape == (2, 2)
 
     def test_missing_layer_in_offline(self) -> None:
         """Layer present only in captured is a shape mismatch."""
         layers = compare_layerwise({0: torch.ones(2, 2)}, {})
         assert len(layers) == 1
         assert layers[0].shape_match is False
-        assert layers[0].captured_shape == [2, 2]
-        assert layers[0].offline_shape == []
+        assert layers[0].captured_shape == (2, 2)
+        assert layers[0].offline_shape == ()
 
     def test_multiple_layers_sorted(self) -> None:
         """Multiple layers are returned sorted by layer index."""
@@ -249,6 +249,145 @@ class TestRelativeMetrics:
         assert lc.mean_rel_error is None
         assert lc.cosine_similarity is None
         assert lc.mean_ref_magnitude is None
+        assert lc.max_rel_error is None
+        assert lc.p99_rel_error is None
+
+
+class TestElementwiseRelErrorFloor:
+    """Regression tests for the scale-tied denominator floor on max_rel_error.
+
+    Before the floor was introduced, ``max_rel_error`` divided by
+    ``|offline_i| + 1e-12`` and real Stage 0 artifacts reported values of
+    1e12-1e14 -- i.e. the metric measured the smallness of the denominator,
+    not the size of the discrepancy.
+    """
+
+    #: Metrics that must be invariant under a common rescaling of both tensors.
+    _SCALE_INVARIANT = (
+        "mean_rel_error",
+        "max_rel_error",
+        "p99_rel_error",
+        "cosine_similarity",
+    )
+
+    def test_scale_invariance(self) -> None:
+        """Multiplying both tensors by 1000 changes no relative metric."""
+        torch.manual_seed(0)
+        # float64 so the x1000 rescale is exact enough to compare tightly.
+        ref = torch.randn(64, 128, dtype=torch.float64)
+        cap = ref + torch.randn(64, 128, dtype=torch.float64) * 0.01
+
+        base = compare_layerwise({0: cap}, {0: ref})[0]
+        scaled = compare_layerwise({0: cap * 1000.0}, {0: ref * 1000.0})[0]
+
+        for name in self._SCALE_INVARIANT:
+            got = getattr(scaled, name)
+            want = getattr(base, name)
+            assert got == pytest.approx(want, rel=1e-9), name
+
+    def test_zeros_and_denormals_do_not_explode(self) -> None:
+        """Exact zeros and denormal-scale reference values stay bounded.
+
+        This is the real-artifact failure mode: a reference tensor whose bulk
+        is O(1) but which also contains exact zeros and ~1e-38 elements.  The
+        captured tensor differs only by ordinary bf16-scale noise everywhere.
+        """
+        ref = torch.ones(4, 16) * 2.0
+        ref[0, 0] = 0.0
+        ref[0, 1] = 1e-38  # denormal-ish relative to the O(1) bulk
+        ref[0, 2] = -0.0
+        cap = ref + 1e-3  # uniform, tiny, absolute perturbation
+
+        lc = compare_layerwise({0: cap}, {0: ref})[0]
+
+        assert lc.max_rel_error is not None
+        assert lc.p99_rel_error is not None
+        assert math.isfinite(lc.max_rel_error)
+        # RMS of ref is ~2.0 => floor ~2e-3, so the worst element reports
+        # ~1e-3/2e-3 = 0.5, not 1e35.
+        assert lc.max_rel_error < 1.0
+        assert lc.p99_rel_error <= lc.max_rel_error
+
+    def test_real_divergence_still_caught(self) -> None:
+        """A genuinely diverging element is still reported at full size.
+
+        The floor must not mask divergence: an element whose reference value
+        is a normal O(1) magnitude is divided by its own value, unchanged.
+        """
+        ref = torch.ones(4, 16) * 2.0
+        cap = ref.clone()
+        cap[2, 5] = 2.0 + 40.0  # 20x relative divergence on a normal element
+
+        lc = compare_layerwise({0: cap}, {0: ref})[0]
+
+        assert lc.max_rel_error == pytest.approx(20.0, rel=1e-4)
+        # ...and it survives a rescale of both tensors.
+        scaled = compare_layerwise({0: cap * 1000.0}, {0: ref * 1000.0})[0]
+        assert scaled.max_rel_error == pytest.approx(20.0, rel=1e-4)
+
+    def test_divergence_on_a_small_element_still_caught(self) -> None:
+        """Divergence large relative to the *tensor* is caught on tiny refs.
+
+        A reference element of ~0 whose captured counterpart is the size of
+        the whole tensor is a real divergence, and the floor (a small
+        fraction of the RMS) keeps the reported ratio large.
+        """
+        ref = torch.ones(4, 16) * 2.0
+        ref[1, 3] = 0.0
+        cap = ref.clone()
+        cap[1, 3] = 2.0  # was zero, now a full-scale value
+
+        lc = compare_layerwise({0: cap}, {0: ref})[0]
+
+        assert lc.max_rel_error is not None
+        # 2.0 / (1e-3 * RMS~2.0) ~= 1000: unmistakably a failure.
+        assert lc.max_rel_error > 100.0
+
+    def test_identical_tensors_zero_max_and_p99(self) -> None:
+        """Identical tensors give exactly zero for both elementwise metrics."""
+        t = torch.randn(8, 32)
+        lc = compare_layerwise({0: t}, {0: t})[0]
+        assert lc.max_rel_error == pytest.approx(0.0, abs=1e-12)
+        assert lc.p99_rel_error == pytest.approx(0.0, abs=1e-12)
+
+    def test_all_zero_reference_reports_unit_scale_error(self) -> None:
+        """An all-zero reference falls back to the captured tensor's scale."""
+        cap = torch.ones(4, 8)
+        ref = torch.zeros(4, 8)
+        lc = compare_layerwise({0: cap}, {0: ref})[0]
+        assert lc.max_rel_error is not None
+        assert math.isfinite(lc.max_rel_error)
+        # |1-0| / (1e-3 * RMS(cap)=1.0) == 1000, not 1e12.
+        assert lc.max_rel_error == pytest.approx(1000.0, rel=1e-4)
+
+    def test_both_zero_gives_zero(self) -> None:
+        """Two all-zero tensors have zero relative error, not NaN."""
+        z = torch.zeros(4, 8)
+        lc = compare_layerwise({0: z}, {0: z})[0]
+        assert lc.max_rel_error == pytest.approx(0.0, abs=1e-12)
+        assert lc.p99_rel_error == pytest.approx(0.0, abs=1e-12)
+
+    def test_max_rel_error_does_not_gate_the_verdict(self) -> None:
+        """A large max_rel_error alone must not flip the verdict to FAIL.
+
+        The verdict is driven by shapes, ``mean_rel_error`` and the pre-norm
+        check; the elementwise metrics are diagnostics only.
+        """
+        ref = torch.ones(4, 16) * 2.0
+        ref[1, 3] = 0.0
+        cap = ref.clone()
+        cap[1, 3] = 2.0
+
+        result = build_result(
+            {0: cap}, {0: ref},
+            captured_final_pre_norm=cap,
+            offline_final_pre_norm=ref,
+        )
+        assert result.layers[0].max_rel_error is not None
+        assert result.layers[0].max_rel_error > 100.0
+        assert result.layers[0].mean_rel_error is not None
+        assert result.layers[0].mean_rel_error <= DEFAULT_RELATIVE_TOLERANCE
+        assert result.verdict == "PASS"
 
 
 class TestTrendDetection:
@@ -548,6 +687,8 @@ class TestSerialization:
         # New fields present
         layer_0 = d["layers"][0]
         assert "mean_rel_error" in layer_0
+        assert "max_rel_error" in layer_0
+        assert "p99_rel_error" in layer_0
         assert "cosine_similarity" in layer_0
         assert "mean_ref_magnitude" in layer_0
         assert layer_0["cosine_similarity"] == pytest.approx(1.0, abs=1e-6)
@@ -897,9 +1038,12 @@ class TestSafetensorsIO:
             {
                 "layer_5": torch.ones(2, 4),
                 "metadata": torch.zeros(1),  # should be ignored
-                "__metadata__": torch.zeros(1),  # should be ignored
+                "prompt_ids": torch.zeros(1),  # should be ignored
             },
             str(capture_dir / "captured.safetensors"),
+            # ``__metadata__`` is the reserved safetensors header slot and only
+            # accepts str -> str; it must not be passed as a tensor key.
+            metadata={"final_layer_idx": "35"},  # should be ignored
         )
 
         from tests.e2e.test_serving_activation_capture import _load_captured_safetensors

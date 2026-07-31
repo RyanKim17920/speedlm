@@ -522,6 +522,19 @@ single most valuable artifact of the whole project — it is what converts
 "we believe capture is equivalent" into "we check it every CI run." It must exist
 before any training consumes captured data.
 
+The verdict is driven by the *aggregate* relative error
+(`mean_rel_error = mean|cap-off| / mean|off|`, tolerance 0.10) together with the
+shape check and the pre-norm check; cosine similarity is the corroborating
+signal. The elementwise metrics `max_rel_error` and `p99_rel_error` are
+diagnostics and do **not** gate PASS/FAIL. They divide by
+`max(|off_i|, 1e-3 * RMS(off))`, not by `|off_i| + eps`: a residual stream is
+full of near-zero elements, and a bare additive epsilon turns ordinary bf16
+noise on those elements into ratios of 1e12-1e14 (which is exactly what Stage 0
+artifacts written before 2026-07-31 report). Because the floor is a fraction of
+the reference tensor's own RMS, every relative metric is scale-invariant, while
+a genuinely diverging element of normal magnitude is still divided by its own
+value and still reported at full size.
+
 ### 6.3 Rejected draft rows are counterfactual
 
 With speculative decoding, the batch layout allocates `num_draft_tokens + 1`

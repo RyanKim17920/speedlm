@@ -29,6 +29,15 @@ post-norm vs. pre-norm, or a shifted residual).  The relative metric
 ``mean_rel_error`` (mean|a-b| / mean|b|) drives the verdict; the absolute
 tolerance is retained for reference but no longer gates PASS/FAIL.
 
+**Elementwise relative error (``max_rel_error`` / ``p99_rel_error``)**
+These are diagnostics only -- they never gate PASS/FAIL.  They divide by
+``max(|offline_i|, floor)`` where ``floor`` is a small fraction of the
+reference tensor's RMS, *not* by ``|offline_i| + epsilon``.  A bare epsilon
+makes the ratio unbounded on the near-zero elements that fill a residual
+stream, which is why earlier artifacts reported ``max_rel_error`` values of
+1e12-1e14 next to a ``mean_rel_error`` of 0.035.  See
+``_REL_ERROR_FLOOR_FRACTION``.
+
 **Trend detection**
 If relative error is roughly *constant* across layers, the divergence is
 proportional to activation magnitude -- consistent with numerical noise on the
@@ -70,6 +79,38 @@ DEFAULT_RELATIVE_TOLERANCE: float = 0.10
 #: Small constant to avoid division by zero in relative error computation.
 _EPSILON: float = 1e-12
 
+#: Fraction of the reference tensor's RMS used as a *floor* on the denominator
+#: of the elementwise relative error.
+#:
+#: WHY A BARE EPSILON FAILS: dividing by ``|ref| + 1e-12`` makes the ratio
+#: unbounded as ``|ref| -> 0``.  A residual-stream activation tensor contains
+#: many elements that are essentially zero, so a perfectly ordinary bf16
+#: rounding difference of ~1e-3 divided by a reference element of ~1e-15 yields
+#: a "relative error" of ~1e12.  That is exactly what real Stage 0 artifacts
+#: show: ``max_rel_error`` in the 1e12-1e14 range while ``mean_rel_error`` is
+#: ~0.035 and cosine similarity is ~0.99.  The metric was measuring the
+#: smallness of the denominator, not the badness of the difference.
+#:
+#: The physical model is that error does NOT propagate per-element: each
+#: activation is the output of a reduction (matmul / residual add) over the
+#: whole hidden dimension, so its rounding noise is bounded by the *tensor's*
+#: magnitude, not by that element's own magnitude.  The correct denominator is
+#: therefore ``max(|ref_i|, floor)`` with ``floor`` proportional to a magnitude
+#: statistic of the reference tensor.  RMS is used (rather than mean|ref| or a
+#: high percentile) because it is the L2 scale that matmul reductions actually
+#: accumulate against, and because it is scale-equivariant: scaling both
+#: tensors by k scales the floor by k, leaving every relative metric unchanged.
+#:
+#: 1e-3 is deliberately permissive: only elements below 0.1 % of the tensor RMS
+#: are floored, so a genuinely diverging element of any meaningful magnitude is
+#: still divided by its own value and still reported at full size.
+_REL_ERROR_FLOOR_FRACTION: float = 1e-3
+
+#: Percentile reported alongside ``max_rel_error``.  Even with a denominator
+#: floor, ``max`` over millions of elements is an extreme-order statistic; the
+#: p99 is the robust "how bad is a bad element, typically" number.
+_REL_ERROR_PERCENTILE: float = 0.99
+
 
 # ---------------------------------------------------------------------------
 # Per-layer result
@@ -91,7 +132,12 @@ class LayerComparison:
     mean_ref_magnitude: float | None = None  # mean |offline|
     max_ref_magnitude: float | None = None   # max |offline|
     mean_rel_error: float | None = None      # mean|cap-off| / mean|off|
-    max_rel_error: float | None = None       # max(|cap-off| / (|off|+eps))
+    #: max(|cap-off| / max(|off|, floor)) where floor is tied to the reference
+    #: tensor's RMS -- see _REL_ERROR_FLOOR_FRACTION.
+    max_rel_error: float | None = None
+    #: p99 of the same floored elementwise ratio; robust companion to
+    #: ``max_rel_error``, which is a single extreme order statistic.
+    p99_rel_error: float | None = None
     cosine_similarity: float | None = None   # cosine(captured, offline)
 
 
@@ -159,6 +205,7 @@ class ComparisonResult:
                     "max_ref_magnitude": lc.max_ref_magnitude,
                     "mean_rel_error": lc.mean_rel_error,
                     "max_rel_error": lc.max_rel_error,
+                    "p99_rel_error": lc.p99_rel_error,
                     "cosine_similarity": lc.cosine_similarity,
                 }
                 for lc in self.layers
@@ -188,6 +235,57 @@ class ComparisonResult:
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+
+def _at_least_float32(t: Tensor) -> Tensor:
+    """Promote a narrow dtype to float32, leaving float32/float64 untouched.
+
+    bf16 cannot represent the squared values of large activations (the real
+    artifacts contain elements above 4e4), so the promotion is not optional.
+    ``element_size()`` is used instead of a dtype comparison so that this
+    module keeps its runtime-torch-free import surface.
+    """
+    return t.float() if t.element_size() < 4 else t
+
+
+def _rms(t: Tensor) -> float:
+    """Root-mean-square magnitude of a tensor, in at least float32."""
+    return float(_at_least_float32(t).pow(2).mean().sqrt())
+
+
+def _percentile(t: Tensor, q: float) -> float:
+    """Return the *q* quantile of a tensor (nearest-rank, 0 <= q <= 1).
+
+    ``torch.quantile`` refuses inputs above ~16M elements, which real capture
+    tensors exceed, so this uses ``kthvalue`` on the flattened tensor instead.
+    """
+    flat = t.flatten()
+    n = int(flat.numel())
+    if n == 0:
+        return 0.0
+    # Nearest-rank: the smallest value at or above the q fraction of the data.
+    k = min(n, max(1, int(q * n + 0.5)))
+    return float(flat.kthvalue(k).values)
+
+
+def _elementwise_rel_error(diff: Tensor, ref_abs: Tensor, captured: Tensor) -> Tensor:
+    """Elementwise |captured-offline| / max(|offline|, scale-tied floor).
+
+    The floor is ``_REL_ERROR_FLOOR_FRACTION * RMS(offline)``.  See the
+    constant's docstring for why a bare additive epsilon produces the
+    1e12-1e14 garbage values seen in real Stage 0 artifacts.
+
+    When the reference tensor is *identically* zero its RMS gives no usable
+    scale, so the captured tensor's RMS is used instead: that reports a total
+    divergence as a relative error of ~1.0 (still far above the 0.10
+    tolerance) rather than as an arbitrary 1/epsilon blow-up.  If both tensors
+    are zero every difference is zero and the ratio is 0 regardless.
+    """
+    scale = _rms(ref_abs)
+    if scale <= 0.0:
+        scale = _rms(captured)
+    floor = max(_REL_ERROR_FLOOR_FRACTION * scale, _EPSILON)
+    return _at_least_float32(diff) / _at_least_float32(ref_abs).clamp_min(floor)
 
 
 def _detect_rel_error_trend(
@@ -272,14 +370,15 @@ def compare_layerwise(
             # Relative error: mean|a-b| / mean|b|  (epsilon-guarded).
             mean_rel = float(diff.mean()) / (mean_ref_mag + _EPSILON)
 
-            # Elementwise relative error with epsilon guard.
-            elem_rel = diff / (o_abs + _EPSILON)
+            # Elementwise relative error with a scale-tied denominator floor.
+            elem_rel = _elementwise_rel_error(diff, o_abs, c)
             max_rel = float(elem_rel.max())
+            p99_rel = _percentile(elem_rel, _REL_ERROR_PERCENTILE)
 
-            # Cosine similarity (scale-invariant, cast to float32 for
-            # precision in the dot product).
-            c_flat = c.flatten().float()
-            o_flat = o.flatten().float()
+            # Cosine similarity (scale-invariant, promoted to at least
+            # float32 for precision in the dot product).
+            c_flat = _at_least_float32(c.flatten())
+            o_flat = _at_least_float32(o.flatten())
             dot = float((c_flat * o_flat).sum())
             norm_c = float(c_flat.norm())
             norm_o = float(o_flat.norm())
@@ -297,6 +396,7 @@ def compare_layerwise(
                     max_ref_magnitude=max_ref_mag,
                     mean_rel_error=mean_rel,
                     max_rel_error=max_rel,
+                    p99_rel_error=p99_rel,
                     cosine_similarity=cosine,
                 )
             )
