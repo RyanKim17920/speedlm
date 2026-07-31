@@ -63,10 +63,23 @@ def _wait_for_health(url: str, timeout: float, poll: float = 0.5) -> None:
     raise TimeoutError(f"vLLM did not become ready within {timeout}s; {last_err}")
 
 
-def _write_conversation_jsonl(path: Path, prompt: str) -> None:
-    """Write a single-row speculators-conversations.jsonl for *prompt*."""
-    row = {"input_ids": "0", "output": prompt, "output_ids": "0"}
-    path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+def _write_conversation_jsonl(
+    path: Path, prompt: str, *, assistant_response: str | None = None
+) -> None:
+    """Write a single-row speculators-conversations.jsonl for *prompt*.
+
+    Emits rows in the same schema as the production renderer
+    (``_speculators_record`` in ``eagle3.py``): a ``conversations`` list
+    carrying ``role`` / ``content`` dicts, with at least one assistant turn.
+    ``prepare_data.py`` drops records that lack an assistant turn, so omitting
+    one would produce a silently empty dataset.
+    """
+    turns = [
+        {"role": "user", "content": prompt},
+        {"role": "assistant", "content": assistant_response or ""},
+    ]
+    row = {"conversations": turns}
+    path.write_text(json.dumps(row, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
 def extract(
@@ -135,6 +148,16 @@ def extract(
         stderr = prepare_result.stderr.decode(errors="replace")
         raise RuntimeError(
             f"prepare_data.py failed (exit {prepare_result.returncode}):\n{stderr}"
+        )
+
+    # Guard: if prepare_data.py produced zero rows, fail early with the
+    # rendered row so the caller can see what was sent vs. what survived.
+    prepared_files = sorted(prepared_dir.iterdir())
+    if not prepared_files:
+        rendered = jsonl_path.read_text(encoding="utf-8").strip()
+        raise RuntimeError(
+            f"prepare_data.py produced an empty dataset (0 rows) in {prepared_dir}.\n"
+            f"Rendered input row: {rendered}"
         )
 
     # Step 3: launch hidden-state server
