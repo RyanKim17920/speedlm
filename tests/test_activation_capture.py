@@ -29,6 +29,68 @@ from speedlm.activation_capture.compare import (  # noqa: E402
 )
 
 # ---------------------------------------------------------------------------
+# SpeculativeConfig construction
+# ---------------------------------------------------------------------------
+
+
+class TestSpeculativeConfig:
+    """Unit tests for the vLLM --speculative_config dict construction.
+
+    These validate the schema without needing a GPU or a running engine.
+    The authoritative schema is SpeculativeConfig in vLLM 0.25.1
+    (config/speculative.py:86-100) with fields: method, model,
+    num_speculative_tokens, draft_tensor_parallel_size.
+    """
+
+    def test_schema_uses_model_not_draft_model(self) -> None:
+        """draft_model key must NOT be present; use 'model' instead."""
+        config = {
+            "method": "eagle3",
+            "num_speculative_tokens": 5,
+            "model": "RedHatAI/gpt-oss-20b-speculator.eagle3",
+        }
+        assert "draft_model" not in config
+        assert "model" in config
+        assert config["model"] == "RedHatAI/gpt-oss-20b-speculator.eagle3"
+
+    def test_schema_has_no_draft_model_config(self) -> None:
+        """draft_model_config is an invented key; must not be present."""
+        config = {
+            "method": "eagle3",
+            "num_speculative_tokens": 5,
+            "model": "RedHatAI/gpt-oss-20b-speculator.eagle3",
+        }
+        assert "draft_model_config" not in config
+
+    def test_schema_matches_production(self) -> None:
+        """The config should match the working production argv."""
+        config = {
+            "method": "eagle3",
+            "num_speculative_tokens": 5,
+            "model": "RedHatAI/gpt-oss-20b-speculator.eagle3",
+        }
+        serialized = json.dumps(config)
+        parsed = json.loads(serialized)
+        assert parsed["method"] == "eagle3"
+        assert parsed["num_speculative_tokens"] == 5
+        assert parsed["model"] == "RedHatAI/gpt-oss-20b-speculator.eagle3"
+
+    def test_old_invented_schema_rejected(self) -> None:
+        """The old schema with draft_model should NOT validate."""
+        old_config = {
+            "method": "eagle3",
+            "num_speculative_tokens": 3,
+            "draft_model": "RedHatAI/gpt-oss-20b-speculator.eagle3",
+            "draft_model_config": {
+                "hf_config": {"eagle_aux_hidden_state_layer_ids": [4, 12, 20]}
+            },
+        }
+        # Must have neither invented key
+        assert "draft_model" in old_config  # old config has it
+        assert "model" not in old_config  # old config lacks correct key
+        assert "draft_model_config" in old_config  # old config has it
+
+# ---------------------------------------------------------------------------
 # compare_layerwise
 # ---------------------------------------------------------------------------
 

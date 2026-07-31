@@ -105,6 +105,13 @@ def _ready_timeout() -> float:
 
 
 def _target_layer_ids() -> list[int]:
+    """Return the target aux layer IDs for the offline extraction path.
+
+    The serving engine reads its aux layers from the drafter's own hf_config
+    on disk.  The offline extraction must use the same IDs or the comparison
+    is meaningless.  If SPEEDLM_E2E_TARGET_LAYER_IDS is set, the test will
+    later verify that the engine's actual aux layers match this expectation.
+    """
     raw = os.environ.get("SPEEDLM_E2E_TARGET_LAYER_IDS")
     if raw:
         try:
@@ -219,11 +226,15 @@ def _load_captured_safetensors(capture_dir: Path) -> dict[int, torch.Tensor]:
     return tensors
 
 
-def _load_offline_hidden_states(hs_dir: Path) -> dict[int, torch.Tensor]:
+def _load_offline_hidden_states(
+    hs_dir: Path, *, target_layers: list[int]
+) -> dict[int, torch.Tensor]:
     """Load offline hs_*.safetensors shards into {layer_idx: tensor}.
 
     The offline path writes shape (seq_len, num_layers, hidden_size).
-    We split the layer dimension so each layer becomes a separate tensor.
+    We split the layer dimension and map positional index *i* to
+    ``target_layers[i]`` so the keys match the serving capture's
+    actual layer indices (which come from the engine's drafter config).
     """
     shards = sorted(hs_dir.glob("hs_*.safetensors"))
     if not shards:
@@ -235,7 +246,8 @@ def _load_offline_hidden_states(hs_dir: Path) -> dict[int, torch.Tensor]:
             hs = f.get_tensor("hidden_states")
         # hs shape: (seq_len, num_layers, hidden_size)
         for i in range(hs.shape[1]):
-            layers.setdefault(i, []).append(hs[:, i])
+            key = target_layers[i] if i < len(target_layers) else i
+            layers.setdefault(key, []).append(hs[:, i])
 
     merged: dict[int, torch.Tensor] = {}
     for idx in sorted(layers.keys()):
@@ -295,11 +307,8 @@ def test_stage0_activation_capture() -> None:
 
     speculative_config = {
         "method": "eagle3",
-        "num_speculative_tokens": 3,
-        "draft_model": drafter,
-        "draft_model_config": {
-            "hf_config": {"eagle_aux_hidden_state_layer_ids": target_layers}
-        },
+        "num_speculative_tokens": 5,
+        "model": drafter,
     }
 
     capture_dir = artifact_dir / "captured"
@@ -349,6 +358,18 @@ def test_stage0_activation_capture() -> None:
         captured_tensors = _load_captured_safetensors(capture_dir)
         logger.info("Captured layers: %s", sorted(captured_tensors.keys()))
 
+        # Verify the engine's aux layer IDs match our expectation.  The hook
+        # reads the actual aux layers from the drafter's hf_config on disk.
+        # The offline extraction uses *target_layers* as positional keys; they
+        # must be the same or the comparison is meaningless.
+        captured_aux = sorted(k for k in captured_tensors if k < 100)
+        assert captured_aux == target_layers, (
+            f"Captured aux layers {captured_aux} do not match "
+            f"target_layers {target_layers} — offline extraction will use "
+            f"wrong keys.  Set SPEEDLM_E2E_TARGET_LAYER_IDS to match the "
+            f"drafter's config."
+        )
+
         # Step 4: Run offline extraction
         offline_dir = artifact_dir / "offline"
         hs_dir = _run_offline_extract(
@@ -358,7 +379,7 @@ def test_stage0_activation_capture() -> None:
             offline_dir,
             port=port + 1000,  # Different port
         )
-        offline_tensors = _load_offline_hidden_states(hs_dir)
+        offline_tensors = _load_offline_hidden_states(hs_dir, target_layers=target_layers)
         logger.info("Offline layers: %s", sorted(offline_tensors.keys()))
 
         # Step 5: Align and compare
@@ -436,18 +457,14 @@ def test_prefix_cache_coverage() -> None:
     """
     verifier, drafter, artifact_root = _require_environment()
     prompt = os.environ.get("SPEEDLM_E2E_PROMPT", DEFAULT_PROMPT)
-    target_layers = _target_layer_ids()
     artifact_dir = _create_artifact_dir(artifact_root)
     port = int(os.environ.get("SPEEDLM_E2E_PORT", _free_port()))
     timeout = _ready_timeout()
 
     speculative_config = {
         "method": "eagle3",
-        "num_speculative_tokens": 3,
-        "draft_model": drafter,
-        "draft_model_config": {
-            "hf_config": {"eagle_aux_hidden_state_layer_ids": target_layers}
-        },
+        "num_speculative_tokens": 5,
+        "model": drafter,
     }
 
     capture_dir = artifact_dir / "captured"
