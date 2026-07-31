@@ -707,6 +707,16 @@ def test_stage0_activation_capture() -> None:
     result.write_json(result_path)
     logger.info("Result written to %s — verdict: %s", result_path, result.verdict)
 
+    # By default, a FAIL verdict fails the test so that regressions are caught.
+    # Set SPEEDLM_E2E_STRICT_VERDICT=0 to skip this assertion for exploratory runs.
+    strict = os.environ.get("SPEEDLM_E2E_STRICT_VERDICT", "1") != "0"
+    if strict:
+        assert result.verdict == "PASS", (
+            f"Activation capture comparison failed: verdict={result.verdict}, "
+            f"rel_error_trend={result.rel_error_trend}. "
+            f"Full result at {result_path}"
+        )
+
 
 # ---------------------------------------------------------------------------
 # Prefix-cache coverage measurement

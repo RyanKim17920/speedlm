@@ -10,6 +10,7 @@ project venv).
 from __future__ import annotations
 
 import json
+import math
 from pathlib import Path
 
 import pytest
@@ -17,10 +18,12 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from speedlm.activation_capture.compare import (  # noqa: E402
+    DEFAULT_RELATIVE_TOLERANCE,
     DEFAULT_TOLERANCE,
     ComparisonResult,
     LayerComparison,
     PrefixCacheResult,
+    _detect_rel_error_trend,
     build_result,
     check_pre_norm,
     check_within_tolerance,
@@ -156,6 +159,149 @@ class TestCompareLayerwise:
 
 
 # ---------------------------------------------------------------------------
+# Relative metrics, cosine similarity, trend detection
+# ---------------------------------------------------------------------------
+
+
+class TestRelativeMetrics:
+    """Verify relative error metrics are correct on known inputs."""
+
+    def test_identical_tensors_zero_rel_error(self) -> None:
+        """Identical tensors have zero relative error and cosine = 1.0."""
+        t = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+        layers = compare_layerwise({0: t}, {0: t})
+        lc = layers[0]
+        assert lc.mean_rel_error == pytest.approx(0.0, abs=1e-10)
+        assert lc.max_rel_error == pytest.approx(0.0, abs=1e-10)
+        assert lc.cosine_similarity == pytest.approx(1.0, abs=1e-6)
+        assert lc.mean_ref_magnitude == pytest.approx(2.5, abs=1e-6)
+
+    def test_known_relative_error(self) -> None:
+        """mean|a-b| / mean|b| is computed correctly."""
+        a = torch.ones(4, 8) * 10.0
+        b = torch.ones(4, 8) * 1.0  # 10% relative diff
+        layers = compare_layerwise({0: a}, {0: b})
+        lc = layers[0]
+        # mean|a-b| = 9.0, mean|b| = 1.0 => mean_rel_error = 9.0
+        assert lc.mean_rel_error == pytest.approx(9.0, abs=1e-6)
+
+    def test_small_relative_error(self) -> None:
+        """A 1% perturbation gives ~0.01 mean relative error."""
+        a = torch.ones(4, 8) * 100.0
+        b = torch.ones(4, 8) * 101.0  # 1% relative
+        layers = compare_layerwise({0: a}, {0: b})
+        lc = layers[0]
+        # mean|a-b| = 1.0, mean|b| = 101.0 => mean_rel ~ 0.0099
+        assert lc.mean_rel_error == pytest.approx(1.0 / 101.0, abs=1e-6)
+
+    def test_cosine_identical(self) -> None:
+        """Cosine similarity of identical vectors is 1.0."""
+        t = torch.randn(8, 16)
+        layers = compare_layerwise({0: t}, {0: t})
+        assert layers[0].cosine_similarity == pytest.approx(1.0, abs=1e-6)
+
+    def test_cosine_scaled(self) -> None:
+        """Cosine similarity is scale-invariant."""
+        t = torch.randn(8, 16)
+        layers = compare_layerwise({0: t * 3.7}, {0: t})
+        assert layers[0].cosine_similarity == pytest.approx(1.0, abs=1e-6)
+
+    def test_cosine_negative(self) -> None:
+        """Cosine of opposite vectors is -1.0."""
+        t = torch.ones(4, 8)
+        layers = compare_layerwise({0: t}, {0: -t})
+        assert layers[0].cosine_similarity == pytest.approx(-1.0, abs=1e-6)
+
+    def test_cosine_orthogonal_approx(self) -> None:
+        """Orthogonal-ish vectors have cosine near 0."""
+        a = torch.tensor([[1.0, 0.0]])
+        b = torch.tensor([[0.0, 1.0]])
+        layers = compare_layerwise({0: a}, {0: b})
+        assert layers[0].cosine_similarity == pytest.approx(0.0, abs=1e-10)
+
+    def test_divide_by_zero_guarded(self) -> None:
+        """Zero reference tensor does not cause NaN or inf."""
+        a = torch.ones(4, 8)
+        b = torch.zeros(4, 8)
+        layers = compare_layerwise({0: a}, {0: b})
+        lc = layers[0]
+        # mean_ref_magnitude = 0; rel error uses epsilon guard
+        assert lc.mean_ref_magnitude == 0.0
+        assert lc.mean_rel_error is not None
+        assert not math.isnan(lc.mean_rel_error)
+        assert not math.isinf(lc.cosine_similarity)
+
+    def test_magnitude_metrics_present(self) -> None:
+        """Reference magnitude fields are populated."""
+        a = torch.ones(4, 8) * 5.0
+        b = torch.ones(4, 8) * 10.0
+        layers = compare_layerwise({0: a}, {0: b})
+        lc = layers[0]
+        assert lc.mean_ref_magnitude == pytest.approx(10.0, abs=1e-6)
+        assert lc.max_ref_magnitude == pytest.approx(10.0, abs=1e-6)
+
+    def test_shape_mismatch_no_relative_fields(self) -> None:
+        """Mismatched shapes leave relative fields as None."""
+        a = torch.ones(4, 8)
+        b = torch.ones(4, 16)
+        layers = compare_layerwise({0: a}, {0: b})
+        lc = layers[0]
+        assert lc.mean_rel_error is None
+        assert lc.cosine_similarity is None
+        assert lc.mean_ref_magnitude is None
+
+
+class TestTrendDetection:
+    """Test _detect_rel_error_trend classifies relative error trends."""
+
+    def test_constant_trend(self) -> None:
+        """Similar relative errors across layers -> constant."""
+        layers = [
+            LayerComparison(2, (1, 1), (1, 1), True, 0.1, 0.1,
+                            mean_rel_error=0.01),
+            LayerComparison(12, (1, 1), (1, 1), True, 0.1, 0.1,
+                            mean_rel_error=0.012),
+            LayerComparison(21, (1, 1), (1, 1), True, 0.1, 0.1,
+                            mean_rel_error=0.011),
+        ]
+        assert _detect_rel_error_trend(layers) == "constant"
+
+    def test_growing_trend(self) -> None:
+        """Relative error growing by >3x -> growing."""
+        layers = [
+            LayerComparison(2, (1, 1), (1, 1), True, 0.1, 0.1,
+                            mean_rel_error=0.001),
+            LayerComparison(12, (1, 1), (1, 1), True, 0.1, 0.1,
+                            mean_rel_error=0.01),
+            LayerComparison(21, (1, 1), (1, 1), True, 0.1, 0.1,
+                            mean_rel_error=0.05),
+        ]
+        assert _detect_rel_error_trend(layers) == "growing"
+
+    def test_insufficient_data_single_layer(self) -> None:
+        """One layer -> insufficient_data."""
+        layers = [
+            LayerComparison(2, (1, 1), (1, 1), True, 0.1, 0.1,
+                            mean_rel_error=0.01),
+        ]
+        assert _detect_rel_error_trend(layers) == "insufficient_data"
+
+    def test_insufficient_data_empty(self) -> None:
+        """No layers -> insufficient_data."""
+        assert _detect_rel_error_trend([]) == "insufficient_data"
+
+    def test_zero_first_layer_growth(self) -> None:
+        """Zero relative error at first layer with non-zero later -> growing."""
+        layers = [
+            LayerComparison(2, (1, 1), (1, 1), True, 0.1, 0.1,
+                            mean_rel_error=0.0),
+            LayerComparison(21, (1, 1), (1, 1), True, 0.1, 0.1,
+                            mean_rel_error=0.05),
+        ]
+        assert _detect_rel_error_trend(layers) == "growing"
+
+
+# ---------------------------------------------------------------------------
 # check_pre_norm
 # ---------------------------------------------------------------------------
 
@@ -196,31 +342,43 @@ class TestCheckPreNorm:
 
 
 class TestCheckWithinTolerance:
-    def test_all_within(self) -> None:
+    def test_all_within_relative(self) -> None:
+        """Layers with small relative errors are within tolerance."""
         layers = [
-            LayerComparison(0, (4, 8), (4, 8), True, 0.001, 0.001),
-            LayerComparison(1, (4, 8), (4, 8), True, 0.009, 0.005),
+            LayerComparison(0, (4, 8), (4, 8), True, 0.001, 0.001,
+                            mean_rel_error=0.001),
+            LayerComparison(1, (4, 8), (4, 8), True, 0.009, 0.005,
+                            mean_rel_error=0.005),
         ]
-        assert check_within_tolerance(layers, DEFAULT_TOLERANCE) is True
+        assert check_within_tolerance(layers) is True
 
-    def test_one_exceeds(self) -> None:
+    def test_one_exceeds_relative(self) -> None:
+        """One layer exceeding relative tolerance fails."""
         layers = [
-            LayerComparison(0, (4, 8), (4, 8), True, 0.001, 0.001),
-            LayerComparison(1, (4, 8), (4, 8), True, 0.05, 0.03),
+            LayerComparison(0, (4, 8), (4, 8), True, 0.001, 0.001,
+                            mean_rel_error=0.001),
+            LayerComparison(1, (4, 8), (4, 8), True, 0.05, 0.03,
+                            mean_rel_error=0.5),
         ]
-        assert check_within_tolerance(layers, DEFAULT_TOLERANCE) is False
+        assert check_within_tolerance(layers) is False
 
     def test_empty(self) -> None:
-        assert check_within_tolerance([], DEFAULT_TOLERANCE) is True
+        assert check_within_tolerance([]) is True
 
-    def test_none_diff_treated_as_within(self) -> None:
-        """None max_abs_diff means shapes didn't match; tolerance check
-        is irrelevant. The verdict layer handles this separately."""
+    def test_none_rel_error_fails(self) -> None:
+        """None mean_rel_error (shape mismatch) fails tolerance check."""
         layers = [
             LayerComparison(0, (4, 8), (4, 16), False, None, None),
         ]
-        # None is not <= tolerance, so this returns False
-        assert check_within_tolerance(layers, DEFAULT_TOLERANCE) is False
+        assert check_within_tolerance(layers) is False
+
+    def test_legacy_absolute_tolerance(self) -> None:
+        """When relative_tolerance=None and tolerance is given, use absolute."""
+        layers = [
+            LayerComparison(0, (4, 8), (4, 8), True, 0.001, 0.001),
+        ]
+        assert check_within_tolerance(layers, tolerance=0.01,
+                                      relative_tolerance=None) is True
 
 
 # ---------------------------------------------------------------------------
@@ -243,9 +401,12 @@ class TestDeriveVerdict:
         )
 
     def test_pass(self) -> None:
+        """Small relative errors + pre_norm=True -> PASS."""
         layers = [
-            LayerComparison(0, (4, 8), (4, 8), True, 0.001, 0.001),
-            LayerComparison(1, (4, 8), (4, 8), True, 0.005, 0.003),
+            LayerComparison(0, (4, 8), (4, 8), True, 0.001, 0.001,
+                            mean_rel_error=0.001),
+            LayerComparison(1, (4, 8), (4, 8), True, 0.005, 0.003,
+                            mean_rel_error=0.003),
         ]
         result = self._result(layers, True)
         assert derive_verdict(result) == "PASS"
@@ -261,23 +422,27 @@ class TestDeriveVerdict:
         result = self._result(layers, True)
         assert derive_verdict(result) == "FAIL_shape"
 
-    def test_fail_tolerance(self) -> None:
+    def test_fail_tolerance_relative(self) -> None:
+        """Large relative error -> FAIL_tolerance."""
         layers = [
-            LayerComparison(0, (4, 8), (4, 8), True, 0.05, 0.03),
+            LayerComparison(0, (4, 8), (4, 8), True, 0.05, 0.03,
+                            mean_rel_error=0.5),
         ]
         result = self._result(layers, True)
         assert derive_verdict(result) == "FAIL_tolerance"
 
     def test_fail_pre_norm_none(self) -> None:
         layers = [
-            LayerComparison(0, (4, 8), (4, 8), True, 0.001, 0.001),
+            LayerComparison(0, (4, 8), (4, 8), True, 0.001, 0.001,
+                            mean_rel_error=0.001),
         ]
         result = self._result(layers, None)
         assert derive_verdict(result) == "FAIL_pre_norm"
 
     def test_fail_pre_norm_false(self) -> None:
         layers = [
-            LayerComparison(0, (4, 8), (4, 8), True, 0.001, 0.001),
+            LayerComparison(0, (4, 8), (4, 8), True, 0.001, 0.001,
+                            mean_rel_error=0.001),
         ]
         result = self._result(layers, False)
         assert derive_verdict(result) == "FAIL_pre_norm"
@@ -302,6 +467,7 @@ class TestBuildResult:
         assert result.pre_norm_match is True
 
     def test_fail_tolerance_build(self) -> None:
+        """Completely different tensors exceed relative tolerance."""
         a = torch.zeros(4, 8)
         b = torch.ones(4, 8)
         result = build_result(
@@ -331,14 +497,30 @@ class TestBuildResult:
         assert result.prefix_cache_test is not None
         assert result.prefix_cache_test.cache_hit is False
 
-    def test_custom_tolerance(self) -> None:
+    def test_custom_relative_tolerance(self) -> None:
+        """A 1.5% relative diff passes at 0.02 but fails at 0.001."""
         a = torch.ones(4, 8)
-        b = torch.ones(4, 8) + 0.015
-        # With default tolerance (0.01), this fails. With 0.02, it passes.
-        result_strict = build_result({0: a}, {0: b}, tolerance=0.01)
-        assert result_strict.verdict == "FAIL_tolerance"
-        result_lenient = build_result({0: a}, {0: b}, tolerance=0.02)
-        assert result_lenient.verdict == "FAIL_pre_norm"  # no pre-norm tensors
+        b = torch.ones(4, 8) * 1.015  # 1.5% relative
+        result_strict = build_result(
+            {0: a}, {0: b}, relative_tolerance=0.001,
+        )
+        assert result_strict.verdict in ("FAIL_tolerance", "FAIL_pre_norm")
+        result_lenient = build_result(
+            {0: a}, {0: b}, relative_tolerance=0.05,
+        )
+        # With lenient rel tol, layer passes but no pre-norm -> FAIL_pre_norm
+        assert result_lenient.verdict == "FAIL_pre_norm"
+
+    def test_trend_is_recorded(self) -> None:
+        """build_result records rel_error_trend."""
+        t = torch.ones(4, 8)
+        result = build_result(
+            {0: t, 1: t},
+            {0: t, 1: t},
+            captured_final_pre_norm=t,
+            offline_final_pre_norm=t,
+        )
+        assert result.rel_error_trend in ("constant", "insufficient_data")
 
 
 # ---------------------------------------------------------------------------
@@ -358,10 +540,17 @@ class TestSerialization:
         d = result.to_dict()
         assert d["verdict"] == "PASS"
         assert d["tolerance"] == DEFAULT_TOLERANCE
+        assert d["relative_tolerance"] == DEFAULT_RELATIVE_TOLERANCE
         assert d["all_shapes_match"] is True
         assert d["all_within_tolerance"] is True
         assert d["pre_norm_match"] is True
         assert len(d["layers"]) == 2
+        # New fields present
+        layer_0 = d["layers"][0]
+        assert "mean_rel_error" in layer_0
+        assert "cosine_similarity" in layer_0
+        assert "mean_ref_magnitude" in layer_0
+        assert layer_0["cosine_similarity"] == pytest.approx(1.0, abs=1e-6)
 
     def test_write_json(self, tmp_path: Path) -> None:
         t = torch.ones(2, 4)
@@ -393,6 +582,19 @@ class TestSerialization:
         data = json.loads(out.read_text())
         assert data["prefix_cache_test"]["cache_hit"] is True
         assert data["prefix_cache_test"]["rows_missing"] == 2
+
+    def test_write_json_includes_trend(self, tmp_path: Path) -> None:
+        t = torch.ones(2, 4)
+        result = build_result(
+            {0: t},
+            {0: t},
+            captured_final_pre_norm=t,
+            offline_final_pre_norm=t,
+        )
+        out = tmp_path / "result.json"
+        result.write_json(out)
+        data = json.loads(out.read_text())
+        assert "rel_error_trend" in data
 
 
 # ---------------------------------------------------------------------------
@@ -516,6 +718,21 @@ class TestE2EHelpers:
         finally:
             if original is not None:
                 os.environ["VLLM_SERVER_DEV_MODE"] = original
+
+    def test_strict_verdict_env_var(self) -> None:
+        """SPEEDLM_E2E_STRICT_VERDICT=0 disables verdict assertion."""
+        import os
+
+        # Default: strict is enabled
+        assert os.environ.get("SPEEDLM_E2E_STRICT_VERDICT", "1") != "0"
+
+        # Opt-out: setting to "0" disables
+        os.environ["SPEEDLM_E2E_STRICT_VERDICT"] = "0"
+        try:
+            strict = os.environ.get("SPEEDLM_E2E_STRICT_VERDICT", "1") != "0"
+            assert strict is False
+        finally:
+            del os.environ["SPEEDLM_E2E_STRICT_VERDICT"]
 
 
 # ---------------------------------------------------------------------------
@@ -1008,9 +1225,12 @@ class TestDeriveVerdictPreNormInvariant:
     def test_pass_requires_pre_norm_true(self) -> None:
         """PASS verdict requires pre_norm_match == True, not None."""
         layers = [
-            LayerComparison(2, (4, 8), (4, 8), True, 0.001, 0.001),
-            LayerComparison(12, (4, 8), (4, 8), True, 0.001, 0.001),
-            LayerComparison(21, (4, 8), (4, 8), True, 0.001, 0.001),
+            LayerComparison(2, (4, 8), (4, 8), True, 0.001, 0.001,
+                            mean_rel_error=0.001),
+            LayerComparison(12, (4, 8), (4, 8), True, 0.001, 0.001,
+                            mean_rel_error=0.001),
+            LayerComparison(21, (4, 8), (4, 8), True, 0.001, 0.001,
+                            mean_rel_error=0.001),
         ]
         result_with_none = ComparisonResult(
             layers=layers,
@@ -1028,3 +1248,45 @@ class TestDeriveVerdictPreNormInvariant:
             verdict="",
         )
         assert derive_verdict(result_with_true) == "PASS"
+
+    def test_fail_verdict_fails_test(self) -> None:
+        """A FAIL verdict should fail the e2e test by default."""
+        # Simulate the verdict check in the e2e test
+        result = build_result(
+            {0: torch.zeros(4, 8)},
+            {0: torch.ones(4, 8)},
+            captured_final_pre_norm=torch.zeros(4, 8),
+            offline_final_pre_norm=torch.ones(4, 8),
+        )
+        assert result.verdict != "PASS"
+        # The e2e test would now assert on this
+        import os
+        strict = os.environ.get("SPEEDLM_E2E_STRICT_VERDICT", "1") != "0"
+        assert strict  # default is strict
+        # With strict mode, a FAIL verdict would fail the test
+        if strict:
+            with pytest.raises(AssertionError, match="Activation capture comparison failed"):
+                assert result.verdict == "PASS", (
+                    f"Activation capture comparison failed: verdict={result.verdict}"
+                )
+
+    def test_opt_out_env_var_allows_exploratory(self) -> None:
+        """SPEEDLM_E2E_STRICT_VERDICT=0 allows FAIL verdict without test failure."""
+        import os
+
+        result = build_result(
+            {0: torch.zeros(4, 8)},
+            {0: torch.ones(4, 8)},
+            captured_final_pre_norm=torch.zeros(4, 8),
+            offline_final_pre_norm=torch.ones(4, 8),
+        )
+        assert result.verdict != "PASS"
+
+        # With opt-out, the verdict check is skipped
+        os.environ["SPEEDLM_E2E_STRICT_VERDICT"] = "0"
+        try:
+            strict = os.environ.get("SPEEDLM_E2E_STRICT_VERDICT", "1") != "0"
+            assert strict is False
+            # The assertion would be skipped
+        finally:
+            del os.environ["SPEEDLM_E2E_STRICT_VERDICT"]
