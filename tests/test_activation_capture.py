@@ -705,3 +705,326 @@ class TestSafetensorsIO:
 
         tensors = _load_captured_safetensors(capture_dir)
         assert tensors[2].dtype == torch.bfloat16
+
+
+# ---------------------------------------------------------------------------
+# Metadata reading
+# ---------------------------------------------------------------------------
+
+
+class TestCaptureMetadata:
+    """Test _load_capture_metadata reads metadata from disk."""
+
+    def test_load_metadata_roundtrip(self, tmp_path: Path) -> None:
+        """Metadata written by flush_capture can be read back."""
+        from tests.e2e.test_serving_activation_capture import _load_capture_metadata
+
+        capture_dir = tmp_path / "captured"
+        capture_dir.mkdir()
+        meta = {
+            "final_layer_idx": 24,
+            "original_aux_layers": [2, 12, 21],
+        }
+        import json
+
+        (capture_dir / "captured.safetensors.meta.json").write_text(
+            json.dumps(meta), encoding="utf-8"
+        )
+
+        loaded = _load_capture_metadata(capture_dir)
+        assert loaded["final_layer_idx"] == 24
+        assert loaded["original_aux_layers"] == [2, 12, 21]
+
+    def test_load_metadata_missing_file(self, tmp_path: Path) -> None:
+        """Returns sensible defaults when metadata file is absent."""
+        from tests.e2e.test_serving_activation_capture import _load_capture_metadata
+
+        capture_dir = tmp_path / "captured"
+        capture_dir.mkdir()
+
+        loaded = _load_capture_metadata(capture_dir)
+        assert loaded["final_layer_idx"] is None
+        assert loaded["original_aux_layers"] == []
+
+
+# ---------------------------------------------------------------------------
+# Split captured layers
+# ---------------------------------------------------------------------------
+
+
+class TestSplitCapturedLayers:
+    """Test _split_captured_layers separates drafter-inputs from regression-target."""
+
+    def test_split_correct_with_final_layer(self) -> None:
+        """Captured [2,12,21,24] with metadata [2,12,21] + final=24 splits correctly."""
+        from tests.e2e.test_serving_activation_capture import _split_captured_layers
+
+        captured = {
+            2: torch.ones(4, 8),
+            12: torch.ones(4, 8) * 2,
+            21: torch.ones(4, 8) * 3,
+            24: torch.ones(4, 8) * 4,
+        }
+        meta = {
+            "final_layer_idx": 24,
+            "original_aux_layers": [2, 12, 21],
+        }
+
+        drafter_ids, final_idx, drafter_tensors, regression = _split_captured_layers(
+            captured, meta
+        )
+
+        assert drafter_ids == [2, 12, 21]
+        assert final_idx == 24
+        assert sorted(drafter_tensors.keys()) == [2, 12, 21]
+        assert regression is not None
+        assert torch.allclose(regression, torch.ones(4, 8) * 4)
+
+    def test_split_without_final_layer(self) -> None:
+        """When final_layer_idx is None, regression target is None."""
+        from tests.e2e.test_serving_activation_capture import _split_captured_layers
+
+        captured = {2: torch.ones(4, 8), 12: torch.ones(4, 8)}
+        meta = {"final_layer_idx": None, "original_aux_layers": [2, 12]}
+
+        drafter_ids, final_idx, drafter_tensors, regression = _split_captured_layers(
+            captured, meta
+        )
+
+        assert drafter_ids == [2, 12]
+        assert final_idx is None
+        assert sorted(drafter_tensors.keys()) == [2, 12]
+        assert regression is None
+
+    def test_split_wrong_layers_still_succeeds(self) -> None:
+        """If captured has unexpected layers, only the expected ones are split."""
+        from tests.e2e.test_serving_activation_capture import _split_captured_layers
+
+        captured = {
+            2: torch.ones(4, 8),
+            12: torch.ones(4, 8),
+            99: torch.ones(4, 8),  # unexpected
+        }
+        meta = {
+            "final_layer_idx": 24,
+            "original_aux_layers": [2, 12, 21],
+        }
+
+        drafter_ids, final_idx, drafter_tensors, regression = _split_captured_layers(
+            captured, meta
+        )
+
+        assert drafter_ids == [2, 12]  # 21 not in captured
+        assert final_idx == 24
+        assert regression is None  # 24 not in captured
+
+
+# ---------------------------------------------------------------------------
+# Split offline layers
+# ---------------------------------------------------------------------------
+
+
+class TestSplitOfflineLayers:
+    """Test _split_offline_layers separates drafter-inputs from regression-target."""
+
+    def test_split_correct_with_final_layer(self) -> None:
+        """Offline [2,12,21,24] splits into drafter [2,12,21] and final 24."""
+        from tests.e2e.test_serving_activation_capture import _split_offline_layers
+
+        offline = {
+            2: torch.ones(4, 8),
+            12: torch.ones(4, 8) * 2,
+            21: torch.ones(4, 8) * 3,
+            24: torch.ones(4, 8) * 4,
+        }
+        offline_target_layers = [2, 12, 21, 24]
+
+        drafter_ids, final_idx, drafter_tensors, regression = _split_offline_layers(
+            offline, offline_target_layers
+        )
+
+        assert drafter_ids == [2, 12, 21]
+        assert final_idx == 24
+        assert sorted(drafter_tensors.keys()) == [2, 12, 21]
+        assert regression is not None
+        assert torch.allclose(regression, torch.ones(4, 8) * 4)
+
+    def test_split_without_final_layer(self) -> None:
+        """When offline_target_layers has only drafter inputs, no regression target."""
+        from tests.e2e.test_serving_activation_capture import _split_offline_layers
+
+        offline = {2: torch.ones(4, 8), 12: torch.ones(4, 8)}
+        offline_target_layers = [2, 12]
+
+        drafter_ids, final_idx, drafter_tensors, regression = _split_offline_layers(
+            offline, offline_target_layers
+        )
+
+        # With only 2 layers, the last is still treated as final
+        assert drafter_ids == [2]
+        assert final_idx == 12
+        assert sorted(drafter_tensors.keys()) == [2]
+        assert regression is not None
+
+
+# ---------------------------------------------------------------------------
+# Assertion: captured layers match target + final
+# ---------------------------------------------------------------------------
+
+
+class TestCorrectedAssertion:
+    """Test that the corrected assertion logic works correctly."""
+
+    def test_correct_captured_layers_pass(self) -> None:
+        """[2,12,21,24] passes when target=[2,12,21] and final=24."""
+        captured_keys = sorted([2, 12, 21, 24])
+        meta = {"original_aux_layers": [2, 12, 21], "final_layer_idx": 24}
+        target_layers = [2, 12, 21]
+
+        # Drafter-input check
+        assert sorted(meta["original_aux_layers"]) == target_layers
+
+        # Full key check
+        expected = sorted(
+            meta["original_aux_layers"]
+            + ([meta["final_layer_idx"]] if meta["final_layer_idx"] is not None else [])
+        )
+        assert captured_keys == expected
+
+    def test_wrong_captured_layers_fail(self) -> None:
+        """[2,12,21,99] fails when target=[2,12,21] and final=24."""
+        captured_keys = sorted([2, 12, 21, 99])
+        meta = {"original_aux_layers": [2, 12, 21], "final_layer_idx": 24}
+        target_layers = [2, 12, 21]
+
+        assert sorted(meta["original_aux_layers"]) == target_layers
+
+        expected = sorted(
+            meta["original_aux_layers"]
+            + ([meta["final_layer_idx"]] if meta["final_layer_idx"] is not None else [])
+        )
+        assert captured_keys != expected  # 99 != 24, so they differ
+
+    def test_drafter_input_vs_regression_mapping(self) -> None:
+        """Verify drafter-inputs and regression-target are correctly mapped."""
+        from tests.e2e.test_serving_activation_capture import (
+            _split_captured_layers,
+            _split_offline_layers,
+        )
+
+        captured = {
+            2: torch.ones(4, 8),
+            12: torch.ones(4, 8) * 2,
+            21: torch.ones(4, 8) * 3,
+            24: torch.ones(4, 8) * 4,
+        }
+        meta = {"final_layer_idx": 24, "original_aux_layers": [2, 12, 21]}
+
+        offline = dict(captured)  # same layers for offline
+        offline_target_layers = [2, 12, 21, 24]
+
+        (
+            cap_drafter_ids,
+            cap_final_idx,
+            cap_drafter,
+            cap_regression,
+        ) = _split_captured_layers(captured, meta)
+
+        (
+            off_drafter_ids,
+            off_final_idx,
+            off_drafter,
+            off_regression,
+        ) = _split_offline_layers(offline, offline_target_layers)
+
+        # Drafter-input layer ids must match
+        assert cap_drafter_ids == off_drafter_ids == [2, 12, 21]
+
+        # Final layer indices must match
+        assert cap_final_idx == off_final_idx == 24
+
+        # Drafter tensors are compared by key
+        for idx in cap_drafter_ids:
+            assert idx in cap_drafter
+            assert idx in off_drafter
+
+        # Regression targets are compared separately
+        assert cap_regression is not None
+        assert off_regression is not None
+
+
+# ---------------------------------------------------------------------------
+# check_pre_norm: real captured final layer produces real verdict
+# ---------------------------------------------------------------------------
+
+
+class TestCheckPreNormReal:
+    """Verify check_pre_norm returns True/False when both tensors present."""
+
+    def test_real_match_returns_true(self) -> None:
+        """Identical tensors -> True."""
+        t = torch.randn(4, 8)
+        assert check_pre_norm(t, t) is True
+
+    def test_real_mismatch_returns_false(self) -> None:
+        """Very different tensors -> False (not None)."""
+        a = torch.zeros(4, 8)
+        b = torch.ones(4, 8)
+        assert check_pre_norm(a, b) is False
+
+    def test_build_result_passes_with_real_final_layer(self) -> None:
+        """build_result produces PASS when final layer is present and matches."""
+        t = torch.ones(4, 8)
+        result = build_result(
+            {2: t, 12: t, 21: t},
+            {2: t, 12: t, 21: t},
+            captured_final_pre_norm=t,
+            offline_final_pre_norm=t,
+        )
+        assert result.verdict == "PASS"
+        assert result.pre_norm_match is True
+
+    def test_build_result_fails_when_no_final_layer(self) -> None:
+        """build_result produces FAIL_pre_norm when final layer absent."""
+        t = torch.ones(4, 8)
+        result = build_result(
+            {2: t, 12: t, 21: t},
+            {2: t, 12: t, 21: t},
+            captured_final_pre_norm=None,
+            offline_final_pre_norm=None,
+        )
+        assert result.verdict == "FAIL_pre_norm"
+        assert result.pre_norm_match is None
+
+
+# ---------------------------------------------------------------------------
+# derive_verdict cannot PASS with pre_norm_match None
+# ---------------------------------------------------------------------------
+
+
+class TestDeriveVerdictPreNormInvariant:
+    """derive_verdict must never return PASS when pre_norm_match is None."""
+
+    def test_pass_requires_pre_norm_true(self) -> None:
+        """PASS verdict requires pre_norm_match == True, not None."""
+        layers = [
+            LayerComparison(2, (4, 8), (4, 8), True, 0.001, 0.001),
+            LayerComparison(12, (4, 8), (4, 8), True, 0.001, 0.001),
+            LayerComparison(21, (4, 8), (4, 8), True, 0.001, 0.001),
+        ]
+        result_with_none = ComparisonResult(
+            layers=layers,
+            pre_norm_match=None,
+            tolerance=DEFAULT_TOLERANCE,
+            verdict="",
+        )
+        assert derive_verdict(result_with_none) != "PASS"
+        assert derive_verdict(result_with_none) == "FAIL_pre_norm"
+
+        result_with_true = ComparisonResult(
+            layers=layers,
+            pre_norm_match=True,
+            tolerance=DEFAULT_TOLERANCE,
+            verdict="",
+        )
+        assert derive_verdict(result_with_true) == "PASS"

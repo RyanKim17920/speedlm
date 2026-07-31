@@ -310,6 +310,59 @@ def _load_captured_safetensors(capture_dir: Path) -> dict[int, torch.Tensor]:
     return tensors
 
 
+def _load_capture_metadata(capture_dir: Path) -> dict:
+    """Load the capture metadata JSON written alongside captured.safetensors.
+
+    Returns the raw metadata dict (``final_layer_idx``, ``original_aux_layers``).
+    Falls back to ``{"final_layer_idx": None, "original_aux_layers": []}`` if
+    the metadata file is absent (e.g., for legacy captures that predate this
+    feature).
+    """
+    meta_path = capture_dir / "captured.safetensors.meta.json"
+    if meta_path.exists():
+        return json.loads(meta_path.read_text(encoding="utf-8"))
+    return {"final_layer_idx": None, "original_aux_layers": []}
+
+
+def _split_captured_layers(
+    captured: dict[int, torch.Tensor],
+    metadata: dict,
+) -> tuple[list[int], int | None, dict[int, torch.Tensor], torch.Tensor | None]:
+    """Split captured tensors into drafter-input and regression-target groups.
+
+    Uses the metadata from the hook (``original_aux_layers`` and
+    ``final_layer_idx``) to distinguish:
+
+    - **Drafter-input layers**: the layers the drafter model consumes (e.g.
+      [2, 12, 21]).  These correspond to ``original_aux_layers`` and are
+      compared against the offline path's ``target_layers``.
+
+    - **Regression-target layer**: the final decoder layer (e.g. 24) appended
+      by the hook so the pre-norm regression target can be captured.  This is
+      ``final_layer_idx`` and is compared against the offline path's
+      ``hidden_states[:, -1]``.
+
+    Returns:
+        Tuple of (drafter_input_layer_ids, final_layer_idx,
+        drafter_input_tensors, regression_target_tensor).
+    """
+    final_layer_idx = metadata.get("final_layer_idx")
+    original_aux = metadata.get("original_aux_layers", [])
+
+    # Drafter-input tensors are those whose keys match original_aux_layers.
+    drafter_input_tensors: dict[int, torch.Tensor] = {
+        k: v for k, v in captured.items() if k in original_aux
+    }
+    drafter_input_ids = sorted(drafter_input_tensors.keys())
+
+    # Regression target is the final layer, if present.
+    regression_target: torch.Tensor | None = None
+    if final_layer_idx is not None and final_layer_idx in captured:
+        regression_target = captured[final_layer_idx]
+
+    return drafter_input_ids, final_layer_idx, drafter_input_tensors, regression_target
+
+
 def _load_offline_hidden_states(
     hs_dir: Path, *, target_layers: list[int]
 ) -> dict[int, torch.Tensor]:
@@ -364,6 +417,78 @@ def _align_token_count(
         f"captured has fewer rows ({captured.shape[0]}) than offline "
         f"({offline.shape[0]}) — cannot align"
     )
+
+
+def _split_captured_layers(
+    captured: dict[int, torch.Tensor],
+    metadata: dict,
+) -> tuple[list[int], int | None, dict[int, torch.Tensor], torch.Tensor | None]:
+    """Split captured tensors into drafter-input and regression-target groups.
+
+    Uses the metadata from the hook (``original_aux_layers`` and
+    ``final_layer_idx``) to distinguish:
+
+    - **Drafter-input layers**: the layers the drafter model consumes
+      (e.g. [2, 12, 21]).  These correspond to ``original_aux_layers`` and
+      are compared against the offline path's ``target_layers``.
+
+    - **Regression-target layer**: the final decoder layer (e.g. 24) appended
+      by the hook so the pre-norm regression target can be captured.  This is
+      ``final_layer_idx`` and is compared against the offline path's
+      ``hidden_states[:, -1]``.
+
+    Returns:
+        Tuple of (drafter_input_layer_ids, final_layer_idx,
+        drafter_input_tensors, regression_target_tensor).
+    """
+    final_layer_idx = metadata.get("final_layer_idx")
+    original_aux = metadata.get("original_aux_layers", [])
+
+    # Drafter-input tensors are those whose keys match original_aux_layers.
+    drafter_input_tensors: dict[int, torch.Tensor] = {
+        k: v for k, v in captured.items() if k in original_aux
+    }
+    drafter_input_ids = sorted(drafter_input_tensors.keys())
+
+    # Regression target is the final layer, if present.
+    regression_target: torch.Tensor | None = None
+    if final_layer_idx is not None and final_layer_idx in captured:
+        regression_target = captured[final_layer_idx]
+
+    return drafter_input_ids, final_layer_idx, drafter_input_tensors, regression_target
+
+
+def _split_offline_layers(
+    offline: dict[int, torch.Tensor],
+    offline_target_layers: list[int],
+) -> tuple[list[int], int | None, dict[int, torch.Tensor], torch.Tensor | None]:
+    """Split offline tensors into drafter-input and regression-target groups.
+
+    The ``offline_target_layers`` list contains the drafter-input layers
+    followed by the final layer index (if included).  The last entry is the
+    regression-target layer; all preceding entries are drafter inputs.
+
+    Returns:
+        Tuple of (drafter_input_layer_ids, final_layer_idx,
+        drafter_input_tensors, regression_target_tensor).
+    """
+    if not offline_target_layers:
+        return [], None, {}, None
+
+    # The last entry in offline_target_layers is the final (regression target)
+    # layer; all preceding entries are drafter inputs.
+    final_layer_idx = offline_target_layers[-1]
+    drafter_input_ids = offline_target_layers[:-1]
+
+    drafter_input_tensors: dict[int, torch.Tensor] = {
+        k: v for k, v in offline.items() if k in drafter_input_ids
+    }
+
+    regression_target: torch.Tensor | None = None
+    if final_layer_idx in offline:
+        regression_target = offline[final_layer_idx]
+
+    return sorted(drafter_input_ids), final_layer_idx, drafter_input_tensors, regression_target
 
 
 # ---------------------------------------------------------------------------
@@ -444,47 +569,104 @@ def test_stage0_activation_capture() -> None:
         captured_tensors = _load_captured_safetensors(capture_dir)
         logger.info("Captured layers: %s", sorted(captured_tensors.keys()))
 
-        # Verify the engine's aux layer IDs match our expectation.  The hook
-        # reads the actual aux layers from the drafter's hf_config on disk.
-        # The offline extraction uses *target_layers* as positional keys; they
-        # must be the same or the comparison is meaningless.
-        captured_aux = sorted(k for k in captured_tensors if k < 100)
-        assert captured_aux == target_layers, (
-            f"Captured aux layers {captured_aux} do not match "
+        # Load metadata written by the hook during flush_capture so we can
+        # correctly distinguish drafter-input layers from the appended final
+        # regression-target layer.
+        meta = _load_capture_metadata(capture_dir)
+        final_layer_idx = meta["final_layer_idx"]
+        original_aux = meta["original_aux_layers"]
+
+        # Verify the drafter-input layers match the test's expectations.
+        assert sorted(original_aux) == target_layers, (
+            f"Captured drafter-input layers {sorted(original_aux)} do not match "
             f"target_layers {target_layers} — offline extraction will use "
             f"wrong keys.  Set SPEEDLM_E2E_TARGET_LAYER_IDS to match the "
             f"drafter's config."
         )
 
-        # Step 4: Run offline extraction
+        # The captured keys must be exactly original_aux + final_layer_idx.
+        _extra = [final_layer_idx] if final_layer_idx is not None else []
+        expected_captured = sorted(original_aux + _extra)
+        actual_captured = sorted(captured_tensors.keys())
+        assert actual_captured == expected_captured, (
+            f"Captured layer keys {actual_captured} do not match expected "
+            f"{expected_captured} (original_aux={original_aux}, "
+            f"final_layer_idx={final_layer_idx})"
+        )
+
+        # Step 4: Run offline extraction — include the final layer so the
+        # regression-target comparison has something to compare against.
+        offline_target_layers = list(target_layers)
+        if final_layer_idx is not None:
+            offline_target_layers.append(final_layer_idx)
         offline_dir = artifact_dir / "offline"
         hs_dir = _run_offline_extract(
             verifier,
             prompt,
-            target_layers,
+            offline_target_layers,
             offline_dir,
             port=port + 1000,  # Different port
         )
-        offline_tensors = _load_offline_hidden_states(hs_dir, target_layers=target_layers)
+        offline_tensors = _load_offline_hidden_states(hs_dir, target_layers=offline_target_layers)
         logger.info("Offline layers: %s", sorted(offline_tensors.keys()))
 
-        # Step 5: Align and compare
-        # Determine the prompt token count (approximate from offline shape)
+        # Step 5: Align and compare — using explicit split to avoid comparing
+        # drafter-input layers against the regression target or vice versa.
+
+        # --- Layer mapping (CRITICAL: must not be mixed up) ---
+        # Captured side:
+        #   drafter_input_layers  = original_aux (e.g. [2, 12, 21])
+        #   final_layer           = final_layer_idx (e.g. 24)
+        # Offline side:
+        #   offline_target_layers = target_layers + [final_layer_idx]
+        #   Positional index i -> offline_target_layers[i]
+        #   The last positional slice (hidden_states[:, -1]) is the
+        #   regression target, mapped to final_layer_idx.
+        #
+        # Both sides use the same layer-index keys so the comparison is
+        # keyed by actual decoder layer, not positional order.
+
+        # Split captured tensors into drafter-inputs and regression-target.
+        (
+            captured_drafter_ids,
+            captured_final_idx,
+            captured_drafter,
+            captured_regression,
+        ) = _split_captured_layers(captured_tensors, meta)
+
+        # Split offline tensors into drafter-inputs and regression-target.
+        (
+            offline_drafter_ids,
+            offline_final_idx,
+            offline_drafter,
+            offline_regression,
+        ) = _split_offline_layers(offline_tensors, offline_target_layers)
+
+        # The drafter-input layer ids must match between captured and offline.
+        assert captured_drafter_ids == offline_drafter_ids, (
+            f"Drafter-input layer mismatch: captured {captured_drafter_ids} "
+            f"vs offline {offline_drafter_ids}"
+        )
+
+        # The final layer indices must also match.
+        assert captured_final_idx == offline_final_idx, (
+            f"Final layer index mismatch: captured {captured_final_idx} "
+            f"vs offline {offline_final_idx}"
+        )
+
+        # Determine the prompt token count (from offline shape)
         prompt_token_count: int | None = None
-        for t in offline_tensors.values():
+        for t in offline_drafter.values():
             prompt_token_count = t.shape[0]
             break
         assert prompt_token_count is not None
 
+        # Align drafter-input layers (same key set on both sides)
         aligned_captured: dict[int, torch.Tensor] = {}
         aligned_offline: dict[int, torch.Tensor] = {}
-        # Find the final layer index (highest in offline set, typically num_hidden_layers)
-        offline_indices = sorted(offline_tensors.keys())
-        for idx in offline_indices:
-            cap = captured_tensors.get(idx)
-            off = offline_tensors[idx]
-            if cap is None:
-                continue
+        for idx in offline_drafter_ids:
+            cap = captured_drafter[idx]
+            off = offline_drafter[idx]
             try:
                 c_aligned, o_aligned = _align_token_count(cap, off, prompt_token_count)
                 aligned_captured[idx] = c_aligned
@@ -492,12 +674,16 @@ def test_stage0_activation_capture() -> None:
             except ValueError as exc:
                 logger.warning("Cannot align layer %d: %s", idx, exc)
 
-        # The final layer (num_hidden_layers) is the regression target.
-        # It should be the highest index in the offline set.
-        if offline_indices:
-            final_idx = offline_indices[-1]
-            captured_final = aligned_captured.get(final_idx)
-            offline_final = aligned_offline.get(final_idx)
+        # Align the regression-target (final layer) separately
+        captured_final: torch.Tensor | None = None
+        offline_final: torch.Tensor | None = None
+        if captured_regression is not None and offline_regression is not None:
+            try:
+                captured_final, offline_final = _align_token_count(
+                    captured_regression, offline_regression, prompt_token_count,
+                )
+            except ValueError as exc:
+                logger.warning("Cannot align final layer: %s", exc)
 
         # Step 6: Build verdict
         prefix_cache = PrefixCacheResult(

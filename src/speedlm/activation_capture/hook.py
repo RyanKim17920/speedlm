@@ -40,6 +40,7 @@ sees only the 3 canonical layers.
 from __future__ import annotations
 
 import fcntl
+import json
 import logging
 import os
 import threading
@@ -191,8 +192,37 @@ class ActivationCaptureExtension:
 
         # Remove lock file after writer finishes so readers can proceed
         os.remove(lock_path)
+
+        # Write metadata alongside the captured file so the caller can
+        # distinguish drafter-input layers from the appended final layer.
+        meta_path = path + ".meta.json"
+        meta = {
+            "final_layer_idx": self._final_layer_idx,
+            "original_aux_layers": list(self._original_aux_layers),
+        }
+        with open(meta_path, "w") as mf:
+            json.dump(meta, mf)
+
         logger.info("Flushed %d layer activations to %s", len(saved), path)
         return path
+
+    def capture_info(self) -> dict:
+        """Return metadata about the active capture session.
+
+        Called via collective_rpc from the driver process.  Returns the final
+        layer index and the original (pre-extension) aux layer tuple so the
+        caller can correctly split drafter-input layers from the appended
+        final regression-target layer.
+
+        Returns:
+            Dict with keys ``final_layer_idx`` (int or None) and
+            ``original_aux_layers`` (list[int]).
+        """
+        self._ensure_init()
+        return {
+            "final_layer_idx": self._final_layer_idx,
+            "original_aux_layers": list(self._original_aux_layers),
+        }
 
     def deactivate_capture(self) -> None:
         """Deactivate capture and remove hooks.
