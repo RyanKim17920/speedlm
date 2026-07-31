@@ -533,3 +533,157 @@ def test_draft_swap_extension_methods_exist() -> None:
     assert hasattr(DraftSwapExtension, "_validate_compatibility")
     assert hasattr(DraftSwapExtension, "_apply_weights")
     assert hasattr(DraftSwapExtension, "_get_quantization")
+
+
+# ---------------------------------------------------------------------------
+# Worker extension dotted-path resolution (BUG 1)
+# ---------------------------------------------------------------------------
+
+
+def test_activation_capture_extension_dotted_path() -> None:
+    """The dotted path 'speedlm.activation_capture.hook.ActivationCaptureExtension'
+    resolves via importlib (vLLM's resolve_obj_by_qualname expects dots, not colons)."""
+    from importlib import import_module
+
+    mod = import_module("speedlm.activation_capture.hook")
+    cls = mod.ActivationCaptureExtension
+    assert cls.__name__ == "ActivationCaptureExtension"
+
+
+def test_combined_extension_dotted_path() -> None:
+    """The dotted path 'speedlm.gateway.draft_swap.CombinedWorkerExtension' resolves."""
+    from importlib import import_module
+
+    mod = import_module("speedlm.gateway.draft_swap")
+    cls = mod.CombinedWorkerExtension
+    assert cls.__name__ == "CombinedWorkerExtension"
+
+
+def test_draft_swap_extension_dotted_path() -> None:
+    """The dotted path 'speedlm.gateway.draft_swap.DraftSwapExtension' resolves."""
+    from importlib import import_module
+
+    mod = import_module("speedlm.gateway.draft_swap")
+    cls = mod.DraftSwapExtension
+    assert cls.__name__ == "DraftSwapExtension"
+
+
+# ---------------------------------------------------------------------------
+# Extension works WITHOUT __init__ being called (BUG 2)
+# ---------------------------------------------------------------------------
+
+
+def test_activation_capture_extension_without_init() -> None:
+    """ActivationCaptureExtension works when instantiated via object.__new__
+    (simulating vLLM's __bases__ injection which never calls __init__)."""
+    from speedlm.activation_capture.hook import ActivationCaptureExtension
+
+    ext = object.__new__(ActivationCaptureExtension)
+
+    # Class-level defaults should be accessible
+    assert ext._capture_active is False
+    assert ext._capture_dir is None
+    assert ext._original_model_forward is None
+    assert ext._final_layer_idx is None
+    assert ext._original_aux_layers == ()
+
+    # _ensure_init should create mutable state
+    ext._ensure_init()
+    assert ext._lock is not None
+    assert ext._pending is not None
+    assert isinstance(ext._pending, dict)
+
+
+def test_combined_extension_without_init() -> None:
+    """CombinedWorkerExtension works when instantiated via object.__new__
+    (simulating vLLM's __bases__ injection which never calls __init__)."""
+    from speedlm.gateway.draft_swap import CombinedWorkerExtension
+
+    ext = object.__new__(CombinedWorkerExtension)
+
+    # Class-level defaults should be accessible
+    assert ext._capture_active is False
+    assert ext._capture_dir is None
+    assert ext._original_model_forward is None
+
+    # _ensure_init should create mutable state
+    ext._ensure_init()
+    assert ext._lock is not None
+    assert ext._pending is not None
+    assert isinstance(ext._pending, dict)
+
+
+def test_extension_methods_callable_after_ensure_init() -> None:
+    """Extension entry point methods can be called after _ensure_init
+    without raising AttributeError for missing instance attributes."""
+    from speedlm.activation_capture.hook import ActivationCaptureExtension
+
+    ext = object.__new__(ActivationCaptureExtension)
+    ext._ensure_init()
+
+    # deactivate_capture should not raise AttributeError
+    # (it calls _deactivate_impl which accesses _original_model_forward)
+    # Note: _deactivate_impl will raise ImportError for vllm, but that's fine
+    # — we're checking it doesn't raise AttributeError for missing state
+    try:
+        ext.deactivate_capture()
+    except (ImportError, AttributeError) as exc:
+        # ImportError is expected (no vLLM in project venv)
+        # AttributeError means we missed a class-level default
+        if isinstance(exc, AttributeError):
+            raise AssertionError(
+                f"deactivate_capture raised AttributeError: {exc}"
+            ) from exc
+        # ImportError is acceptable
+
+
+# ---------------------------------------------------------------------------
+# Attribute collision audit
+# ---------------------------------------------------------------------------
+
+
+def test_no_collision_activation_capture_extension() -> None:
+    """ActivationCaptureExtension defines no name that collides with
+    known vLLM Worker/WorkerBase attributes."""
+    from speedlm.activation_capture.hook import ActivationCaptureExtension
+
+    # Representative vLLM Worker/WorkerBase attribute names
+    known_vllm = {
+        "model_runner", "model_executor", "vllm_config",
+        "executor_backend", "driver_worker", "cuda_context",
+        "worker_init_fn", "load_model", "deterministic_init",
+        "compile_model", "start_worker_loop", "execute_model",
+        "cache_info", "get_capacity", "num_seq_ids",
+        "get_cluster_usage_info", "get_mm_processor",
+        "add_mm_ppu_data", "check_health",
+        "collective_rpc", "start",
+        "detached_executors", "scheduler",
+        "num_prefill", "num_decoder",
+        "store_model_torch_compile_stats",
+    }
+    ext_attrs = {a for a in dir(ActivationCaptureExtension) if not a.startswith("__")}
+    collisions = ext_attrs & known_vllm
+    assert not collisions, f"Attribute collisions: {collisions}"
+
+
+def test_no_collision_combined_extension() -> None:
+    """CombinedWorkerExtension defines no name that collides with
+    known vLLM Worker/WorkerBase attributes."""
+    from speedlm.gateway.draft_swap import CombinedWorkerExtension
+
+    known_vllm = {
+        "model_runner", "model_executor", "vllm_config",
+        "executor_backend", "driver_worker", "cuda_context",
+        "worker_init_fn", "load_model", "deterministic_init",
+        "compile_model", "start_worker_loop", "execute_model",
+        "cache_info", "get_capacity", "num_seq_ids",
+        "get_cluster_usage_info", "get_mm_processor",
+        "add_mm_ppu_data", "check_health",
+        "collective_rpc", "start",
+        "detached_executors", "scheduler",
+        "num_prefill", "num_decoder",
+        "store_model_torch_compile_stats",
+    }
+    ext_attrs = {a for a in dir(CombinedWorkerExtension) if not a.startswith("__")}
+    collisions = ext_attrs & known_vllm
+    assert not collisions, f"Attribute collisions: {collisions}"

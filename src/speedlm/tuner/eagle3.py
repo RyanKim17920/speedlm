@@ -17,7 +17,7 @@ from typing import Protocol
 from speedlm.training.base import BackendInfo
 from speedlm.training.masking import FinalAssistantMaskError, MaskPolicy
 
-MAX_SCRATCH_BYTES = 5 * 1024 * 1024 * 1024
+MAX_SCRATCH_BYTES = 20 * 1024 * 1024 * 1024
 DEFAULT_VERIFIER_MODEL = "openai/gpt-oss-20b"
 DEFAULT_DRAFT_MODEL = "RedHatAI/gpt-oss-20b-speculator.eagle3"
 
@@ -35,7 +35,8 @@ class ScratchQuotaExceeded(Eagle3Error):
         self.used_bytes = used_bytes
         self.quota_bytes = quota_bytes
         super().__init__(
-            f"scratch quota exceeded: used {used_bytes} bytes, limit {quota_bytes} bytes"
+            f"scratch quota exceeded: used {used_bytes} bytes, limit {quota_bytes} bytes "
+            f"(raise tuning.scratch_quota_bytes to increase)"
         )
 
 
@@ -161,7 +162,10 @@ class Eagle3Config:
             or self.scratch_quota_bytes <= 0
             or self.scratch_quota_bytes > MAX_SCRATCH_BYTES
         ):
-            raise ValueError("scratch_quota_bytes must be in 1..5 GiB")
+            raise ValueError(
+                "scratch_quota_bytes must be in 1..20 GiB "
+                "(field: tuning.scratch_quota_bytes)"
+            )
 
     @property
     def effective_training_params(self) -> Mapping[str, object]:

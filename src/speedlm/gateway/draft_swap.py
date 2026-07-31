@@ -11,7 +11,7 @@ Rather than requiring the caller to choose between the two, this module
 provides ``CombinedWorkerExtension`` -- a composite class that merges both
 extensions via multiple inheritance.  Register it via::
 
-    --worker-extension-cls speedlm.gateway.draft_swap:CombinedWorkerExtension
+    --worker-extension-cls speedlm.gateway.draft_swap.CombinedWorkerExtension
 
 The composite class merges both extension namespaces into one MRO chain.
 vLLM checks for attribute collisions at startup (``worker_base.py:268-275``);
@@ -28,6 +28,7 @@ match.  The caller MUST validate compatibility before invoking the swap.
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -221,32 +222,41 @@ class CombinedWorkerExtension:  # noqa: RUF012
     worker.
 
     Register via ``--worker-extension-cls
-    speedlm.gateway.draft_swap:CombinedWorkerExtension``.
+    speedlm.gateway.draft_swap.CombinedWorkerExtension``.
 
     The two extensions use non-overlapping method prefixes, so vLLM's
     attribute-collision check (``worker_base.py:268-275``) will pass cleanly.
 
-    **Initialization:** vLLM does not call ``__init__`` on extension classes
-    (it appends the class to ``worker_class.__bases__``).  ``ActivationCaptureExtension``
-    relies on ``__init__`` to set up state variables.  This composite class
-    re-initializes that state lazily on first method call so it works correctly
-    even though vLLM skips the ``__init__`` call.
+    **Note:** vLLM does not call ``__init__`` on extension classes (it appends
+    the class to ``worker_class.__bases__``).  All mutable state uses class-level
+    defaults or lazy initialization (via ``_ensure_init``) to function without
+    ``__init__`` being invoked.
     """
 
-    def __init__(self) -> None:
-        # Initialize ActivationCaptureExtension state.
-        # DraftSwapExtension has no __init__, so needs nothing.
-        import threading
+    # Class-level defaults for activation capture state.
+    _capture_active = False
+    _capture_dir: str | None = None
+    _original_model_forward: Any = None
 
-        self._capture_active = False
-        self._capture_dir: str | None = None
-        self._pending: dict[int, list] = {}
-        self._lock = threading.Lock()
-        self._original_model_forward: Any = None
+    # Mutable per-instance state — lazy-initialized on first use.
+    _pending: dict[int, list] | None = None
+    _lock: threading.Lock | None = None
+
+    def _ensure_init(self) -> None:
+        """Lazy initialization for mutable per-instance state.
+
+        vLLM never calls ``__init__`` (it appends the class to the worker's
+        base tuple).  This method guarantees the mutable defaults exist.
+        """
+        if self._lock is None:
+            self._lock = threading.Lock()
+        if self._pending is None:
+            self._pending = {}
 
     # -- ActivationCaptureExtension delegates --
 
     def activate_capture(self, capture_dir: str) -> None:
+        self._ensure_init()
         self._capture_active = True
         self._capture_dir = capture_dir
         import os
@@ -256,6 +266,7 @@ class CombinedWorkerExtension:  # noqa: RUF012
         logger.info("Activation capture activated, output dir: %s", capture_dir)
 
     def flush_capture(self) -> str:
+        self._ensure_init()
         if not self._capture_active or self._capture_dir is None:
             raise RuntimeError("capture is not active")
         import os
@@ -301,6 +312,7 @@ class CombinedWorkerExtension:  # noqa: RUF012
         return path
 
     def deactivate_capture(self) -> None:
+        self._ensure_init()
         self._capture_active = False
         self._deactivate_impl()
         logger.info("Activation capture deactivated")
@@ -335,6 +347,7 @@ class CombinedWorkerExtension:  # noqa: RUF012
             logger.exception("Error removing _model_forward hook")
 
     def _buffer_aux(self, aux_hidden_states: list) -> None:
+        self._ensure_init()
         if not self._capture_active:
             return
         with self._lock:

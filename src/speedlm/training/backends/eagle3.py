@@ -278,7 +278,10 @@ class SpeculatorsPipelineConfig:
             or not isinstance(self.scratch_quota_bytes, int)
             or not 0 < self.scratch_quota_bytes <= MAX_SCRATCH_BYTES
         ):
-            raise ValueError("scratch_quota_bytes must be in 1..5 GiB")
+            raise ValueError(
+                "scratch_quota_bytes must be in 1..20 GiB "
+                "(field: tuning.scratch_quota_bytes)"
+            )
         for name, timeout_value in (
             ("model_resolve_timeout_seconds", self.model_resolve_timeout_seconds),
             ("server_shutdown_timeout_seconds", self.server_shutdown_timeout_seconds),

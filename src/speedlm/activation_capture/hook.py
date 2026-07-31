@@ -63,7 +63,7 @@ class ActivationCaptureExtension:
     """vLLM worker extension for capturing aux hidden states at serving time.
 
     Register via ``--worker-extension-cls
-    speedlm.activation_capture.hook:ActivationCaptureExtension``.
+    speedlm.activation_capture.hook.ActivationCaptureExtension``.
 
     The extension monkeypatches the model runner's ``_model_forward`` method
     after the model is loaded, intercepting ``aux_hidden_states`` before they
@@ -71,16 +71,34 @@ class ActivationCaptureExtension:
 
     **Important:** the extension's public methods are called via ``collective_rpc``
     from the driver process. They are NOT regular worker methods.
+
+    **Note:** vLLM injects this class via ``worker_class.__bases__`` injection
+    and NEVER calls ``__init__``.  All instance state uses class-level defaults
+    or lazy initialization (via ``_ensure_init``) to function without ``__init__``.
     """
 
-    def __init__(self) -> None:
-        self._capture_active = False
-        self._capture_dir: str | None = None
-        self._pending: dict[int, list[Tensor]] = {}
-        self._lock = threading.Lock()
-        self._original_model_forward: Any = None
-        self._final_layer_idx: int | None = None
-        self._original_aux_layers: tuple[int, ...] = ()
+    # Class-level defaults — safe because they are the initial "no capture"
+    # state and immutable types.  Mutable state is lazy-initialized below.
+    _capture_active = False
+    _capture_dir: str | None = None
+    _original_model_forward: Any = None
+    _final_layer_idx: int | None = None
+    _original_aux_layers: tuple[int, ...] = ()
+
+    # These must be per-instance (mutable) — lazy-initialized on first use.
+    _pending: dict[int, list] | None = None
+    _lock: threading.Lock | None = None
+
+    def _ensure_init(self) -> None:
+        """Lazy initialization for mutable per-instance state.
+
+        vLLM never calls ``__init__`` (it appends the class to the worker's
+        base tuple).  This method guarantees the mutable defaults exist.
+        """
+        if self._lock is None:
+            self._lock = threading.Lock()
+        if self._pending is None:
+            self._pending = {}
 
     # -- collective_rpc handlers --
 
@@ -93,6 +111,7 @@ class ActivationCaptureExtension:
         its pre-norm output is captured alongside the canonical EAGLE-3 aux
         layers. The extra entry is sliced off before reaching the drafter.
         """
+        self._ensure_init()
         if self._capture_active:
             logger.warning("capture already active; resetting")
             self._deactivate_impl()
@@ -115,6 +134,7 @@ class ActivationCaptureExtension:
         Called via collective_rpc from the driver process.
         Returns the path to the written safetensors file.
         """
+        self._ensure_init()
         if not self._capture_active or self._capture_dir is None:
             raise RuntimeError("capture is not active")
 
@@ -167,6 +187,7 @@ class ActivationCaptureExtension:
 
         Called via collective_rpc from the driver process.
         """
+        self._ensure_init()
         self._capture_active = False
         self._deactivate_impl()
         logger.info("Activation capture deactivated")
@@ -275,6 +296,7 @@ class ActivationCaptureExtension:
         aux_hidden_states is a list of tensors, one per collected layer,
         in layer-index order. Each tensor has shape (num_scheduled_tokens, H).
         """
+        self._ensure_init()
         if not self._capture_active:
             return
 
