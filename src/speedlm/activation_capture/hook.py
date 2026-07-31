@@ -48,9 +48,13 @@ import fcntl
 import logging
 import os
 import threading
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import torch
+if TYPE_CHECKING:
+    # Only executed by static type checkers. mypy has per-module overrides for
+    # torch/safetensors/vllm (see pyproject.toml [[tool.mypy.overrides]]) so
+    # this does not require torch to be installed in the project venv.
+    from torch import Tensor
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +81,7 @@ class ActivationCaptureExtension:
     def __init__(self) -> None:
         self._capture_active = False
         self._capture_dir: str | None = None
-        self._pending: dict[int, list[torch.Tensor]] = {}
+        self._pending: dict[int, list[Tensor]] = {}
         self._lock = threading.Lock()
         self._original_model_forward: Any = None
 
@@ -116,13 +120,15 @@ class ActivationCaptureExtension:
         if not pending:
             logger.warning("flush_capture called with no buffered data")
 
+        import torch  # lazy: only available at runtime inside the vLLM venv
+
         # Group by layer index
-        by_layer: dict[int, list[torch.Tensor]] = {}
+        by_layer: dict[int, list[Tensor]] = {}
         for layer_idx, tensors in pending.items():
             by_layer[layer_idx] = tensors
 
         # Stack tensors per layer
-        saved: dict[str, torch.Tensor] = {}
+        saved: dict[str, Tensor] = {}
         for lidx in sorted(by_layer.keys()):
             layer_tensors = by_layer[lidx]
             if len(layer_tensors) == 1:
@@ -209,7 +215,7 @@ class ActivationCaptureExtension:
         except Exception:
             logger.exception("Error removing _model_forward hook")
 
-    def _buffer_aux(self, aux_hidden_states: list[torch.Tensor]) -> None:
+    def _buffer_aux(self, aux_hidden_states: list[Tensor]) -> None:
         """Buffer aux hidden states into the pending dict.
 
         aux_hidden_states is a list of tensors, one per collected layer,

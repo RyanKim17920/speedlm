@@ -30,9 +30,13 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import torch
+if TYPE_CHECKING:
+    # Only executed by static type checkers. mypy has per-module overrides for
+    # torch/safetensors/vllm (see pyproject.toml [[tool.mypy.overrides]]) so
+    # this does not require torch to be installed in the project venv.
+    from torch import Tensor
 
 # ---------------------------------------------------------------------------
 # Tolerance
@@ -145,8 +149,8 @@ class ComparisonResult:
 
 
 def compare_layerwise(
-    captured: dict[int, torch.Tensor],
-    offline: dict[int, torch.Tensor],
+    captured: dict[int, Tensor],
+    offline: dict[int, Tensor],
     *,
     tolerance: float = DEFAULT_TOLERANCE,
 ) -> list[LayerComparison]:
@@ -209,8 +213,8 @@ def compare_layerwise(
 
 
 def check_pre_norm(
-    captured_final: torch.Tensor | None,
-    offline_final: torch.Tensor | None,
+    captured_final: Tensor | None,
+    offline_final: Tensor | None,
     *,
     tolerance: float = DEFAULT_TOLERANCE,
 ) -> bool | None:
@@ -262,11 +266,11 @@ def derive_verdict(result: ComparisonResult) -> str:
 
 
 def build_result(
-    captured: dict[int, torch.Tensor],
-    offline: dict[int, torch.Tensor],
+    captured: dict[int, Tensor],
+    offline: dict[int, Tensor],
     *,
-    captured_final_pre_norm: torch.Tensor | None = None,
-    offline_final_pre_norm: torch.Tensor | None = None,
+    captured_final_pre_norm: Tensor | None = None,
+    offline_final_pre_norm: Tensor | None = None,
     prefix_cache: PrefixCacheResult | None = None,
     tolerance: float = DEFAULT_TOLERANCE,
 ) -> ComparisonResult:

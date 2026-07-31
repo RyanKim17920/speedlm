@@ -61,3 +61,19 @@ python_version = "3.12"
 warn_unused_ignores = true
 disallow_untyped_defs = true
 files = ["src/speedlm"]
+
+# Activation-capture modules import torch/safetensors/vllm lazily at runtime.
+# They execute inside the separate vLLM venv (/admin/home/ryan.kim/speedlm/.preflight/venvs/vllm/)
+# where these packages are installed. The project venv only has fastapi/httpx/uvicorn
+# (see project.dependencies above) — adding torch here would break that minimal env.
+[[tool.mypy.overrides]]
+module = ["torch.*", "torch"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["safetensors.*", "safetensors"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["vllm.*", "vllm"]
+ignore_missing_imports = true
