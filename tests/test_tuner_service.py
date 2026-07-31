@@ -16,7 +16,7 @@ from speedlm.gateway.activity import ActivityTracker
 from speedlm.traces.store import TraceStats
 from speedlm.training.base import BackendInfo
 from speedlm.tuner.artifacts import ArtifactRegistry
-from speedlm.tuner.eagle3 import TraceSnapshot
+from speedlm.tuner.eagle3 import TraceSnapshot, TrainingResult
 from speedlm.tuner.idle import ActivitySource, TuningPreempted
 from speedlm.tuner.orchestrator import (
     CycleOutcome,
@@ -87,10 +87,12 @@ class FakeBackend:
         work_dir: Path,
         *,
         should_abort: Callable[[], bool],
-    ) -> Path:
+    ) -> TrainingResult:
         del extracted, should_abort
         self.calls.append("train")
-        return work_dir / "checkpoint"
+        checkpoint = work_dir / "checkpoint"
+        checkpoint.mkdir()
+        return TrainingResult(checkpoint, 0)
 
     def materialize(
         self,

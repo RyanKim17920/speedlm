@@ -798,7 +798,8 @@ class SpeculatorsTrainingProcess:
                     f"checkpoint_best is missing: {checkpoint}",
                     stderr=result.stderr,
                 )
-            return TrainingResult(checkpoint, result.returncode, result.stderr)
+            val_loss = _parse_val_loss(checkpoint)
+            return TrainingResult(checkpoint, result.returncode, result.stderr, val_loss=val_loss)
         except BaseException:
             _remove(destination)
             _remove(scratch / "warm-start-pinned")
@@ -811,7 +812,6 @@ class SpeculatorsDraftMaterializer:
     _TRANSIENT = {
         "optimizer_state_dict.pt",
         "scheduler_state_dict.pt",
-        "val_metrics.json",
     }
 
     def __init__(self, *, scratch_quota_bytes: int) -> None:
@@ -1342,6 +1342,31 @@ def _writable(path: Path) -> None:
     for child in path.rglob("*"):
         child.chmod(0o755 if child.is_dir() else 0o644)
     path.chmod(0o755)
+
+
+def _parse_val_loss(checkpoint_best: Path) -> float | None:
+    """Read ``loss_epoch`` from the checkpoint's ``val_metrics.json``.
+
+    The Speculators trainer writes this file after each epoch; with
+    ``--save-best`` the ``checkpoint_best`` symlink points at the best
+    epoch, so this is the best validation loss.
+
+    Returns ``None`` if the file is missing or malformed — the caller
+    must treat that as "unavailable" and NOT fail the cycle.
+    """
+    path = checkpoint_best / "val_metrics.json"
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    loss = data.get("loss_epoch")
+    if not isinstance(loss, (int, float)) or isinstance(loss, bool):
+        return None
+    return float(loss)
 
 
 def _cleanup_transients(work_dir: Path) -> None:

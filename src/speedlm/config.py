@@ -281,6 +281,42 @@ class PromotionConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ValLossPreFilterConfig:
+    """Cheap pre-filter to skip expensive benchmarks on non-improving candidates.
+
+    The Speculators trainer computes validation loss on an internal 10% split
+    of the training data.  This metric is free (no engine restart required) and
+    serves as an early indicator that a candidate is worth benchmarking.
+
+    IMPORTANT: this is a COST FILTER, not a promotion criterion.  The acceptance
+    gate remains the sole authority on whether a candidate gets promoted.  A
+    candidate that passes this pre-filter still must clear the acceptance gate.
+
+    The validation split is the trainer's INTERNAL 10% holdout — it is
+    independent of speedlm's held-out benchmark split.  Those benchmark
+    contexts must NOT be used for validation: src/speedlm/training/split.py
+    raises Eagle3Error on train/benchmark overlap.  DO NOT change this to use
+    the benchmark split.
+    """
+
+    enabled: bool = True
+    #: Minimum improvement in validation loss to justify a benchmark.
+    #: A positive value means the candidate must be strictly better (lower loss)
+    #: than the incumbent by at least this delta.  The incumbent's val_loss is
+    #: read from its artifact manifest; if neither side has a val_loss, the
+    #: pre-filter falls through to the benchmark (fail open).
+    min_improvement: float = 0.01
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enabled, bool):
+            raise ConfigError(
+                f"tuning.val_loss_prefilter.enabled must be a bool, "
+                f"got {type(self.enabled).__name__!r}"
+            )
+        _validate_float_gte(self.min_improvement, "tuning.val_loss_prefilter.min_improvement", 0)
+
+
+@dataclass(frozen=True, slots=True)
 class IdleTuningConfig:
     """Production composition settings for the opt-in idle tuner."""
 
@@ -335,6 +371,7 @@ class IdleTuningConfig:
     training_port: int = 8_131
     scratch_quota_bytes: int = 5 * 1024 * 1024 * 1024
     shutdown_timeout_seconds: float = 30.0
+    val_loss_prefilter: ValLossPreFilterConfig = field(default_factory=ValLossPreFilterConfig)
 
     def __post_init__(self) -> None:
         _validate_int_gte(self.min_trace_records, "tuning.min_trace_records", 2)
@@ -594,9 +631,16 @@ class SpeedLMConfig:
                 "training_port",
                 "scratch_quota_bytes",
                 "shutdown_timeout_seconds",
+                "val_loss_prefilter",
             },
         )
         sampling_data = _nested(data, "sampling", {"temperature", "top_p", "seed"})
+
+        # Handle nested val_loss_prefilter config
+        if "val_loss_prefilter" in tuning_data:
+            vlp_data = tuning_data["val_loss_prefilter"]
+            if isinstance(vlp_data, dict):
+                tuning_data["val_loss_prefilter"] = ValLossPreFilterConfig(**vlp_data)
 
         return cls(
             model=data["model"],

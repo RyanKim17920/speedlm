@@ -75,6 +75,7 @@ class TrainingResult:
     checkpoint_best: Path
     returncode: int
     stderr: str = ""
+    val_loss: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

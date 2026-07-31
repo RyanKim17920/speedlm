@@ -11,6 +11,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Final, Protocol
 
+from speedlm.config import ValLossPreFilterConfig
 from speedlm.gate.decide import Decision
 from speedlm.storage import atomic_write_bytes, atomic_write_json
 from speedlm.training.base import SpeculatorBackend
@@ -219,6 +220,7 @@ class CycleOutcome(StrEnum):
     NOT_IDLE = "not_idle"
     PROMOTED = "promoted"
     REJECTED = "rejected"
+    VAL_LOSS_NOT_IMPROVED = "val_loss_not_improved"
     PREEMPTED = "preempted"
     FINAL_ASSISTANT_MASK_ERROR = "final_assistant_mask_error"
     FAILED = "failed"
@@ -234,6 +236,7 @@ class CycleResult:
     error: str | None = None
     #: Where the gate decision was persisted, when the gate produced one.
     decision_path: Path | None = None
+    val_loss: float | None = None
 
 
 class TunerOrchestrator:
@@ -251,6 +254,7 @@ class TunerOrchestrator:
         work_root: Path,
         timeouts: OrchestratorTimeouts = _DEFAULT_TIMEOUTS,
         run_id_factory: Callable[[], str] = lambda: uuid.uuid4().hex,
+        val_loss_prefilter: ValLossPreFilterConfig | None = None,
     ) -> None:
         self._state = state
         self._idle = idle
@@ -261,6 +265,7 @@ class TunerOrchestrator:
         self._work_root = work_root
         self._timeouts = timeouts
         self._run_id_factory = run_id_factory
+        self._val_loss_prefilter = val_loss_prefilter
 
     def run_once(self) -> CycleResult:
         """Poll idle state and, when eligible, execute one complete tuning cycle."""
@@ -324,6 +329,11 @@ class TunerOrchestrator:
                 should_abort=lambda: guard.is_preempted,
             )
             backend_info = self._backend.describe()
+            # Read defensively: ``train`` is a protocol method, and a backend
+            # that predates this field returns a result without one.  A missing
+            # val_loss means "unavailable", which the pre-filter below treats
+            # as fail-open -- it must never turn into a failed cycle.
+            val_loss = getattr(trained, "val_loss", None)
             artifact = self._artifacts.publish(
                 draft_directory,
                 ArtifactSpec(
@@ -332,9 +342,48 @@ class TunerOrchestrator:
                     base_draft=backend_info.from_pretrained,
                     trace_hash=prepared.snapshot.content_hash,
                     training_params=backend_info.training_params,
+                    val_loss=val_loss,
                 ),
             )
             artifact_id = artifact.artifact_id
+
+            # Pre-filter: skip the expensive benchmark if validation loss
+            # did not improve.  This is a COST FILTER, not a promotion
+            # criterion — the acceptance gate remains the sole authority.
+            incumbent_val_loss = None
+            incumbent = self._artifacts.active()
+            if incumbent is not None:
+                incumbent_val_loss = incumbent.manifest.val_loss
+
+            if (
+                self._val_loss_prefilter is not None
+                and self._val_loss_prefilter.enabled
+                and val_loss is not None
+                and incumbent_val_loss is not None
+            ):
+                improvement = incumbent_val_loss - val_loss
+                if improvement < self._val_loss_prefilter.min_improvement:
+                    # Validation loss did not improve enough — skip benchmark.
+                    self._state.transition(
+                        TunerState.ROLLING_BACK,
+                        reason=(
+                            f"val_loss not improved: candidate={val_loss:.4f}, "
+                            f"incumbent={incumbent_val_loss:.4f}, "
+                            f"improvement={improvement:.4f}, "
+                            f"threshold={self._val_loss_prefilter.min_improvement:.4f}"
+                        ),
+                    )
+                    cleanup_errors = self._finish_rollback(pointer_changed=False)
+                    return CycleResult(
+                        outcome=(
+                            CycleOutcome.VAL_LOSS_NOT_IMPROVED
+                            if not cleanup_errors
+                            else CycleOutcome.FAILED
+                        ),
+                        artifact_id=artifact_id,
+                        error="; ".join(cleanup_errors) if cleanup_errors else None,
+                        val_loss=val_loss,
+                    )
             guard.check()
 
             self._state.transition(
@@ -375,6 +424,7 @@ class TunerOrchestrator:
                     gate=gate_result,
                     error="; ".join(cleanup_errors) if cleanup_errors else None,
                     decision_path=decision_path,
+                    val_loss=val_loss,
                 )
 
             self._state.transition(
@@ -391,6 +441,7 @@ class TunerOrchestrator:
                 artifact_id=artifact_id,
                 gate=gate_result,
                 decision_path=decision_path,
+                val_loss=val_loss,
             )
         except FinalAssistantMaskError as exc:
             cleanup_errors = self._rollback_after_failure(pointer_changed)

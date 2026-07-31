@@ -32,6 +32,7 @@ class ArtifactSpec:
     base_draft: str
     trace_hash: str
     training_params: Mapping[str, object]
+    val_loss: float | None = None
 
     def __post_init__(self) -> None:
         for name, value in (
@@ -55,6 +56,7 @@ class ArtifactManifest:
     trace_hash: str
     training_params: Mapping[str, object]
     created_at: float
+    val_loss: float | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -65,6 +67,7 @@ class ArtifactManifest:
             "trace_hash": self.trace_hash,
             "training_params": dict(self.training_params),
             "created_at": self.created_at,
+            "val_loss": self.val_loss,
         }
 
     @classmethod
@@ -78,8 +81,14 @@ class ArtifactManifest:
             "training_params",
             "created_at",
         }
-        if set(value) != required:
-            raise ArtifactError("artifact manifest has missing or unknown fields")
+        # val_loss is optional (added after initial release); allow it as
+        # an extra key but don't require it.
+        allowed = required | {"val_loss"}
+        if not required.issubset(set(value)):
+            raise ArtifactError("artifact manifest has missing fields")
+        extra = set(value) - allowed
+        if extra:
+            raise ArtifactError(f"artifact manifest has unknown fields: {extra}")
         params = value["training_params"]
         created_at = value["created_at"]
         if not isinstance(params, dict):
@@ -87,17 +96,22 @@ class ArtifactManifest:
         if isinstance(created_at, bool) or not isinstance(created_at, (int, float)):
             raise ArtifactError("manifest created_at must be numeric")
         strings: dict[str, str] = {}
-        for field in (
+        for fld in (
             "artifact_id",
             "verifier_model",
             "draft_model",
             "base_draft",
             "trace_hash",
         ):
-            item = value[field]
+            item = value[fld]
             if not isinstance(item, str) or not item:
-                raise ArtifactError(f"manifest {field} must be a non-empty string")
-            strings[field] = item
+                raise ArtifactError(f"manifest {fld} must be a non-empty string")
+            strings[fld] = item
+        val_loss = value.get("val_loss")
+        if val_loss is not None:
+            if isinstance(val_loss, bool) or not isinstance(val_loss, (int, float)):
+                raise ArtifactError("manifest val_loss must be a number or null")
+            val_loss = float(val_loss)
         return cls(
             artifact_id=strings["artifact_id"],
             verifier_model=strings["verifier_model"],
@@ -106,6 +120,7 @@ class ArtifactManifest:
             trace_hash=strings["trace_hash"],
             training_params=params,
             created_at=float(created_at),
+            val_loss=val_loss,
         )
 
 
@@ -227,6 +242,7 @@ class ArtifactRegistry:
                 trace_hash=spec.trace_hash,
                 training_params=dict(spec.training_params),
                 created_at=self._clock(),
+                val_loss=spec.val_loss,
             )
             atomic_write_json(temp_path / _MANIFEST_NAME, manifest.to_dict())
             _make_tree_read_only(temp_path)

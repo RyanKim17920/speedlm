@@ -153,6 +153,7 @@ def build_tuner_orchestrator(
         kwargs["timeouts"] = timeouts
     if run_id_factory is not None:
         kwargs["run_id_factory"] = run_id_factory
+    kwargs["val_loss_prefilter"] = config.tuning.val_loss_prefilter
 
     return TunerOrchestrator(
         state=state_machine,
@@ -616,6 +617,7 @@ class TunerService:
                         if result.decision_path is not None
                         else None
                     ),
+                    "val_loss": result.val_loss,
                 }
                 if result is not None
                 else None
