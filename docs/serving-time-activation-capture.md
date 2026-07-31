@@ -489,13 +489,31 @@ quantity. Nothing would error; the draft head would simply be trained against th
 wrong thing.
 
 **Mitigation:** add the final decoder layer to the serving engine's aux layer
-list so it is collected pre-norm, exactly as offline does. **This is not free:**
-the aux count sets the drafter's `fc` input width
-(`V/model_executor/models/llama_eagle3.py:187`, consumed at `:208-214`), so
-moving from 3 aux layers to 4 changes the drafter architecture and invalidates
-warm-starting from a 3-layer public checkpoint. Since SpeedLM is explicitly a
-warm-start system that refuses a missing `from_pretrained` base
-(`README.md:10-14`), this interacts with a load-bearing product constraint.
+list so it is collected pre-norm, exactly as offline does. **This does NOT change
+the drafter's architecture or break warm-start.** Verified in source
+(this correction is derived from code reading, not measurement — Stage 0's
+elementwise comparison remains the empirical check): the drafter's `fc_input_size`
+is computed in the drafter's own `__init__`
+(`V/model_executor/models/llama_eagle3.py:176-187`) from the drafter's
+`hf_config` (`speculative_config.draft_model_config.hf_config` at `:139`), fixed
+at drafter construction time. The set of aux layers collected during serving is
+applied to the target model via `set_aux_hidden_state_layers`
+(`V/v1/worker/gpu_model_runner.py:5395-5402`) landing on the target's
+`EagleModelMixin` (`V/model_executor/models/interfaces.py:1326-1327`), consumed
+by `_maybe_add_hidden_state` (`:1329-1339`). These operate on different models at
+different times, even though both read the same
+`eagle_aux_hidden_state_layer_ids` config key. The offline extraction path
+demonstrates this separation in practice: it collects 4 entries (3 aux layers +
+final decoder layer) while the drafter's `fc` remains 3-wide, because training
+slices `hidden_states[:, :-1]` as drafter input and `[:, -1]` as regression
+target. **What collecting the 4th layer DOES require:** the concatenation at
+`V/v1/worker/gpu_model_runner.py:5119-5121` must slice the extra entry out before
+feeding the drafter, or a 4H tensor hits a 3H `fc` and crashes at runtime. This
+is a localized model-runner patch, consistent with Option B (Section 5.3).
+Additionally, capturing the final layer's pre-norm output requires adding its
+index to the aux collection list — the pre-norm value exists only inside the
+decoder loop and is not stored or returned elsewhere; after the loop, the final
+RMSNorm is applied and only the post-norm tensor survives.
 
 **Detector:** a numerical equivalence test. Run the same short prompt through the
 offline extraction path and the serving capture path and assert the produced
@@ -635,7 +653,7 @@ assert `len(loss_mask) == captured_row_count` per row before training starts.
 | # | Hazard | Severity | Mitigation | Detector |
 | --- | --- | --- | --- | --- |
 | 6.1 | Prefix-cache coverage holes | **High** (data-dependent, biased) | `--no-enable-prefix-caching` or per-request `skip_reading_prefix_cache` | Per-request row count == prompt + generated; fail closed below a floor |
-| 6.2 | Pre-norm vs post-norm target | **High** (wrong quantity, invisible) | Collect the final layer as a 4th aux layer; accept `fc` width change | Offline-vs-serving elementwise equivalence test |
+| 6.2 | Pre-norm vs post-norm target | **High** (wrong quantity, invisible) | Collect the final layer as a 4th aux layer; slice it before drafter `fc` (localized model-runner patch) — does NOT change drafter architecture | Offline-vs-serving elementwise equivalence test |
 | 6.3 | Rejected draft rows | Medium | Filter by `num_rejected_tokens`; handle async deferral | Captured rows == served tokens, per request, exact |
 | 6.4 | Prefill/decode numerics | Medium (pre-existing) | Measure first; `VLLM_BATCH_INVARIANT=1` if warranted | Equivalence harness across batch sizes; publish the spread |
 | 6.5 | CUDA-graph padding | Medium (stale, plausible values) | Slice to `total_num_scheduled_tokens` | Row count == scheduled tokens, in-process; stale-row spot check |
@@ -814,9 +832,11 @@ the plan is worth writing:
 - Measured p50 and p99 serving latency with capture on versus off, published.
 
 **Kill condition:** if the tensors cannot be made to match, or if matching
-requires a drafter architecture change that breaks warm-start
-(`README.md:10-14`), stop and re-scope. The correct outcome of Stage 0 may be
-"do not build this."
+requires a model-runner patch that cannot be isolated from the drafter's forward
+path (e.g., the serving engine fundamentally cannot produce the pre-norm
+activation the trainer expects), stop and re-scope. The correct outcome of Stage
+0 may be "do not build this." Collecting the final layer as a 4th aux layer
+does NOT break warm-start (see Section 6.2 — corrected).
 
 ### Stage 1 — Correct capture of one request
 
@@ -882,9 +902,13 @@ changes.
    current cycle trains on ~1500 tokens. Nobody has measured whether more helps,
    and the retention design depends on the answer (7.3).
 7. **Does adding the final decoder layer as a 4th aux layer break warm-start from
-   the public checkpoint?** It changes `fc` input width
-   (`llama_eagle3.py:187`), and warm-start is a hard product constraint
-   (`README.md:10-14`). This may be the binding constraint on the whole proposal.
+   the public checkpoint?** Code reading says no — the drafter's `fc` input width
+   is fixed from the drafter's own config at construction time
+   (`llama_eagle3.py:176-187`, `:139`), independent of how many aux layers the
+   serving engine collects. The binding constraint is a localized model-runner
+   patch that slices the 4th entry before feeding the drafter. This correction is
+   derived from code reading, not measurement; Stage 0's elementwise comparison
+   remains the empirical check.
 8. **What is the actual size of the reference verifier's weights, and what is the
    host's PCIe link generation and width?** Both are quoted in Section 7 and
    Section 8 from memory rather than from the machine.
