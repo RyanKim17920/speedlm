@@ -187,21 +187,55 @@ def _wait_for_ready(
     )
 
 
+def _check_endpoint(url: str) -> None:
+    """Verify the deployment serves /v1/chat/completions and fail clearly."""
+    with httpx.Client(timeout=10.0, trust_env=False) as client:
+        resp = client.get(f"{url}/v1/models")
+        if resp.status_code == 200:
+            return
+    # Fallback: just try a HEAD on the chat endpoint
+    with httpx.Client(timeout=10.0, trust_env=False) as client:
+        resp = client.head(f"{url}/v1/chat/completions")
+    if resp.status_code in (404, 405, 501):
+        # List known routes from OpenAPI if available
+        try:
+            with httpx.Client(timeout=10.0, trust_env=False) as client:
+                openapi = client.get(f"{url}/openapi.json").json()
+                routes = sorted(
+                    path for path in openapi.get("paths", {})
+                    if not path.startswith("/collective")
+                )
+        except Exception:
+            routes = ["(unable to determine)"]
+        raise AssertionError(
+            f"deployment does not serve /v1/chat/completions; "
+            f"available routes: {routes}"
+        ) from None
+
+
 def _send_prompt(url: str, prompt: str) -> str:
-    """Send a single completion request and return the output text."""
+    """Send a single chat completion request and return the output text.
+
+    Uses /v1/chat/completions with a messages array so that vLLM applies
+    the model's chat template — matching the offline extraction path, which
+    also applies the chat template via prepare_data.py / apply_chat_template.
+    """
     with httpx.Client(timeout=120.0, trust_env=False) as client:
+        _check_endpoint(url)
         resp = client.post(
-            f"{url}/v1/completions",
+            f"{url}/v1/chat/completions",
             json={
                 "model": "test",
-                "prompt": prompt,
+                "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 16,
                 "temperature": 0,
+                "top_p": 1,
+                "seed": 0,
             },
         )
         resp.raise_for_status()
         data = resp.json()
-    return data["choices"][0]["text"]
+    return data["choices"][0]["message"]["content"]
 
 
 def _collective_rpc(
