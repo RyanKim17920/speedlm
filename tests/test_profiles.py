@@ -13,6 +13,7 @@ from speedlm.profiles import (
     GPT_OSS_EAGLE3_PROFILE,
     LLAMA_31_8B_EAGLE3_PROFILE,
     QWEN_35_9B_MTP_PROFILE,
+    QWEN_3_8B_EAGLE3_PROFILE,
     AuxLayerError,
     ModelProfile,
     ParserRegistry,
@@ -157,6 +158,9 @@ def test_builtin_profiles_load_and_validate(tmp_path: Path) -> None:
         "method": "mtp",
         "num_speculative_tokens": 3,
     }
+    assert QWEN_3_8B_EAGLE3_PROFILE.verifier_model == "Qwen/Qwen3-8B"
+    assert QWEN_3_8B_EAGLE3_PROFILE.target_layer_ids is None
+    assert QWEN_3_8B_EAGLE3_PROFILE.num_hidden_layers == 36
 
 
 def test_user_profile_loads_and_overrides_builtin(tmp_path: Path) -> None:
@@ -546,3 +550,67 @@ def test_ngram_json_cannot_claim_to_be_trainable() -> None:
 
     with pytest.raises(ProfileError, match="trainable must be False"):
         ModelProfile.from_dict(data)
+
+
+def test_qwen3_8b_eagle3_profile_fields() -> None:
+    """Qwen3-8B EAGLE-3 profile reflects the real model/drafter configs."""
+    assert QWEN_3_8B_EAGLE3_PROFILE.verifier_model == "Qwen/Qwen3-8B"
+    assert QWEN_3_8B_EAGLE3_PROFILE.draft_model == "RedHatAI/Qwen3-8B-speculator.eagle3"
+    assert QWEN_3_8B_EAGLE3_PROFILE.speculative_method == "eagle3"
+    assert QWEN_3_8B_EAGLE3_PROFILE.num_speculative_tokens == 3
+    assert QWEN_3_8B_EAGLE3_PROFILE.num_hidden_layers == 36
+    assert QWEN_3_8B_EAGLE3_PROFILE.max_seq_len == 40_960
+    assert QWEN_3_8B_EAGLE3_PROFILE.chat_template_kind == "chatml"
+    assert QWEN_3_8B_EAGLE3_PROFILE.target_layer_ids is None
+    assert QWEN_3_8B_EAGLE3_PROFILE.trainable is True
+
+
+def test_qwen3_8b_aux_layers_derived_not_hardcoded() -> None:
+    """Qwen3-8B aux layers come from derivation, not literal pinning.
+
+    The profile has target_layer_ids=None, so resolve_target_layer_ids must
+    derive them via default_aux_layers(36) -> (2, 18, 33).  We also verify
+    that gpt-oss and llama resolutions are unaffected by the new profile.
+    """
+    # Qwen3-8B: 36 layers -> default_aux_layers(36) = (2, 18, 33)
+    assert default_aux_layers(36) == (2, 18, 33)
+
+    resolved = resolve_target_layer_ids(
+        explicit=QWEN_3_8B_EAGLE3_PROFILE.target_layer_ids,
+        num_hidden_layers=QWEN_3_8B_EAGLE3_PROFILE.num_hidden_layers,
+        drafter_aux_count=None,
+    )
+    assert resolved == (2, 18, 33)
+
+    # gpt-oss (24 layers) and Llama (32 layers) are unchanged
+    gpt_oss_resolved = resolve_target_layer_ids(
+        explicit=GPT_OSS_EAGLE3_PROFILE.target_layer_ids,
+        num_hidden_layers=GPT_OSS_EAGLE3_PROFILE.num_hidden_layers,
+        drafter_aux_count=None,
+    )
+    assert gpt_oss_resolved == (2, 12, 21)
+
+    llama_resolved = resolve_target_layer_ids(
+        explicit=LLAMA_31_8B_EAGLE3_PROFILE.target_layer_ids,
+        num_hidden_layers=LLAMA_31_8B_EAGLE3_PROFILE.num_hidden_layers,
+        drafter_aux_count=None,
+    )
+    assert llama_resolved == (2, 16, 29)
+
+
+def test_qwen3_8b_profile_in_builtin_registry() -> None:
+    assert "qwen3-8b-eagle3" in BUILTIN_PROFILES
+    assert BUILTIN_PROFILES["qwen3-8b-eagle3"] is QWEN_3_8B_EAGLE3_PROFILE
+
+
+def test_qwen3_8b_profile_resolution_regression() -> None:
+    assert (
+        resolve_profile(
+            served_model="Qwen/Qwen3-8B", profiles=BUILTIN_PROFILES
+        ) is QWEN_3_8B_EAGLE3_PROFILE
+    )
+    assert (
+        resolve_profile(
+            served_model="qwen3-8b-eagle3", profiles=BUILTIN_PROFILES
+        ) is QWEN_3_8B_EAGLE3_PROFILE
+    )

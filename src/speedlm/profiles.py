@@ -530,6 +530,19 @@ QWEN_35_9B_MTP_PROFILE: Final = ModelProfile(
     tool_call_parser="hermes",
 )
 
+QWEN_3_8B_EAGLE3_PROFILE: Final = ModelProfile(
+    name="qwen3-8b-eagle3",
+    verifier_model="Qwen/Qwen3-8B",
+    draft_model="RedHatAI/Qwen3-8B-speculator.eagle3",
+    speculative_method="eagle3",
+    num_speculative_tokens=3,
+    target_layer_ids=None,
+    chat_template_kind="chatml",
+    max_seq_len=40_960,
+    num_hidden_layers=36,
+    tool_call_parser="qwen3_xml",
+)
+
 BUILTIN_PROFILES: Final[Mapping[str, ModelProfile]] = MappingProxyType(
     {
         profile.name: profile
@@ -537,6 +550,7 @@ BUILTIN_PROFILES: Final[Mapping[str, ModelProfile]] = MappingProxyType(
             GPT_OSS_EAGLE3_PROFILE,
             LLAMA_31_8B_EAGLE3_PROFILE,
             QWEN_35_9B_MTP_PROFILE,
+            QWEN_3_8B_EAGLE3_PROFILE,
         )
     }
 )
