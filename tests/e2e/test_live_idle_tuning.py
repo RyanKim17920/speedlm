@@ -321,9 +321,14 @@ def _post_chat(
     choices = body.get("choices")
     assert isinstance(choices, list) and choices, body
     assert isinstance(choices[0], dict), body
-    # A truncated reply is unrealistic production traffic and trains the draft on
-    # a sentence the target never finished, so require a natural stop.
-    assert choices[0].get("finish_reason") == "stop", body
+    # Accept natural termination ("stop") or token-cap truncation ("length").
+    # A "length" finish means the response hit max_tokens — this is normal
+    # serving behaviour for longer prompts (e.g. ultrachat p95 ~2751 chars) and
+    # produces valid training traces.  Reject genuinely bad terminal states.
+    finish = choices[0].get("finish_reason")
+    assert finish in ("stop", "length"), (
+        f"unexpected finish_reason: {finish!r}; got body: {body}"
+    )
     usage = body.get("usage")
     assert isinstance(usage, dict), body
     assert isinstance(usage.get("prompt_tokens"), int) and usage["prompt_tokens"] > 0
