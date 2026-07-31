@@ -194,8 +194,8 @@ def _get_served_model_id(url: str) -> str:
     /data/.../snapshots/<commit>), not the friendly repo id.  Using the
     wrong id causes a 404 — not a 400 — so we always resolve it here.
 
-    Also verifies that /v1/chat/completions is routable; raises with a
-    clear message if the endpoint is missing.
+    Also verifies that /v1/chat/completions is routable by inspecting the
+    OpenAPI schema; raises with a clear message if the endpoint is missing.
     """
     with httpx.Client(timeout=10.0, trust_env=False) as client:
         resp = client.get(f"{url}/v1/models")
@@ -208,19 +208,16 @@ def _get_served_model_id(url: str) -> str:
             "finished loading"
         )
 
-    # Verify /v1/chat/completions is routable as a safety net
+    # Verify /v1/chat/completions is routable via the OpenAPI schema.
+    # Do NOT use HEAD — /v1/chat/completions is POST-only and returns 405
+    # for HEAD, which would be a false "route missing" signal.
     with httpx.Client(timeout=10.0, trust_env=False) as client:
-        head_resp = client.head(f"{url}/v1/chat/completions")
-    if head_resp.status_code in (404, 405, 501):
-        try:
-            with httpx.Client(timeout=10.0, trust_env=False) as client:
-                openapi = client.get(f"{url}/openapi.json").json()
-                routes = sorted(
-                    path for path in openapi.get("paths", {})
-                    if not path.startswith("/collective")
-                )
-        except Exception:
-            routes = ["(unable to determine)"]
+        openapi = client.get(f"{url}/openapi.json").json()
+        paths = openapi.get("paths", {})
+    if "/v1/chat/completions" not in paths:
+        routes = sorted(
+            path for path in paths if not path.startswith("/collective")
+        )
         raise AssertionError(
             f"deployment does not serve /v1/chat/completions; "
             f"available routes: {routes}"

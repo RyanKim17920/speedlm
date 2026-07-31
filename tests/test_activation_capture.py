@@ -516,3 +516,28 @@ class TestE2EHelpers:
         finally:
             if original is not None:
                 os.environ["VLLM_SERVER_DEV_MODE"] = original
+
+    def test_405_not_treated_as_route_missing(self) -> None:
+        """A POST-only endpoint returning 405 must not be treated as 'route missing'.
+
+        The previous implementation probed /v1/chat/completions with HEAD,
+        which returned 405 (Method Not Allowed) because the endpoint only
+        accepts POST. The guard misinterpreted this as 'route missing' and
+        killed the GPU job with a false negative.
+
+        The fix uses the OpenAPI schema to check route availability instead.
+        """
+        import inspect
+
+        from tests.e2e.test_serving_activation_capture import _get_served_model_id
+
+        source = inspect.getsource(_get_served_model_id)
+        # Must NOT contain a HEAD request
+        assert ".head(" not in source, (
+            "_get_served_model_id must not use HEAD requests — "
+            "POST-only endpoints return 405 for HEAD, causing false negatives"
+        )
+        # Must use OpenAPI schema to check route availability
+        assert "openapi" in source.lower() or "openapi" in source, (
+            "_get_served_model_id should check route availability via OpenAPI schema"
+        )
