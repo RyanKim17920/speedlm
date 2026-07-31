@@ -128,6 +128,17 @@ def _create_artifact_dir(root: Path) -> Path:
     return d
 
 
+def _vllm_env() -> dict[str, str]:
+    """Return a copy of os.environ with VLLM_SERVER_DEV_MODE enabled.
+
+    vLLM only registers the /collective_rpc dev endpoint when
+    VLLM_SERVER_DEV_MODE is truthy.
+    """
+    env = os.environ.copy()
+    env["VLLM_SERVER_DEV_MODE"] = "1"
+    return env
+
+
 def _read_log_tail(log_path: Path, lines: int = 100) -> str:
     """Return the last *lines* of a log file, or a short fallback."""
     try:
@@ -193,23 +204,34 @@ def _send_prompt(url: str, prompt: str) -> str:
     return data["choices"][0]["text"]
 
 
-def _collective_rpc(vllm_proc: subprocess.Popen[bytes], method: str, *args: object) -> None:
+def _collective_rpc(
+    vllm_proc: subprocess.Popen[bytes], port: int, method: str, *args: object
+) -> None:
     """Issue a collective_rpc call to the vLLM engine via the debug endpoint.
 
     vLLM exposes a /collective_rpc endpoint that forwards to all workers.
+    The caller must pass the actual port the engine is listening on.
     """
-    # We use a separate port offset for the collective_rpc endpoint.
-    # vLLM's engine serves this on the same port as the API.
-    url = f"http://127.0.0.1:{os.environ.get('SPEEDLM_E2E_PORT', _free_port())}"
+    url = f"http://127.0.0.1:{port}"
     with httpx.Client(timeout=30.0, trust_env=False) as client:
         resp = client.post(
             f"{url}/collective_rpc",
-            json={"method": method, "args": list(args)},
+            json={"method": method, "args": [str(a) for a in args]},
         )
         if resp.status_code != 200:
             raise RuntimeError(
                 f"collective_rpc {method} failed: {resp.status_code} {resp.text}"
             )
+        # vLLM returns {"results": [...]} on success.  Each entry is the
+        # worker's return value (None, a dict/list, or str(result)).  If a
+        # worker-side method raised, the entry may contain error information.
+        body = resp.json()
+        if "results" in body:
+            for i, result in enumerate(body["results"]):
+                if isinstance(result, dict) and result.get("error"):
+                    raise RuntimeError(
+                        f"collective_rpc {method} worker {i} error: {result['error']}"
+                    )
 
 
 def _load_captured_safetensors(capture_dir: Path) -> dict[int, torch.Tensor]:
@@ -340,6 +362,7 @@ def test_stage0_activation_capture() -> None:
         stdout=log_handle,
         stderr=subprocess.STDOUT,
         cwd=str(REPO_ROOT),
+        env=_vllm_env(),
     )
 
     try:
@@ -348,11 +371,11 @@ def test_stage0_activation_capture() -> None:
         )
 
         # Step 2: Activate capture via collective_rpc, send prompt, flush
-        _collective_rpc(vllm_proc, "activate_capture", str(capture_dir))
+        _collective_rpc(vllm_proc, port, "activate_capture", str(capture_dir))
         _send_prompt(f"http://127.0.0.1:{port}", prompt)
         # Small pause to let the hook buffer finish
         time.sleep(0.5)
-        _collective_rpc(vllm_proc, "flush_capture")
+        _collective_rpc(vllm_proc, port, "flush_capture")
 
         # Step 3: Load captured tensors
         captured_tensors = _load_captured_safetensors(capture_dir)
@@ -496,6 +519,7 @@ def test_prefix_cache_coverage() -> None:
         stdout=log_handle,
         stderr=subprocess.STDOUT,
         cwd=str(REPO_ROOT),
+        env=_vllm_env(),
     )
 
     try:
@@ -504,14 +528,14 @@ def test_prefix_cache_coverage() -> None:
         )
 
         # Activate capture
-        _collective_rpc(vllm_proc, "activate_capture", str(capture_dir))
+        _collective_rpc(vllm_proc, port, "activate_capture", str(capture_dir))
 
         # Send same prompt twice; second should hit prefix cache
         _send_prompt(f"http://127.0.0.1:{port}", prompt)
         _send_prompt(f"http://127.0.0.1:{port}", prompt)
 
         time.sleep(0.5)
-        _collective_rpc(vllm_proc, "flush_capture")
+        _collective_rpc(vllm_proc, port, "flush_capture")
 
         # Load captured results to measure row counts
         captured = _load_captured_safetensors(capture_dir)

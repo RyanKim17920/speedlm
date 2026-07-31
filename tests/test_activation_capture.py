@@ -468,3 +468,51 @@ class TestTokenAlignment:
         trimmed = cap[: off.shape[0]]
         assert trimmed.dtype == torch.bfloat16
         assert trimmed.shape == (12, 2880)
+
+
+# ---------------------------------------------------------------------------
+# E2E test helper contract (no GPU needed)
+# ---------------------------------------------------------------------------
+
+
+class TestE2EHelpers:
+    """Verify the e2e test helper contracts without a running engine."""
+
+    def test_collective_rpc_accepts_port_parameter(self) -> None:
+        """_collective_rpc must accept a port parameter (not re-derive it)."""
+        import inspect
+
+        from tests.e2e.test_serving_activation_capture import _collective_rpc
+        sig = inspect.signature(_collective_rpc)
+        params = list(sig.parameters.keys())
+        assert "port" in params, (
+            f"_collective_rpc must have a 'port' parameter; got {params}"
+        )
+        # port should come before method
+        assert params.index("port") < params.index("method"), (
+            "port should come before method in _collective_rpc signature"
+        )
+
+    def test_vllm_env_contains_dev_mode(self) -> None:
+        """_vllm_env must set VLLM_SERVER_DEV_MODE=1."""
+
+        from tests.e2e.test_serving_activation_capture import _vllm_env
+        env = _vllm_env()
+        assert env.get("VLLM_SERVER_DEV_MODE") == "1"
+        # Should inherit other env vars
+        assert "PATH" in env or len(env) > 1  # basic sanity
+
+    def test_vllm_env_does_not_mutate_os_environ(self) -> None:
+        """_vllm_env must not modify os.environ."""
+        import os
+
+        from tests.e2e.test_serving_activation_capture import _vllm_env
+        # Temporarily unset the key to prove we copy
+        original = os.environ.pop("VLLM_SERVER_DEV_MODE", None)
+        try:
+            env = _vllm_env()
+            assert os.environ.get("VLLM_SERVER_DEV_MODE") is None
+            assert env.get("VLLM_SERVER_DEV_MODE") == "1"
+        finally:
+            if original is not None:
+                os.environ["VLLM_SERVER_DEV_MODE"] = original
