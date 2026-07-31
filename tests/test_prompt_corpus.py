@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 from pathlib import Path
 
 import pytest
@@ -58,7 +59,7 @@ def _select_prompts(
             f"{seed_count} are needed; set SPEEDLM_E2E_SEED_REQUESTS "
             f"<= {len(corpus)} or use a larger corpus"
         )
-    return corpus[:seed_count]
+    return random.Random(42).sample(corpus, seed_count)
 
 
 # ── tests ────────────────────────────────────────────────────────────────────
@@ -151,16 +152,33 @@ class TestSelectPrompts:
         assert result[0] == "This is idle-tuning seed request 1/3. Reply with one short sentence."
         assert result[2] == "This is idle-tuning seed request 3/3. Reply with one short sentence."
 
-    def test_deterministic_prefix(self) -> None:
+    def test_deterministic_fixed_seed(self) -> None:
         corpus = ["alpha", "beta", "gamma", "delta"]
         result = _select_prompts(corpus, seed_count=2)
-        assert result == ["alpha", "beta"]
+        # Fixed-seed sample is deterministic; verify it doesn't just return a prefix.
+        assert len(result) == 2
+        assert set(result).issubset(set(corpus))
+        assert result == _select_prompts(corpus, seed_count=2)
 
     def test_same_subset_every_time(self) -> None:
         corpus = ["first", "second", "third", "fourth"]
         a = _select_prompts(corpus, seed_count=3)
         b = _select_prompts(corpus, seed_count=3)
-        assert a == b == ["first", "second", "third"]
+        assert a == b
+        assert len(a) == 3
+
+    def test_selection_spans_corpus(self) -> None:
+        """Selected prompts should be drawn from across the corpus, not one block."""
+        corpus = [f"prompt-{i:04d}" for i in range(100)]
+        result = _select_prompts(corpus, seed_count=20)
+        indices = [int(p.split("-")[1]) for p in result]
+        # With a well-spread selection over 100 items, 20 picks should
+        # reach beyond the first 25% of the corpus.
+        assert max(indices) > 25, (
+            f"selection is too front-loaded: max index {max(indices)} <= 25"
+        )
+        # Also check we don't just grab a contiguous prefix
+        assert indices != list(range(20)), "selection appears to be a plain prefix"
 
     def test_raises_when_corpus_too_small(self) -> None:
         corpus = ["only", "two"]

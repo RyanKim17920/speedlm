@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import shutil
 import signal
 import socket
@@ -101,7 +102,13 @@ def _select_prompts(
             f"{seed_count} are needed; set SPEEDLM_E2E_SEED_REQUESTS <= {len(corpus)} "
             f"or use a larger corpus"
         )
-    return corpus[:seed_count]
+    # Use a fixed-seed sample to draw a deterministic, well-spread subset across
+    # the entire corpus.  A plain prefix (corpus[:seed_count]) is biased: the
+    # ultrachat corpus can be topically clustered by index, so a prefix silently
+    # narrows the distribution.  Random.sample with a dedicated instance (seed=42)
+    # is O(corpus), requires no extra state, and yields the same subset every run
+    # for a given seed_count — critical for reproducible comparison of results.
+    return random.Random(42).sample(corpus, seed_count)
 
 
 pytestmark = pytest.mark.e2e
