@@ -488,6 +488,7 @@ def test_cycle_exception_is_logged_and_service_keeps_watching(
         ),
         enabled=True,
         min_trace_records=2,
+        min_corpus_records=2,
         poll_interval_seconds=0.005,
     )
 
@@ -543,6 +544,7 @@ def test_worker_shutdown_preempts_then_recovers_before_stop_returns() -> None:
         orchestrator_factory=factory,
         enabled=True,
         min_trace_records=2,
+        min_corpus_records=2,
         poll_interval_seconds=0.005,
     )
     service.start()
@@ -600,6 +602,7 @@ def test_paused_startup_exposes_recovery_barrier_before_polling() -> None:
         orchestrator_factory=lambda _activity: runner,
         enabled=True,
         min_trace_records=2,
+        min_corpus_records=2,
         poll_interval_seconds=0.005,
     )
 
@@ -655,6 +658,7 @@ def test_factory_uses_explicit_state_artifacts_and_work_root(
         runtime=runtime,
         enabled=True,
         min_trace_records=2,
+        min_corpus_records=2,
         poll_interval_seconds=0.005,
         home=tmp_path / "home",
         state=state,
@@ -785,6 +789,7 @@ def test_scheduler_status_persists_cycle_error(tmp_path: Path) -> None:
         ),
         enabled=True,
         min_trace_records=2,
+        min_corpus_records=2,
         poll_interval_seconds=0.005,
         status_path=runs / "scheduler.json",
     )
