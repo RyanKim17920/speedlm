@@ -121,14 +121,37 @@ def _create_artifact_dir(root: Path) -> Path:
     return d
 
 
-def _wait_for_ready(url: str, process: subprocess.Popen[bytes], timeout: float) -> None:
+def _read_log_tail(log_path: Path, lines: int = 100) -> str:
+    """Return the last *lines* of a log file, or a short fallback."""
+    try:
+        raw = log_path.read_text(encoding="utf-8", errors="replace")
+        all_lines = raw.splitlines()
+        tail = all_lines[-lines:]
+        return "\n".join(tail)
+    except FileNotFoundError:
+        return "(log file not found)"
+
+
+def _wait_for_ready(
+    url: str,
+    process: subprocess.Popen[bytes],
+    timeout: float,
+    *,
+    log_path: Path,
+) -> None:
     deadline = time.monotonic() + timeout
     last_error = "not attempted"
     with httpx.Client(timeout=2.0, trust_env=False) as client:
         while time.monotonic() < deadline:
             rc = process.poll()
             if rc is not None:
-                raise AssertionError(f"vLLM exited before readiness with code {rc}")
+                log_tail = _read_log_tail(log_path)
+                raise AssertionError(
+                    f"vLLM exited before readiness with code {rc}\n"
+                    f"--- vLLM log (last 100 lines) ---\n"
+                    f"{log_tail}\n"
+                    f"--- end of vLLM log ---"
+                )
             try:
                 resp = client.get(f"{url}/health")
                 if 200 <= resp.status_code < 300:
@@ -137,7 +160,13 @@ def _wait_for_ready(url: str, process: subprocess.Popen[bytes], timeout: float) 
             except httpx.HTTPError as exc:
                 last_error = repr(exc)
             time.sleep(0.5)
-    raise AssertionError(f"vLLM did not become ready within {timeout}s; {last_error}")
+    log_tail = _read_log_tail(log_path)
+    raise AssertionError(
+        f"vLLM did not become ready within {timeout}s; {last_error}\n"
+        f"--- vLLM log (last 100 lines) ---\n"
+        f"{log_tail}\n"
+        f"--- end of vLLM log ---"
+    )
 
 
 def _send_prompt(url: str, prompt: str) -> str:
@@ -276,6 +305,8 @@ def test_stage0_activation_capture() -> None:
     capture_dir = artifact_dir / "captured"
     capture_dir.mkdir(exist_ok=True)
 
+    vllm_log = artifact_dir / "vllm.log"
+    log_handle = vllm_log.open("wb")
     vllm_proc = subprocess.Popen(
         [
             str(VLLM_PYTHON),
@@ -297,13 +328,15 @@ def test_stage0_activation_capture() -> None:
             "0.5",
             "--no-enable-prefix-caching",
         ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
         cwd=str(REPO_ROOT),
     )
 
     try:
-        _wait_for_ready(f"http://127.0.0.1:{port}", vllm_proc, timeout)
+        _wait_for_ready(
+            f"http://127.0.0.1:{port}", vllm_proc, timeout, log_path=vllm_log
+        )
 
         # Step 2: Activate capture via collective_rpc, send prompt, flush
         _collective_rpc(vllm_proc, "activate_capture", str(capture_dir))
@@ -386,6 +419,7 @@ def test_stage0_activation_capture() -> None:
         except subprocess.TimeoutExpired:
             vllm_proc.kill()
             vllm_proc.wait()
+        log_handle.close()
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +453,8 @@ def test_prefix_cache_coverage() -> None:
     capture_dir = artifact_dir / "captured"
     capture_dir.mkdir(exist_ok=True)
 
+    vllm_log = artifact_dir / "vllm.log"
+    log_handle = vllm_log.open("wb")
     vllm_proc = subprocess.Popen(
         [
             str(VLLM_PYTHON),
@@ -440,13 +476,15 @@ def test_prefix_cache_coverage() -> None:
             "0.5",
             # Prefix caching ENABLED (default)
         ],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
         cwd=str(REPO_ROOT),
     )
 
     try:
-        _wait_for_ready(f"http://127.0.0.1:{port}", vllm_proc, timeout)
+        _wait_for_ready(
+            f"http://127.0.0.1:{port}", vllm_proc, timeout, log_path=vllm_log
+        )
 
         # Activate capture
         _collective_rpc(vllm_proc, "activate_capture", str(capture_dir))
@@ -489,3 +527,4 @@ def test_prefix_cache_coverage() -> None:
         except subprocess.TimeoutExpired:
             vllm_proc.kill()
             vllm_proc.wait()
+        log_handle.close()
