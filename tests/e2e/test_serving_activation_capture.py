@@ -42,6 +42,10 @@ from speedlm.activation_capture.compare import (  # noqa: E402
 from speedlm.activation_capture.offline_extract import (  # noqa: E402
     extract as _run_offline_extract,
 )
+from speedlm.gateway.control import (  # noqa: E402
+    GPUMemoryPrecondition,
+    NvidiaSmiMemoryProbe,
+)
 
 pytestmark = pytest.mark.e2e
 
@@ -419,45 +423,6 @@ def _align_token_count(
     )
 
 
-def _split_captured_layers(
-    captured: dict[int, torch.Tensor],
-    metadata: dict,
-) -> tuple[list[int], int | None, dict[int, torch.Tensor], torch.Tensor | None]:
-    """Split captured tensors into drafter-input and regression-target groups.
-
-    Uses the metadata from the hook (``original_aux_layers`` and
-    ``final_layer_idx``) to distinguish:
-
-    - **Drafter-input layers**: the layers the drafter model consumes
-      (e.g. [2, 12, 21]).  These correspond to ``original_aux_layers`` and
-      are compared against the offline path's ``target_layers``.
-
-    - **Regression-target layer**: the final decoder layer (e.g. 24) appended
-      by the hook so the pre-norm regression target can be captured.  This is
-      ``final_layer_idx`` and is compared against the offline path's
-      ``hidden_states[:, -1]``.
-
-    Returns:
-        Tuple of (drafter_input_layer_ids, final_layer_idx,
-        drafter_input_tensors, regression_target_tensor).
-    """
-    final_layer_idx = metadata.get("final_layer_idx")
-    original_aux = metadata.get("original_aux_layers", [])
-
-    # Drafter-input tensors are those whose keys match original_aux_layers.
-    drafter_input_tensors: dict[int, torch.Tensor] = {
-        k: v for k, v in captured.items() if k in original_aux
-    }
-    drafter_input_ids = sorted(drafter_input_tensors.keys())
-
-    # Regression target is the final layer, if present.
-    regression_target: torch.Tensor | None = None
-    if final_layer_idx is not None and final_layer_idx in captured:
-        regression_target = captured[final_layer_idx]
-
-    return drafter_input_ids, final_layer_idx, drafter_input_tensors, regression_target
-
-
 def _split_offline_layers(
     offline: dict[int, torch.Tensor],
     offline_target_layers: list[int],
@@ -491,9 +456,77 @@ def _split_offline_layers(
     return sorted(drafter_input_ids), final_layer_idx, drafter_input_tensors, regression_target
 
 
+def _wait_for_gpu_memory_release(
+    gpu_memory_fraction: float,
+    *,
+    timeout: float = 120.0,
+    poll_interval: float = 1.0,
+) -> None:
+    """Block until GPU device memory is released enough for the next engine.
+
+    Uses ``nvidia-smi`` to poll the real driver — not a fixed sleep — so we
+    only proceed once the previous engine has actually freed its allocations.
+
+    Args:
+        gpu_memory_fraction: The fraction of total device memory the next
+            engine will request via ``--gpu-memory-utilization``.
+    """
+    probe = NvidiaSmiMemoryProbe()
+    precondition = GPUMemoryPrecondition(
+        probe=probe,
+        required_fraction=gpu_memory_fraction,
+        timeout_seconds=timeout,
+        poll_interval_seconds=poll_interval,
+    )
+    deadline = time.monotonic() + timeout
+    shortfall = precondition.shortfall()
+    while shortfall is not None:
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"GPU memory was not released within {timeout}s: {shortfall}"
+            )
+        time.sleep(poll_interval)
+        shortfall = precondition.shortfall()
+    logger.info("GPU memory released; proceeding with offline extraction")
+
+
 # ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
+
+
+def _wait_for_gpu_memory_release(
+    gpu_memory_fraction: float,
+    *,
+    timeout: float = 120.0,
+    poll_interval: float = 1.0,
+) -> None:
+    """Block until GPU device memory is released enough for the next engine.
+
+    Uses ``nvidia-smi`` to poll the real driver — not a fixed sleep — so we
+    only proceed once the previous engine has actually freed its allocations.
+
+    Args:
+        gpu_memory_fraction: The fraction of total device memory the next
+            engine will request via ``--gpu-memory-utilization``.
+    """
+    probe = NvidiaSmiMemoryProbe()
+    precondition = GPUMemoryPrecondition(
+        probe=probe,
+        required_fraction=gpu_memory_fraction,
+        timeout_seconds=timeout,
+        poll_interval_seconds=poll_interval,
+    )
+    deadline = time.monotonic() + timeout
+    shortfall = precondition.shortfall()
+    while shortfall is not None:
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"GPU memory was not released within {timeout}s: {shortfall}"
+            )
+        time.sleep(poll_interval)
+        shortfall = precondition.shortfall()
+    logger.info("GPU memory released; proceeding with offline extraction")
 
 
 def test_stage0_activation_capture() -> None:
@@ -503,9 +536,11 @@ def test_stage0_activation_capture() -> None:
     1. Starts a vLLM engine with the EAGLE-3 speculator and capture extension.
     2. Sends a single fixed prompt.
     3. Flushes captured activations to disk.
-    4. Runs the offline extraction on the same prompt.
-    5. Compares the two tensor stacks elementwise per layer.
-    6. Writes a JSON result with PASS/FAIL verdict.
+    4. Tears down the capture engine.
+    5. Waits for GPU memory to be released.
+    6. Runs the offline extraction on the same prompt.
+    7. Compares the two tensor stacks elementwise per layer.
+    8. Writes a JSON result with PASS/FAIL verdict.
     """
     verifier, drafter, artifact_root = _require_environment()
     prompt = os.environ.get("SPEEDLM_E2E_PROMPT", DEFAULT_PROMPT)
@@ -552,8 +587,9 @@ def test_stage0_activation_capture() -> None:
         env=_vllm_env(),
     )
 
+    # Phase 1: capture engine — serve, capture, and tear down.
+    url = f"http://127.0.0.1:{port}"
     try:
-        url = f"http://127.0.0.1:{port}"
         _wait_for_ready(url, vllm_proc, timeout, log_path=vllm_log)
 
         served_model_id = _get_served_model_id(url)
@@ -594,117 +630,6 @@ def test_stage0_activation_capture() -> None:
             f"final_layer_idx={final_layer_idx})"
         )
 
-        # Step 4: Run offline extraction — include the final layer so the
-        # regression-target comparison has something to compare against.
-        offline_target_layers = list(target_layers)
-        if final_layer_idx is not None:
-            offline_target_layers.append(final_layer_idx)
-        offline_dir = artifact_dir / "offline"
-        hs_dir = _run_offline_extract(
-            verifier,
-            prompt,
-            offline_target_layers,
-            offline_dir,
-            port=port + 1000,  # Different port
-        )
-        offline_tensors = _load_offline_hidden_states(hs_dir, target_layers=offline_target_layers)
-        logger.info("Offline layers: %s", sorted(offline_tensors.keys()))
-
-        # Step 5: Align and compare — using explicit split to avoid comparing
-        # drafter-input layers against the regression target or vice versa.
-
-        # --- Layer mapping (CRITICAL: must not be mixed up) ---
-        # Captured side:
-        #   drafter_input_layers  = original_aux (e.g. [2, 12, 21])
-        #   final_layer           = final_layer_idx (e.g. 24)
-        # Offline side:
-        #   offline_target_layers = target_layers + [final_layer_idx]
-        #   Positional index i -> offline_target_layers[i]
-        #   The last positional slice (hidden_states[:, -1]) is the
-        #   regression target, mapped to final_layer_idx.
-        #
-        # Both sides use the same layer-index keys so the comparison is
-        # keyed by actual decoder layer, not positional order.
-
-        # Split captured tensors into drafter-inputs and regression-target.
-        (
-            captured_drafter_ids,
-            captured_final_idx,
-            captured_drafter,
-            captured_regression,
-        ) = _split_captured_layers(captured_tensors, meta)
-
-        # Split offline tensors into drafter-inputs and regression-target.
-        (
-            offline_drafter_ids,
-            offline_final_idx,
-            offline_drafter,
-            offline_regression,
-        ) = _split_offline_layers(offline_tensors, offline_target_layers)
-
-        # The drafter-input layer ids must match between captured and offline.
-        assert captured_drafter_ids == offline_drafter_ids, (
-            f"Drafter-input layer mismatch: captured {captured_drafter_ids} "
-            f"vs offline {offline_drafter_ids}"
-        )
-
-        # The final layer indices must also match.
-        assert captured_final_idx == offline_final_idx, (
-            f"Final layer index mismatch: captured {captured_final_idx} "
-            f"vs offline {offline_final_idx}"
-        )
-
-        # Determine the prompt token count (from offline shape)
-        prompt_token_count: int | None = None
-        for t in offline_drafter.values():
-            prompt_token_count = t.shape[0]
-            break
-        assert prompt_token_count is not None
-
-        # Align drafter-input layers (same key set on both sides)
-        aligned_captured: dict[int, torch.Tensor] = {}
-        aligned_offline: dict[int, torch.Tensor] = {}
-        for idx in offline_drafter_ids:
-            cap = captured_drafter[idx]
-            off = offline_drafter[idx]
-            try:
-                c_aligned, o_aligned = _align_token_count(cap, off, prompt_token_count)
-                aligned_captured[idx] = c_aligned
-                aligned_offline[idx] = o_aligned
-            except ValueError as exc:
-                logger.warning("Cannot align layer %d: %s", idx, exc)
-
-        # Align the regression-target (final layer) separately
-        captured_final: torch.Tensor | None = None
-        offline_final: torch.Tensor | None = None
-        if captured_regression is not None and offline_regression is not None:
-            try:
-                captured_final, offline_final = _align_token_count(
-                    captured_regression, offline_regression, prompt_token_count,
-                )
-            except ValueError as exc:
-                logger.warning("Cannot align final layer: %s", exc)
-
-        # Step 6: Build verdict
-        prefix_cache = PrefixCacheResult(
-            prompt_token_count=prompt_token_count,
-            captured_row_count=sum(t.shape[0] for t in aligned_captured.values()),
-            cache_hit=False,
-            rows_missing=0,
-        )
-
-        result = build_result(
-            aligned_captured,
-            aligned_offline,
-            captured_final_pre_norm=captured_final,
-            offline_final_pre_norm=offline_final,
-            prefix_cache=prefix_cache,
-        )
-
-        result_path = artifact_dir / "result.json"
-        result.write_json(result_path)
-        logger.info("Result written to %s — verdict: %s", result_path, result.verdict)
-
     finally:
         vllm_proc.terminate()
         try:
@@ -713,6 +638,108 @@ def test_stage0_activation_capture() -> None:
             vllm_proc.kill()
             vllm_proc.wait()
         log_handle.close()
+
+    # Phase 2: wait for GPU memory release before launching offline engine.
+    # The capture engine held GPU memory; the offline engine must not start
+    # until the device memory is actually returned, otherwise both engines
+    # compete for the same GPU and the second crashes.
+    _wait_for_gpu_memory_release(gpu_memory_fraction=0.5)
+
+    # Phase 3: offline extraction — now the GPU is free.
+    offline_target_layers = list(target_layers)
+    if final_layer_idx is not None:
+        offline_target_layers.append(final_layer_idx)
+    offline_dir = artifact_dir / "offline"
+    hs_dir = _run_offline_extract(
+        verifier,
+        prompt,
+        offline_target_layers,
+        offline_dir,
+        port=port + 1000,  # Different port
+    )
+    offline_tensors = _load_offline_hidden_states(hs_dir, target_layers=offline_target_layers)
+    logger.info("Offline layers: %s", sorted(offline_tensors.keys()))
+
+    # Phase 4: Align and compare — using explicit split to avoid comparing
+    # drafter-input layers against the regression target or vice versa.
+
+# Split captured tensors into drafter-inputs and regression-target.
+    (
+        captured_drafter_ids,
+        captured_final_idx,
+        captured_drafter,
+        captured_regression,
+    ) = _split_captured_layers(captured_tensors, meta)
+
+    # Split offline tensors into drafter-inputs and regression-target.
+    (
+        offline_drafter_ids,
+        offline_final_idx,
+        offline_drafter,
+        offline_regression,
+    ) = _split_offline_layers(offline_tensors, offline_target_layers)
+
+    # The drafter-input layer ids must match between captured and offline.
+    assert captured_drafter_ids == offline_drafter_ids, (
+        f"Drafter-input layer mismatch: captured {captured_drafter_ids} "
+        f"vs offline {offline_drafter_ids}"
+    )
+
+    # The final layer indices must also match.
+    assert captured_final_idx == offline_final_idx, (
+        f"Final layer index mismatch: captured {captured_final_idx} "
+        f"vs offline {offline_final_idx}"
+    )
+
+    # Determine the prompt token count (from offline shape)
+    prompt_token_count: int | None = None
+    for t in offline_drafter.values():
+        prompt_token_count = t.shape[0]
+        break
+    assert prompt_token_count is not None
+
+    # Align drafter-input layers (same key set on both sides)
+    aligned_captured: dict[int, torch.Tensor] = {}
+    aligned_offline: dict[int, torch.Tensor] = {}
+    for idx in offline_drafter_ids:
+        cap = captured_drafter[idx]
+        off = offline_drafter[idx]
+        try:
+            c_aligned, o_aligned = _align_token_count(cap, off, prompt_token_count)
+            aligned_captured[idx] = c_aligned
+            aligned_offline[idx] = o_aligned
+        except ValueError as exc:
+            logger.warning("Cannot align layer %d: %s", idx, exc)
+
+    # Align the regression-target (final layer) separately
+    captured_final: torch.Tensor | None = None
+    offline_final: torch.Tensor | None = None
+    if captured_regression is not None and offline_regression is not None:
+        try:
+            captured_final, offline_final = _align_token_count(
+                captured_regression, offline_regression, prompt_token_count,
+            )
+        except ValueError as exc:
+            logger.warning("Cannot align final layer: %s", exc)
+    # Phase 5: Build verdict
+    prefix_cache = PrefixCacheResult(
+        prompt_token_count=prompt_token_count,
+        captured_row_count=sum(t.shape[0] for t in aligned_captured.values()),
+        cache_hit=False,
+        rows_missing=0,
+    )
+
+    result = build_result(
+        aligned_captured,
+        aligned_offline,
+        captured_final_pre_norm=captured_final,
+        offline_final_pre_norm=offline_final,
+        prefix_cache=prefix_cache,
+    )
+
+    result_path = artifact_dir / "result.json"
+    result.write_json(result_path)
+    logger.info("Result written to %s — verdict: %s", result_path, result.verdict)
 
 
 # ---------------------------------------------------------------------------
