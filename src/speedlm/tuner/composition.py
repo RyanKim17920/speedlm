@@ -355,6 +355,7 @@ def create_production_tuner(
         runtime=runtime,
         enabled=True,
         min_trace_records=tuning.min_trace_records,
+        min_corpus_records=tuning.min_corpus_records,
         poll_interval_seconds=tuning.poll_interval_seconds,
         home=home,
         state=state,

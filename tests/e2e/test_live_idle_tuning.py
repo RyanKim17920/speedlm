@@ -18,6 +18,7 @@ Optional environment:
 * ``SPEEDLM_E2E_READY_TIMEOUT=900``
 * ``SPEEDLM_E2E_TUNING_TIMEOUT=7200``
 * ``SPEEDLM_E2E_REQUEST_TIMEOUT=1200``
+* ``SPEEDLM_E2E_SEED_REQUESTS=256``
 
 One invocation creates an isolated ``SPEEDLM_HOME`` under the artifact root,
 so old traces, active artifacts, and scheduler state cannot satisfy assertions.
@@ -111,6 +112,20 @@ def _timeout(name: str, default: float) -> float:
         raise AssertionError(f"{name} must be numeric, got {raw!r}") from exc
     assert value > 0, f"{name} must be positive, got {raw!r}"
     return value
+
+
+def _seed_requests(config) -> int:
+    raw = os.environ.get("SPEEDLM_E2E_SEED_REQUESTS")
+    if raw is not None:
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise AssertionError(
+                f"SPEEDLM_E2E_SEED_REQUESTS must be an integer, got {raw!r}"
+            ) from exc
+        assert value > 0, f"SPEEDLM_E2E_SEED_REQUESTS must be positive, got {raw!r}"
+        return value
+    return max(config.tuning.min_trace_records, config.tuning.min_corpus_records)
 
 
 def _vllm_args() -> list[str]:
@@ -425,6 +440,7 @@ def test_live_idle_tuning_preempts_then_completes() -> None:
     ready_timeout = _timeout("SPEEDLM_E2E_READY_TIMEOUT", 900.0)
     tuning_timeout = _timeout("SPEEDLM_E2E_TUNING_TIMEOUT", 7_200.0)
     request_timeout = _timeout("SPEEDLM_E2E_REQUEST_TIMEOUT", 1_200.0)
+    seed_count = _seed_requests(config)
     port = _free_port()
     gateway_url = f"http://127.0.0.1:{port}"
     gateway_log = artifact_dir / "gateway-and-vllm.log"
@@ -483,13 +499,13 @@ def test_live_idle_tuning_preempts_then_completes() -> None:
         assert observed_pids, "speedlm did not launch a vLLM child"
 
         traces_path = home / "traces" / "traces.jsonl"
-        for index in range(config.tuning.min_trace_records):
+        for index in range(seed_count):
             body, _ = _post_chat(
                 gateway_url,
                 config,
                 (
                     "This is idle-tuning seed request "
-                    f"{index + 1}/{config.tuning.min_trace_records}. "
+                    f"{index + 1}/{seed_count}. "
                     "Reply with one short sentence."
                 ),
                 timeout=request_timeout,
@@ -500,7 +516,7 @@ def test_live_idle_tuning_preempts_then_completes() -> None:
             "all seed traces to be captured",
             lambda: (
                 _trace_count(traces_path)
-                if _trace_count(traces_path) >= config.tuning.min_trace_records
+                if _trace_count(traces_path) >= seed_count
                 else None
             ),
             process=process,

@@ -505,6 +505,100 @@ def test_composition_starts_when_huggingface_hub_is_unimportable(
     assert resolve_verifier_revision("openai/gpt-oss-20b", None) is None
 
 
+def test_min_corpus_records_reaches_the_service(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression: create_production_tuner should pass min_corpus_records."""
+    profile = _profile()
+    base_config = _config(tmp_path, profile)
+    config = replace(
+        base_config,
+        tuning=replace(base_config.tuning, min_corpus_records=512, training_window_records=512),
+    )
+    captured: dict[str, Any] = {}
+    state = object()
+    artifacts = object()
+    split = SimpleNamespace(
+        suite_dir=tmp_path / "held-out",
+        training_context_hashes=frozenset({"train-hash"}),
+    )
+    backend = object()
+    runtime = object()
+    gate = object()
+    service = object()
+
+    monkeypatch.setattr(
+        composition,
+        "ensure_layout",
+        lambda _home: SimpleNamespace(runs_dir=tmp_path / "runs"),
+    )
+    monkeypatch.setattr(composition, "TunerStateMachine", lambda _path: state)
+    monkeypatch.setattr(composition, "ArtifactRegistry", lambda _path: artifacts)
+
+    def build_split(_traces: object, **kwargs: object) -> object:
+        captured["split"] = kwargs
+        return split
+
+    def build_pipeline(**kwargs: object) -> object:
+        captured["pipeline"] = kwargs
+        return SimpleNamespace(gpu_memory_utilization=0.80)
+
+    def build_backend(_pipeline: object, **kwargs: object) -> object:
+        captured["backend"] = kwargs
+        return backend
+
+    def build_runtime(**kwargs: object) -> object:
+        captured["runtime"] = kwargs
+        return runtime
+
+    def build_gate(**kwargs: object) -> object:
+        captured["gate"] = kwargs
+        return gate
+
+    def build_service(_config: SpeedLMConfig, **kwargs: object) -> object:
+        captured["service"] = kwargs
+        return service
+
+    monkeypatch.setattr(composition, "HeldOutTraceSnapshotLeaser", build_split)
+    monkeypatch.setattr(composition, "SpeculatorsPipelineConfig", build_pipeline)
+    monkeypatch.setattr(
+        composition,
+        "Eagle3Backend",
+        SimpleNamespace(from_speculators=build_backend),
+    )
+    monkeypatch.setattr(composition, "RuntimeController", build_runtime)
+    monkeypatch.setattr(composition, "BenchmarkGateRunner", build_gate)
+    monkeypatch.setattr(composition, "create_tuner_service", build_service)
+
+    activity = object()
+    admission = object()
+    traces = object()
+    capture = object()
+    process = object()
+    http = object()
+    loop = asyncio.new_event_loop()
+    try:
+        create_production_tuner(
+            config,
+            profile=profile,
+            active_draft="acme/active-draft",
+            activity=activity,  # type: ignore[arg-type]
+            admission=admission,  # type: ignore[arg-type]
+            traces=traces,  # type: ignore[arg-type]
+            capture=capture,  # type: ignore[arg-type]
+            process=process,  # type: ignore[arg-type]
+            http=http,  # type: ignore[arg-type]
+            child_url="http://127.0.0.1:8765",
+            loop=loop,
+            home=tmp_path / "home",
+        )
+    finally:
+        loop.close()
+
+    assert captured["service"]["min_corpus_records"] == 512
+
+
 def test_a_local_verifier_path_is_its_own_pin(tmp_path: Path) -> None:
     local = tmp_path / "verifier"
     local.mkdir()

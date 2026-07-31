@@ -550,6 +550,7 @@ class SpeedLMConfig:
         }
         result["tuning"] = {
             "min_trace_records": self.tuning.min_trace_records,
+            "min_corpus_records": self.tuning.min_corpus_records,
             "poll_interval_seconds": self.tuning.poll_interval_seconds,
             "held_out_fraction": self.tuning.held_out_fraction,
             "benchmark_repeats": self.tuning.benchmark_repeats,
@@ -627,6 +628,7 @@ class SpeedLMConfig:
             "tuning",
             {
                 "min_trace_records",
+                "min_corpus_records",
                 "poll_interval_seconds",
                 "held_out_fraction",
                 "benchmark_repeats",
