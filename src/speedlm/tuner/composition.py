@@ -28,8 +28,8 @@ from speedlm.gateway.vllm_http import VLLMControlClient
 from speedlm.profiles import (
     ModelProfile,
     canonical_verifier_reference,
-    default_aux_layers,
     resolve_profile,
+    resolve_target_layer_ids,
 )
 from speedlm.storage import ensure_layout
 from speedlm.traces.store import TraceStore
@@ -306,7 +306,11 @@ def create_production_tuner(
         ),
         warm_start_model=profile.draft_model,
         target_layer_ids=profile.target_layer_ids or (
-            default_aux_layers(profile.num_hidden_layers)
+            resolve_target_layer_ids(
+                explicit=None,
+                num_hidden_layers=profile.num_hidden_layers,
+                drafter_aux_count=None,
+            )
             if profile.num_hidden_layers is not None
             else ()
         ),

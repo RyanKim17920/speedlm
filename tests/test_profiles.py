@@ -13,6 +13,7 @@ from speedlm.profiles import (
     GPT_OSS_EAGLE3_PROFILE,
     LLAMA_31_8B_EAGLE3_PROFILE,
     QWEN_35_9B_MTP_PROFILE,
+    AuxLayerError,
     ModelProfile,
     ParserRegistry,
     ProfileError,
@@ -21,6 +22,8 @@ from speedlm.profiles import (
     load_profiles,
     resolve_model_parsers,
     resolve_profile,
+    resolve_target_layer_ids,
+    spread_aux_layers,
 )
 
 
@@ -36,6 +39,102 @@ def test_default_aux_layers_uses_vllm_rule() -> None:
     assert default_aux_layers(24) == (2, 12, 21)
     assert default_aux_layers(32) == (2, 16, 29)
     assert default_aux_layers(48) == (2, 24, 45)
+
+
+# -- spread_aux_layers tests --
+
+
+def test_spread_aux_layers_reproduces_vllm_rule_k3() -> None:
+    """k=3, n>=7 must match vLLM's (2, n//2, n-3) exactly."""
+    assert spread_aux_layers(3, 24) == (2, 12, 21)
+    assert spread_aux_layers(3, 32) == (2, 16, 29)
+    assert spread_aux_layers(3, 48) == (2, 24, 45)
+    assert spread_aux_layers(3, 7) == (2, 3, 4)
+
+
+def test_spread_aux_layers_small_models_raise() -> None:
+    """n < 7 with k=3 is provably invalid."""
+    for n in (2, 4, 5, 6):
+        with pytest.raises(ValueError):
+            spread_aux_layers(3, n)
+
+
+def test_spread_aux_layers_k4_produces_four_valid_indices() -> None:
+    """k=4 should produce four strictly increasing indices."""
+    result = spread_aux_layers(4, 24)
+    assert len(result) == 4
+    assert result == tuple(sorted(set(result)))
+    assert all(0 <= idx < 24 for idx in result)
+
+
+def test_spread_aux_layers_k1_returns_single() -> None:
+    assert spread_aux_layers(1, 24) == (2,)
+
+
+def test_spread_aux_layers_k2_returns_anchors() -> None:
+    assert spread_aux_layers(2, 24) == (2, 21)
+
+
+# -- resolve_target_layer_ids tests --
+
+
+def test_resolve_explicit_profile_override_wins() -> None:
+    explicit = (1, 8, 19)
+    resolved = resolve_target_layer_ids(
+        explicit=explicit,
+        num_hidden_layers=24,
+        drafter_aux_count=3,
+    )
+    assert resolved is explicit
+
+
+def test_resolve_drafter_aux_count_drives_k() -> None:
+    """When drafter_aux_count is known, use it for spread_aux_layers."""
+    resolved = resolve_target_layer_ids(
+        explicit=None,
+        num_hidden_layers=24,
+        drafter_aux_count=4,
+    )
+    assert len(resolved) == 4
+    assert resolved == spread_aux_layers(4, 24)
+
+
+def test_resolve_fallback_to_k3() -> None:
+    """Without drafter_aux_count, default to k=3."""
+    resolved = resolve_target_layer_ids(
+        explicit=None,
+        num_hidden_layers=32,
+        drafter_aux_count=None,
+    )
+    assert resolved == (2, 16, 29)
+
+
+def test_resolve_raises_without_num_hidden_layers() -> None:
+    with pytest.raises(AuxLayerError, match="num_hidden_layers"):
+        resolve_target_layer_ids(
+            explicit=None,
+            num_hidden_layers=None,
+            drafter_aux_count=None,
+        )
+
+
+def test_resolve_validates_explicit_arity_mismatch() -> None:
+    with pytest.raises(AuxLayerError, match="4 entries") as exc_info:
+        resolve_target_layer_ids(
+            explicit=(2, 12, 16, 20),
+            num_hidden_layers=24,
+            drafter_aux_count=3,
+        )
+    assert "drafter expects 3 aux layers" in str(exc_info.value)
+
+
+def test_resolve_validates_explicit_out_of_range() -> None:
+    with pytest.raises(AuxLayerError, match="out of range"):
+        resolve_target_layer_ids(
+            explicit=(2, 12, 99),
+            num_hidden_layers=24,
+            drafter_aux_count=3,
+        )
 
 
 def test_builtin_profiles_load_and_validate(tmp_path: Path) -> None:

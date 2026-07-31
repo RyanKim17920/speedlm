@@ -30,6 +30,27 @@ class Eagle3Error(RuntimeError):
     """Base class for EAGLE-3 adapter failures."""
 
 
+class AuxLayerCountMismatch(Eagle3Error):
+    """The aux-layer count does not match the drafter's expectation.
+
+    The drafter's ``fc_input_size`` is derived from its configured
+    ``num_aux_hidden_states`` (or the length of
+    ``eagle_aux_hidden_state_layer_ids`` in ``eagle_config``).
+    A mismatch means a shape error in the forward pass.
+    """
+
+    def __init__(
+        self, expected: int, actual: int, drafter_model: str | None = None
+    ) -> None:
+        self.expected = expected
+        self.actual = actual
+        source = f" (drafter: {drafter_model})" if drafter_model else ""
+        super().__init__(
+            f"aux-layer count mismatch: drafter expects {expected} aux layers{source}, "
+            f"but {actual} were provided"
+        )
+
+
 class ScratchQuotaExceeded(Eagle3Error):
     """The per-cycle scratch directory exceeded its hard byte limit."""
 

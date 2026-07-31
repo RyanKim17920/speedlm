@@ -322,14 +322,174 @@ class ModelProfile:
         return profile
 
 
-def default_aux_layers(num_hidden_layers: int) -> tuple[int, ...]:
-    """Return the default auxiliary layer IDs used by vLLM for speculative decoding.
+def spread_aux_layers(k: int, n: int) -> tuple[int, ...]:
+    """Spread *k* aux-layer indices across *n* hidden layers.
 
-    This is the default rule from vLLM's ``interfaces.py``.
+    This generalises vLLM's three-position heuristic
+    ``(2, n//2, n-3)`` to an arbitrary count *k*, while reproducing it
+    exactly when ``k == 3`` and ``n >= 7``.
+
+    The rule places the first index at 2, the last at ``n - 3``, and
+    distributes the remaining ``k - 2`` indices evenly between them.
+    The result is validated: indices must be unique, strictly increasing,
+    and all within ``[0, n)``.
+
+    Raises ``ValueError`` when the requested count cannot be satisfied —
+    for example when the model is too shallow.  The error message names
+    *k*, *n*, and why the resolution failed so the operator can adjust
+    the model or the aux-layer count.
+    """
+    if not isinstance(k, int) or isinstance(k, bool) or k < 1:
+        raise ValueError(f"aux-layer count must be a positive integer, got {k!r}")
+    if not isinstance(n, int) or isinstance(n, bool) or n < 1:
+        raise ValueError(f"num_hidden_layers must be a positive integer, got {n!r}")
+
+    first = 2
+    last = n - 3
+
+    if k == 1:
+        indices = [first]
+    elif k == 2:
+        indices = [first, last]
+    elif k == 3:
+        if last < first + 2:
+            raise ValueError(
+                f"cannot spread {k} aux layers across {n} hidden layers: "
+                f"the available range ({first}..{last}) is too narrow"
+            )
+        # Reproduce vLLM's formula exactly: (2, n//2, n-3).
+        indices = [first, n // 2, last]
+    else:
+        if last - first < k - 1:
+            raise ValueError(
+                f"cannot spread {k} aux layers across {n} hidden layers: "
+                f"the available range ({first}..{last}) is too narrow "
+                f"(need at least {k - 1} slots for {k} indices)"
+            )
+        # Place k - 2 intermediate indices evenly between `first` and `last`.
+        # We divide the span (last - first) into (k - 1) equal segments,
+        # so position j is: first + j * (last - first) / (k - 1), rounded down.
+        span = last - first
+        seg_count = k - 1
+        indices = [first]
+        for j in range(1, seg_count):
+            idx = first + (j * span) // seg_count
+            indices.append(idx)
+        indices.append(last)
+
+    # Validate: unique, strictly increasing, within [0, n)
+    if len(set(indices)) != len(indices):
+        raise ValueError(
+            f"cannot spread {k} aux layers across {n} hidden layers: "
+            f"generated indices {tuple(indices)} contain duplicates"
+        )
+    for i in range(1, len(indices)):
+        if indices[i] <= indices[i - 1]:
+            raise ValueError(
+                f"cannot spread {k} aux layers across {n} hidden layers: "
+                f"indices are not strictly increasing at position {i} "
+                f"({indices[i - 1]} >= {indices[i]})"
+            )
+    if any(idx < 0 or idx >= n for idx in indices):
+        raise ValueError(
+            f"cannot spread {k} aux layers across {n} hidden layers: "
+            f"indices {tuple(indices)} are out of range [0, {n})"
+        )
+
+    return tuple(indices)
+
+
+def default_aux_layers(num_hidden_layers: int) -> tuple[int, ...]:
+    """Return vLLM's default three aux-layer IDs for *num_hidden_layers*.
+
+    DEPRECATED: use :func:`spread_aux_layers` with the drafter's actual
+    aux-layer count instead.  This function remains for backward
+    compatibility with code that still hardcodes ``k == 3``.
+
     For example, gpt-oss-20b (24 layers) gives ``(2, 12, 21)``
     and Llama-3.1-8B (32 layers) gives ``(2, 16, 29)``.
+
+    Raises ``ValueError`` when the model is too small (n < 7).
     """
-    return (2, num_hidden_layers // 2, num_hidden_layers - 3)
+    return spread_aux_layers(3, num_hidden_layers)
+
+
+class AuxLayerError(ValueError):
+    """Raised when aux-layer resolution produces an invalid result."""
+
+
+def resolve_target_layer_ids(
+    *,
+    explicit: tuple[int, ...] | None = None,
+    num_hidden_layers: int | None = None,
+    drafter_aux_count: int | None = None,
+) -> tuple[int, ...]:
+    """Resolve EAGLE-3 target aux-layer IDs with a documented precedence.
+
+    Resolution order:
+
+    1. **Explicit profile override** — ``explicit``, if set, is the
+       authoritative pin.  It is validated against ``num_hidden_layers``
+       when that is known.
+
+    2. **Drafter-driven derivation** — when ``drafter_aux_count`` is known,
+       the drafter's declared count of aux layers is used as *k* for
+       :func:`spread_aux_layers`.  This matches the drafter's
+       ``fc_input_size`` expectation (see ``llama_eagle3.py``).
+
+    3. **Heuristic fallback** — as a last resort, default to ``k == 3``.
+       This is the vLLM default when the drafter config carries no
+       ``num_aux_hidden_states`` or ``eagle_aux_hidden_state_layer_ids``.
+
+    Raises :class:`AuxLayerError` when resolution cannot produce a valid
+    set of indices.  The error message names the model, its layer count,
+    and the required count so the operator can take corrective action.
+    """
+    if explicit is not None:
+        if num_hidden_layers is not None:
+            _validate_layer_ids(
+                explicit, num_hidden_layers, expected_count=drafter_aux_count
+            )
+        return explicit
+
+    if num_hidden_layers is None:
+        raise AuxLayerError(
+            "cannot resolve aux layers: num_hidden_layers is not known"
+        )
+
+    k = drafter_aux_count if drafter_aux_count is not None else 3
+
+    return spread_aux_layers(k, num_hidden_layers)
+
+
+def _validate_layer_ids(
+    indices: tuple[int, ...],
+    num_hidden_layers: int,
+    *,
+    expected_count: int | None = None,
+) -> None:
+    """Validate that *indices* is a valid aux-layer set."""
+    if len(indices) == 0:
+        raise AuxLayerError("target_layer_ids must not be empty")
+    if len(set(indices)) != len(indices):
+        raise AuxLayerError(
+            f"target_layer_ids contains duplicates: {indices}"
+        )
+    for i in range(1, len(indices)):
+        if indices[i] <= indices[i - 1]:
+            raise AuxLayerError(
+                f"target_layer_ids is not strictly increasing: {indices}"
+            )
+    if any(idx < 0 or idx >= num_hidden_layers for idx in indices):
+        raise AuxLayerError(
+            f"target_layer_ids {indices} is out of range for a model "
+            f"with {num_hidden_layers} hidden layers"
+        )
+    if expected_count is not None and len(indices) != expected_count:
+        raise AuxLayerError(
+            f"target_layer_ids has {len(indices)} entries but the drafter "
+            f"expects {expected_count} aux layers"
+        )
 
 
 GPT_OSS_EAGLE3_PROFILE: Final = ModelProfile(
