@@ -253,6 +253,18 @@ class CombinedWorkerExtension:  # noqa: RUF012
         if self._pending is None:
             self._pending = {}
 
+    def _get_lock(self) -> threading.Lock:
+        """Return the per-instance lock, initializing it lazily."""
+        self._ensure_init()
+        assert self._lock is not None  # guaranteed by _ensure_init
+        return self._lock
+
+    def _get_pending(self) -> dict[int, list]:
+        """Return the per-instance pending dict, initializing it lazily."""
+        self._ensure_init()
+        assert self._pending is not None  # guaranteed by _ensure_init
+        return self._pending
+
     # -- ActivationCaptureExtension delegates --
 
     def activate_capture(self, capture_dir: str) -> None:
@@ -273,8 +285,8 @@ class CombinedWorkerExtension:  # noqa: RUF012
 
         import torch  # lazy: only available at runtime inside the vLLM venv
 
-        with self._lock:
-            pending = self._pending
+        with self._get_lock():
+            pending = self._get_pending()
             self._pending = {}
 
         if not pending:
@@ -350,12 +362,13 @@ class CombinedWorkerExtension:  # noqa: RUF012
         self._ensure_init()
         if not self._capture_active:
             return
-        with self._lock:
+        with self._get_lock():
+            pending = self._get_pending()
             for i, tensor in enumerate(aux_hidden_states):
                 cpu_tensor = tensor.detach().cpu()
-                if i not in self._pending:
-                    self._pending[i] = []
-                self._pending[i].append(cpu_tensor)
+                if i not in pending:
+                    pending[i] = []
+                pending[i].append(cpu_tensor)
 
     # -- DraftSwapExtension delegates (same implementations) --
 

@@ -687,3 +687,48 @@ def test_no_collision_combined_extension() -> None:
     ext_attrs = {a for a in dir(CombinedWorkerExtension) if not a.startswith("__")}
     collisions = ext_attrs & known_vllm
     assert not collisions, f"Attribute collisions: {collisions}"
+
+
+# ---------------------------------------------------------------------------
+# Mutable state is NOT shared across instances (BUG 2 follow-up)
+# ---------------------------------------------------------------------------
+
+
+def test_activation_capture_extension_no_shared_state() -> None:
+    """Two ActivationCaptureExtension instances created via object.__new__
+    do not share their _pending dicts or _lock instances."""
+    from speedlm.activation_capture.hook import ActivationCaptureExtension
+
+    ext_a = object.__new__(ActivationCaptureExtension)
+    ext_b = object.__new__(ActivationCaptureExtension)
+
+    ext_a._ensure_init()
+    ext_b._ensure_init()
+
+    # Each instance has its own lock
+    assert ext_a._lock is not ext_b._lock
+    # Each instance has its own pending dict
+    assert ext_a._pending is not ext_b._pending
+    # And they are both empty (not sharing a class-level dict)
+    assert ext_a._pending == {}
+    assert ext_b._pending == {}
+
+
+def test_combined_extension_no_shared_state() -> None:
+    """Two CombinedWorkerExtension instances created via object.__new__
+    do not share their _pending dicts or _lock instances."""
+    from speedlm.gateway.draft_swap import CombinedWorkerExtension
+
+    ext_a = object.__new__(CombinedWorkerExtension)
+    ext_b = object.__new__(CombinedWorkerExtension)
+
+    ext_a._ensure_init()
+    ext_b._ensure_init()
+
+    # Each instance has its own lock
+    assert ext_a._lock is not ext_b._lock
+    # Each instance has its own pending dict
+    assert ext_a._pending is not ext_b._pending
+    # And they are both empty (not sharing a class-level dict)
+    assert ext_a._pending == {}
+    assert ext_b._pending == {}

@@ -100,6 +100,18 @@ class ActivationCaptureExtension:
         if self._pending is None:
             self._pending = {}
 
+    def _get_lock(self) -> threading.Lock:
+        """Return the per-instance lock, initializing it lazily."""
+        self._ensure_init()
+        assert self._lock is not None  # guaranteed by _ensure_init
+        return self._lock
+
+    def _get_pending(self) -> dict[int, list]:
+        """Return the per-instance pending dict, initializing it lazily."""
+        self._ensure_init()
+        assert self._pending is not None  # guaranteed by _ensure_init
+        return self._pending
+
     # -- collective_rpc handlers --
 
     def activate_capture(self, capture_dir: str) -> None:
@@ -138,8 +150,8 @@ class ActivationCaptureExtension:
         if not self._capture_active or self._capture_dir is None:
             raise RuntimeError("capture is not active")
 
-        with self._lock:
-            pending = self._pending
+        with self._get_lock():
+            pending = self._get_pending()
             self._pending = {}
 
         if not pending:
@@ -310,10 +322,11 @@ class ActivationCaptureExtension:
             # Fallback to positional indices if we can't reach the model
             layer_indices = tuple(range(len(aux_hidden_states)))
 
-        with self._lock:
+        with self._get_lock():
+            pending = self._get_pending()
             for i, tensor in enumerate(aux_hidden_states):
                 cpu_tensor = tensor.detach().cpu()
                 key = layer_indices[i] if i < len(layer_indices) else i
-                if key not in self._pending:
-                    self._pending[key] = []
-                self._pending[key].append(cpu_tensor)
+                if key not in pending:
+                    pending[key] = []
+                pending[key].append(cpu_tensor)
