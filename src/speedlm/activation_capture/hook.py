@@ -27,19 +27,14 @@ Why this approach:
    vLLM attributes at runtime (inevitable given vLLM exposes no supported hook
    for this).
 
-**What CANNOT be done without a vLLM patch:**
-
-- Collecting the **final decoder layer's pre-norm output** as a 4th aux layer
-  in the serving engine. The ``set_aux_hidden_state_layers`` call controls
-  which layers are collected, but the default config only includes the 3
-  EAGLE-3 aux layers. Adding the final layer requires either:
-  (a) patching ``set_aux_hidden_state_layers`` to accept an arbitrary list, or
-  (b) patching the runner to append the final layer index.
-
-  Without this, we can only compare the 3 aux layers (which the drafter uses).
-  The pre-norm/post-norm question for the *final layer specifically* therefore
-  requires a vLLM patch to answer empirically. The prototype will report this
-  as a known limitation when the final layer is absent.
+**Final-layer pre-norm capture.** The extension CAN collect the final decoder
+layer as a 4th aux layer by calling ``set_aux_hidden_state_layers`` with an
+extended tuple. The drafter's ``fc`` width is fixed from the drafter's own
+config at construction time (``llama_eagle3.py:176-187``) and is unaffected.
+However, the concatenation at ``gpu_model_runner.py:5119-5121`` would produce
+a 4*H tensor for a 3*H drafter. The extension therefore removes the extra
+entry from the ``aux_hidden_states`` list AFTER buffering it, so the drafter
+sees only the 3 canonical layers.
 """
 
 from __future__ import annotations
@@ -84,6 +79,8 @@ class ActivationCaptureExtension:
         self._pending: dict[int, list[Tensor]] = {}
         self._lock = threading.Lock()
         self._original_model_forward: Any = None
+        self._final_layer_idx: int | None = None
+        self._original_aux_layers: tuple[int, ...] = ()
 
     # -- collective_rpc handlers --
 
@@ -91,6 +88,10 @@ class ActivationCaptureExtension:
         """Enable capture and install the monkeypatch.
 
         Called via collective_rpc from the driver process.
+
+        Also adds the final decoder layer to the aux collection list so that
+        its pre-norm output is captured alongside the canonical EAGLE-3 aux
+        layers. The extra entry is sliced off before reaching the drafter.
         """
         if self._capture_active:
             logger.warning("capture already active; resetting")
@@ -99,6 +100,10 @@ class ActivationCaptureExtension:
         self._capture_active = True
         self._capture_dir = capture_dir
         os.makedirs(capture_dir, exist_ok=True)
+
+        # Add the final decoder layer to aux collection.
+        # self is mixed into the worker class, so we have model_runner.
+        self._extend_aux_layers()
 
         # Install monkeypatch on _model_forward
         self._install_hook()
@@ -174,6 +179,7 @@ class ActivationCaptureExtension:
             from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
             original = GPUModelRunner._model_forward
+            ext = self  # capture extension self for closure
 
             def _wrapped_forward(self_ref: Any, *args: Any, **kwargs: Any) -> Any:
                 result = original(self_ref, *args, **kwargs)
@@ -181,18 +187,18 @@ class ActivationCaptureExtension:
                 # The result tuple for eagle3 includes aux_hidden_states.
                 # gpu_model_runner.py:4362-4368 unpacks:
                 #   hidden_states, aux_hidden_states = model_output
-                # We capture aux_hidden_states from the runner's instance.
-                # After _model_forward returns, aux_hidden_states is available
-                # as a local, but we can also read it from the model output.
-
-                # We need to capture from the runner's perspective.
-                # The simplest approach: capture from the model output itself.
-                # If the model returned (hidden_states, aux_hidden_states),
-                # aux_hidden_states is in result.
+                # We capture aux_hidden_states from the model output.
                 if isinstance(result, tuple) and len(result) >= 2:
                     aux_hidden_states = result[1]
                     if isinstance(aux_hidden_states, list) and len(aux_hidden_states) > 0:
-                        self._buffer_aux(aux_hidden_states)
+                        ext._buffer_aux(aux_hidden_states)
+                        # If we added the final layer (4 entries total), remove
+                        # it AFTER buffering so the drafter sees exactly 3.
+                        # The drafter's fc expects num_aux * H (gpu_model_runner.py
+                        # concatenates all entries at :5119-5121).
+                        expected = len(ext._original_aux_layers)
+                        if len(aux_hidden_states) > expected:
+                            del aux_hidden_states[expected:]
                 return result
 
             self._original_model_forward = original
@@ -215,6 +221,54 @@ class ActivationCaptureExtension:
         except Exception:
             logger.exception("Error removing _model_forward hook")
 
+    def _extend_aux_layers(self) -> None:
+        """Add the final decoder layer to the aux collection list.
+
+        This lets the serving engine capture the final layer's pre-norm
+        output as a 4th aux entry.  The runner's ``aux_hidden_state_layers``
+        is set by ``set_aux_hidden_state_layers`` (gpu_model_runner.py:5402)
+        landing on the model's ``EagleModelMixin`` (interfaces.py:1326-1327).
+
+        The drafter's ``fc`` width is fixed from the drafter's own config at
+        construction time (``llama_eagle3.py:176-187``) and is unaffected.
+        We remove the extra entry after buffering (in the _model_forward hook)
+        so the concatenation at ``gpu_model_runner.py:5119-5121`` produces a
+        3*H tensor for the 3*H drafter fc.
+        """
+        try:
+            runner = self.model_runner  # type: ignore[attr-defined]
+            model = runner.model
+            current_layers = model.aux_hidden_state_layers
+
+            # Read the total layer count from the model config
+            hf_config = runner.vllm_config.model_config.hf_config
+            num_layers = getattr(hf_config, "num_hidden_layers", None)
+            if num_layers is None:
+                logger.warning(
+                    "could not determine num_hidden_layers; "
+                    "skipping final-layer aux extension"
+                )
+                return
+
+            final_idx = num_layers  # 1-based index used by vLLM's aux collection
+            if final_idx in current_layers:
+                # Already present (e.g., offline extraction config)
+                self._original_aux_layers = current_layers
+                return
+
+            self._original_aux_layers = current_layers
+            self._final_layer_idx = final_idx
+            extended = current_layers + (final_idx,)
+            model.set_aux_hidden_state_layers(extended)
+            logger.info(
+                "Extended aux layers from %s to %s (added final layer %d)",
+                current_layers, extended, final_idx,
+            )
+        except Exception:
+            logger.exception(
+                "Failed to extend aux layers; final-layer capture unavailable"
+            )
+
     def _buffer_aux(self, aux_hidden_states: list[Tensor]) -> None:
         """Buffer aux hidden states into the pending dict.
 
@@ -224,15 +278,20 @@ class ActivationCaptureExtension:
         if not self._capture_active:
             return
 
-        # We need the layer indices. The runner sets them via
-        # set_aux_hidden_state_layers. We can read them from the model.
-        # For now, buffer by position — the caller knows the layer list.
+        # Use actual layer indices from the model's aux_hidden_state_layers.
+        # These are the indices the runner configured via
+        # set_aux_hidden_state_layers (interfaces.py:1326-1327).
+        try:
+            runner = self.model_runner  # type: ignore[attr-defined]
+            layer_indices: tuple[int, ...] = runner.model.aux_hidden_state_layers
+        except Exception:
+            # Fallback to positional indices if we can't reach the model
+            layer_indices = tuple(range(len(aux_hidden_states)))
+
         with self._lock:
             for i, tensor in enumerate(aux_hidden_states):
-                # Detach and pin for async CPU transfer
                 cpu_tensor = tensor.detach().cpu()
-                # Key by sequential index; the caller maps to layer indices
-                key = i
+                key = layer_indices[i] if i < len(layer_indices) else i
                 if key not in self._pending:
                     self._pending[key] = []
                 self._pending[key].append(cpu_tensor)

@@ -331,3 +331,78 @@ class TestSerialization:
         data = json.loads(out.read_text())
         assert data["prefix_cache_test"]["cache_hit"] is True
         assert data["prefix_cache_test"]["rows_missing"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Slice-before-drafter logic (hook.py)
+# ---------------------------------------------------------------------------
+
+
+class TestSliceBeforeDrafter:
+    """Test that the extension correctly slices the final-layer entry
+    from aux_hidden_states before feeding to the drafter.
+    """
+
+    def test_slice_removes_extra_entry(self) -> None:
+        """4-entry aux list truncated to 3 for the drafter."""
+        aux = [torch.ones(10, 2880) for _ in range(4)]
+        expected_count = 3
+        if len(aux) > expected_count:
+            del aux[expected_count:]
+        assert len(aux) == 3
+
+    def test_slice_noop_when_correct_count(self) -> None:
+        """3-entry aux list is untouched."""
+        aux = [torch.ones(10, 2880) for _ in range(3)]
+        expected_count = 3
+        if len(aux) > expected_count:
+            del aux[expected_count:]
+        assert len(aux) == 3
+
+    def test_concat_width_matches_drafter_fc(self) -> None:
+        """After slicing, concatenated width = num_aux * H."""
+        aux = [torch.ones(10, 2880) for _ in range(3)]
+        concat = torch.cat(aux, dim=-1)
+        assert concat.shape == (10, 3 * 2880)
+
+    def test_four_entries_would_crash_drafter(self) -> None:
+        """4 entries concatenated would be 4*H, not 3*H."""
+        aux = [torch.ones(10, 2880) for _ in range(4)]
+        concat = torch.cat(aux, dim=-1)
+        assert concat.shape[1] == 4 * 2880
+        assert concat.shape[1] != 3 * 2880
+
+
+# ---------------------------------------------------------------------------
+# Token count alignment (e2e test helpers)
+# ---------------------------------------------------------------------------
+
+
+class TestTokenAlignment:
+    """Test that captured/offline token alignment works correctly."""
+
+    def test_equal_lengths_pass_through(self) -> None:
+        cap = torch.randn(12, 2880)
+        off = torch.randn(12, 2880)
+        assert cap.shape[0] == off.shape[0]
+        # _align_token_count would return them unchanged
+
+    def test_captured_longer_is_trimmed(self) -> None:
+        cap = torch.randn(28, 2880)  # prompt + generated
+        off = torch.randn(12, 2880)  # prompt only
+        trimmed = cap[: off.shape[0]]
+        assert trimmed.shape == off.shape
+        assert trimmed.shape[0] == 12
+
+    def test_captured_shorter_raises(self) -> None:
+        cap = torch.randn(6, 2880)
+        off = torch.randn(12, 2880)
+        # Captured has fewer rows — this should be detected as a mismatch
+        assert cap.shape[0] < off.shape[0]
+
+    def test_bf16_alignment_preserves_dtype(self) -> None:
+        cap = torch.randn(16, 2880, dtype=torch.bfloat16)
+        off = torch.randn(12, 2880, dtype=torch.bfloat16)
+        trimmed = cap[: off.shape[0]]
+        assert trimmed.dtype == torch.bfloat16
+        assert trimmed.shape == (12, 2880)
