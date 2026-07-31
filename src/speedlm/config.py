@@ -285,6 +285,13 @@ class IdleTuningConfig:
     """Production composition settings for the opt-in idle tuner."""
 
     min_trace_records: int = 32
+    #: Accumulation threshold: the corpus must reach this size before a tuning
+    #: cycle is allowed to fire.  Matches ``training_window_records`` (256) by
+    #: default so the cycle trains on the full window rather than a partial one.
+    #: ``min_trace_records`` (32) remains as the lower-bound sanity floor; the
+    #: accumulation gate is a separate, higher bar that prevents training on a
+    #: corpus too small to produce a meaningful gradient step.
+    min_corpus_records: int = 256
     poll_interval_seconds: float = 1.0
     held_out_fraction: float = 0.2
     #: Scored suite passes per arm.  Five, not three, because the gate's
@@ -348,6 +355,15 @@ class IdleTuningConfig:
                 self.training_window_records,
                 "tuning.training_window_records",
                 self.min_trace_records,
+            )
+        _validate_int_gte(self.min_corpus_records, "tuning.min_corpus_records", 2)
+        if (
+            self.training_window_records is not None
+            and self.training_window_records < self.min_corpus_records
+        ):
+            raise ConfigError(
+                "tuning.training_window_records must be >= min_corpus_records "
+                f"({self.training_window_records} < {self.min_corpus_records})"
             )
         for name, value in (
             ("verifier_revision", self.verifier_revision),

@@ -363,3 +363,25 @@ def test_save_load_round_trip(tmp_path: Path) -> None:
     save_config(cfg, path)
     loaded = load_config(path)
     assert loaded.to_dict() == cfg.to_dict()
+
+
+# ---------------------------------------------------------------------------
+# IdleTuningConfig
+# ---------------------------------------------------------------------------
+
+
+def test_idle_tuning_config_default_min_corpus_records() -> None:
+    cfg = IdleTuningConfig()
+    assert cfg.min_corpus_records == 256
+    assert cfg.min_trace_records == 32
+    assert cfg.training_window_records == 256
+
+
+def test_idle_tuning_config_window_must_be_at_least_corpus() -> None:
+    with pytest.raises(ConfigError, match="training_window_records"):
+        IdleTuningConfig(training_window_records=128, min_corpus_records=256)
+
+
+def test_idle_tuning_config_corpus_too_small() -> None:
+    with pytest.raises(ConfigError, match="min_corpus_records"):
+        IdleTuningConfig(min_corpus_records=1)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, MutableMapping
+from collections.abc import AsyncIterator, Awaitable, Callable, MutableMapping
 from pathlib import Path
 from typing import Any
 
@@ -15,9 +15,7 @@ from fastapi.responses import JSONResponse
 from speedlm.cli import main
 from speedlm.gateway.app import create_app
 from speedlm.traces.store import TraceStore
-from speedlm.training.masking import MaskPolicy, require_trainable_window
-from speedlm.training.rows import prepare_training_row, training_row_from_trace
-from speedlm.training.templates.chatml import ChatMLTemplate
+from speedlm.training.rows import training_row_from_trace
 
 _ASGIMessage = MutableMapping[str, Any]
 _ASGIApp = Callable[
@@ -151,13 +149,6 @@ class _StreamingASGITransport(httpx.AsyncBaseTransport):
         )
 
 
-class _CharacterTokenizer:
-    def __call__(self, text: str, **kwargs: object) -> Mapping[str, object]:
-        del kwargs
-        return {
-            "input_ids": list(range(len(text))),
-            "offset_mapping": [(index, index + 1) for index in range(len(text))],
-        }
 
 
 def _upstream_app() -> FastAPI:
@@ -239,18 +230,8 @@ def test_capture_store_stats_and_training_rows(
     assert (stats.count, stats.tokens, stats.measured_tokens) == (1, 11, 11)
     record = next(store.iter_records())
     row = training_row_from_trace(record)
-    prepared = prepare_training_row(
-        row,
-        template=ChatMLTemplate(),
-        tokenizer=_CharacterTokenizer(),
-        mask_policy=MaskPolicy.FINAL_SPAN,
-    )
-
-    assert prepared.assistant_spans
-    assert any(prepared.loss_mask)
-    summary = require_trainable_window([prepared], total_seq_len=prepared.seq_len)
-    assert summary.row_count == 1
-    assert summary.retained_supervised_tokens > 0
+    assert row.id == "captured-integration"
+    assert row.conversation
 
 
 def test_trace_import_round_trip_across_openai_and_proxy_formats(
@@ -312,23 +293,5 @@ def test_trace_import_round_trip_across_openai_and_proxy_formats(
     records = list(store.iter_records())
     assert {record.id for record in records} == {"openai-shaped", "proxy-shaped"}
     assert store.stats().count == 2
-
-    prepared_rows = [
-        prepare_training_row(
-                training_row_from_trace(
-                    record,
-                    trust_untagged_assistant_messages=True,
-                ),
-            template=ChatMLTemplate(),
-            tokenizer=_CharacterTokenizer(),
-            mask_policy=MaskPolicy.FINAL_SPAN,
-        )
-        for record in records
-    ]
-    assert all(row.assistant_spans and any(row.loss_mask) for row in prepared_rows)
-    summary = require_trainable_window(
-        prepared_rows,
-        total_seq_len=max(row.seq_len for row in prepared_rows),
-    )
-    assert summary.row_count == 2
-    assert summary.rows_without_retained_supervision == 0
+    rows = [training_row_from_trace(r, trust_untagged_assistant_messages=True) for r in records]
+    assert all(row.conversation for row in rows)

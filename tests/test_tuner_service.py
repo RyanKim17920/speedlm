@@ -293,6 +293,7 @@ def _service(
     activity: ActivityTracker | None = None,
     enabled: bool | None = True,
     min_trace_records: int = 2,
+    min_corpus_records: int = 2,
 ) -> tuple[TunerService, FakeBackend, FakeGate, FakeRuntime, ActivityTracker]:
     actual_backend = backend or FakeBackend()
     actual_activity = activity or ActivityTracker()
@@ -314,6 +315,7 @@ def _service(
         runtime=runtime,
         enabled=enabled,
         min_trace_records=min_trace_records,
+        min_corpus_records=min_corpus_records,
         poll_interval_seconds=0.005,
         home=tmp_path,
         run_id_factory=run_id,
@@ -817,6 +819,65 @@ def test_factory_resolves_profile_before_creating_durable_state(
         )
 
     assert not (tmp_path / "runs" / "state.json").exists()
+
+
+def test_corpus_below_accumulation_threshold_does_not_fire_cycle(
+    tmp_path: Path,
+) -> None:
+    """The accumulation gate blocks training on too-small corpora."""
+    traces = FakeTraces(10)
+    service, backend, gate, _, _ = _service(
+        tmp_path, traces=traces, min_corpus_records=32
+    )
+    service.start()
+    try:
+        time.sleep(0.05)
+        assert gate.calls == 0
+        assert backend.calls == []
+    finally:
+        service.stop(timeout_seconds=1.0)
+
+
+def test_corpus_at_accumulation_threshold_fires_cycle(tmp_path: Path) -> None:
+    """Once the corpus reaches the accumulation threshold, a cycle fires."""
+    traces = FakeTraces(32)
+    service, backend, gate, _, _ = _service(
+        tmp_path, traces=traces, min_trace_records=2, min_corpus_records=32
+    )
+    service.start()
+    try:
+        _wait_until(lambda: gate.calls == 1)
+    finally:
+        service.stop(timeout_seconds=1.0)
+
+
+def test_retention_does_not_evict_while_accumulating(tmp_path: Path) -> None:
+    """Pruning is skipped while corpus < min_corpus_records."""
+    traces = FakeTraces(10)
+    service, _, gate, _, _ = _service(
+        tmp_path, traces=traces, min_corpus_records=32
+    )
+    service.start()
+    try:
+        time.sleep(0.05)
+        assert gate.calls == 0
+        assert traces.prunes == 0
+    finally:
+        service.stop(timeout_seconds=1.0)
+
+
+def test_retention_runs_after_cycle_fires(tmp_path: Path) -> None:
+    """Once the cycle fires, pruning is no longer suppressed."""
+    traces = FakeTraces(32)
+    service, _, gate, _, _ = _service(
+        tmp_path, traces=traces, min_trace_records=2, min_corpus_records=32
+    )
+    service.start()
+    try:
+        _wait_until(lambda: gate.calls == 1)
+        _wait_until(lambda: traces.prunes >= 1)
+    finally:
+        service.stop(timeout_seconds=1.0)
 
 
 def _runner_for(

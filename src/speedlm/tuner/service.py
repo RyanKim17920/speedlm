@@ -31,6 +31,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_POLL_INTERVAL_SECONDS = 1.0
 DEFAULT_MIN_TRACE_RECORDS = 32
+DEFAULT_MIN_CORPUS_RECORDS = 256
 SCHEDULER_STATUS_FILE = "scheduler.json"
 
 
@@ -179,6 +180,7 @@ def create_tuner_service(
     runtime: RuntimeController,
     enabled: bool | None = None,
     min_trace_records: int = DEFAULT_MIN_TRACE_RECORDS,
+    min_corpus_records: int = DEFAULT_MIN_CORPUS_RECORDS,
     poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
     home: Path | None = None,
     profiles: Mapping[str, ModelProfile] | None = None,
@@ -222,6 +224,7 @@ def create_tuner_service(
         orchestrator_factory=orchestrator_factory,
         enabled=enabled,
         min_trace_records=min_trace_records,
+        min_corpus_records=min_corpus_records,
         poll_interval_seconds=poll_interval_seconds,
         clock=clock,
         wall_clock=wall_clock,
@@ -245,6 +248,7 @@ class TunerService:
         orchestrator_factory: OrchestratorFactory,
         enabled: bool | None = None,
         min_trace_records: int = DEFAULT_MIN_TRACE_RECORDS,
+        min_corpus_records: int = DEFAULT_MIN_CORPUS_RECORDS,
         poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
@@ -261,6 +265,12 @@ class TunerService:
         ):
             raise TunerServiceConfigurationError("min_trace_records must be a positive integer")
         if (
+            isinstance(min_corpus_records, bool)
+            or not isinstance(min_corpus_records, int)
+            or min_corpus_records < 1
+        ):
+            raise TunerServiceConfigurationError("min_corpus_records must be a positive integer")
+        if (
             isinstance(poll_interval_seconds, bool)
             or not isinstance(poll_interval_seconds, (int, float))
             or poll_interval_seconds <= 0
@@ -270,6 +280,7 @@ class TunerService:
         self._enabled = enabled
         self._traces = traces
         self._min_trace_records = min_trace_records
+        self._min_corpus_records = min_corpus_records
         self._poll_interval_seconds = float(poll_interval_seconds)
         self._stop_requested = Event()
         self._startup_complete = Event()
@@ -460,6 +471,7 @@ class TunerService:
 
         if (
             watermark.count < self._min_trace_records
+            or watermark.count < self._min_corpus_records
             or watermark == self._last_attempted
             or self._stop_requested.is_set()
         ):
@@ -513,6 +525,14 @@ class TunerService:
         untouched when it cannot rewrite it.
         """
         if self._stop_requested.is_set():
+            return
+        # Do not evict records while the corpus is still below the accumulation
+        # threshold; pruning here would prevent accumulation from ever completing.
+        try:
+            record_count = self._traces.stats().count
+        except Exception:
+            record_count = 0
+        if record_count < self._min_corpus_records:
             return
         try:
             dropped = self._traces.prune()

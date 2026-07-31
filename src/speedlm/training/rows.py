@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, Protocol
 
 from speedlm.traces.store import TraceRecord
-from speedlm.training.masking import MaskPolicy, loss_mask_from_offsets
+from speedlm.training.masking import MaskPolicy
 from speedlm.training.templates.base import (
     AssistantSpan,
     ChatTemplate,
@@ -283,60 +283,6 @@ def training_row_from_trace(
         model=model,
         model_revision=model_revision,
         metadata=_json_copy(metadata, f"trace {row_id!r} metadata"),
-    )
-
-
-def prepare_training_row(
-    row: TrainingRow,
-    *,
-    template: ChatTemplate,
-    tokenizer: Tokenizer,
-    mask_policy: MaskPolicy,
-    max_seq_length: int | None = None,
-) -> PreparedTrainingRow:
-    """Render, tokenize, and mask one row with no model/GPU dependency."""
-    if max_seq_length is not None and (
-        isinstance(max_seq_length, bool)
-        or not isinstance(max_seq_length, int)
-        or max_seq_length < 1
-    ):
-        raise ValueError("max_seq_length must be a positive integer")
-    rendered = template.render(row.conversation, tools=row.tools)
-    spans = template.assistant_spans(rendered)
-    generated_spans = _generated_assistant_spans(
-        row,
-        template=template,
-        rendered=rendered,
-        spans=spans,
-    )
-    kwargs: dict[str, object] = {
-        "add_special_tokens": False,
-        "return_offsets_mapping": True,
-    }
-    if max_seq_length is not None:
-        kwargs.update(truncation=True, max_length=max_seq_length)
-    encoded = tokenizer(rendered, **kwargs)
-    input_ids = _integer_sequence(encoded.get("input_ids"), "input_ids", row.id)
-    offsets = _offset_sequence(encoded.get("offset_mapping"), row.id)
-    if len(input_ids) != len(offsets):
-        raise ValueError(
-            f"training row {row.id!r} tokenizer returned {len(input_ids)} ids "
-            f"but {len(offsets)} offsets"
-        )
-    loss_mask = loss_mask_from_offsets(
-        offsets,
-        generated_spans,
-        policy=mask_policy,
-        row_id=row.id,
-    )
-    return PreparedTrainingRow(
-        id=row.id,
-        input_ids=input_ids,
-        loss_mask=loss_mask,
-        seq_len=len(input_ids),
-        rendered=rendered,
-        assistant_spans=spans,
-        mask_policy=mask_policy,
     )
 
 

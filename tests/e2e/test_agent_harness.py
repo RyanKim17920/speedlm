@@ -9,7 +9,6 @@ import shutil
 import signal
 import socket
 import subprocess
-import sys
 import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -18,15 +17,6 @@ from typing import Any
 
 import httpx
 import pytest
-
-from speedlm.training.masking import MaskPolicy
-from speedlm.training.rows import (
-    load_tokenizer_snapshot,
-    prepare_training_row,
-    training_row_from_trace,
-)
-from speedlm.training.templates.chatml import ChatMLTemplate
-from speedlm.training.templates.harmony import HarmonyTemplate
 
 pytestmark = pytest.mark.e2e
 
@@ -942,117 +932,6 @@ def _validate_trace_completeness(
     }
 
 
-def _enable_vllm_transformers() -> None:
-    site_packages = VLLM_VENV / "lib" / "python3.12" / "site-packages"
-    assert site_packages.is_dir(), f"missing vLLM site-packages: {site_packages}"
-    site_text = str(site_packages)
-    if site_text not in sys.path:
-        sys.path.append(site_text)
-
-
-def _training_trace_view(trace: JsonObject) -> JsonObject:
-    """Supply tool-result names omitted by strict OpenAI clients such as Qwen Code."""
-    view = json.loads(json.dumps(trace))
-    messages = view["messages"]
-    call_names: dict[str, str] = {}
-    for message in messages:
-        for call_id, name, _ in _call_details(message):
-            call_names[call_id] = name
-        if message.get("role") == "tool" and "name" not in message:
-            call_id = message.get("tool_call_id")
-            assert isinstance(call_id, str) and call_id in call_names, message
-            message["name"] = call_names[call_id]
-    return view
-
-
-def _training_yield_report(
-    traces: Sequence[JsonObject],
-    *,
-    model: str,
-    snapshot: Path,
-) -> tuple[JsonObject, str]:
-    rows = [
-        training_row_from_trace(_training_trace_view(trace), tools=AGENT_TOOLS)
-        for trace in traces
-    ]
-    template = HarmonyTemplate() if "gpt-oss" in model.lower() else ChatMLTemplate()
-    if isinstance(template, ChatMLTemplate):
-        eligible = [
-            row
-            for row in rows
-            if any(
-                message.get("role") == "assistant"
-                and isinstance(message.get("content"), str)
-                and message["content"]
-                for message in row.conversation
-            )
-        ]
-    else:
-        eligible = rows
-    assert eligible, "captured traces produced no template-trainable rows"
-
-    _enable_vllm_transformers()
-    tokenizer = load_tokenizer_snapshot(snapshot)
-    table_rows: list[JsonObject] = []
-    for policy in (
-        MaskPolicy.FINAL_SPAN,
-        MaskPolicy.FINAL_TURN_ALL_CHANNELS,
-        MaskPolicy.ALL_ASSISTANT_TURNS,
-    ):
-        prepared = [
-            prepare_training_row(
-                row,
-                template=template,
-                tokenizer=tokenizer,
-                mask_policy=policy,
-            )
-            for row in eligible
-        ]
-        sequence_tokens = sum(item.seq_len for item in prepared)
-        supervised_tokens = sum(sum(item.loss_mask) for item in prepared)
-        assert sequence_tokens > 0
-        assert supervised_tokens > 0
-        table_rows.append(
-            {
-                "policy": policy.name,
-                "rows": len(prepared),
-                "sequence_tokens": sequence_tokens,
-                "supervised_tokens": supervised_tokens,
-                "yield_percent": 100.0 * supervised_tokens / sequence_tokens,
-            }
-        )
-    supervised = [item["supervised_tokens"] for item in table_rows]
-    assert supervised == sorted(supervised), (
-        "broader MaskPolicy selections must not reduce supervised-token yield"
-    )
-
-    lines = [
-        "Supervised-token yield from captured agent traces",
-        (
-            "policy                   rows  sequence_tokens  "
-            "supervised_tokens  yield_percent"
-        ),
-    ]
-    for item in table_rows:
-        lines.append(
-            f"{item['policy']:<25}"
-            f"{item['rows']:>5}"
-            f"{item['sequence_tokens']:>17}"
-            f"{item['supervised_tokens']:>19}"
-            f"{item['yield_percent']:>15.2f}"
-        )
-    report: JsonObject = {
-        "model": model,
-        "template": template.name,
-        "captured_trace_count": len(traces),
-        "eligible_training_rows": len(eligible),
-        "tokenizer_snapshot": str(snapshot),
-        "tool_schema_source": "harness agent adapter",
-        "policies": table_rows,
-    }
-    return report, "\n".join(lines) + "\n"
-
-
 @pytest.mark.e2e
 def test_agent_harness_full_circle() -> None:
     _require_live_e2e()
@@ -1188,18 +1067,6 @@ def test_agent_harness_full_circle() -> None:
             advertised_tools=agent_run.advertised_tools,
         )
         _write_json(artifact_dir / "trace-completeness.json", completeness)
-
-        yield_report, yield_table = _training_yield_report(
-            traces,
-            model=model,
-            snapshot=snapshot,
-        )
-        _write_json(artifact_dir / "supervised-token-yield.json", yield_report)
-        (artifact_dir / "supervised-token-yield.txt").write_text(
-            yield_table,
-            encoding="utf-8",
-        )
-        print(yield_table, end="")
     finally:
         if process.poll() is None:
             os.killpg(process.pid, signal.SIGTERM)

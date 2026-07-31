@@ -11,7 +11,6 @@ from speedlm.training.masking import (
 from speedlm.training.rows import (
     PreparedTrainingRow,
     TrainingRow,
-    prepare_training_row,
     training_row_from_trace,
 )
 
@@ -24,7 +23,6 @@ __all__ = [
     "TrainingBackendError",
     "TrainingRow",
     "TrainingWindowSummary",
-    "prepare_training_row",
     "require_trainable_window",
     "summarize_training_window",
     "training_row_from_trace",
