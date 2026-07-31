@@ -225,13 +225,24 @@ class ActivationCaptureExtension:
                     aux_hidden_states = result[1]
                     if isinstance(aux_hidden_states, list) and len(aux_hidden_states) > 0:
                         ext._buffer_aux(aux_hidden_states)
-                        # If we added the final layer (4 entries total), remove
-                        # it AFTER buffering so the drafter sees exactly 3.
-                        # The drafter's fc expects num_aux * H (gpu_model_runner.py
-                        # concatenates all entries at :5119-5121).
+                        # If we extended the aux layers, remove the extra entry
+                        # AFTER buffering so the drafter sees exactly the
+                        # canonical layers.  Only strip when extension actually
+                        # succeeded (detected by _original_aux_layers being
+                        # non-empty).  The drafter's fc expects num_aux * H
+                        # (gpu_model_runner.py concatenates all entries at
+                        # :5119-5121).
                         expected = len(ext._original_aux_layers)
-                        if len(aux_hidden_states) > expected:
+                        if expected > 0 and len(aux_hidden_states) > expected:
                             del aux_hidden_states[expected:]
+                        # Hard guard: the drafter will crash on empty list
+                        # (torch.cat of empty list).
+                        if len(aux_hidden_states) == 0:
+                            raise RuntimeError(
+                                "aux_hidden_states is empty before drafter; "
+                                "activation capture extension left the "
+                                "engine in a broken state"
+                            )
                 return result
 
             self._original_model_forward = original
@@ -262,45 +273,63 @@ class ActivationCaptureExtension:
         is set by ``set_aux_hidden_state_layers`` (gpu_model_runner.py:5402)
         landing on the model's ``EagleModelMixin`` (interfaces.py:1326-1327).
 
+        The ``aux_hidden_state_layers`` attribute lives on the *inner* model
+        (the one that inherits ``EagleModelMixin``), not the top-level model
+        (e.g. ``GptOssForCausalLM``).  We resolve the inner model the same
+        way vLLM does in ``SupportsEagle3.set_aux_hidden_state_layers``
+        (interfaces.py:1395-1406): try ``get_language_model()`` /
+        ``.language_model``, then access ``.model``.
+
         The drafter's ``fc`` width is fixed from the drafter's own config at
         construction time (``llama_eagle3.py:176-187``) and is unaffected.
         We remove the extra entry after buffering (in the _model_forward hook)
         so the concatenation at ``gpu_model_runner.py:5119-5121`` produces a
         3*H tensor for the 3*H drafter fc.
+
+        Raises:
+            RuntimeError: if the inner model cannot be resolved or lacks the
+                aux_hidden_state_layers attribute.  The caller
+                (``activate_capture``) should NOT catch this — a failed
+                extension means the pre-norm capture is broken and serving
+                must not proceed.
         """
-        try:
-            runner = self.model_runner  # type: ignore[attr-defined]
-            model = runner.model
-            current_layers = model.aux_hidden_state_layers
+        runner = self.model_runner  # type: ignore[attr-defined]
+        model = runner.model
 
-            # Read the total layer count from the model config
-            hf_config = runner.vllm_config.model_config.hf_config
-            num_layers = getattr(hf_config, "num_hidden_layers", None)
-            if num_layers is None:
-                logger.warning(
-                    "could not determine num_hidden_layers; "
-                    "skipping final-layer aux extension"
-                )
-                return
+        # Resolve the inner model the same way vLLM does
+        # (interfaces.py:1395-1406).
+        parent_ref = model
+        if hasattr(model, "get_language_model"):
+            parent_ref = model.get_language_model()
+        elif hasattr(model, "language_model"):
+            parent_ref = model.language_model
+        inner_model = parent_ref.model
 
-            final_idx = num_layers  # 1-based index used by vLLM's aux collection
-            if final_idx in current_layers:
-                # Already present (e.g., offline extraction config)
-                self._original_aux_layers = current_layers
-                return
+        current_layers = inner_model.aux_hidden_state_layers
 
+        # Read the total layer count from the model config
+        hf_config = runner.vllm_config.model_config.hf_config
+        num_layers = getattr(hf_config, "num_hidden_layers", None)
+        if num_layers is None:
+            raise RuntimeError(
+                "could not determine num_hidden_layers; "
+                "cannot extend aux layers for final-layer capture"
+            )
+
+        final_idx = num_layers  # 1-based index used by vLLM's aux collection
+        if final_idx in current_layers:
+            # Already present (e.g., offline extraction config)
             self._original_aux_layers = current_layers
-            self._final_layer_idx = final_idx
-            extended = current_layers + (final_idx,)
-            model.set_aux_hidden_state_layers(extended)
-            logger.info(
-                "Extended aux layers from %s to %s (added final layer %d)",
-                current_layers, extended, final_idx,
-            )
-        except Exception:
-            logger.exception(
-                "Failed to extend aux layers; final-layer capture unavailable"
-            )
+            return
+
+        self._original_aux_layers = current_layers
+        self._final_layer_idx = final_idx
+        extended = current_layers + (final_idx,)
+        model.set_aux_hidden_state_layers(extended)
+        logger.info(
+            "Extended aux layers from %s to %s (added final layer %d)",
+            current_layers, extended, final_idx,
+        )
 
     def _buffer_aux(self, aux_hidden_states: list[Tensor]) -> None:
         """Buffer aux hidden states into the pending dict.
@@ -317,7 +346,13 @@ class ActivationCaptureExtension:
         # set_aux_hidden_state_layers (interfaces.py:1326-1327).
         try:
             runner = self.model_runner  # type: ignore[attr-defined]
-            layer_indices: tuple[int, ...] = runner.model.aux_hidden_state_layers
+            top_model = runner.model
+            _parent = top_model
+            if hasattr(_parent, "get_language_model"):
+                _parent = _parent.get_language_model()
+            elif hasattr(_parent, "language_model"):
+                _parent = _parent.language_model
+            layer_indices: tuple[int, ...] = _parent.model.aux_hidden_state_layers
         except Exception:
             # Fallback to positional indices if we can't reach the model
             layer_indices = tuple(range(len(aux_hidden_states)))
