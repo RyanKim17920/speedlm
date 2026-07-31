@@ -302,10 +302,10 @@ def _load_captured_safetensors(capture_dir: Path) -> dict[int, torch.Tensor]:
     if not path.exists():
         raise FileNotFoundError(f"no captured.safetensors in {capture_dir}")
     tensors: dict[int, torch.Tensor] = {}
-    with safe_open(str(path), framework="pt") as f:
-        for key in f:
+    with safe_open(str(path), framework="pt", device="cpu") as f:
+        for key in f.keys():  # noqa: SIM118  (safe_open handle, not a dict)  # noqa: SIM118 (safe_open handle, not a dict)
             if key.startswith("layer_"):
-                idx = int(key.split("_")[1])
+                idx = int(key.split("_", 1)[1])
                 tensors[idx] = f.get_tensor(key)
     return tensors
 

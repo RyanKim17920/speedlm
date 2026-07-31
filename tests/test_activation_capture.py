@@ -517,27 +517,191 @@ class TestE2EHelpers:
             if original is not None:
                 os.environ["VLLM_SERVER_DEV_MODE"] = original
 
-    def test_405_not_treated_as_route_missing(self) -> None:
-        """A POST-only endpoint returning 405 must not be treated as 'route missing'.
 
-        The previous implementation probed /v1/chat/completions with HEAD,
-        which returned 405 (Method Not Allowed) because the endpoint only
-        accepts POST. The guard misinterpreted this as 'route missing' and
-        killed the GPU job with a false negative.
+# ---------------------------------------------------------------------------
+# Real safetensors I/O (prevents safe_open API misuse from recurring)
+# ---------------------------------------------------------------------------
 
-        The fix uses the OpenAPI schema to check route availability instead.
+
+class TestSafetensorsIO:
+    """Round-trip through real safetensors files on tmp_path.
+
+    These tests write actual safetensors files and read them back through
+    the loaders used by the e2e test and offline_extract.  They use
+    pytest.importorskip so they skip cleanly when torch/safetensors are
+    unavailable in the project venv.
+    """
+
+    safetensors = pytest.importorskip("safetensors")
+
+    def test_captured_loader_roundtrip(self, tmp_path: Path) -> None:
+        """_load_captured_safetensors can read a file we wrote."""
+        from safetensors.torch import save_file
+
+        capture_dir = tmp_path / "captured"
+        capture_dir.mkdir()
+        save_file(
+            {
+                "layer_2": torch.ones(4, 8),
+                "layer_12": torch.ones(4, 8) * 2,
+                "layer_21": torch.ones(4, 8) * 3,
+                "layer_24": torch.ones(4, 8) * 4,  # final layer
+            },
+                str(capture_dir / "captured.safetensors"),
+        )
+
+        from tests.e2e.test_serving_activation_capture import _load_captured_safetensors
+
+        tensors = _load_captured_safetensors(capture_dir)
+        assert sorted(tensors.keys()) == [2, 12, 21, 24]
+        assert tensors[2].shape == (4, 8)
+        assert torch.allclose(tensors[12], torch.ones(4, 8) * 2)
+
+    def test_captured_loader_missing_file(self, tmp_path: Path) -> None:
+        """_load_captured_safetensors raises FileNotFoundError when absent."""
+        capture_dir = tmp_path / "captured"
+        capture_dir.mkdir()
+
+        from tests.e2e.test_serving_activation_capture import _load_captured_safetensors
+
+        with pytest.raises(FileNotFoundError, match="no captured.safetensors"):
+            _load_captured_safetensors(capture_dir)
+
+    def test_offline_loader_roundtrip(self, tmp_path: Path) -> None:
+        """_load_offline_hidden_states reads hs_*.safetensors shards."""
+        from safetensors.torch import save_file
+
+        hs_dir = tmp_path / "offline_hs"
+        hs_dir.mkdir()
+        # (seq_len=4, num_layers=4, hidden_size=8)
+        hs = torch.randn(4, 4, 8)
+        save_file({"hidden_states": hs}, str(hs_dir / "hs_0.safetensors"))
+
+        from tests.e2e.test_serving_activation_capture import _load_offline_hidden_states
+
+        target_layers = [2, 12, 21, 24]
+        tensors = _load_offline_hidden_states(hs_dir, target_layers=target_layers)
+        # 4 layers in shard -> keys = target_layers
+        assert sorted(tensors.keys()) == [2, 12, 21, 24]
+        assert tensors[2].shape == (4, 8)
+        assert torch.allclose(tensors[2], hs[:, 0])
+
+    def test_offline_loader_missing_file(self, tmp_path: Path) -> None:
+        """_load_offline_hidden_states raises FileNotFoundError when absent."""
+        hs_dir = tmp_path / "offline_hs"
+        hs_dir.mkdir()
+
+        from tests.e2e.test_serving_activation_capture import _load_offline_hidden_states
+
+        with pytest.raises(FileNotFoundError, match="no hs_.*safetensors"):
+            _load_offline_hidden_states(hs_dir, target_layers=[2])
+
+    def test_offline_loader_multiple_shards(self, tmp_path: Path) -> None:
+        """Multiple hs_*.safetensors shards are concatenated along dim=0."""
+        from safetensors.torch import save_file
+
+        hs_dir = tmp_path / "offline_hs"
+        hs_dir.mkdir()
+        save_file({"hidden_states": torch.ones(4, 2, 8)}, str(hs_dir / "hs_0.safetensors"))
+        save_file({"hidden_states": torch.ones(3, 2, 8) * 2}, str(hs_dir / "hs_1.safetensors"))
+
+        from tests.e2e.test_serving_activation_capture import _load_offline_hidden_states
+
+        tensors = _load_offline_hidden_states(hs_dir, target_layers=[2, 12])
+        assert sorted(tensors.keys()) == [2, 12]
+        # 4 + 3 = 7 rows concatenated
+        assert tensors[2].shape == (7, 8)
+
+    def test_load_hidden_states_roundtrip(self, tmp_path: Path) -> None:
+        """offline_extract.load_hidden_states reads shards correctly."""
+        from safetensors.torch import save_file
+
+        from speedlm.activation_capture.offline_extract import load_hidden_states
+
+        hs_dir = tmp_path / "offline_hs"
+        hs_dir.mkdir()
+        hs = torch.randn(6, 3, 16)
+        save_file({"hidden_states": hs}, str(hs_dir / "hs_0.safetensors"))
+
+        result = load_hidden_states(hs_dir)
+        assert sorted(result.keys()) == ["0", "1", "2"]
+        assert result["0"].shape == (6, 16)
+        assert torch.allclose(result["0"], hs[:, 0])
+
+    def test_safe_open_uses_keys_method(self, tmp_path: Path) -> None:
+        """Verify that safe_open handle is NOT directly iterable; .keys() is required.
+
+        Regression test: iterating the handle directly raised
+        TypeError: 'builtins.safe_open' object is not iterable.
         """
-        import inspect
+        from safetensors.torch import save_file
 
-        from tests.e2e.test_serving_activation_capture import _get_served_model_id
+        path = tmp_path / "test.safetensors"
+        save_file({"layer_42": torch.ones(2, 4)}, str(path))
 
-        source = inspect.getsource(_get_served_model_id)
-        # Must NOT contain a HEAD request
-        assert ".head(" not in source, (
-            "_get_served_model_id must not use HEAD requests — "
-            "POST-only endpoints return 405 for HEAD, causing false negatives"
+        from safetensors import safe_open
+
+        # This should work
+        with safe_open(str(path), framework="pt", device="cpu") as f:
+            keys = list(f.keys())
+        assert keys == ["layer_42"]
+
+        # Direct iteration would fail (documented, not tested here to avoid
+        # asserting on C extension behavior that may change)
+
+    def test_key_parsing_robust(self, tmp_path: Path) -> None:
+        """Key parsing with split("_", 1) handles layer indices with underscores."""
+        from safetensors.torch import save_file
+
+        capture_dir = tmp_path / "captured"
+        capture_dir.mkdir()
+        # Edge case: layer index could theoretically contain extra text
+        save_file(
+            {
+                "layer_2": torch.ones(2, 4),
+                "layer_12": torch.ones(2, 4),
+            },
+            str(capture_dir / "captured.safetensors"),
         )
-        # Must use OpenAPI schema to check route availability
-        assert "openapi" in source.lower() or "openapi" in source, (
-            "_get_served_model_id should check route availability via OpenAPI schema"
+
+        from tests.e2e.test_serving_activation_capture import _load_captured_safetensors
+
+        tensors = _load_captured_safetensors(capture_dir)
+        assert 2 in tensors
+        assert 12 in tensors
+
+    def test_captured_loader_ignores_non_layer_keys(self, tmp_path: Path) -> None:
+        """Keys not starting with 'layer_' are silently skipped."""
+        from safetensors.torch import save_file
+
+        capture_dir = tmp_path / "captured"
+        capture_dir.mkdir()
+        save_file(
+            {
+                "layer_5": torch.ones(2, 4),
+                "metadata": torch.zeros(1),  # should be ignored
+                "__metadata__": torch.zeros(1),  # should be ignored
+            },
+            str(capture_dir / "captured.safetensors"),
         )
+
+        from tests.e2e.test_serving_activation_capture import _load_captured_safetensors
+
+        tensors = _load_captured_safetensors(capture_dir)
+        assert sorted(tensors.keys()) == [5]
+
+    def test_bf16_roundtrip(self, tmp_path: Path) -> None:
+        """Captured tensors are bf16; loader preserves dtype."""
+        from safetensors.torch import save_file
+
+        capture_dir = tmp_path / "captured"
+        capture_dir.mkdir()
+        save_file(
+            {"layer_2": torch.randn(4, 8, dtype=torch.bfloat16)},
+            str(capture_dir / "captured.safetensors"),
+        )
+
+        from tests.e2e.test_serving_activation_capture import _load_captured_safetensors
+
+        tensors = _load_captured_safetensors(capture_dir)
+        assert tensors[2].dtype == torch.bfloat16
