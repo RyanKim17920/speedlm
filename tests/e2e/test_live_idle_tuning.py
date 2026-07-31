@@ -19,6 +19,7 @@ Optional environment:
 * ``SPEEDLM_E2E_TUNING_TIMEOUT=7200``
 * ``SPEEDLM_E2E_REQUEST_TIMEOUT=1200``
 * ``SPEEDLM_E2E_SEED_REQUESTS=256``
+* ``SPEEDLM_E2E_PROMPT_CORPUS=/path/to/prompts.jsonl``
 
 One invocation creates an isolated ``SPEEDLM_HOME`` under the artifact root,
 so old traces, active artifacts, and scheduler state cannot satisfy assertions.
@@ -42,6 +43,66 @@ import httpx
 import pytest
 
 from speedlm.config import SpeedLMConfig, load_config
+
+# ── prompt corpus helpers ───────────────────────────────────────────────────
+
+def _load_prompt_corpus() -> list[str] | None:
+    """Load real prompts from SPEEDLM_E2E_PROMPT_CORPUS if set.
+
+    Expects a JSONL file where each line is
+    ``{"messages": [{"role": "user", "content": "…"}]}``.
+    Returns ``None`` when the env var is not set.
+    """
+    corpus_path = os.environ.get("SPEEDLM_E2E_PROMPT_CORPUS")
+    if corpus_path is None:
+        return None
+    path = Path(corpus_path).expanduser().resolve()
+    assert path.is_file(), f"SPEEDLM_E2E_PROMPT_CORPUS is not a file: {path}"
+    prompts: list[str] = []
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        stripped = raw_line.strip()
+        if not stripped:
+            continue
+        obj: object = json.loads(stripped)
+        assert isinstance(obj, dict), f"corpus line is not a JSON object: {stripped[:80]}"
+        messages = obj.get("messages")
+        assert isinstance(messages, list) and messages, (
+            f"corpus line missing 'messages': {stripped[:80]}"
+        )
+        first = messages[0]
+        assert isinstance(first, dict) and first.get("role") == "user", (
+            f"first message must be user role: {stripped[:80]}"
+        )
+        content = first.get("content")
+        assert isinstance(content, str) and content.strip(), (
+            f"empty user content: {stripped[:80]}"
+        )
+        prompts.append(content)
+    return prompts
+
+
+def _select_prompts(
+    corpus: list[str] | None, *, seed_count: int
+) -> list[str]:
+    """Return ``seed_count`` prompts, deterministically.
+
+    When *corpus* is ``None``, fall back to the original synthetic template.
+    When the corpus is too small, raise AssertionError with a clear message.
+    """
+    if corpus is None:
+        return [
+            f"This is idle-tuning seed request {i + 1}/{seed_count}. "
+            f"Reply with one short sentence."
+            for i in range(seed_count)
+        ]
+    if len(corpus) < seed_count:
+        raise AssertionError(
+            f"prompt corpus has {len(corpus)} prompts but "
+            f"{seed_count} are needed; set SPEEDLM_E2E_SEED_REQUESTS <= {len(corpus)} "
+            f"or use a larger corpus"
+        )
+    return corpus[:seed_count]
+
 
 pytestmark = pytest.mark.e2e
 
@@ -499,15 +560,15 @@ def test_live_idle_tuning_preempts_then_completes() -> None:
         assert observed_pids, "speedlm did not launch a vLLM child"
 
         traces_path = home / "traces" / "traces.jsonl"
-        for index in range(seed_count):
+        prompts = _select_prompts(
+            _load_prompt_corpus(), seed_count=seed_count
+        )
+        assert len(prompts) == seed_count
+        for index, prompt in enumerate(prompts):
             body, _ = _post_chat(
                 gateway_url,
                 config,
-                (
-                    "This is idle-tuning seed request "
-                    f"{index + 1}/{seed_count}. "
-                    "Reply with one short sentence."
-                ),
+                prompt,
                 timeout=request_timeout,
             )
             _write_json(artifact_dir / f"seed-response-{index + 1:04d}.json", body)
