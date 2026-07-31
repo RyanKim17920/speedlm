@@ -495,40 +495,6 @@ def _wait_for_gpu_memory_release(
 # ---------------------------------------------------------------------------
 
 
-def _wait_for_gpu_memory_release(
-    gpu_memory_fraction: float,
-    *,
-    timeout: float = 120.0,
-    poll_interval: float = 1.0,
-) -> None:
-    """Block until GPU device memory is released enough for the next engine.
-
-    Uses ``nvidia-smi`` to poll the real driver — not a fixed sleep — so we
-    only proceed once the previous engine has actually freed its allocations.
-
-    Args:
-        gpu_memory_fraction: The fraction of total device memory the next
-            engine will request via ``--gpu-memory-utilization``.
-    """
-    probe = NvidiaSmiMemoryProbe()
-    precondition = GPUMemoryPrecondition(
-        probe=probe,
-        required_fraction=gpu_memory_fraction,
-        timeout_seconds=timeout,
-        poll_interval_seconds=poll_interval,
-    )
-    deadline = time.monotonic() + timeout
-    shortfall = precondition.shortfall()
-    while shortfall is not None:
-        if time.monotonic() >= deadline:
-            raise RuntimeError(
-                f"GPU memory was not released within {timeout}s: {shortfall}"
-            )
-        time.sleep(poll_interval)
-        shortfall = precondition.shortfall()
-    logger.info("GPU memory released; proceeding with offline extraction")
-
-
 def test_stage0_activation_capture() -> None:
     """Full Stage 0 experiment: serve one prompt with capture, compare offline.
 
