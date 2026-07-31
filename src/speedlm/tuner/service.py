@@ -499,6 +499,16 @@ class TunerService:
             logger.error("idle tuning cycle failed: %s", result.error or "unknown error")
             if result.outcome is CycleOutcome.FAILED:
                 self._recover_serving("failed cycle")
+        elif result.outcome is CycleOutcome.BENCHMARK_TIMED_OUT:
+            # An infrastructure failure, not a rejection: the cycle already
+            # rolled back and restored serving, but a deadline that cannot fit
+            # the benchmark will recur every cycle until it is noticed.
+            logger.error(
+                "idle tuning benchmark exceeded its deadline without measuring: %s",
+                result.gate.reason if result.gate is not None else "unknown reason",
+            )
+        elif result.outcome is CycleOutcome.BENCHMARK_ABORTED:
+            logger.info("idle tuning benchmark preempted by serving activity")
         elif result.outcome is CycleOutcome.PREEMPTED:
             logger.info("idle tuning cycle preempted by serving activity")
         elif result.outcome is not CycleOutcome.NOT_IDLE:

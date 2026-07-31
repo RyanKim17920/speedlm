@@ -20,9 +20,11 @@ from speedlm.tuner.orchestrator import (
     BenchmarkGate,
     CycleOutcome,
     CycleResult,
+    GateFailure,
     GateResult,
     RuntimeController,
     TunerOrchestrator,
+    derive_benchmark_timeout,
 )
 from speedlm.tuner.state import (
     IllegalTransitionError,
@@ -45,6 +47,7 @@ __all__ = [
     "Eagle3Adapter",
     "Eagle3Config",
     "FinalAssistantMaskError",
+    "GateFailure",
     "GateResult",
     "IdleDetector",
     "IllegalTransitionError",
@@ -57,4 +60,5 @@ __all__ = [
     "TunerState",
     "TunerStateMachine",
     "TuningPreempted",
+    "derive_benchmark_timeout",
 ]

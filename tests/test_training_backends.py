@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import io
+import json
 import sys
 import types
 from collections.abc import Sequence
@@ -12,6 +13,7 @@ import pytest
 
 from speedlm.training.backends.eagle3 import (
     _RESOLVE_MODEL,
+    _VALIDATE_DRAFT,
     Eagle3Backend,
     Eagle3Config,
     SpeculatorsPipelineConfig,
@@ -263,3 +265,116 @@ def test_an_unsatisfiable_pin_falls_back_to_the_bare_repo_id(tmp_path: Path) -> 
     resolver = _Resolver(pipeline, runner, _State())
 
     assert resolver.verifier(lambda: False, tmp_path) == "openai/gpt-oss-20b"
+
+
+_QWEN_SNAPSHOT = (
+    "/data/ryan.kim/hf-cache/hub/models--Qwen--Qwen3-8B/snapshots/b968826d"
+)
+#: Distinguishes a config that omits the key from one that spells it ``null``.
+_ABSENT = object()
+
+
+def _write_draft(
+    root: Path,
+    *,
+    verifier: str,
+    layer_ids: object,
+    nest_layer_ids: bool = False,
+) -> Path:
+    """Materialize the on-disk shape of a published EAGLE-3 drafter."""
+    draft = root / "draft"
+    draft.mkdir()
+    speculators: dict[str, object] = {
+        "algorithm": "eagle3",
+        "verifier": {"architectures": ["Qwen3ForCausalLM"], "name_or_path": verifier},
+    }
+    config: dict[str, object] = {
+        "speculators_model_type": "eagle3",
+        "speculators_config": speculators,
+    }
+    if layer_ids is not _ABSENT:
+        if nest_layer_ids:
+            speculators["eagle_aux_hidden_state_layer_ids"] = layer_ids
+        else:
+            config["eagle_aux_hidden_state_layer_ids"] = layer_ids
+    (draft / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    (draft / "model.safetensors").write_text("", encoding="utf-8")
+    return draft
+
+
+def _run_validate_script(draft: Path, verifier: str, layers: Sequence[int]) -> None:
+    """Execute the real _VALIDATE_DRAFT source against a stub safetensors.
+
+    The repo venv carries no safetensors, and the weight check is not what is
+    under test here, so the reader is stubbed to report the vocab mappings a
+    healthy draft has.  Everything before it is the real snippet.
+    """
+
+    class _Handle:
+        def __enter__(self) -> _Handle:
+            return self
+
+        def __exit__(self, *_exc: object) -> None:
+            return None
+
+        def keys(self) -> set[str]:
+            return {"d2t", "t2d"}
+
+    module = types.ModuleType("safetensors")
+    module.safe_open = lambda *_a, **_k: _Handle()  # type: ignore[attr-defined]
+
+    argv = ["-", str(draft), verifier, *(str(layer) for layer in layers)]
+    with mock.patch.dict(sys.modules, {"safetensors": module}), mock.patch.object(
+        sys, "argv", argv
+    ):
+        exec(compile(_VALIDATE_DRAFT, "<validate>", "exec"), {"__name__": "__main__"})
+
+
+def test_a_snapshot_path_validates_against_the_repo_id_it_resolves_to(
+    tmp_path: Path,
+) -> None:
+    """Reproduces job 368962: the same model named two ways is not a mismatch."""
+    draft = _write_draft(tmp_path, verifier="Qwen/Qwen3-8B", layer_ids=None)
+
+    _run_validate_script(draft, _QWEN_SNAPSHOT + "/", (2, 18, 33))
+
+
+def test_a_genuinely_different_verifier_still_fails_loudly(tmp_path: Path) -> None:
+    """Canonicalisation must not blur two distinct models together."""
+    draft = _write_draft(tmp_path, verifier="openai/gpt-oss-20b", layer_ids=None)
+
+    with pytest.raises(SystemExit, match="draft verifier mismatch"):
+        _run_validate_script(draft, _QWEN_SNAPSHOT, (2, 18, 33))
+
+
+@pytest.mark.parametrize("layer_ids", [None, _ABSENT])
+def test_unpinned_layer_ids_do_not_contradict_the_contract(
+    tmp_path: Path, layer_ids: object
+) -> None:
+    """Both published drafters ship null here; null pins nothing."""
+    draft = _write_draft(tmp_path, verifier="Qwen/Qwen3-8B", layer_ids=layer_ids)
+
+    _run_validate_script(draft, _QWEN_SNAPSHOT, (2, 18, 33))
+
+
+def test_layer_ids_compare_as_ints_not_as_json_versus_tuple(tmp_path: Path) -> None:
+    """A JSON list and the contract's tuple are the same pinned layers."""
+    draft = _write_draft(tmp_path, verifier="Qwen/Qwen3-8B", layer_ids=[2, 18, 33])
+
+    _run_validate_script(draft, _QWEN_SNAPSHOT, (2, 18, 33))
+
+
+@pytest.mark.parametrize("nested", [False, True])
+def test_pinned_layer_ids_that_disagree_with_the_contract_fail(
+    tmp_path: Path, nested: bool
+) -> None:
+    """A present list is a claim, and a false claim must stop the run."""
+    draft = _write_draft(
+        tmp_path,
+        verifier="Qwen/Qwen3-8B",
+        layer_ids=[1, 2, 3],
+        nest_layer_ids=nested,
+    )
+
+    with pytest.raises(SystemExit, match="draft target layer ids"):
+        _run_validate_script(draft, _QWEN_SNAPSHOT, (2, 18, 33))

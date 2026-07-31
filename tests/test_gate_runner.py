@@ -11,9 +11,14 @@ import pytest
 from speedlm.config import SamplingConfig, SpeedLMConfig
 from speedlm.gate.decide import Reason, Verdict
 from speedlm.gate.replay import ReplayResult, RequestResult, RunResults
-from speedlm.gate.runner import BenchmarkGateRunner
+from speedlm.gate.runner import (
+    DEFAULT_REPLAY_CONCURRENCY,
+    BenchmarkGateRunner,
+    HttpReplayExecutor,
+)
 from speedlm.gate.suite import BenchmarkSuite, FrozenContext, SuiteError
 from speedlm.traces.store import TraceRecord
+from speedlm.tuner.orchestrator import GateFailure, derive_benchmark_timeout
 
 
 @dataclass
@@ -648,3 +653,161 @@ def test_scrape_bodies_survive_an_abort(tmp_path: Path) -> None:
 
     assert result.decision is None
     assert dict(result.metrics_bodies) == {"stock-before": expected[0]}
+
+
+# ---------------------------------------------------------------------------
+# Replay concurrency
+# ---------------------------------------------------------------------------
+
+
+def test_default_replay_executor_is_concurrent() -> None:
+    """The default executor must not fall back to one request at a time."""
+    assert DEFAULT_REPLAY_CONCURRENCY > 1
+    assert HttpReplayExecutor().concurrency == DEFAULT_REPLAY_CONCURRENCY
+
+
+def test_replay_concurrency_reaches_the_default_executor(tmp_path: Path) -> None:
+    runner = BenchmarkGateRunner(
+        config=SpeedLMConfig(model="model"),
+        trace_source=FakeTraceSource((_trace(),)),
+        suite_dir=tmp_path / "suite",
+        stock_draft="stock",
+        endpoint=FakeEndpoint(),
+        metrics_source=FakeMetricsSource(_normal_scrapes()),
+        replay_concurrency=4,
+        training_context_hashes=frozenset(),
+    )
+
+    executor = runner._replay_executor
+    assert isinstance(executor, HttpReplayExecutor)
+    assert executor.concurrency == 4
+
+
+@pytest.mark.parametrize("concurrency", [0, -1, True])
+def test_invalid_replay_concurrency_is_rejected(
+    tmp_path: Path,
+    concurrency: object,
+) -> None:
+    with pytest.raises(ValueError, match="concurrency"):
+        HttpReplayExecutor(concurrency=concurrency)
+
+
+def test_metrics_record_the_concurrency_both_arms_ran_at(tmp_path: Path) -> None:
+    """Absolute tok/s is only comparable across runs at the same degree."""
+    runner, _, _, _ = _runner(tmp_path, scrapes=_normal_scrapes())
+
+    result = runner.benchmark(
+        tmp_path / "candidate",
+        timeout_seconds=30,
+        should_abort=lambda: False,
+    )
+
+    assert result.metrics["replay_concurrency"] == DEFAULT_REPLAY_CONCURRENCY
+
+
+def test_executor_without_a_declared_degree_reports_the_configured_one(
+    tmp_path: Path,
+) -> None:
+    """Report what ran where the executor says so, the request otherwise."""
+    runner, _, _, _ = _runner(tmp_path, scrapes=_normal_scrapes())
+
+    result = runner.benchmark(
+        tmp_path / "candidate",
+        timeout_seconds=30,
+        should_abort=lambda: False,
+    )
+
+    # FakeReplayExecutor exposes no ``concurrency``, so the configured default
+    # stands in rather than a fabricated number.
+    assert result.metrics["replay_concurrency"] == DEFAULT_REPLAY_CONCURRENCY
+
+
+# ---------------------------------------------------------------------------
+# Typed gate failures
+# ---------------------------------------------------------------------------
+
+
+def test_abort_carries_a_typed_failure(tmp_path: Path) -> None:
+    aborted = [False]
+    replay = FakeReplayExecutor(abort_after_first=aborted)
+    runner, _, _, _ = _runner(
+        tmp_path,
+        scrapes=_normal_scrapes(),
+        replay=replay,
+    )
+
+    result = runner.benchmark(
+        tmp_path / "candidate",
+        timeout_seconds=30,
+        should_abort=lambda: aborted[0],
+    )
+
+    assert result.failure is GateFailure.ABORTED
+
+
+def test_timeout_carries_a_typed_failure(tmp_path: Path) -> None:
+    clock = FakeClock()
+    replay = FakeReplayExecutor(advance_after_first=lambda: clock.advance(6))
+    runner, _, _, _ = _runner(
+        tmp_path,
+        scrapes=_normal_scrapes(),
+        replay=replay,
+        clock=clock,
+    )
+
+    result = runner.benchmark(
+        tmp_path / "candidate",
+        timeout_seconds=5,
+        should_abort=lambda: False,
+    )
+
+    assert result.failure is GateFailure.TIMED_OUT
+
+
+def test_a_measured_rejection_carries_no_failure(tmp_path: Path) -> None:
+    """A rejection is a result; only a non-measurement is a failure."""
+    runner, _, _, _ = _runner(
+        tmp_path,
+        scrapes=_normal_scrapes(candidate_accepted=10, candidate_rejected=90),
+    )
+
+    result = runner.benchmark(
+        tmp_path / "candidate",
+        timeout_seconds=30,
+        should_abort=lambda: False,
+    )
+
+    assert result.passed is False
+    assert result.decision is not None
+    assert result.failure is None
+
+
+# ---------------------------------------------------------------------------
+# Derived benchmark deadline
+# ---------------------------------------------------------------------------
+
+
+def test_estimated_benchmark_seconds_scales_with_the_suite(tmp_path: Path) -> None:
+    runner, _, _, _ = _runner(tmp_path, scrapes=_normal_scrapes())
+
+    estimate = runner.estimated_benchmark_seconds()
+
+    assert estimate is not None
+    assert estimate == derive_benchmark_timeout(
+        num_contexts=1,
+        repeats=3,
+        warmup_repeats=1,
+        concurrency=DEFAULT_REPLAY_CONCURRENCY,
+    )
+
+
+def test_estimated_benchmark_seconds_is_none_when_no_suite_can_be_built(
+    tmp_path: Path,
+) -> None:
+    runner, _, _, _ = _runner(
+        tmp_path,
+        scrapes=_normal_scrapes(),
+        trace_source=FakeTraceSource(()),
+    )
+
+    assert runner.estimated_benchmark_seconds() is None

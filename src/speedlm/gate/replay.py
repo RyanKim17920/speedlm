@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -228,12 +229,30 @@ async def _run_single(
     suite: BenchmarkSuite,
     sampling: SamplingConfig,
     model: str,
+    concurrency: int,
 ) -> RunResults:
-    """Execute one full pass over the suite."""
-    results: list[RequestResult] = []
-    for ctx in suite.contexts:
-        result = await _send_request(client, ctx, sampling, model)
-        results.append(result)
+    """Execute one full pass over the suite, up to *concurrency* in flight.
+
+    Concurrency changes only how fast the pass runs, never what it contains.
+    Every context in ``suite.contexts`` is sent exactly once, and the recorded
+    ``results`` stay in suite order regardless of completion order:
+    :func:`asyncio.gather` returns results positionally, so the per-request
+    array remains alignable with the suite that produced it.  The aggregates
+    below are order-independent sums, so they are unaffected either way.
+
+    At ``concurrency == 1`` this is byte-for-byte the sequential pass it
+    replaced -- a semaphore of one admits one waiter at a time, in the order
+    the tasks were created.
+    """
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def bounded(ctx: FrozenContext) -> RequestResult:
+        async with semaphore:
+            return await _send_request(client, ctx, sampling, model)
+
+    results: list[RequestResult] = list(
+        await asyncio.gather(*(bounded(ctx) for ctx in suite.contexts))
+    )
 
     total_latency = sum(r.latency_s for r in results)
     total_pt = sum(r.prompt_tokens for r in results)
@@ -260,6 +279,7 @@ async def replay_suite(
     repeats: int = 1,
     timeout: float = 120.0,
     model: str = "auto",
+    concurrency: int = 1,
 ) -> ReplayResult:
     """Replay suite against an OpenAI-compatible endpoint N times.
 
@@ -269,17 +289,24 @@ async def replay_suite(
         sampling: Sampling parameters (temperature, top_p, seed).
         repeats: Number of full passes over the suite.
         timeout: Per-request timeout in seconds.
+        model: Served model name to request.
+        concurrency: Requests kept in flight within one pass.  Repeats stay
+            strictly sequential -- a repeat is the unit the gate's per-repeat
+            statistic is computed over, so overlapping two of them would fold
+            two samples into one measurement.
 
     Returns:
         Aggregated :class:`ReplayResult` with per-run data.
 
     Raises:
-        ReplayError: If repeats < 1 or suite is empty.
+        ReplayError: If repeats < 1, concurrency < 1, or suite is empty.
     """
     import httpx
 
     if repeats < 1:
         raise ReplayError(f"repeats must be >= 1, got {repeats}")
+    if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
+        raise ReplayError(f"concurrency must be an integer >= 1, got {concurrency!r}")
     if not suite.contexts:
         raise ReplayError("Cannot replay empty suite")
 
@@ -289,9 +316,15 @@ async def replay_suite(
         base_url=endpoint_url,
         timeout=timeout,
         headers={"Content-Type": "application/json"},
+        # The pool must not become the narrower limit than the semaphore, or
+        # the configured degree would silently not be the degree achieved.
+        limits=httpx.Limits(
+            max_connections=concurrency,
+            max_keepalive_connections=concurrency,
+        ),
     ) as client:
         for _ in range(repeats):
-            run = await _run_single(client, suite, sampling, model)
+            run = await _run_single(client, suite, sampling, model, concurrency)
             runs.append(run)
 
     return ReplayResult(

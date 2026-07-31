@@ -404,6 +404,13 @@ def test_create_production_tuner_assembles_profile_bound_collaborators(
     # hidden-state engine will be launched with, or it is decorative.
     assert captured["runtime"]["gpu_memory"].required_fraction == 0.80
     assert captured["gate"]["stock_draft"] == "acme/active-draft"
+    # The gate replay was serialized until this reached it; a default that
+    # never leaves composition is the same bug in a different place.
+    assert captured["gate"]["repeats"] == config.tuning.benchmark_repeats
+    assert (
+        captured["gate"]["replay_concurrency"]
+        == config.tuning.benchmark_concurrency
+    )
     assert captured["gate"]["suite_dir"]() == split.suite_dir
     assert captured["gate"]["training_context_hashes"]() == frozenset({"train-hash"})
     assert captured["service"]["backend"] is backend

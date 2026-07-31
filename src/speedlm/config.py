@@ -336,10 +336,29 @@ class IdleTuningConfig:
     #: ~76.7 tok/s mean puts the arm-to-arm standard error at 1.43% over three
     #: repeats but 1.10% over five, which moves the -2.0% guard from 1.4 to 1.8
     #: standard errors clear of zero.  The cost is four extra suite passes per
-    #: tuning cycle -- on job 368670 a pass took ~8s, so ~32s added to a ~275s
-    #: benchmark phase inside a ~1200s cycle (~3%).  Engine restarts, not
-    #: repeats, dominate that phase.
+    #: tuning cycle.
+    #:
+    #: A previous revision of this comment claimed "Engine restarts, not
+    #: repeats, dominate that phase", extrapolating from job 368670's ~8s suite
+    #: pass.  That is false for the gpt-oss profile: on job 368959 a *single*
+    #: 103-context pass ran for over 1720s while two engine restarts cost ~90s
+    #: each, so repeats outweighed restarts by more than an order of magnitude
+    #: and the fixed 1800s benchmark deadline expired inside the stock arm's
+    #: warmup.  Suite-pass cost scales with suite size, output length and
+    #: replay concurrency, so it is not a constant that can be assumed small;
+    #: ``benchmark_concurrency`` is what makes it affordable, and
+    #: :func:`speedlm.tuner.orchestrator.derive_benchmark_timeout` is what
+    #: keeps the deadline sized to it.
     benchmark_repeats: int = 5
+    #: Held-out requests kept in flight per arm during a gate replay.
+    #:
+    #: Before this existed the replay was strictly serial and the served engine
+    #: never saw more than one request at a time.  Eight matches
+    #: ``concurrency`` below, which is the degree this codebase already drives
+    #: a vLLM engine at; the served engine sets no ``--max-num-seqs``, so it
+    #: runs vLLM's default scheduler width and can absorb it.  Set to 1 to
+    #: restore single-stream measurement.
+    benchmark_concurrency: int = 8
     #: How many of the newest trace records one cycle may train on.
     #:
     #: Trace selection is a sliding window, not a full rescan: without a bound
@@ -393,6 +412,11 @@ class IdleTuningConfig:
         ):
             raise ConfigError("tuning.held_out_fraction must be in (0, 1)")
         _validate_int_gte(self.benchmark_repeats, "tuning.benchmark_repeats", 3)
+        _validate_int_gte(
+            self.benchmark_concurrency,
+            "tuning.benchmark_concurrency",
+            1,
+        )
         if self.training_window_records is not None:
             _validate_int_gte(
                 self.training_window_records,
@@ -560,6 +584,7 @@ class SpeedLMConfig:
             "poll_interval_seconds": self.tuning.poll_interval_seconds,
             "held_out_fraction": self.tuning.held_out_fraction,
             "benchmark_repeats": self.tuning.benchmark_repeats,
+            "benchmark_concurrency": self.tuning.benchmark_concurrency,
             "training_window_records": self.tuning.training_window_records,
             "verifier_revision": self.tuning.verifier_revision,
             "speculators_repo": self.tuning.speculators_repo,
@@ -638,6 +663,7 @@ class SpeedLMConfig:
                 "poll_interval_seconds",
                 "held_out_fraction",
                 "benchmark_repeats",
+                "benchmark_concurrency",
                 "training_window_records",
                 "verifier_revision",
                 "speculators_repo",

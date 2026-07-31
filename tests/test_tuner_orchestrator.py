@@ -26,12 +26,18 @@ from speedlm.tuner.eagle3 import (
 )
 from speedlm.tuner.idle import IdleDetector
 from speedlm.tuner.orchestrator import (
+    BENCHMARK_MAX_SECONDS,
+    BENCHMARK_MIN_SECONDS,
     DECISION_FILE_NAME,
     METRICS_DIR_NAME,
+    BenchmarkGate,
     CycleOutcome,
     DecisionPersistError,
+    GateFailure,
     GateResult,
+    OrchestratorTimeouts,
     TunerOrchestrator,
+    derive_benchmark_timeout,
     write_decision,
     write_metrics_bodies,
 )
@@ -192,6 +198,9 @@ class FakeGate:
     passed: bool
     decision: Decision | None = None
     metrics_bodies: dict[str, str] = field(default_factory=dict)
+    failure: GateFailure | None = None
+    #: Deadlines the orchestrator handed to :meth:`benchmark`, in order.
+    seen_timeouts: list[float] = field(default_factory=list)
 
     def benchmark(
         self,
@@ -200,6 +209,15 @@ class FakeGate:
         timeout_seconds: float,
         should_abort: Callable[[], bool],
     ) -> GateResult:
+        self.seen_timeouts.append(timeout_seconds)
+        if self.failure is not None:
+            return GateResult(
+                False,
+                f"benchmark {self.failure.value}",
+                metrics={self.failure.value: True},
+                metrics_bodies=dict(self.metrics_bodies),
+                failure=self.failure,
+            )
         return GateResult(
             self.passed,
             "thresholds met" if self.passed else "regression",
@@ -421,6 +439,8 @@ def _orchestrator(
     decision: Decision | None = None,
     metrics_bodies: dict[str, str] | None = None,
     work_root: Path | None = None,
+    gate: BenchmarkGate | None = None,
+    timeouts: OrchestratorTimeouts | None = None,
 ) -> tuple[TunerOrchestrator, TunerStateMachine, ArtifactRegistry, FakeRuntime]:
     activity = activity or FakeActivity()
     runtime = runtime or FakeRuntime(activity)
@@ -432,9 +452,10 @@ def _orchestrator(
         backend=backend or FakeBackend(),
         artifacts=artifacts,
         runtime=runtime,
-        gate=FakeGate(gate_passed, decision, metrics_bodies or {}),
+        gate=gate or FakeGate(gate_passed, decision, metrics_bodies or {}),
         work_root=work_root or (tmp_path / "work"),
         run_id_factory=lambda: "run-1",
+        **({"timeouts": timeouts} if timeouts is not None else {}),
     )
     return orchestrator, state, artifacts, runtime
 
@@ -725,3 +746,241 @@ def test_gate_metrics_bodies_are_persisted_without_a_decision(tmp_path: Path) ->
 def test_unsafe_metrics_label_is_refused(tmp_path: Path) -> None:
     with pytest.raises(DecisionPersistError, match="unsafe label"):
         write_metrics_bodies(tmp_path, {"../escape": "body"})
+
+
+# ---------------------------------------------------------------------------
+# Infrastructure failures are not scientific results
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("failure", "expected"),
+    [
+        (GateFailure.TIMED_OUT, CycleOutcome.BENCHMARK_TIMED_OUT),
+        (GateFailure.ABORTED, CycleOutcome.BENCHMARK_ABORTED),
+    ],
+)
+def test_gate_failure_gets_its_own_terminal_outcome(
+    tmp_path: Path,
+    failure: GateFailure,
+    expected: CycleOutcome,
+) -> None:
+    """A benchmark that never measured must not read as a rejection."""
+    gate = FakeGate(False, failure=failure)
+    orchestrator, state, artifacts, runtime = _orchestrator(tmp_path, gate=gate)
+
+    result = orchestrator.run_once()
+
+    assert result.outcome is expected
+    assert result.outcome is not CycleOutcome.REJECTED
+    # Rollback and serving restoration are unchanged: only the label differs.
+    assert state.state is TunerState.READY
+    assert artifacts.active() is None
+    assert runtime.calls == [
+        "quiesce",
+        "sleep",
+        "start_candidate",
+        "restore:base-draft",
+        "wake",
+    ]
+
+
+def test_gate_failure_leaves_no_decision_to_report(tmp_path: Path) -> None:
+    gate = FakeGate(False, failure=GateFailure.TIMED_OUT)
+    orchestrator, _, _, _ = _orchestrator(tmp_path, gate=gate)
+
+    result = orchestrator.run_once()
+
+    assert result.decision_path is None
+    assert result.gate is not None
+    assert result.gate.decision is None
+    assert result.gate.failure is GateFailure.TIMED_OUT
+
+
+def test_measured_rejection_keeps_the_rejected_outcome(tmp_path: Path) -> None:
+    """The distinction must not swallow genuine rejections."""
+    orchestrator, _, _, _ = _orchestrator(tmp_path, gate_passed=False)
+
+    result = orchestrator.run_once()
+
+    assert result.outcome is CycleOutcome.REJECTED
+    assert result.gate is not None
+    assert result.gate.failure is None
+
+
+def test_every_gate_failure_maps_to_a_distinct_outcome() -> None:
+    """A new GateFailure must not silently fall back to ``rejected``."""
+    from speedlm.tuner.orchestrator import _GATE_FAILURE_OUTCOMES
+
+    assert set(_GATE_FAILURE_OUTCOMES) == set(GateFailure)
+    assert len(set(_GATE_FAILURE_OUTCOMES.values())) == len(GateFailure)
+    assert CycleOutcome.REJECTED not in set(_GATE_FAILURE_OUTCOMES.values())
+
+
+def test_gate_result_failure_cannot_claim_a_measurement() -> None:
+    with pytest.raises(ValueError, match="cannot have passed"):
+        GateResult(True, "ok", failure=GateFailure.TIMED_OUT)
+
+
+def test_gate_result_failure_cannot_carry_a_decision() -> None:
+    decision = _real_decision(promote=True)
+    with pytest.raises(ValueError, match="cannot carry a decision"):
+        GateResult(False, "nope", decision=decision, failure=GateFailure.ABORTED)
+
+
+def test_gate_result_failure_must_be_typed() -> None:
+    with pytest.raises(TypeError, match="GateFailure"):
+        GateResult(False, "nope", failure="timed_out")  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Derived benchmark deadline
+# ---------------------------------------------------------------------------
+
+
+def test_derived_timeout_scales_with_suite_repeats_and_arms() -> None:
+    small = derive_benchmark_timeout(num_contexts=10, repeats=5, concurrency=1)
+    big = derive_benchmark_timeout(num_contexts=100, repeats=5, concurrency=1)
+    more_repeats = derive_benchmark_timeout(
+        num_contexts=10, repeats=50, concurrency=1
+    )
+
+    assert big > small
+    assert more_repeats > small
+
+
+def test_derived_timeout_shrinks_with_concurrency() -> None:
+    serial = derive_benchmark_timeout(num_contexts=100, repeats=5, concurrency=1)
+    parallel = derive_benchmark_timeout(num_contexts=100, repeats=5, concurrency=8)
+
+    assert parallel < serial
+
+
+def test_derived_timeout_would_have_survived_job_368959() -> None:
+    """The regression this derivation exists for.
+
+    103 held-out contexts, five scored repeats plus one warmup, two arms, at
+    the observed >16.7s per serialized generation.  The fixed 1800s deadline
+    expired inside the stock arm's warmup pass alone.
+    """
+    warmup_pass_seconds = 103 * 16.7
+
+    budget = derive_benchmark_timeout(
+        num_contexts=103,
+        repeats=5,
+        warmup_repeats=1,
+        concurrency=8,
+    )
+
+    assert budget > 1_800.0
+    assert budget > 2 * warmup_pass_seconds
+
+
+def test_derived_timeout_is_clamped_at_both_ends() -> None:
+    tiny = derive_benchmark_timeout(
+        num_contexts=1,
+        repeats=3,
+        concurrency=64,
+        fixed_overhead_seconds=1.0,
+    )
+    huge = derive_benchmark_timeout(
+        num_contexts=100_000, repeats=100, concurrency=1
+    )
+
+    assert tiny == BENCHMARK_MIN_SECONDS
+    assert huge == BENCHMARK_MAX_SECONDS
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"num_contexts": 0},
+        {"repeats": 0},
+        {"arms": 0},
+        {"concurrency": 0},
+        {"warmup_repeats": -1},
+        {"seconds_per_generation": 0.0},
+        {"safety_factor": -1.0},
+        {"fixed_overhead_seconds": 0},
+    ],
+)
+def test_derived_timeout_rejects_nonsense(kwargs: dict[str, object]) -> None:
+    base: dict[str, object] = {"num_contexts": 10, "repeats": 5}
+    with pytest.raises(ValueError):
+        derive_benchmark_timeout(**{**base, **kwargs})  # type: ignore[arg-type]
+
+
+@dataclass
+class SizingGate(FakeGate):
+    """Gate that can size its own benchmark, as the real runner does."""
+
+    estimate: float | None = None
+
+    def estimated_benchmark_seconds(self) -> float | None:
+        if isinstance(self.estimate, str):
+            raise RuntimeError("estimator blew up")
+        return self.estimate
+
+
+def test_orchestrator_uses_the_gate_estimate_when_it_is_smaller(
+    tmp_path: Path,
+) -> None:
+    gate = SizingGate(True, estimate=900.0)
+    orchestrator, _, _, _ = _orchestrator(tmp_path, gate=gate)
+
+    orchestrator.run_once()
+
+    assert gate.seen_timeouts == [900.0]
+
+
+def test_orchestrator_never_lets_an_estimate_exceed_the_ceiling(
+    tmp_path: Path,
+) -> None:
+    """The ceiling is what bounds a genuine hang and must stay authoritative."""
+    gate = SizingGate(True, estimate=BENCHMARK_MAX_SECONDS * 10)
+    orchestrator, _, _, _ = _orchestrator(
+        tmp_path,
+        gate=gate,
+        timeouts=OrchestratorTimeouts(benchmark=1_200.0),
+    )
+
+    orchestrator.run_once()
+
+    assert gate.seen_timeouts == [1_200.0]
+
+
+@pytest.mark.parametrize("estimate", [None, 0.0, -5.0, "boom"])
+def test_orchestrator_falls_back_to_the_ceiling(
+    tmp_path: Path,
+    estimate: object,
+) -> None:
+    gate = SizingGate(True, estimate=estimate)  # type: ignore[arg-type]
+    orchestrator, _, _, _ = _orchestrator(
+        tmp_path,
+        gate=gate,
+        timeouts=OrchestratorTimeouts(benchmark=1_234.0),
+    )
+
+    orchestrator.run_once()
+
+    assert gate.seen_timeouts == [1_234.0]
+
+
+def test_gate_without_an_estimator_still_gets_the_configured_ceiling(
+    tmp_path: Path,
+) -> None:
+    gate = FakeGate(True)
+    orchestrator, _, _, _ = _orchestrator(
+        tmp_path,
+        gate=gate,
+        timeouts=OrchestratorTimeouts(benchmark=777.0),
+    )
+
+    orchestrator.run_once()
+
+    assert gate.seen_timeouts == [777.0]
+
+
+def test_default_benchmark_ceiling_is_no_longer_the_fixed_1800s() -> None:
+    assert OrchestratorTimeouts().benchmark == BENCHMARK_MAX_SECONDS
+    assert OrchestratorTimeouts().benchmark > 1_800.0

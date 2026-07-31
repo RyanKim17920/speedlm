@@ -12,7 +12,7 @@ import time
 from collections.abc import Callable, Iterator
 from contextlib import suppress
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, TypeVar
+from typing import TYPE_CHECKING, Final, Protocol, TypeVar
 
 from speedlm.config import SamplingConfig, SpeedLMConfig
 from speedlm.gate.decide import Decision, Verdict, decide_promotion
@@ -34,7 +34,7 @@ from speedlm.gate.suite import (
 from speedlm.traces.store import TraceRecord
 
 if TYPE_CHECKING:
-    from speedlm.tuner.orchestrator import GateResult
+    from speedlm.tuner.orchestrator import GateFailure, GateResult
 
 AbortCheck = Callable[[], bool]
 DraftReference = Path | str
@@ -46,6 +46,38 @@ TrainingHashes = (
 )
 SuiteDirectory = Path | Callable[[], Path]
 _T = TypeVar("_T")
+
+#: Held-out requests kept in flight per arm while a suite pass runs.
+#:
+#: Until this existed the replay issued one request at a time -- vLLM logged
+#: ``Running: 1 reqs`` for the entire benchmark on job 368959, and a single
+#: 103-context warmup pass took over 1720s, which is what exhausted that run's
+#: benchmark deadline before a measurement was ever taken.  The served engine
+#: is not the constraint: the gate replays against the managed ``vllm serve``
+#: child built by :func:`speedlm.gateway.process.build_vllm_argv`, which never
+#: sets ``--max-num-seqs``, so the engine runs vLLM's default scheduler width
+#: and can absorb many more than one in-flight request.  (The
+#: ``max_num_seqs=1`` in :mod:`speedlm.training.backends.eagle3` belongs to the
+#: offline hidden-state extraction engine, which is not on the gate's serving
+#: path.)
+#:
+#: Eight matches :attr:`speedlm.config.IdleTuningConfig.concurrency`, the
+#: degree the codebase already uses when driving this same engine family.
+#:
+#: The gating statistic -- see
+#: :data:`speedlm.gate.decide.GATING_THROUGHPUT_STATISTIC` -- divides completion
+#: tokens by the *sum* of per-request latencies, so its absolute value depends
+#: on how much batching the engine is doing.  Both arms are always replayed at
+#: the same degree, which is what the arm-to-arm delta needs; the consequence
+#: is that absolute tok/s figures are only comparable across runs that used the
+#: same concurrency, which is why the value is recorded in the gate's metrics.
+DEFAULT_REPLAY_CONCURRENCY: Final = 8
+
+
+def _validated_concurrency(value: int, name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"{name} must be an integer >= 1")
+    return value
 
 
 class TraceSource(Protocol):
@@ -108,10 +140,21 @@ class HttpReplayExecutor:
 
     _POLL_SECONDS = 0.05
 
-    def __init__(self, *, model: str = "auto") -> None:
+    def __init__(
+        self,
+        *,
+        model: str = "auto",
+        concurrency: int = DEFAULT_REPLAY_CONCURRENCY,
+    ) -> None:
         if not model:
             raise ValueError("replay model must be non-empty")
         self._model = model
+        self._concurrency = _validated_concurrency(concurrency, "replay concurrency")
+
+    @property
+    def concurrency(self) -> int:
+        """Requests this executor keeps in flight within one suite pass."""
+        return self._concurrency
 
     def replay(
         self,
@@ -134,6 +177,7 @@ class HttpReplayExecutor:
                     repeats=repeats,
                     timeout=timeout_seconds,
                     model=self._model,
+                    concurrency=self._concurrency,
                 )
             )
             try:
@@ -174,6 +218,7 @@ class BenchmarkGateRunner:
         endpoint: DraftEndpoint,
         metrics_source: MetricsSource,
         replay_executor: ReplayExecutor | None = None,
+        replay_concurrency: int = DEFAULT_REPLAY_CONCURRENCY,
         repeats: int = 3,
         warmup_repeats: int = 1,
         held_out_fraction: float = 0.2,
@@ -200,8 +245,21 @@ class BenchmarkGateRunner:
         self._stock_draft = stock_draft
         self._endpoint = endpoint
         self._metrics_source = metrics_source
+        _validated_concurrency(replay_concurrency, "replay_concurrency")
         self._replay_executor = replay_executor or HttpReplayExecutor(
             model=config.alias,
+            concurrency=replay_concurrency,
+        )
+        # Report what the executor actually does, not what was asked for: an
+        # injected executor owns its own degree and a metrics field that
+        # disagrees with the traffic it describes is worse than no field.
+        executor_concurrency = getattr(self._replay_executor, "concurrency", None)
+        self._replay_concurrency = (
+            executor_concurrency
+            if isinstance(executor_concurrency, int)
+            and not isinstance(executor_concurrency, bool)
+            and executor_concurrency >= 1
+            else replay_concurrency
         )
         self._repeats = repeats
         self._warmup_repeats = warmup_repeats
@@ -348,18 +406,24 @@ class BenchmarkGateRunner:
                 ),
             )
         except BenchmarkAborted as exc:
+            from speedlm.tuner.orchestrator import GateFailure  # noqa: PLC0415
+
             return _gate_result(
                 passed=False,
                 reason=str(exc),
                 metrics={"aborted": True},
                 metrics_bodies=bodies,
+                failure=GateFailure.ABORTED,
             )
         except (BenchmarkTimedOut, TimeoutError) as exc:
+            from speedlm.tuner.orchestrator import GateFailure  # noqa: PLC0415
+
             return _gate_result(
                 passed=False,
                 reason=str(exc) or "benchmark timed out",
                 metrics={"timed_out": True},
                 metrics_bodies=bodies,
+                failure=GateFailure.TIMED_OUT,
             )
 
         return _gate_result(
@@ -372,6 +436,9 @@ class BenchmarkGateRunner:
                 # ran must mean three repeats ran.
                 "num_repeats": min(stock_replay.num_runs, candidate_replay.num_runs),
                 "requested_repeats": self._repeats,
+                # Both arms replay at this degree.  Absolute tok/s figures are
+                # only comparable across runs that shared it.
+                "replay_concurrency": self._replay_concurrency,
                 "stock_runs": stock_replay.num_runs,
                 "candidate_runs": candidate_replay.num_runs,
                 # Unscored, but not invisible: the warmup pass is reported so a
@@ -386,6 +453,30 @@ class BenchmarkGateRunner:
             },
             metrics_bodies=bodies,
             decision=decision,
+        )
+
+    def estimated_benchmark_seconds(self) -> float | None:
+        """Deadline this benchmark needs, sized from the work it will do.
+
+        The orchestrator reads this to replace a fixed benchmark deadline with
+        one derived from the actual held-out suite; ``None`` means "cannot
+        tell", and the caller falls back to its configured hard ceiling.
+
+        Freezing the suite here is deliberate and cheap: ``_load_or_build_suite``
+        persists it, so the pass that follows loads exactly the same suite this
+        estimate was sized against rather than a differently-sized one.
+        """
+        try:
+            suite = self._load_or_build_suite()
+        except Exception:
+            return None
+        from speedlm.tuner.orchestrator import derive_benchmark_timeout  # noqa: PLC0415
+
+        return derive_benchmark_timeout(
+            num_contexts=len(suite.contexts),
+            repeats=self._repeats,
+            warmup_repeats=self._warmup_repeats,
+            concurrency=self._replay_concurrency,
         )
 
     def _load_or_build_suite(self) -> BenchmarkSuite:
@@ -519,6 +610,7 @@ def _gate_result(
     metrics: dict[str, object],
     metrics_bodies: dict[str, str] | None = None,
     decision: Decision | None = None,
+    failure: GateFailure | None = None,
 ) -> GateResult:
     # Importing GateResult at module load time would cycle while the
     # orchestrator imports speedlm.gate.decide through this package.
@@ -530,4 +622,5 @@ def _gate_result(
         metrics=metrics,
         metrics_bodies=dict(metrics_bodies or {}),
         decision=decision,
+        failure=failure,
     )

@@ -352,6 +352,7 @@ def create_production_tuner(
         endpoint=endpoint,
         metrics_source=_MetricsSource(http),
         repeats=tuning.benchmark_repeats,
+        replay_concurrency=tuning.benchmark_concurrency,
         held_out_fraction=tuning.held_out_fraction,
         training_context_hashes=lambda: split.training_context_hashes,
     )

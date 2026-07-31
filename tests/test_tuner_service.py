@@ -21,6 +21,7 @@ from speedlm.tuner.idle import ActivitySource, TuningPreempted
 from speedlm.tuner.orchestrator import (
     CycleOutcome,
     CycleResult,
+    GateFailure,
     GateResult,
 )
 from speedlm.tuner.service import (
@@ -893,3 +894,87 @@ def _runner_for(
 ) -> ExplodingRunner:
     del activity
     return runner
+
+
+@dataclass
+class FixedOutcomeRunner:
+    """Orchestrator stub that always reports one terminal outcome."""
+
+    outcome: CycleOutcome
+    gate: GateResult | None = None
+    calls: int = 0
+
+    def run_once(self) -> CycleResult:
+        self.calls += 1
+        return CycleResult(self.outcome, gate=self.gate)
+
+    def recover(self) -> tuple[str, ...]:
+        return ()
+
+
+def _service_for(runner: object) -> TunerService:
+    return TunerService(
+        _config(),
+        activity=ActivityTracker(),
+        traces=FakeTraces(2),
+        orchestrator_factory=lambda cycle_activity: _runner_for(
+            cycle_activity,
+            runner,
+        ),
+        enabled=True,
+        min_trace_records=2,
+        min_corpus_records=2,
+        poll_interval_seconds=0.005,
+    )
+
+
+def test_benchmark_timeout_is_logged_as_an_error_not_a_result(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A deadline too small for the suite recurs every cycle until noticed."""
+    runner = FixedOutcomeRunner(
+        CycleOutcome.BENCHMARK_TIMED_OUT,
+        gate=GateResult(
+            False,
+            "benchmark timed out during stock warmup",
+            metrics={"timed_out": True},
+            failure=GateFailure.TIMED_OUT,
+        ),
+    )
+    service = _service_for(runner)
+
+    with caplog.at_level(logging.INFO, logger="speedlm.tuner.service"):
+        service.start()
+        try:
+            _wait_until(lambda: runner.calls >= 1)
+        finally:
+            service.stop(timeout_seconds=1.0)
+
+    assert "exceeded its deadline without measuring" in caplog.text
+    assert "benchmark timed out during stock warmup" in caplog.text
+    assert any(
+        record.levelno >= logging.ERROR
+        and "exceeded its deadline" in record.getMessage()
+        for record in caplog.records
+    )
+    # It must not be reported as a completed cycle.
+    assert "idle tuning cycle completed" not in caplog.text
+
+
+def test_benchmark_abort_is_logged_as_preemption(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runner = FixedOutcomeRunner(CycleOutcome.BENCHMARK_ABORTED)
+    service = _service_for(runner)
+
+    with caplog.at_level(logging.INFO, logger="speedlm.tuner.service"):
+        service.start()
+        try:
+            _wait_until(lambda: runner.calls >= 1)
+        finally:
+            service.stop(timeout_seconds=1.0)
+
+    assert "benchmark preempted by serving activity" in caplog.text
+    assert not [
+        record for record in caplog.records if record.levelno >= logging.ERROR
+    ]

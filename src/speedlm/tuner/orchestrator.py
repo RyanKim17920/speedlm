@@ -40,6 +40,22 @@ class DecisionPersistError(RuntimeError):
     """Raised when a gate decision cannot be persisted for later reporting."""
 
 
+class GateFailure(StrEnum):
+    """Why a gate returned without measuring anything.
+
+    A gate that ran to completion leaves this ``None``, whatever its verdict:
+    a rejection is a measurement.  These two values mean the opposite -- the
+    benchmark never produced a :class:`~speedlm.gate.decide.Decision` -- and
+    exist so that fact survives into ``scheduler.json`` instead of being
+    flattened into the same ``rejected`` outcome a real comparison produces.
+    """
+
+    #: Serving activity preempted the benchmark.
+    ABORTED = "aborted"
+    #: The whole-run benchmark deadline expired.
+    TIMED_OUT = "timed_out"
+
+
 @dataclass(frozen=True, slots=True)
 class GateResult:
     """Outcome returned by the injected benchmark/promotion gate.
@@ -52,6 +68,11 @@ class GateResult:
     ``metrics_bodies`` maps a scrape label to the verbatim Prometheus body the
     gate read.  It is the evidence behind every derived rate, persisted next to
     the decision so provenance questions are answerable from artifacts.
+
+    ``failure`` is set only when the gate gave up without measuring; it is the
+    typed form of the ``{"aborted": True}`` / ``{"timed_out": True}`` markers
+    the runner also writes into ``metrics``, and it is what lets the
+    orchestrator emit an infrastructure outcome rather than a scientific one.
     """
 
     passed: bool
@@ -59,6 +80,7 @@ class GateResult:
     metrics: Mapping[str, object] = field(default_factory=dict)
     metrics_bodies: Mapping[str, str] = field(default_factory=dict)
     decision: Decision | None = None
+    failure: GateFailure | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.passed, bool):
@@ -67,6 +89,15 @@ class GateResult:
             raise ValueError("gate result reason must be a non-empty string")
         if self.decision is not None and not isinstance(self.decision, Decision):
             raise TypeError("gate result decision must be a Decision or None")
+        if self.failure is not None:
+            if not isinstance(self.failure, GateFailure):
+                raise TypeError("gate result failure must be a GateFailure or None")
+            # A failure means "never measured".  Allowing it alongside a pass
+            # or a decision would recreate exactly the ambiguity it removes.
+            if self.passed:
+                raise ValueError("a failed gate result cannot have passed")
+            if self.decision is not None:
+                raise ValueError("a failed gate result cannot carry a decision")
 
 
 def write_decision(run_dir: Path, decision: Decision) -> Path:
@@ -187,6 +218,97 @@ class RuntimeController(Protocol):
     def wake(self, *, timeout_seconds: float) -> None: ...
 
 
+#: Wall-clock one held-out generation is assumed to cost, serialized.
+#:
+#: Measured, not guessed: on job 368959 a single warmup pass of 103 contexts
+#: ran for more than 1720s with one request in flight, i.e. >16.7s per
+#: generation for this gpt-oss profile.  Rounded up to 20.0 so the derived
+#: deadline is not sized off the exact observation that produced it.
+BENCHMARK_SECONDS_PER_GENERATION: Final = 20.0
+
+#: Fixed, per-benchmark cost that is not generation: two engine activations
+#: (~90s each on job 368959), four Prometheus scrapes, suite load and the
+#: leakage check.  600s is roughly three times the observed total, which is
+#: cheap insurance on a term that does not scale with the suite.
+BENCHMARK_FIXED_OVERHEAD_SECONDS: Final = 600.0
+
+#: Multiplier applied to the derived generation budget.
+#:
+#: The budget divides the serial cost by the full replay concurrency, which
+#: assumes linear speedup from batching.  Real speedup is sublinear -- and
+#: sublinear specifically for speculative decoding, whose per-step cost grows
+#: with batch size -- so this factor is the slack that absorbs the gap.  It is
+#: not a safety margin against a hang; :data:`BENCHMARK_MAX_SECONDS` is.
+BENCHMARK_SAFETY_FACTOR: Final = 1.25
+
+#: Floor for a derived deadline, so a tiny suite still tolerates one slow
+#: engine start rather than timing out on overhead alone.
+BENCHMARK_MIN_SECONDS: Final = 300.0
+
+#: Hard ceiling on any benchmark deadline, derived or configured.
+#:
+#: A genuine hang must still terminate the cycle, and the tuner only runs while
+#: serving is idle -- ``should_abort`` cuts a benchmark short the moment real
+#: traffic arrives -- so the ceiling only has to bound the pathological case.
+BENCHMARK_MAX_SECONDS: Final = 14_400.0
+
+
+def derive_benchmark_timeout(
+    *,
+    num_contexts: int,
+    repeats: int,
+    warmup_repeats: int = 1,
+    arms: int = 2,
+    concurrency: int = 1,
+    seconds_per_generation: float = BENCHMARK_SECONDS_PER_GENERATION,
+    fixed_overhead_seconds: float = BENCHMARK_FIXED_OVERHEAD_SECONDS,
+    safety_factor: float = BENCHMARK_SAFETY_FACTOR,
+) -> float:
+    """Size a benchmark deadline from the work the benchmark will do.
+
+    The work is ``arms x (warmup_repeats + repeats) x num_contexts``
+    generations, spread over ``concurrency`` in-flight requests, plus a fixed
+    overhead that does not scale with the suite.  The result is clamped into
+    ``[BENCHMARK_MIN_SECONDS, BENCHMARK_MAX_SECONDS]``.
+
+    This exists because a fixed 1800s deadline is not a statement about
+    anything: on job 368959 it was smaller than one arm's warmup pass, so the
+    gate died before its first measurement and the failure was indistinguishable
+    from a rejection.  A deadline that moves with the suite cannot silently
+    become too small when the suite grows.
+
+    Raises:
+        ValueError: If any count is not a positive integer or any cost factor
+            is not a positive number.
+    """
+    for name, count in (
+        ("num_contexts", num_contexts),
+        ("repeats", repeats),
+        ("arms", arms),
+        ("concurrency", concurrency),
+    ):
+        if isinstance(count, bool) or not isinstance(count, int) or count < 1:
+            raise ValueError(f"{name} must be an integer >= 1")
+    if (
+        isinstance(warmup_repeats, bool)
+        or not isinstance(warmup_repeats, int)
+        or warmup_repeats < 0
+    ):
+        raise ValueError("warmup_repeats must be an integer >= 0")
+    for name, factor in (
+        ("seconds_per_generation", seconds_per_generation),
+        ("fixed_overhead_seconds", fixed_overhead_seconds),
+        ("safety_factor", safety_factor),
+    ):
+        if isinstance(factor, bool) or not isinstance(factor, (int, float)) or factor <= 0:
+            raise ValueError(f"{name} must be a positive number")
+
+    generations = arms * (warmup_repeats + repeats) * num_contexts
+    generation_seconds = generations * float(seconds_per_generation) / concurrency
+    budget = generation_seconds * float(safety_factor) + float(fixed_overhead_seconds)
+    return min(max(budget, BENCHMARK_MIN_SECONDS), BENCHMARK_MAX_SECONDS)
+
+
 @dataclass(frozen=True, slots=True)
 class OrchestratorTimeouts:
     """Timeouts for runtime and gate effects."""
@@ -194,7 +316,14 @@ class OrchestratorTimeouts:
     quiesce: float = 30.0
     sleep: float = 120.0
     candidate_start: float = 600.0
-    benchmark: float = 1_800.0
+    #: Hard upper bound on one benchmark, not the expected duration.
+    #:
+    #: The deadline actually handed to the gate is
+    #: ``min(gate.estimated_benchmark_seconds(), benchmark)`` -- see
+    #: :meth:`TunerOrchestrator._benchmark_timeout` -- so this field is what
+    #: stops a genuine hang, while :func:`derive_benchmark_timeout` is what
+    #: keeps a healthy-but-large suite from being cut off mid-measurement.
+    benchmark: float = BENCHMARK_MAX_SECONDS
     restore: float = 600.0
     wake: float = 30.0
 
@@ -219,11 +348,25 @@ class CycleOutcome(StrEnum):
 
     NOT_IDLE = "not_idle"
     PROMOTED = "promoted"
+    #: The gate measured both arms and declined to promote.  A scientific
+    #: result: ``decision_path`` points at the measurement behind it.
     REJECTED = "rejected"
     VAL_LOSS_NOT_IMPROVED = "val_loss_not_improved"
     PREEMPTED = "preempted"
+    #: The benchmark's whole-run deadline expired.  Infrastructure failure,
+    #: not a result: no arms were compared and there is no decision to read.
+    BENCHMARK_TIMED_OUT = "benchmark_timed_out"
+    #: Serving activity preempted the benchmark before it could measure.
+    BENCHMARK_ABORTED = "benchmark_aborted"
     FINAL_ASSISTANT_MASK_ERROR = "final_assistant_mask_error"
     FAILED = "failed"
+
+
+#: Terminal outcome for each way the gate can fail without measuring.
+_GATE_FAILURE_OUTCOMES: Final[Mapping[GateFailure, CycleOutcome]] = {
+    GateFailure.ABORTED: CycleOutcome.BENCHMARK_ABORTED,
+    GateFailure.TIMED_OUT: CycleOutcome.BENCHMARK_TIMED_OUT,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -400,7 +543,7 @@ class TunerOrchestrator:
             self._state.transition(TunerState.BENCHMARKING, reason="candidate running")
             gate_result = self._gate.benchmark(
                 artifact.path,
-                timeout_seconds=self._timeouts.benchmark,
+                timeout_seconds=self._benchmark_timeout(),
                 should_abort=lambda: guard.is_preempted,
             )
             # Persist before the preemption check: a completed benchmark is a
@@ -409,14 +552,28 @@ class TunerOrchestrator:
             guard.check()
 
             if not gate_result.passed:
+                # A gate that never measured is not a rejection.  Both paths
+                # roll back identically; only the reported outcome differs, so
+                # that a reader of scheduler.json can tell an infrastructure
+                # failure from a scientific one without opening the metrics.
+                failed_outcome = (
+                    CycleOutcome.REJECTED
+                    if gate_result.failure is None
+                    else _GATE_FAILURE_OUTCOMES[gate_result.failure]
+                )
+                verb = (
+                    "rejected candidate"
+                    if gate_result.failure is None
+                    else f"could not measure candidate ({gate_result.failure.value})"
+                )
                 self._state.transition(
                     TunerState.ROLLING_BACK,
-                    reason=f"gate rejected candidate: {gate_result.reason}",
+                    reason=f"gate {verb}: {gate_result.reason}",
                 )
                 cleanup_errors = self._finish_rollback(pointer_changed=False)
                 return CycleResult(
                     outcome=(
-                        CycleOutcome.REJECTED
+                        failed_outcome
                         if not cleanup_errors
                         else CycleOutcome.FAILED
                     ),
@@ -464,6 +621,36 @@ class TunerOrchestrator:
                 artifact_id=artifact_id,
                 error=_combine_error(exc, cleanup_errors),
             )
+
+    def _benchmark_timeout(self) -> float:
+        """Deadline for this cycle's benchmark, derived where the gate can.
+
+        Read defensively, in the same spirit as ``val_loss`` above:
+        ``estimated_benchmark_seconds`` is not part of the
+        :class:`BenchmarkGate` protocol, so a gate that predates it -- or one
+        that cannot size itself yet because no suite exists -- simply falls
+        back to the configured hard ceiling.  Sizing the deadline must never be
+        able to fail a cycle.
+
+        The estimate is clamped by ``timeouts.benchmark`` in both directions of
+        intent: it may shrink the ceiling but never raise it, so the hard bound
+        on a hang stays exactly where it was configured.
+        """
+        ceiling = self._timeouts.benchmark
+        estimator = getattr(self._gate, "estimated_benchmark_seconds", None)
+        if not callable(estimator):
+            return ceiling
+        try:
+            estimate = estimator()
+        except Exception:
+            return ceiling
+        if (
+            isinstance(estimate, bool)
+            or not isinstance(estimate, (int, float))
+            or estimate <= 0
+        ):
+            return ceiling
+        return min(float(estimate), ceiling)
 
     def _persist_decision(self, run_dir: Path, gate_result: GateResult) -> Path | None:
         """Record the gate's decision so ``speedlm gain`` can report it.

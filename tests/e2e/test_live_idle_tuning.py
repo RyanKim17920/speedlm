@@ -122,8 +122,22 @@ ACTIVE_PREEMPTIBLE_STATES = frozenset(
         "BENCHMARKING",
     }
 )
+# Outcomes that mean the gate measured both arms and reached a verdict.  A
+# benchmark that timed out or was aborted produced no measurement at all, so it
+# is deliberately absent: accepting it here is what let job 368959's exhausted
+# 1800s deadline read as a terminal "rejected" result.
 COMPLETE_OUTCOMES = frozenset({"promoted", "rejected"})
-FAILED_OUTCOMES = frozenset({"failed", "final_assistant_mask_error"})
+# Outcomes that must fail the run loudly rather than be waited out.
+# ``benchmark_timed_out`` is in here because a deadline too small for the suite
+# is a harness defect that will recur on every cycle; silently retrying it
+# burns the whole e2e budget and then reports a timeout on the wrong thing.
+FAILED_OUTCOMES = frozenset(
+    {
+        "failed",
+        "final_assistant_mask_error",
+        "benchmark_timed_out",
+    }
+)
 
 # Verdicts reached by actually comparing the two arms.  Anything else means the
 # gate rejected for want of data, which is a legitimate runtime outcome but not

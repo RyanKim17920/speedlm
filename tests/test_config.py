@@ -265,6 +265,8 @@ def test_idle_tuning_config_round_trip_without_machine_specific_paths() -> None:
         {"min_trace_records": 1},
         {"held_out_fraction": 0},
         {"benchmark_repeats": 2},
+        {"benchmark_concurrency": 0},
+        {"benchmark_concurrency": "eight"},
         {"speculators_repo": ""},
         {"learning_rate": 1e-4},
     ],
@@ -272,6 +274,21 @@ def test_idle_tuning_config_round_trip_without_machine_specific_paths() -> None:
 def test_invalid_idle_tuning_config_is_rejected(tuning: dict[str, object]) -> None:
     with pytest.raises(ConfigError):
         SpeedLMConfig.from_dict({"model": "org/model", "tuning": tuning})
+
+
+def test_benchmark_concurrency_round_trips_and_defaults_above_one() -> None:
+    """The gate replay was serial until this knob existed; 1 must be opt-in."""
+    default = SpeedLMConfig(model="org/model")
+    assert default.tuning.benchmark_concurrency > 1
+
+    configured = SpeedLMConfig.from_dict(
+        {"model": "org/model", "tuning": {"benchmark_concurrency": 3}}
+    )
+    assert configured.tuning.benchmark_concurrency == 3
+    assert (
+        SpeedLMConfig.from_dict(configured.to_dict()).tuning.benchmark_concurrency
+        == 3
+    )
 
 
 # ---------------------------------------------------------------------------

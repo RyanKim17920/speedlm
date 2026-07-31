@@ -126,11 +126,50 @@ for index, row in enumerate(load_from_disk(sys.argv[1])):
         print(f"SPEEDLM_ZERO_MASK_ROW={row.get('id', index)}")
         raise SystemExit(3)
 """.strip()
+#: Validate a materialized draft against the training contract.
+#:
+#: Both comparisons here are identity questions, not string questions, and
+#: writing them as ``!=`` failed a genuinely correct cross-model run (job
+#: 368962, Qwen3-8B).
+#:
+#: *Verifier.*  A Speculators config records its verifier as the repo id it was
+#: published under ("Qwen/Qwen3-8B"), while the caller passes the resolved
+#: snapshot directory the cache handed back.  Those name the same model, so the
+#: comparison is on canonical form: a snapshot path carries the repo id in its
+#: ``models--<org>--<name>`` cache segment, which maps back by ``--`` -> ``/``.
+#: A genuinely different model still fails, because the two canonical repo ids
+#: differ.
+#:
+#: *Layer ids.*  ``eagle_aux_hidden_state_layer_ids`` is ``null`` in both
+#: drafters this deployment warm-starts from -- absent entirely in
+#: RedHatAI/Qwen3-8B-speculator.eagle3, present-but-null in
+#: RedHatAI/gpt-oss-20b-speculator.eagle3 -- and neither carries the key under
+#: ``speculators_config``.  Null means the drafter did not pin layers, which
+#: contradicts nothing, so it passes; a *present* list that disagrees with the
+#: contract is a real conflict and still fails.  The comparison is on lists of
+#: ints so the config's JSON ``[2, 18, 33]`` matches the contract's tuple.  The
+#: fallback lookup under ``speculators_config`` costs nothing and only ever
+#: turns a silent pass into a loud failure, so it guards configs that nest the
+#: key where these two do not.
 _VALIDATE_DRAFT = """
 import json
 import sys
 from pathlib import Path
 from safetensors import safe_open
+
+
+def canonical_model(value):
+    # Repo id for a HF snapshot path, else the identifier as given.
+    text = str(value or "").strip().rstrip("/")
+    if not text:
+        return ""
+    for part in reversed(Path(text).parts):
+        if part.startswith("models--"):
+            text = part[len("models--"):].replace("--", "/")
+            break
+    return text.lower()
+
+
 root = Path(sys.argv[1])
 verifier = sys.argv[2]
 layers = [int(value) for value in sys.argv[3:]]
@@ -144,10 +183,17 @@ speculators = config.get("speculators_config", {})
 if speculators.get("algorithm") != "eagle3":
     raise SystemExit("materialized draft has a non-eagle3 algorithm")
 actual_verifier = speculators.get("verifier", {}).get("name_or_path")
-if actual_verifier != verifier:
+if canonical_model(actual_verifier) != canonical_model(verifier):
     raise SystemExit(f"draft verifier mismatch: {actual_verifier!r} != {verifier!r}")
-if config.get("eagle_aux_hidden_state_layer_ids") != layers:
-    raise SystemExit("draft target layer ids do not match the training contract")
+actual_layers = config.get("eagle_aux_hidden_state_layer_ids")
+if actual_layers is None:
+    actual_layers = speculators.get("eagle_aux_hidden_state_layer_ids")
+if actual_layers is not None and layers:
+    if [int(value) for value in actual_layers] != layers:
+        raise SystemExit(
+            "draft target layer ids do not match the training contract: "
+            f"{actual_layers!r} != {layers!r}"
+        )
 weights = sorted(root.glob("*.safetensors"))
 if not weights:
     raise SystemExit("materialized draft has no safetensors weights")
