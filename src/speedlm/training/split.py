@@ -153,7 +153,8 @@ class HeldOutTraceSnapshotLeaser:
                     written += len(line)
                     if written > self._scratch_quota_bytes:
                         raise Eagle3Error(
-                            "training trace snapshot exceeds the scratch quota"
+                            "training trace snapshot exceeds the scratch quota; "
+                            "increase tuning.scratch_quota_bytes in config"
                         )
                     output.write(line)
                     digest.update(line)
