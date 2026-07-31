@@ -97,6 +97,9 @@ class ModelProfile:
     target_layer_ids: tuple[int, ...] | None
     chat_template_kind: ChatTemplateKind
     max_seq_len: int
+    num_hidden_layers: int | None = None
+    max_scratch_bytes: int | None = None
+    """Hidden-state scratch scales with hidden_size x num_aux_layers x tokens."""
     tool_call_parser: str | None = None
     reasoning_parser: str | None = None
     trainable: bool = field(init=False)
@@ -114,6 +117,10 @@ class ModelProfile:
             )
         _positive_int(self.num_speculative_tokens, "num_speculative_tokens")
         _positive_int(self.max_seq_len, "max_seq_len")
+        if self.num_hidden_layers is not None:
+            _positive_int(self.num_hidden_layers, "num_hidden_layers")
+        if self.max_scratch_bytes is not None:
+            _positive_int(self.max_scratch_bytes, "max_scratch_bytes")
         if self.tool_call_parser is not None:
             _non_empty_string(self.tool_call_parser, "tool_call_parser")
         if self.reasoning_parser is not None:
@@ -136,8 +143,6 @@ class ModelProfile:
             raise ProfileError(
                 "target_layer_ids must be null or unique non-negative integers"
             )
-        if self.speculative_method == "eagle3" and not self.target_layer_ids:
-            raise ProfileError("target_layer_ids are required for eagle3 profiles")
         if (
             self.speculative_method in {"eagle3", "medusa", "draft_model"}
             and self.draft_model is None
@@ -172,6 +177,8 @@ class ModelProfile:
             ),
             "chat_template_kind": self.chat_template_kind,
             "max_seq_len": self.max_seq_len,
+            "num_hidden_layers": self.num_hidden_layers,
+            "max_scratch_bytes": self.max_scratch_bytes,
             "tool_call_parser": self.tool_call_parser,
             "reasoning_parser": self.reasoning_parser,
             "trainable": self.trainable,
@@ -215,6 +222,8 @@ class ModelProfile:
         }
         allowed = required | {
             "target_layer_ids",
+            "num_hidden_layers",
+            "max_scratch_bytes",
             "tool_call_parser",
             "reasoning_parser",
             "trainable",
@@ -267,6 +276,18 @@ class ModelProfile:
                 reasoning_parser_value, "reasoning_parser"
             )
 
+        num_hidden_layers_value = data.get("num_hidden_layers")
+        if num_hidden_layers_value is not None:
+            num_hidden_layers_value = _positive_int(
+                num_hidden_layers_value, "num_hidden_layers"
+            )
+
+        max_scratch_bytes_value = data.get("max_scratch_bytes")
+        if max_scratch_bytes_value is not None:
+            max_scratch_bytes_value = _positive_int(
+                data["max_scratch_bytes"], "max_scratch_bytes"
+            )
+
         try:
             profile = cls(
                 name=_non_empty_string(data["name"], "name"),
@@ -281,6 +302,8 @@ class ModelProfile:
                 target_layer_ids=target_layer_ids,
                 chat_template_kind=cast(ChatTemplateKind, template_value),
                 max_seq_len=_positive_int(data["max_seq_len"], "max_seq_len"),
+                num_hidden_layers=cast(int | None, num_hidden_layers_value),
+                max_scratch_bytes=cast(int | None, max_scratch_bytes_value),
                 tool_call_parser=cast(str | None, tool_call_parser_value),
                 reasoning_parser=cast(str | None, reasoning_parser_value),
             )
@@ -299,6 +322,16 @@ class ModelProfile:
         return profile
 
 
+def default_aux_layers(num_hidden_layers: int) -> tuple[int, ...]:
+    """Return the default auxiliary layer IDs used by vLLM for speculative decoding.
+
+    This is the default rule from vLLM's ``interfaces.py``.
+    For example, gpt-oss-20b (24 layers) gives ``(2, 12, 21)``
+    and Llama-3.1-8B (32 layers) gives ``(2, 16, 29)``.
+    """
+    return (2, num_hidden_layers // 2, num_hidden_layers - 3)
+
+
 GPT_OSS_EAGLE3_PROFILE: Final = ModelProfile(
     name="gpt-oss-20b-eagle3",
     verifier_model="openai/gpt-oss-20b",
@@ -308,6 +341,7 @@ GPT_OSS_EAGLE3_PROFILE: Final = ModelProfile(
     target_layer_ids=(2, 12, 21),
     chat_template_kind="harmony",
     max_seq_len=131_072,
+    num_hidden_layers=24,
     tool_call_parser="openai",
     reasoning_parser="openai_gptoss",
 )
@@ -318,9 +352,10 @@ LLAMA_31_8B_EAGLE3_PROFILE: Final = ModelProfile(
     draft_model="RedHatAI/Llama-3.1-8B-Instruct-speculator.eagle3",
     speculative_method="eagle3",
     num_speculative_tokens=5,
-    target_layer_ids=(2, 12, 21),
+    target_layer_ids=(2, 16, 29),
     chat_template_kind="auto",
     max_seq_len=131_072,
+    num_hidden_layers=32,
 )
 
 QWEN_35_9B_MTP_PROFILE: Final = ModelProfile(

@@ -395,7 +395,13 @@ def _eagle3_adapter(
     quota: int = 1024 * 1024,
 ) -> Eagle3Adapter:
     return Eagle3Adapter(
-        Eagle3Config(training_params={"steps": 2}, scratch_quota_bytes=quota),
+        Eagle3Config(
+            verifier_model="openai/gpt-oss-20b",
+            draft_model="RedHatAI/gpt-oss-20b-speculator.eagle3",
+            from_pretrained="RedHatAI/gpt-oss-20b-speculator.eagle3",
+            training_params={"steps": 2},
+            scratch_quota_bytes=quota,
+        ),
         leaser=FakeLeaser(),
         renderer=renderer or FakeRenderer(),
         extractor=FakeExtractor(),

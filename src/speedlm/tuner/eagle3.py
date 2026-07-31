@@ -17,9 +17,11 @@ from typing import Protocol
 from speedlm.training.base import BackendInfo
 from speedlm.training.masking import FinalAssistantMaskError, MaskPolicy
 
+# Hidden-state scratch scales with hidden_size x num_aux_layers x tokens.
+# Larger models need proportionally more space.  This constant is a hard
+# safety ceiling; the per-instance scratch_quota_bytes in Eagle3Config
+# should typically be smaller.
 MAX_SCRATCH_BYTES = 20 * 1024 * 1024 * 1024
-DEFAULT_VERIFIER_MODEL = "openai/gpt-oss-20b"
-DEFAULT_DRAFT_MODEL = "RedHatAI/gpt-oss-20b-speculator.eagle3"
 
 AbortCheck = Callable[[], bool]
 
@@ -107,13 +109,13 @@ class Eagle3Timeouts:
 class Eagle3Config:
     """Models and training controls for one EAGLE-3 adapter."""
 
-    verifier_model: str = DEFAULT_VERIFIER_MODEL
+    verifier_model: str
+    draft_model: str
+    from_pretrained: str
     verifier_revision: str | None = None
-    draft_model: str = DEFAULT_DRAFT_MODEL
     draft_revision: str | None = None
-    from_pretrained: str = DEFAULT_DRAFT_MODEL
-    target_layer_ids: tuple[int, ...] = (2, 12, 21)
-    sequence_length: int = 8_192
+    target_layer_ids: tuple[int, ...] | None = None
+    sequence_length: int = 16_384
     num_speculative_steps: int = 3
     mask_policy: MaskPolicy = MaskPolicy.FINAL_TURN_ALL_CHANNELS
     training_params: Mapping[str, object] = field(default_factory=dict)
@@ -136,7 +138,7 @@ class Eagle3Config:
                 not isinstance(revision_value, str) or not revision_value
             ):
                 raise ValueError(f"{revision_name} must be a non-empty string or null")
-        if (
+        if self.target_layer_ids is not None and (
             not isinstance(self.target_layer_ids, tuple)
             or not self.target_layer_ids
             or any(
@@ -173,7 +175,6 @@ class Eagle3Config:
         result = dict(self.training_params)
         result.update(
             {
-                "target_layer_ids": self.target_layer_ids,
                 "sequence_length": self.sequence_length,
                 "num_speculative_steps": self.num_speculative_steps,
                 "distillation_loss": "soft_kl",
@@ -186,6 +187,8 @@ class Eagle3Config:
             result["verifier_revision"] = self.verifier_revision
         if self.draft_revision is not None:
             result["draft_revision"] = self.draft_revision
+        if self.target_layer_ids is not None:
+            result["target_layer_ids"] = self.target_layer_ids
         return result
 
 

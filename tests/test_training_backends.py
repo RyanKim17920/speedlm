@@ -8,6 +8,8 @@ from collections.abc import Sequence
 from pathlib import Path
 from unittest import mock
 
+import pytest
+
 from speedlm.training.backends.eagle3 import (
     _RESOLVE_MODEL,
     Eagle3Backend,
@@ -70,9 +72,20 @@ def test_shift_drops_position_zero_and_reports_row_id() -> None:
         raise AssertionError("expected shifted all-zero supervision to fail")
 
 
+def test_eagle3_config_requires_explicit_model() -> None:
+    """Constructing Eagle3Config without a model must raise."""
+    with pytest.raises(TypeError, match="missing"):
+        Eagle3Config()  # type: ignore[call-arg]
+
+
 def test_eagle3_backend_satisfies_protocol_and_declares_distillation_contract() -> None:
     backend = object.__new__(Eagle3Backend)
-    config = Eagle3Config(mask_policy=MaskPolicy.FINAL_TURN_ALL_CHANNELS)
+    config = Eagle3Config(
+        verifier_model="openai/gpt-oss-20b",
+        draft_model="RedHatAI/gpt-oss-20b-speculator.eagle3",
+        from_pretrained="RedHatAI/gpt-oss-20b-speculator.eagle3",
+        mask_policy=MaskPolicy.FINAL_TURN_ALL_CHANNELS,
+    )
 
     assert isinstance(backend, SpeculatorBackend)
     assert config.from_pretrained == "RedHatAI/gpt-oss-20b-speculator.eagle3"
@@ -86,6 +99,9 @@ def test_describe_carries_the_pinned_verifier_revision_into_the_manifest() -> No
     """The manifest must say *which* verifier, not merely which repo."""
     backend = object.__new__(Eagle3Backend)
     backend.config = Eagle3Config(
+        verifier_model="openai/gpt-oss-20b",
+        draft_model="RedHatAI/gpt-oss-20b-speculator.eagle3",
+        from_pretrained="RedHatAI/gpt-oss-20b-speculator.eagle3",
         mask_policy=MaskPolicy.FINAL_TURN_ALL_CHANNELS,
         verifier_revision="6cee5e81ee83917806bbde320786a8fb61efebee",
         training_params={"epochs": 1},
@@ -102,7 +118,12 @@ def test_describe_carries_the_pinned_verifier_revision_into_the_manifest() -> No
 def test_describe_records_an_unresolved_revision_as_null() -> None:
     """An absent key cannot be told apart from an unpinned cycle; null can."""
     backend = object.__new__(Eagle3Backend)
-    backend.config = Eagle3Config(mask_policy=MaskPolicy.FINAL_TURN_ALL_CHANNELS)
+    backend.config = Eagle3Config(
+        verifier_model="openai/gpt-oss-20b",
+        draft_model="RedHatAI/gpt-oss-20b-speculator.eagle3",
+        from_pretrained="RedHatAI/gpt-oss-20b-speculator.eagle3",
+        mask_policy=MaskPolicy.FINAL_TURN_ALL_CHANNELS,
+    )
 
     params = backend.describe().training_params
 
@@ -117,6 +138,8 @@ def _pipeline(tmp_path: Path) -> SpeculatorsPipelineConfig:
         prepared_validator_script=script,
         speculators_repo=tmp_path,
         training_python=tmp_path / "python",
+        verifier_model="openai/gpt-oss-20b",
+        warm_start_model="RedHatAI/gpt-oss-20b-speculator.eagle3",
         verifier_revision="6cee5e81ee83917806bbde320786a8fb61efebee",
     )
 

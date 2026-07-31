@@ -16,6 +16,7 @@ from speedlm.profiles import (
     ModelProfile,
     ParserRegistry,
     ProfileError,
+    default_aux_layers,
     discover_vllm_parser_registry,
     load_profiles,
     resolve_model_parsers,
@@ -31,6 +32,12 @@ def _write_profile(home: Path, filename: str, data: dict[str, object]) -> Path:
     return path
 
 
+def test_default_aux_layers_uses_vllm_rule() -> None:
+    assert default_aux_layers(24) == (2, 12, 21)
+    assert default_aux_layers(32) == (2, 16, 29)
+    assert default_aux_layers(48) == (2, 24, 45)
+
+
 def test_builtin_profiles_load_and_validate(tmp_path: Path) -> None:
     profiles = load_profiles(tmp_path)
 
@@ -40,6 +47,7 @@ def test_builtin_profiles_load_and_validate(tmp_path: Path) -> None:
     assert GPT_OSS_EAGLE3_PROFILE.tool_call_parser == "openai"
     assert GPT_OSS_EAGLE3_PROFILE.reasoning_parser == "openai_gptoss"
     assert LLAMA_31_8B_EAGLE3_PROFILE.speculative_method == "eagle3"
+    assert LLAMA_31_8B_EAGLE3_PROFILE.target_layer_ids == (2, 16, 29)
     assert QWEN_35_9B_MTP_PROFILE.verifier_model == "Qwen/Qwen3.5-9B"
     assert QWEN_35_9B_MTP_PROFILE.draft_model is None
     assert QWEN_35_9B_MTP_PROFILE.speculative_method == "mtp"

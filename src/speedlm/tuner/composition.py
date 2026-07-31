@@ -28,6 +28,7 @@ from speedlm.gateway.vllm_http import VLLMControlClient
 from speedlm.profiles import (
     ModelProfile,
     canonical_verifier_reference,
+    default_aux_layers,
     resolve_profile,
 )
 from speedlm.storage import ensure_layout
@@ -304,7 +305,11 @@ def create_production_tuner(
             profile.verifier_model, tuning.verifier_revision
         ),
         warm_start_model=profile.draft_model,
-        target_layer_ids=profile.target_layer_ids or (),
+        target_layer_ids=profile.target_layer_ids or (
+            default_aux_layers(profile.num_hidden_layers)
+            if profile.num_hidden_layers is not None
+            else ()
+        ),
         sequence_length=min(tuning.sequence_length, profile.max_seq_len),
         learning_rate=tuning.learning_rate,
         epochs=tuning.epochs,

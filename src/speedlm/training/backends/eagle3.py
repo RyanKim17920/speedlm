@@ -25,8 +25,6 @@ from speedlm.training.backends.speculators_runner import (
 )
 from speedlm.training.masking import FinalAssistantMaskError, MaskPolicy
 from speedlm.tuner.eagle3 import (
-    DEFAULT_DRAFT_MODEL,
-    DEFAULT_VERIFIER_MODEL,
     MAX_SCRATCH_BYTES,
     AbortCheck,
     DraftMaterializer,
@@ -178,15 +176,18 @@ class SpeculatorsPipelineConfig:
     """Configurable reproduction of the verified Speculators pipeline."""
 
     prepared_validator_script: Path
+    verifier_model: str
+    warm_start_model: str
     row_count: int | None = None
     speculators_repo: Path = DEFAULT_SPECULATORS_REPO
     training_python: Path = DEFAULT_SPECULATORS_PYTHON
     vllm_python: Path | None = None
-    verifier_model: str = DEFAULT_VERIFIER_MODEL
     verifier_revision: str | None = None
-    warm_start_model: str = DEFAULT_DRAFT_MODEL
     warm_start_revision: str | None = None
-    target_layer_ids: tuple[int, ...] = (2, 12, 21)
+    target_layer_ids: tuple[int, ...] = ()
+    #: Sequence length for training. A value of 16384 collapsed a 512-record
+    #: corpus into 1 batch; 4096 yielded 44 steps, making this a key lever
+    #: for sampler throughput and gradient frequency.
     sequence_length: int = 16_384
     learning_rate: float = 1e-5
     epochs: int = 1
@@ -249,9 +250,8 @@ class SpeculatorsPipelineConfig:
             _positive_int("row_count", self.row_count)
         if self.port > 65_535:
             raise ValueError("port must be at most 65535")
-        if (
-            not self.target_layer_ids
-            or any(
+        if self.target_layer_ids and (
+            any(
                 isinstance(layer, bool) or not isinstance(layer, int) or layer < 0
                 for layer in self.target_layer_ids
             )
@@ -1393,10 +1393,8 @@ def _health(url: str, timeout: float) -> bool:
 
 
 __all__ = [
-    "DEFAULT_DRAFT_MODEL",
     "DEFAULT_SPECULATORS_PYTHON",
     "DEFAULT_SPECULATORS_REPO",
-    "DEFAULT_VERIFIER_MODEL",
     "MAX_SCRATCH_BYTES",
     "DraftMaterializer",
     "DraftValidator",

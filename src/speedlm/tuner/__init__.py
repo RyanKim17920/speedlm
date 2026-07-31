@@ -10,8 +10,6 @@ from speedlm.tuner.artifacts import (
     ArtifactSpec,
 )
 from speedlm.tuner.eagle3 import (
-    DEFAULT_DRAFT_MODEL,
-    DEFAULT_VERIFIER_MODEL,
     Eagle3Adapter,
     Eagle3Config,
     ScratchQuotaExceeded,
@@ -34,8 +32,6 @@ from speedlm.tuner.state import (
 )
 
 __all__ = [
-    "DEFAULT_DRAFT_MODEL",
-    "DEFAULT_VERIFIER_MODEL",
     "ActivitySource",
     "Artifact",
     "ArtifactError",
