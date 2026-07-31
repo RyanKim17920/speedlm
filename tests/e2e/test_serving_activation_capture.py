@@ -187,17 +187,31 @@ def _wait_for_ready(
     )
 
 
-def _check_endpoint(url: str) -> None:
-    """Verify the deployment serves /v1/chat/completions and fail clearly."""
+def _get_served_model_id(url: str) -> str:
+    """Query /v1/models and return the first served model id.
+
+    vLLM registers the model under its resolved snapshot path (e.g.
+    /data/.../snapshots/<commit>), not the friendly repo id.  Using the
+    wrong id causes a 404 — not a 400 — so we always resolve it here.
+
+    Also verifies that /v1/chat/completions is routable; raises with a
+    clear message if the endpoint is missing.
+    """
     with httpx.Client(timeout=10.0, trust_env=False) as client:
         resp = client.get(f"{url}/v1/models")
-        if resp.status_code == 200:
-            return
-    # Fallback: just try a HEAD on the chat endpoint
+        resp.raise_for_status()
+        body = resp.json()
+        model_ids = [m["id"] for m in body.get("data", [])]
+    if not model_ids:
+        raise AssertionError(
+            "/v1/models returned no served models — the engine may not have "
+            "finished loading"
+        )
+
+    # Verify /v1/chat/completions is routable as a safety net
     with httpx.Client(timeout=10.0, trust_env=False) as client:
-        resp = client.head(f"{url}/v1/chat/completions")
-    if resp.status_code in (404, 405, 501):
-        # List known routes from OpenAPI if available
+        head_resp = client.head(f"{url}/v1/chat/completions")
+    if head_resp.status_code in (404, 405, 501):
         try:
             with httpx.Client(timeout=10.0, trust_env=False) as client:
                 openapi = client.get(f"{url}/openapi.json").json()
@@ -212,20 +226,24 @@ def _check_endpoint(url: str) -> None:
             f"available routes: {routes}"
         ) from None
 
+    return model_ids[0]
 
-def _send_prompt(url: str, prompt: str) -> str:
+
+def _send_prompt(url: str, prompt: str, *, served_model_id: str) -> str:
     """Send a single chat completion request and return the output text.
 
     Uses /v1/chat/completions with a messages array so that vLLM applies
     the model's chat template — matching the offline extraction path, which
     also applies the chat template via prepare_data.py / apply_chat_template.
+
+    ``served_model_id`` must be the exact id from /v1/models (the resolved
+    snapshot path), not a friendly repo id like "openai/gpt-oss-20b".
     """
     with httpx.Client(timeout=120.0, trust_env=False) as client:
-        _check_endpoint(url)
         resp = client.post(
             f"{url}/v1/chat/completions",
             json={
-                "model": "test",
+                "model": served_model_id,
                 "messages": [{"role": "user", "content": prompt}],
                 "max_tokens": 16,
                 "temperature": 0,
@@ -233,6 +251,19 @@ def _send_prompt(url: str, prompt: str) -> str:
                 "seed": 0,
             },
         )
+        if resp.status_code == 404:
+            # Self-diagnosing: show what we sent vs. what is served.
+            try:
+                with httpx.Client(timeout=10.0, trust_env=False) as probe:
+                    models_resp = probe.get(f"{url}/v1/models")
+                    models_resp.raise_for_status()
+                    served = [m["id"] for m in models_resp.json().get("data", [])]
+            except Exception:
+                served = ["(unable to query /v1/models)"]
+            raise AssertionError(
+                f"404 from /v1/chat/completions — model id mismatch. "
+                f"Sent model={served_model_id!r}, served model ids={served}"
+            ) from None
         resp.raise_for_status()
         data = resp.json()
     return data["choices"][0]["message"]["content"]
@@ -400,13 +431,14 @@ def test_stage0_activation_capture() -> None:
     )
 
     try:
-        _wait_for_ready(
-            f"http://127.0.0.1:{port}", vllm_proc, timeout, log_path=vllm_log
-        )
+        url = f"http://127.0.0.1:{port}"
+        _wait_for_ready(url, vllm_proc, timeout, log_path=vllm_log)
+
+        served_model_id = _get_served_model_id(url)
 
         # Step 2: Activate capture via collective_rpc, send prompt, flush
         _collective_rpc(vllm_proc, port, "activate_capture", str(capture_dir))
-        _send_prompt(f"http://127.0.0.1:{port}", prompt)
+        _send_prompt(url, prompt, served_model_id=served_model_id)
         # Small pause to let the hook buffer finish
         time.sleep(0.5)
         _collective_rpc(vllm_proc, port, "flush_capture")
@@ -557,16 +589,17 @@ def test_prefix_cache_coverage() -> None:
     )
 
     try:
-        _wait_for_ready(
-            f"http://127.0.0.1:{port}", vllm_proc, timeout, log_path=vllm_log
-        )
+        url = f"http://127.0.0.1:{port}"
+        _wait_for_ready(url, vllm_proc, timeout, log_path=vllm_log)
+
+        served_model_id = _get_served_model_id(url)
 
         # Activate capture
         _collective_rpc(vllm_proc, port, "activate_capture", str(capture_dir))
 
         # Send same prompt twice; second should hit prefix cache
-        _send_prompt(f"http://127.0.0.1:{port}", prompt)
-        _send_prompt(f"http://127.0.0.1:{port}", prompt)
+        _send_prompt(url, prompt, served_model_id=served_model_id)
+        _send_prompt(url, prompt, served_model_id=served_model_id)
 
         time.sleep(0.5)
         _collective_rpc(vllm_proc, port, "flush_capture")
