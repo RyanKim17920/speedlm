@@ -72,11 +72,41 @@ class TestBf16Tolerance:
 
     @pytest.mark.parametrize(
         ("layer", "expected"),
-        [(2, 0.0234375), (12, 0.0625), (21, 0.09765625), (36, 0.15625)],
+        [(2, 0.0234375), (18, 0.0859375), (33, 0.14453125), (36, 0.15625)],
     )
     def test_qwen3_8b_layers(self, layer: int, expected: float) -> None:
-        """The values quoted in the module docstring must stay true."""
+        """The values quoted in the module docstring must stay true.
+
+        #: These are Qwen3-8B's actual aux layers ``[2, 18, 33]`` plus the
+        #: appended final layer 36, as resolved from the drafter's
+        #: ``eagle_aux_hidden_state_layer_ids`` at runtime.  The list previously
+        #: asserted here, ``[2, 12, 21]``, was gpt-oss-20b's and was attributed
+        #: to Qwen3-8B by mistake; it pinned a wrong worked example into the
+        #: module docstring.  Nothing in the production path was affected --
+        #: :func:`bf16_relative_tolerance` is called with the resolved layer id
+        #: (``hf_reference.py`` ``for aux_idx in sorted(captured)``), never with
+        #: a positional index -- but the documented example was wrong.
+        """
         assert bf16_relative_tolerance(layer) == pytest.approx(expected)
+
+    def test_tolerance_uses_the_layer_id_not_a_positional_index(self) -> None:
+        """Guard the distinction the wrong-list bug made easy to miss.
+
+        For aux layers ``[2, 18, 33, 36]`` the positional indices are
+        ``0, 1, 2, 3``.  Feeding positions instead of ids would collapse every
+        tolerance into the 1.6e-2..2.7e-2 band -- far too tight at depth 33 --
+        and the comparison would silently target the wrong residual depth.
+        """
+        aux_layer_ids = [2, 18, 33, 36]
+        by_id = [bf16_relative_tolerance(k) for k in aux_layer_ids]
+        by_position = [
+            bf16_relative_tolerance(i) for i in range(len(aux_layer_ids))
+        ]
+        assert by_id != by_position
+        assert by_id == pytest.approx(
+            [0.0234375, 0.0859375, 0.14453125, 0.15625]
+        )
+        assert max(by_position) < min(by_id[1:])
 
     def test_stays_far_below_a_wrong_quantity(self) -> None:
         """Even the deepest bound leaves an order of magnitude to O(1) error."""

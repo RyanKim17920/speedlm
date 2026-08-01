@@ -516,19 +516,40 @@ class ActivationCaptureExtension:
         # Use actual layer indices from the model's aux_hidden_state_layers.
         # These are the indices the runner configured via
         # set_aux_hidden_state_layers (interfaces.py:1326-1327).
+        #: There used to be a ``except Exception:`` here that fell back to
+        #: ``range(len(aux_hidden_states))``.  That fallback is not a
+        #: degradation, it is a silent corruption: for aux layers
+        #: ``(2, 18, 33, 36)`` it would key the buffer ``0, 1, 2, 3``, and every
+        #: downstream consumer -- the bf16 tolerance, which is
+        #: ``2^-8 * (layer_id + 4)``, and the residual-stream depth the capture
+        #: is compared against -- would then be reading the wrong layer with no
+        #: signal at all.  Capture is opt-in and only reaches here while active,
+        #: so failing the request is strictly better than writing mislabelled
+        #: activations into a training cache.
         try:
             runner = self.model_runner  # type: ignore[attr-defined]
             inner_model = self._resolve_inner_model(runner.model)
             layer_indices: tuple[int, ...] = inner_model.aux_hidden_state_layers
-        except Exception:
-            # Fallback to positional indices if we can't reach the model
-            layer_indices = tuple(range(len(aux_hidden_states)))
+        except Exception as exc:
+            raise RuntimeError(
+                "cannot read aux_hidden_state_layers from the running model, "
+                "so captured activations cannot be labelled with their true "
+                "layer indices; refusing to buffer positionally-keyed rows"
+            ) from exc
+
+        if len(layer_indices) != len(aux_hidden_states):
+            raise RuntimeError(
+                f"the model reported {len(layer_indices)} aux layers "
+                f"{layer_indices} but the forward produced "
+                f"{len(aux_hidden_states)} aux hidden states; the layer "
+                f"labelling cannot be trusted"
+            )
 
         with self._get_lock():
             pending = self._get_pending()
             for i, tensor in enumerate(aux_hidden_states):
                 cpu_tensor = tensor.detach().cpu()
-                key = layer_indices[i] if i < len(layer_indices) else i
+                key = layer_indices[i]
                 if key not in pending:
                     pending[key] = []
                 pending[key].append(cpu_tensor)

@@ -466,6 +466,77 @@ statement saying "no hidden states are produced." The inference is
 straightforward — no forward pass, no activations — but it is inference, and it
 should be settled empirically by the prototype rather than argued.
 
+#### 6.1.1 Status: NOT retired. The previous retirement was based on a fabricated value.
+
+This hazard was previously recorded in this document as **retired empirically**,
+on the strength of `{"cache_hit": true, "rows_missing": 0}` in
+`prefix_cache_result.json`. Those were **hardcoded literals**. The test that
+"produced" them contained no `assert` at all and wrote both fields as constants;
+it could not have observed a cache hit and did not. The retirement rested on a
+value nobody measured, and it is withdrawn. Do not cite it.
+
+**What the first real measurement says.** With the literals removed, job 369236
+measured, for two identical requests on an engine with
+`enable_prefix_caching=True`, `enable_chunked_prefill=True`, eagle3 speculative
+decoding and a 153,056-token GPU KV cache:
+
+| Counter | Before | After |
+| --- | --- | --- |
+| `vllm:prefix_cache_queries_total` | 18 | 36 |
+| `vllm:prefix_cache_hits_total` | 0 | 0 |
+| captured rows/layer (cold → warm) | 48 | 48 |
+
+Prefix caching was engaged — queries advanced by exactly the 18 prompt tokens,
+and `record()` is only reached past the `enable_caching` early return
+(`V/v1/core/kv_cache_manager.py:222-244`) — but **nothing matched**.
+
+**Root cause: the prompt was too short for a hit to be representable.** This is
+correct engine behaviour, not a capture defect. Three independent truncations
+apply to an 18-token prompt at the default block size of 16
+(`V/config/cache.py:47`, `DEFAULT_BLOCK_SIZE: ClassVar[int] = 16`; FlashAttention
+keeps 16 on CUDA, `V/v1/attention/backends/flash_attn.py:81-85`):
+
+1. **Only full blocks are hashed.** `V/v1/core/kv_cache_utils.py:709-712` —
+   `if end_token_idx > num_tokens: break  # We only hash full blocks`. Tokens
+   16–17 are never hashed, so an 18-token prompt yields **one** block hash.
+2. **The last token is always recomputed.**
+   `V/v1/core/kv_cache_manager.py:225-231` — "When all tokens hit the cache, we
+   must recompute the last token to obtain logits", so
+   `max_cache_hit_length = request.num_tokens - 1` = 17, and
+   `V/v1/core/single_type_kv_cache_manager.py:590` scans
+   `max_num_blocks = 17 // 16` = **1** block.
+3. **Eagle drops the last matched block.**
+   `V/v1/core/single_type_kv_cache_manager.py:602-605` —
+   `if drop_eagle_block and computed_blocks[0]: computed.pop()`, reached because
+   `eagle3` is in `SpeculativeConfig.use_eagle()`
+   (`V/config/speculative.py:1238-1242`), and the coordinator conservatively
+   flags all groups when `use_eagle` is set
+   (`V/v1/core/kv_cache_coordinator.py:100-105`).
+
+One block hashed, one block scanned, that one block popped ⇒ **zero hits is the
+only possible result**, for any 18-token prompt, on any run of this engine
+configuration. The stats confirm rather than contradict this: `queries` counts
+*tokens*, not blocks (`V/v1/metrics/stats.py:115-142`, "`queries`: Refers to the
+number of tokens that were queried"), which is why it read 36 for two 18-token
+requests.
+
+Chunked prefill is not implicated: `get_computed_blocks` runs before any
+chunking and reads the full `request.block_hashes`
+(`V/v1/core/sched/scheduler.py:478-479`).
+
+**Consequence for the hazard.** 6.1 remains **open and unverified**. Nothing
+about job 369236 argues against it — the experiment simply never reached the
+regime where it applies. The test now uses a ~165-token prompt (10 hashable
+blocks, 9 hittable after the two structural drops) and asserts the hit size
+exactly against the block arithmetic above, so the next run either demonstrates
+the hazard or produces a real negative. Until that run exists, treat 6.1 as
+argued-from-source and unconfirmed.
+
+**Minimum prompt length, for anyone reproducing this.** With block size 16, hit
+blocks = `(N-1)//16 - 1` under eagle. So `N ≥ 33` for any hit at all, and
+`N ≥ 16·(k+2)+1` for `k` hit blocks. Without eagle-family speculation the second
+term disappears and `N ≥ 17` suffices.
+
 **Consequence:** for cache-hit tokens there is no activation row at all. Coverage
 holes are **data-dependent** — they appear exactly on repeated prefixes, which in
 a real deployment means system prompts and few-shot preambles, i.e. the tokens
@@ -620,6 +691,27 @@ of the question.
 Both legs must exist before any training consumes captured data. Leg 1 alone
 cannot tell a correct capture from a well-transported wrong one.
 
+**The two Leg 1 sides do not even run the same model runner.** The offline
+extraction engine logs `Model Runner V2 does not yet support speculative method
+'extract_hidden_states'; using the V1 model runner instead`, while the capture
+engine runs V2. So Leg 1's `max_abs_diff = 0.0` is a V2-runner capture agreeing
+bit-for-bit with a V1-runner extraction.
+
+This **weakens** the "they are the same tensor, so 0.0 is uninformative"
+reading, and it is worth being precise about which direction it cuts. Two
+different runners scheduling and slicing independently would not normally be
+expected to agree to the last bit; that they do is mild evidence that the
+capture is reading the tensor at the same point in the computation the offline
+path does, rather than at a shifted one. But it does **not** upgrade Leg 1 into
+an identity check, for the reason 6.2 gives: both runners obtain the aux states
+from the same `aux_hidden_state_layers` collection inside the same verifier
+forward, so a wrong *layer* or a wrong *side of the norm* would be wrong
+identically on both sides and still print 0.0. A runner difference perturbs
+scheduling, batching and slicing — exactly the things Leg 1 is designed to
+catch — not the choice of quantity. Leg 2 remains the only thing that answers
+identity, and the conclusion "0.0 carries no information about identity" stands
+unchanged.
+
 The Leg 1 verdict is driven by the *aggregate* relative error
 (`mean_rel_error = mean|cap-off| / mean|off|`, tolerance 0.10) together with the
 shape check and the pre-norm check; cosine similarity is the corroborating
@@ -770,7 +862,7 @@ assert `len(loss_mask) == captured_row_count` per row before training starts.
 
 | # | Hazard | Severity | Mitigation | Detector |
 | --- | --- | --- | --- | --- |
-| 6.1 | Prefix-cache coverage holes | **High** (data-dependent, biased) | `--no-enable-prefix-caching` or per-request `skip_reading_prefix_cache` | Per-request row count == prompt + generated; fail closed below a floor |
+| 6.1 | Prefix-cache coverage holes — **open, not retired** (6.1.1) | **High** (data-dependent, biased) | `--no-enable-prefix-caching` or per-request `skip_reading_prefix_cache` | Per-request row count == prompt + generated; fail closed below a floor |
 | 6.2 | Pre-norm vs post-norm target | **High** (wrong quantity, invisible) | Collect the final layer as a 4th aux layer; slice it before drafter `fc` (localized model-runner patch) — does NOT change drafter architecture | Offline-vs-serving elementwise equivalence test |
 | 6.3 | Rejected draft rows | Medium | Filter by `num_rejected_tokens`; handle async deferral | Captured rows == served tokens, per request, exact |
 | 6.4 | Prefill/decode numerics | Medium (pre-existing) | Measure first; `VLLM_BATCH_INVARIANT=1` if warranted | Equivalence harness across batch sizes; publish the spread |
@@ -937,9 +1029,9 @@ the first version of this document got it wrong, so it is stated explicitly.
 | Question | Settled by | Status |
 | --- | --- | --- |
 | Can a mechanism reach `aux_hidden_states` in a serving engine? | The capture running at all | **Yes** — `worker_extension_cls` + `_model_forward` monkeypatch (5.2) |
-| Does the capture survive transport to disk intact — right rows, right layers, right order, no truncation? | Leg 1 (capture vs. offline) | **Yes** — job 369229, `max_abs_diff = 0.0` on all three layers |
+| Does the capture survive transport to disk intact — right rows, right layers, right order, no truncation? | Leg 1 (capture vs. offline) | **Yes** — job 369229, `max_abs_diff = 0.0` on all three layers. Note the two sides run *different model runners* (capture on V2, offline extraction falls back to V1 for `extract_hidden_states`), which makes the bit-identity a slightly stronger transport result than "same tensor twice" — but still says nothing about identity (see 6.2). |
 | Are the captured values the **same quantity** the trainer expects (pre-norm, layer `k`, not `k±1`)? | Leg 2 (capture vs. HF fp32) | **Not settled by Leg 1.** Leg 1 is a transport check between two views of one tensor (see 6.2); a `0.0` there is expected and carries no information about identity. Leg 2 exists to answer this and its verdict gates the test. |
-| Does a prefix-cache hit genuinely drop rows (6.1)? | `test_prefix_cache_coverage` | **Now measured.** Until 2026-08-01 that test contained no `assert` and wrote `cache_hit: true` / `rows_missing: 0` as hardcoded literals — it recorded an assumption. It now reads `vllm:prefix_cache_hits_total` off the engine and asserts a hit occurred, that the warm request captured strictly fewer rows per layer than the cold one, and that rows are actually missing. |
+| Does a prefix-cache hit genuinely drop rows (6.1)? | `test_prefix_cache_coverage` | **Still open — and the earlier "retired" verdict was withdrawn.** Until 2026-08-01 that test contained no `assert` and wrote `cache_hit: true` / `rows_missing: 0` as hardcoded literals; the retirement of 6.1 rested on those fabricated values. The test now reads `vllm:prefix_cache_hits_total` off the engine, but its first real run (job 369236) measured **zero hits** — correctly, because an 18-token prompt cannot fill a hittable block under eagle3 (see 6.1.1). The prompt has been lengthened to ~165 tokens; the hazard has **not** been demonstrated yet. |
 | What is the real serving latency cost of capture? | p50/p99 with capture on vs. off | **Still open.** Not measured. |
 
 Do not cite "Stage 0 passed" as settling the correctness question. Cite which
@@ -968,9 +1060,12 @@ the plan is worth writing:
   without it the previous criterion is satisfiable by any wrong quantity that
   is transported correctly.
 - A cache-hit prompt demonstrably yields fewer captured rows than tokens,
-  confirming 6.1 empirically. **Now actually asserted**, from the engine's own
-  prefix-cache counters rather than from the fact that the same prompt was sent
-  twice.
+  confirming 6.1 empirically. **Not met.** Now actually asserted, from the
+  engine's own prefix-cache counters rather than from the fact that the same
+  prompt was sent twice — but the first honest run produced *no cache hit*,
+  because the 18-token prompt was shorter than one hittable block under eagle3
+  (6.1.1). The prompt is now ~165 tokens; this criterion stays open until a run
+  reports a nonzero hit.
 - Measured p50 and p99 serving latency with capture on versus off, published.
   **Still outstanding.**
 
@@ -1039,13 +1134,15 @@ changes.
    quantity the trainer expects* — is answered by the independent HuggingFace
    fp32 leg, not by this comparison. Do not let a `0.0` in `result.json` retire
    this line item.
-3. **Does the prefix-cache absence inference hold?** Section 6.1 is inference from
-   what crosses an API boundary, not from an explicit statement in code.
-   Empirical check required — and now performed: `test_prefix_cache_coverage`
-   reads `vllm:prefix_cache_hits_total` and asserts the warm request captured
-   strictly fewer rows. Before 2026-08-01 that test asserted nothing and wrote
-   its "findings" as literals, so any earlier citation of it as confirmation of
-   6.1 was citing an assumption.
+3. **Does the prefix-cache absence inference hold?** **Still open.** Section 6.1
+   is inference from what crosses an API boundary, not from an explicit
+   statement in code. Before 2026-08-01 `test_prefix_cache_coverage` asserted
+   nothing and wrote its "findings" as literals, and 6.1 was retired on those
+   literals — so any citation of it as confirmation was citing a fabricated
+   value. The test now reads `vllm:prefix_cache_hits_total` and asserts the warm
+   request captured strictly fewer rows, but its first honest run (job 369236)
+   got zero hits because the prompt was too short to fill a hittable block under
+   eagle3 (6.1.1). The empirical check is still outstanding.
 4. **What did the 16 aborted cycles actually fail on?** The claim that capture
    would have prevented them is currently unsupported. Read the failure records.
 5. **What is the throughput cost of `VLLM_BATCH_INVARIANT=1` on this stack?**

@@ -129,6 +129,78 @@ SPECULATORS_REPO = Path("/admin/home/ryan.kim/speedlm/.preflight/speculators")
 # Short fixed prompt for the experiment
 DEFAULT_PROMPT = "The quick brown fox jumps over the lazy dog."
 
+#: vLLM's default KV block size on CUDA (``V/config/cache.py:47``,
+#: ``DEFAULT_BLOCK_SIZE: ClassVar[int] = 16``; FlashAttention keeps 16 on CUDA,
+#: ``V/v1/attention/backends/flash_attn.py:81-85``).  The prefix-cache test does
+#: not pass ``--block-size``, so this is what it gets.
+PREFIX_CACHE_BLOCK_SIZE: Final[int] = 16
+
+#: Blocks that can never be reported as a prefix-cache hit, however long the
+#: prompt is:
+#:
+#: * one for the trailing partial block, which is never hashed at all --
+#:   ``V/v1/core/kv_cache_utils.py:709-712`` breaks out of the hashing loop with
+#:   "We only hash full blocks", and ``V/v1/core/kv_cache_manager.py:231`` caps
+#:   the lookup at ``request.num_tokens - 1`` so the last token is always
+#:   recomputed for its logits;
+#: * one more because eagle-family speculative decoding drops the last matched
+#:   block -- ``V/v1/core/single_type_kv_cache_manager.py:602-605``,
+#:   ``if drop_eagle_block and computed_blocks[0]: computed.pop()``, reached
+#:   because ``eagle3`` is in ``SpeculativeConfig.use_eagle()``
+#:   (``V/config/speculative.py:1238-1242``).
+#:
+#: So the hit length in blocks is ``(N - 1) // 16 - 1``.
+PREFIX_CACHE_UNHITTABLE_BLOCKS: Final[int] = 2
+
+#: How many blocks must actually hit for the test to be exercising hazard 6.1
+#: rather than measuring the floor.  Four is arbitrary but deliberate: it puts
+#: the prompt several blocks past the point where a hit becomes possible at all,
+#: so the measurement does not sit on a cliff edge.
+PREFIX_CACHE_MIN_HIT_BLOCKS: Final[int] = 4
+
+#: Prompt long enough that a repeat of it spans several cacheable blocks.
+#:
+#: **This length is the point of the prompt.**  The previous version of
+#: ``test_prefix_cache_coverage`` reused :data:`DEFAULT_PROMPT`, which renders to
+#: 18 tokens through Qwen3's chat template.  With a 16-token block that is one
+#: hashable block, the lookup is capped at 17 tokens (one block), and eagle3
+#: pops that single matched block -- so the measured result was
+#: ``queries 18 -> 36, hits 0 -> 0``.  Zero hits was *correct engine behaviour*,
+#: not a capture bug and not a misconfiguration; the prompt was simply too short
+#: for a hit to be representable.  At 165 tokens this renders to 10 hashable
+#: blocks, 9 of which are hittable, which the hazard can actually be observed on.
+PREFIX_CACHE_PROMPT: Final[str] = (
+    "The quick brown fox jumps over the lazy dog. "
+    "Pack my box with five dozen liquor jugs. "
+    "How vexingly quick daft zebras jump. "
+    "Sphinx of black quartz, judge my vow. "
+) * 4
+
+
+def _min_prefix_cache_prompt_tokens() -> int:
+    """Shortest prompt that can show :data:`PREFIX_CACHE_MIN_HIT_BLOCKS` hits.
+
+    Derived from the block arithmetic above rather than written down as a
+    number, so that changing the block size or the required margin cannot leave
+    a stale literal behind.
+    """
+    blocks = PREFIX_CACHE_MIN_HIT_BLOCKS + PREFIX_CACHE_UNHITTABLE_BLOCKS
+    return blocks * PREFIX_CACHE_BLOCK_SIZE + 1
+
+
+def _expected_prefix_cache_hit_tokens(prompt_token_count: int) -> int:
+    """Hit tokens vLLM should report for a re-sent *prompt_token_count* prompt.
+
+    ``(N - 1) // block_size`` blocks are scanned
+    (``V/v1/core/single_type_kv_cache_manager.py:590``), the last matched one is
+    dropped for eagle (``:602-605``), and the hit is reported in tokens
+    (``V/v1/metrics/stats.py:115-142``, "the number of tokens that were
+    queried").  Clamped at zero: for a short enough prompt the correct answer is
+    genuinely no hit.
+    """
+    scanned = (prompt_token_count - 1) // PREFIX_CACHE_BLOCK_SIZE
+    return max(0, scanned - 1) * PREFIX_CACHE_BLOCK_SIZE
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -735,6 +807,47 @@ def _wait_for_gpu_memory_release(
 # ---------------------------------------------------------------------------
 
 
+def _flatten_token_ids(encoded: Any) -> list[int]:
+    """Coerce a tokenizer's chat-template output into a flat ``list[int]``.
+
+    Accepts the three shapes ``apply_chat_template(tokenize=True)`` has
+    returned across transformers versions:
+
+    * a ``BatchEncoding``/mapping with an ``input_ids`` entry (5.x default,
+      since ``return_dict`` became ``True``);
+    * a batched ``[[id, ...]]`` sequence (one row, because one conversation is
+      passed);
+    * a flat ``[id, ...]`` sequence (pre-5.x).
+
+    Anything else raises rather than silently producing a wrong sequence: the
+    whole point of this helper's caller is that the reference forward must run
+    exactly the tokens the engine prefilled.
+    """
+    #: BatchEncoding is a Mapping, so this also covers a plain dict.  Tensors
+    #: are not requested (no return_tensors), so the value is a nested list.
+    if hasattr(encoded, "keys") and "input_ids" in encoded:
+        encoded = encoded["input_ids"]
+    if hasattr(encoded, "tolist"):  #: torch.Tensor / numpy.ndarray
+        encoded = encoded.tolist()
+    if not isinstance(encoded, (list, tuple)) or not encoded:
+        raise TypeError(
+            f"apply_chat_template returned {type(encoded).__name__} with no "
+            f"usable token ids; this test cannot verify that the reference "
+            f"forward runs the same tokens the engine prefilled"
+        )
+    #: One conversation in means at most one row out; a batched return is
+    #: unwrapped, but a batch of >1 means the call was not what we think it is.
+    if isinstance(encoded[0], (list, tuple)):
+        if len(encoded) != 1:
+            raise TypeError(
+                f"apply_chat_template returned {len(encoded)} batched rows for "
+                f"a single conversation; refusing to guess which one the "
+                f"engine prefilled"
+            )
+        encoded = encoded[0]
+    return [int(t) for t in encoded]
+
+
 def _prompt_token_ids(
     verifier: str, prompt: str, *, expected_count: int
 ) -> list[int]:
@@ -745,17 +858,25 @@ def _prompt_token_ids(
     length must equal the engine's own ``usage.prompt_tokens``.  A mismatch
     means the template this test renders and the one vLLM applied are not the
     same, and every downstream number would be comparing different sequences.
+
+    #: transformers 5.x flipped ``apply_chat_template``'s ``return_dict``
+    #: default to ``True`` (``tokenization_utils_base.py:3004``), so
+    #: ``tokenize=True`` returns a ``BatchEncoding`` and iterating it yields the
+    #: key strings ``'input_ids'``/``'attention_mask'`` rather than token ids.
+    #: Pre-5.x returns a flat ``list[int]``.  Both shapes are unwrapped here
+    #: rather than pinning a version, because the vLLM venv's transformers is
+    #: not under this repo's control.
     """
     from transformers import AutoTokenizer
 
     model_dir = _resolve_model_dir(verifier)
     tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
-    token_ids = tokenizer.apply_chat_template(
+    encoded = tokenizer.apply_chat_template(
         [{"role": "user", "content": prompt}],
         add_generation_prompt=True,
         tokenize=True,
     )
-    ids = [int(t) for t in token_ids]
+    ids = _flatten_token_ids(encoded)
     assert len(ids) == expected_count, (
         f"locally rendered prompt is {len(ids)} tokens but the engine reported "
         f"usage.prompt_tokens={expected_count}; the HF reference would be "
@@ -1255,9 +1376,29 @@ def test_prefix_cache_coverage() -> None:
     caching at its default (on) precisely so a hit can occur.  The old
     ``cache_hit: true`` here happened to name the right answer for the wrong
     reason — it was never read off the engine.
+
+    **Why the prompt is not** :data:`DEFAULT_PROMPT`.  The first measured run of
+    this test (job 369236) reported ``queries 18 -> 36`` with ``hits 0 -> 0``
+    and identical cold/warm row counts.  That is not a failure of the hazard and
+    not a misconfiguration — it is arithmetic.  ``DEFAULT_PROMPT`` renders to 18
+    tokens; vLLM hashes only full 16-token blocks
+    (``V/v1/core/kv_cache_utils.py:709-712``), caps the lookup at
+    ``num_tokens - 1`` so the final token is always recomputed
+    (``V/v1/core/kv_cache_manager.py:231``), and drops the last matched block
+    outright under eagle-family speculation
+    (``V/v1/core/single_type_kv_cache_manager.py:602-605``, reached because
+    ``eagle3`` is in ``use_eagle()``, ``V/config/speculative.py:1238-1242``).
+    An 18-token prompt yields exactly one hashable block, and that block is the
+    one eagle drops, so **zero hits is the correct result and no prompt of that
+    length can ever produce another**.  :data:`PREFIX_CACHE_PROMPT` is sized to
+    span several blocks so the hazard is representable at all, and the required
+    length is asserted below against the engine's own token count rather than
+    assumed.
     """
     verifier, drafter, artifact_root = _require_environment()
-    prompt = os.environ.get("SPEEDLM_E2E_PROMPT", DEFAULT_PROMPT)
+    #: Deliberately NOT SPEEDLM_E2E_PROMPT: an overridden short prompt would
+    #: silently reduce this back to the unmeasurable case described above.
+    prompt = PREFIX_CACHE_PROMPT
     artifact_dir = _create_artifact_dir(artifact_root)
     port = int(os.environ.get("SPEEDLM_E2E_PORT", _free_port()))
     timeout = _ready_timeout()
@@ -1334,7 +1475,12 @@ def test_prefix_cache_coverage() -> None:
         second_captured = _load_captured_safetensors(second_dir)
         second_rows = _rows_per_layer(second_captured)
 
-        cache_hit = hits_after > hits_before
+        hit_tokens = hits_after - hits_before
+        cache_hit = hit_tokens > 0
+        min_prompt_tokens = _min_prefix_cache_prompt_tokens()
+        expected_hit_tokens = _expected_prefix_cache_hit_tokens(
+            prompt_token_count
+        )
         result = PrefixCacheResult(
             prompt_token_count=prompt_token_count,
             captured_rows_per_layer=second_rows,
@@ -1358,10 +1504,28 @@ def test_prefix_cache_coverage() -> None:
                 "prefix_cache_hits_after": hits_after,
                 "prefix_cache_queries_before": queries_before,
                 "prefix_cache_queries_after": queries_after,
+                "prefix_cache_hit_tokens": hit_tokens,
+                "prefix_cache_expected_hit_tokens": expected_hit_tokens,
+                "prefix_cache_block_size": PREFIX_CACHE_BLOCK_SIZE,
+                "min_prompt_tokens_for_a_hit": min_prompt_tokens,
             }, indent=2) + "\n",
             encoding="utf-8",
         )
         logger.info("Prefix cache result: %s", result_path)
+
+        #: Checked before the hit assertions, because a prompt below this bound
+        #: makes "no hit" the correct answer and the rest of this test
+        #: meaningless.  Job 369236 failed exactly here, with 18 tokens.
+        assert prompt_token_count >= min_prompt_tokens, (
+            f"the prompt rendered to {prompt_token_count} tokens but at least "
+            f"{min_prompt_tokens} are needed before "
+            f"{PREFIX_CACHE_MIN_HIT_BLOCKS} blocks of "
+            f"{PREFIX_CACHE_BLOCK_SIZE} tokens can be reported as a prefix-cache "
+            f"hit (the trailing partial block is never hashed and eagle drops "
+            f"the last matched block).  Below that bound zero hits is correct "
+            f"engine behaviour and this test cannot observe hazard 6.1 at all.  "
+            f"Result at {result_path}"
+        )
 
         assert queries_after > queries_before, (
             f"the engine recorded no prefix-cache queries across the second "
@@ -1373,6 +1537,21 @@ def test_prefix_cache_coverage() -> None:
             f"the second identical request did not hit the prefix cache "
             f"(vllm:prefix_cache_hits_total {hits_before} -> {hits_after}); "
             f"hazard 6.1 cannot be demonstrated without a hit.  Result at "
+            f"{result_path}"
+        )
+        #: The hit size is fully determined by vLLM's block arithmetic, so it is
+        #: asserted exactly rather than just "greater than zero".  A mismatch
+        #: means one of the premises this test is built on has moved — the
+        #: block size is no longer 16, eagle no longer drops the last matched
+        #: block, or the last-token recompute cap is gone — and the derived
+        #: minimum prompt length above would be wrong too.
+        assert hit_tokens == expected_hit_tokens, (
+            f"the engine reported {hit_tokens} prefix-cache hit tokens for a "
+            f"{prompt_token_count}-token repeat, but vLLM's block arithmetic "
+            f"predicts {expected_hit_tokens} "
+            f"(((N-1)//{PREFIX_CACHE_BLOCK_SIZE})-1 blocks, dropping the "
+            f"unhashed trailing block and eagle's last matched block).  One of "
+            f"those premises no longer holds on this build.  Result at "
             f"{result_path}"
         )
         assert first_prompt_tokens == prompt_token_count, (

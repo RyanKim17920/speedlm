@@ -122,8 +122,9 @@ and for the handful of bf16-rounded reductions inside the first layer::
 The worst-case *linear* accumulation is used deliberately in preference to the
 ``sqrt(k) * u`` random-walk bound: vLLM's kernel selection and reduction order
 are not statistically independent of HuggingFace's, so the errors cannot be
-assumed to cancel.  For Qwen3-8B (``L = 36``, aux layers ``[2, 12, 21]``) this
-gives 2.3e-2, 6.3e-2 and 9.8e-2, and 1.6e-1 for the appended final layer —
+assumed to cancel.  For Qwen3-8B (``L = 36``, aux layers ``[2, 18, 33]`` as
+resolved from the drafter at runtime) this gives 2.3e-2, 8.6e-2 and 1.45e-1,
+and 1.6e-1 for the appended final layer —
 tighter than the flat 0.10 in :mod:`speedlm.activation_capture.compare` at
 shallow depth, looser at the bottom of the stack, and in every case one to two
 orders of magnitude below the O(1) error a genuinely wrong quantity produces.
