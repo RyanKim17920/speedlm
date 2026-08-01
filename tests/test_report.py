@@ -738,3 +738,48 @@ def test_decision_without_warmup_field_reads_back_as_zero(home: Path) -> None:
     decision = load_decision(path)
 
     assert decision.warmup_repeats == 0
+
+
+def test_measurement_context_survives_a_decision_round_trip(home: Path) -> None:
+    """The knobs a cross-run comparison needs must reload as themselves."""
+    payload = _decision_dict()
+    payload["benchmark_max_tokens"] = 512
+    payload["replay_concurrency"] = 8
+    payload["correctness_max_tokens"] = 128
+    payload["suite_hash"] = "abc123"
+    payload["num_contexts"] = 103
+    payload["stock_draft"] = "/runs/artifacts/incumbent"
+    path = _write_decision(home, payload)
+
+    decision = load_decision(path)
+
+    assert decision.benchmark_max_tokens == 512
+    assert decision.replay_concurrency == 8
+    assert decision.correctness_max_tokens == 128
+    assert decision.suite_hash == "abc123"
+    assert decision.num_contexts == 103
+    assert decision.stock_draft == "/runs/artifacts/incumbent"
+    reloaded = decision.to_dict()
+    assert {key: reloaded[key] for key in payload} == payload
+
+
+def test_a_decision_predating_the_measurement_context_stays_readable(
+    home: Path,
+) -> None:
+    """Absent is ``None``, never zero.
+
+    Zero would claim an unbatched, uncapped run, which is a measurement the
+    archive never made.  The schema is additive precisely so archived records
+    keep loading; this pins that they do, and that they say so honestly.
+    """
+    path = _write_decision(home, _decision_dict())
+
+    decision = load_decision(path)
+
+    assert decision.benchmark_max_tokens is None
+    assert decision.replay_concurrency is None
+    assert decision.correctness_max_tokens is None
+    assert decision.suite_hash is None
+    assert decision.num_contexts is None
+    assert decision.stock_draft is None
+    assert build_gain_report(now=2_001.0).status is GainStatus.MEASURED

@@ -46,6 +46,15 @@ TrainingHashes = (
     | Callable[[], set[str] | frozenset[str]]
 )
 SuiteDirectory = Path | Callable[[], Path]
+#: The stock arm's draft, or a callable that resolves it when the gate runs.
+#:
+#: The callable form exists because the stock arm's identity is not a property
+#: of the process, it is a property of the moment: every promotion replaces the
+#: draft that serves live traffic, and the arm that names itself "stock" has to
+#: name *that* draft or the delta it reports is not marginal improvement over
+#: the incumbent.  A bare reference stays supported, and is what a test that
+#: benchmarks one fixed pair of drafts should pass.
+StockDraft = DraftReference | Callable[[], DraftReference]
 _T = TypeVar("_T")
 
 #: Held-out requests kept in flight per arm while a suite pass runs.
@@ -286,7 +295,7 @@ class BenchmarkGateRunner:
         config: SpeedLMConfig,
         trace_source: TraceSource,
         suite_dir: SuiteDirectory,
-        stock_draft: DraftReference,
+        stock_draft: StockDraft,
         endpoint: DraftEndpoint,
         metrics_source: MetricsSource,
         replay_executor: ReplayExecutor | None = None,
@@ -329,6 +338,8 @@ class BenchmarkGateRunner:
         self._config = config
         self._trace_source = trace_source
         self._suite_dir = suite_dir
+        # Held unresolved on purpose; see :data:`StockDraft` and
+        # :meth:`_resolve_stock_draft`.
         self._stock_draft = stock_draft
         self._endpoint = endpoint
         self._metrics_source = metrics_source
@@ -454,15 +465,21 @@ class BenchmarkGateRunner:
                 )
                 return warmup, self._measure_arm(arm, suite, stage, scrape, should_abort)
 
+            # Resolved once, here, rather than at construction: what counts as
+            # "stock" is whatever is serving when this benchmark runs, and both
+            # arms of one benchmark must agree on it even if a promotion lands
+            # between the two activations.
+            stock_draft = self._resolve_stock_draft()
+
             # Running the candidate first reuses the engine that the cycle's
             # CANDIDATE_STARTING phase already built, and leaves the benchmark
             # ending on stock -- which is what a rejection wants serving anyway.
             # See ``tuning.benchmark_candidate_arm_first``.
             if self._candidate_arm_first:
                 candidate_warmup, candidate_arm = run_arm("candidate", candidate_draft)
-                stock_warmup, stock_arm = run_arm("stock", self._stock_draft)
+                stock_warmup, stock_arm = run_arm("stock", stock_draft)
             else:
-                stock_warmup, stock_arm = run_arm("stock", self._stock_draft)
+                stock_warmup, stock_arm = run_arm("stock", stock_draft)
                 candidate_warmup, candidate_arm = run_arm("candidate", candidate_draft)
 
             decision = stage(
@@ -478,6 +495,15 @@ class BenchmarkGateRunner:
                     candidate_repeat_metrics=candidate_arm.repeat_deltas,
                     stock_correctness=stock_arm.correctness,
                     candidate_correctness=candidate_arm.correctness,
+                    # Measurement context.  These were already published on
+                    # ``GateResult.metrics``, which nothing persists, so a
+                    # decision.json could not say what cap, degree, suite or
+                    # baseline produced the numbers it reports.
+                    benchmark_max_tokens=self._benchmark_max_tokens,
+                    replay_concurrency=self._replay_concurrency,
+                    correctness_max_tokens=self._correctness_max_tokens,
+                    num_contexts=len(suite.contexts),
+                    stock_draft=str(stock_draft),
                 ),
             )
             # Candidate-first ends the benchmark on the *stock* draft, which is
@@ -520,6 +546,9 @@ class BenchmarkGateRunner:
             metrics={
                 "suite_hash": suite.suite_hash,
                 "num_contexts": len(suite.contexts),
+                # The baseline this comparison was against, as resolved when
+                # the benchmark ran.  It moves on every promotion.
+                "stock_draft": str(stock_draft),
                 # Observed, not configured: a report that says three repeats
                 # ran must mean three repeats ran.
                 "num_repeats": min(
@@ -659,6 +688,32 @@ class BenchmarkGateRunner:
             pooled_delta=pooled,
             correctness=correctness,
         )
+
+    def _resolve_stock_draft(self) -> DraftReference:
+        """The draft the stock arm must run, as of *now*.
+
+        The gate is the only safeguard and there is no post-promotion rollback,
+        so the baseline it measures against has to be the draft that is
+        currently serving.  Resolving a frozen reference captured at
+        construction time made every cycle after the first compare the
+        candidate against the *original* head: the reported delta was then
+        cumulative improvement over that head rather than marginal improvement
+        over the incumbent, and a candidate strictly worse than what was
+        already serving could still show a positive delta and be promoted.
+
+        Raises:
+            ValueError: If the reference resolves to something that cannot name
+                a draft.  Fail-closed: an unresolvable baseline fails the cycle
+                rather than silently benchmarking against a stale one.
+        """
+        configured = self._stock_draft
+        draft = configured() if callable(configured) else configured
+        if not isinstance(draft, (str, Path)) or not str(draft):
+            raise ValueError(
+                "stock draft must resolve to a non-empty path or model id, "
+                f"got {draft!r}"
+            )
+        return draft
 
     def _load_or_build_suite(self) -> BenchmarkSuite:
         suite_dir = self._suite_dir() if callable(self._suite_dir) else self._suite_dir

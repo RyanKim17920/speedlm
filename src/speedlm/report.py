@@ -1031,6 +1031,15 @@ def parse_decision(record: Mapping[str, Any], *, source: Path) -> Decision:
             if "acceptance_statistic" in record
             else LEGACY_ACCEPTANCE_STATISTIC
         ),
+        # Measurement context.  Optional in both directions: absent means the
+        # record predates the field, and ``None`` is exactly how that reads
+        # back -- never zero, which would claim an unbatched, uncapped run.
+        benchmark_max_tokens=_optional_int(record.get("benchmark_max_tokens")),
+        replay_concurrency=_optional_int(record.get("replay_concurrency")),
+        correctness_max_tokens=_optional_int(record.get("correctness_max_tokens")),
+        suite_hash=_optional_str(record.get("suite_hash")),
+        num_contexts=_optional_int(record.get("num_contexts")),
+        stock_draft=_optional_str(record.get("stock_draft")),
         **_parse_throughput_statistic(record, source, measured=measured),
     )
 

@@ -175,6 +175,26 @@ def _hub_revision(verifier_model: str) -> str | None:
     return str(HfApi().model_info(verifier_model).sha)
 
 
+def active_draft_reference(
+    artifacts: ArtifactRegistry,
+    fallback: DraftReference,
+) -> DraftReference:
+    """The draft serving live traffic *now*, or *fallback* if none was promoted.
+
+    The registry is the durable source of truth and it moves: every promotion
+    rewrites the active pointer.  Anything that needs to name the incumbent --
+    notably the gate's stock arm -- has to ask at the moment it needs the
+    answer, which is what this exists to make easy to do correctly.  It mirrors
+    :meth:`speedlm.tuner.orchestrator.TunerOrchestrator._active_draft`, whose
+    fallback is the backend's ``from_pretrained``, i.e. the same warm-start
+    draft this one falls back to.
+    """
+    active = artifacts.active()
+    if active is not None:
+        return active.path
+    return fallback
+
+
 @dataclass(frozen=True, slots=True)
 class TuningLaunchPlan:
     profile: ModelProfile
@@ -382,6 +402,7 @@ def create_production_tuner(
         draft_swap_http=(
             VLLMDraftSwapClient(http) if tuning.draft_hot_swap_enabled else None
         ),
+        restore_fast_path_timeout_seconds=tuning.restore_fast_path_timeout_seconds,
     )
     endpoint = _DraftEndpoint(
         url=child_url,
@@ -393,7 +414,13 @@ def create_production_tuner(
         config=config,
         trace_source=traces,
         suite_dir=lambda: split.suite_dir,
-        stock_draft=active_draft,
+        # Resolved per benchmark, not captured here.  A frozen reference made
+        # every cycle after the first measure the candidate against the draft
+        # that was active when the *process started* rather than against the
+        # one actually serving, so the reported delta was cumulative gain over
+        # the original head instead of marginal gain over the incumbent -- and
+        # the gate is the only safeguard, with no rollback behind it.
+        stock_draft=lambda: active_draft_reference(artifacts, active_draft),
         endpoint=endpoint,
         metrics_source=_MetricsSource(http),
         repeats=tuning.benchmark_repeats,
@@ -583,6 +610,7 @@ __all__ = [
     "WORKER_EXTENSION_OPTION",
     "ProductionTuningError",
     "TuningLaunchPlan",
+    "active_draft_reference",
     "build_tuning_launch_plan",
     "cached_hub_revision",
     "create_production_tuner",

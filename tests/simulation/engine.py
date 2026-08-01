@@ -116,6 +116,24 @@ class EngineFaults:
     refuse_sleep: bool = False
     #: ``/wake_up`` returns HTTP 500.
     refuse_wake: bool = False
+    #: ``/health`` reports 503 until the next :meth:`SimulatedEngine.activate`.
+    #:
+    #: Distinct from :attr:`never_ready`, which is permanent.  This models the
+    #: engine a *restart* fixes, which is the only way to express "the cheap
+    #: recovery path could not confirm serving, but the expensive one can":
+    #: with ``never_ready`` the fallback restart would fail too, so the test
+    #: could not tell a refused fast path from a dead deployment.
+    unhealthy_until_restart: bool = False
+    #: Successful ``/v1/completions`` responses allowed before the route starts
+    #: returning HTTP 500.  Cleared by :meth:`SimulatedEngine.activate`, like
+    #: :attr:`unhealthy_until_restart` and for the same reason.
+    #:
+    #: ``VLLMControlClient.wait_ready`` and ``VLLMControlClient.canary`` both
+    #: land on this route, and they ask different questions -- "is the child
+    #: up" versus "can the model it is holding still emit a token".  Budgeting
+    #: the route is the only way to make the second fail while the first
+    #: passes, which is exactly the case the restore fast path must refuse.
+    completions_before_failure: int | None = None
 
 
 @dataclass
@@ -159,6 +177,10 @@ class SimulatedEngine:
     * **Sleep is bookkeeping.**  ``/sleep`` flips a flag and stops serving
       generations; it does not free anything, so it cannot exercise the
       GPU-memory wait that the production runtime does after sleeping.
+    * **The control plane is free.**  ``/v1/completions`` (the readiness and
+      canary probe), ``/pause`` and ``/resume`` cost nothing and move no
+      counters, so nothing here can reproduce a restore whose fast path is
+      slower than the restart it replaced.  Only the *decisions* are modelled.
     """
 
     def __init__(
@@ -184,6 +206,8 @@ class SimulatedEngine:
         self._sleeping = False
         self._crashed = False
         self._served = 0
+        self._completions_served = 0
+        self._wedged = self._faults.unhealthy_until_restart
         self._server: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
 
@@ -253,10 +277,41 @@ class SimulatedEngine:
         with self._lock:
             return self._served
 
+    @property
+    def loaded_reference(self) -> str | None:
+        """The draft reference the engine was last launched with.
+
+        ``None`` until something activates one.  This is the engine's *own*
+        answer to "what is serving", independent of any controller's
+        bookkeeping -- which is the whole point of asserting on it: a fast path
+        that wrongly trusted its bookkeeping is only visible from here.
+        """
+        with self._lock:
+            return self.journal.activations[-1] if self.journal.activations else None
+
     def register(self, reference: str, profile: DraftProfile) -> None:
         """Bind a draft reference (a path or a model name) to a behaviour."""
         with self._lock:
             self._profiles[reference] = profile
+
+    def wedge(self) -> None:
+        """Make ``/health`` report 503 until the next :meth:`activate`.
+
+        Set here rather than only at construction so a test can wedge an engine
+        that is already mid-run, which is the shape the fault actually takes.
+        """
+        with self._lock:
+            self._wedged = True
+
+    def set_completion_budget(self, successes: int | None) -> None:
+        """Allow *successes* more ``/v1/completions`` before the route fails.
+
+        The counter is reset as well as the budget, so this means "from now
+        on", not "counting everything this engine has ever answered".
+        """
+        with self._lock:
+            self._faults.completions_before_failure = successes
+            self._completions_served = 0
 
     def set_fallback(self, profile: DraftProfile | None) -> None:
         """Set the behaviour any *unregistered* reference resolves to.
@@ -287,6 +342,14 @@ class SimulatedEngine:
             self._sleeping = False
             self._crashed = False
             self._served = 0
+            # A fresh process cannot inherit the previous one's wedged health
+            # or its exhausted control-plane budget.  Both are cleared outright
+            # rather than merely reset, because both model "the thing a restart
+            # fixes" -- and a fault that survived the restart meant to repair it
+            # would make every recovery path in the system untestable.
+            self._completions_served = 0
+            self._faults.completions_before_failure = None
+            self._wedged = False
             self.journal.activations.append(reference)
             self.journal.restarts += 1
             self.journal.record(f"activate:{profile.name}")
@@ -415,9 +478,51 @@ class SimulatedEngine:
             }
         return 200, body
 
+    def _completion(self, request: Mapping[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Serve one legacy ``/v1/completions``, the control plane's canary.
+
+        Deliberately does *not* advance the speculative counters.  This route
+        exists only because ``VLLMControlClient.wait_ready`` and ``canary`` use
+        it, and those run at activation and restore boundaries -- inside the
+        gate's scrape windows in the general case.  Letting a readiness probe
+        move the acceptance counters would make the gate's arithmetic depend on
+        how many times the controller happened to check whether the engine was
+        up, which is a property of the *control* plane, not of the drafter.
+        """
+        with self._lock:
+            if self._sleeping:
+                return 503, {"error": "engine is sleeping"}
+            if self._crashed or self._wedged:
+                return 500, {"error": "engine cannot serve"}
+            budget = self._faults.completions_before_failure
+            self._completions_served += 1
+            if budget is not None and self._completions_served > budget:
+                return 500, {"error": "engine cannot complete"}
+            model = self._active.name
+        return 200, {
+            "id": "cmpl-sim",
+            "object": "text_completion",
+            "created": 1700000000,
+            "model": request.get("model", model),
+            "choices": [
+                {
+                    "index": 0,
+                    "text": " ok",
+                    "finish_reason": "length",
+                    "logprobs": None,
+                }
+            ],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 1, "total_tokens": 5},
+        }
+
     def _healthy(self) -> bool:
         with self._lock:
-            return not (self._faults.never_ready or self._crashed or self._sleeping)
+            return not (
+                self._faults.never_ready
+                or self._wedged
+                or self._crashed
+                or self._sleeping
+            )
 
 
 def _token_stream(
@@ -511,6 +616,16 @@ def _make_handler(engine: SimulatedEngine) -> type[BaseHTTPRequestHandler]:
             if route == "/v1/chat/completions":
                 status, payload = engine._generation(request)
                 self._send(status, payload)
+            elif route == "/v1/completions":
+                status, payload = engine._completion(request)
+                self._send(status, payload)
+            elif route in {"/pause", "/resume"}:
+                # vLLM's RLHF dev router.  Bookkeeping only: the simulator has
+                # no scheduler to actually stop, so this records the call and
+                # succeeds.  A hot-swap that must fail does so at the
+                # ``/collective_rpc`` step, which is where a real one does.
+                engine.journal.record(route.lstrip("/"))
+                self._send(200, {"status": "ok"})
             elif route == "/sleep":
                 if engine.faults.refuse_sleep:
                     self._send(500, {"error": "cannot sleep"})

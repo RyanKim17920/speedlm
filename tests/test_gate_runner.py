@@ -1275,3 +1275,106 @@ def test_candidate_arm_first_must_be_a_bool(tmp_path: Path) -> None:
             scrapes=_normal_scrapes(),
             candidate_arm_first="yes",  # type: ignore[arg-type]
         )
+
+
+# --- measurement context on the persisted decision --------------------------
+
+
+def test_the_decision_records_what_the_measurement_was_made_under(
+    tmp_path: Path,
+) -> None:
+    """``decision.json`` is the only file ``speedlm gain`` reads.
+
+    Every knob asserted here changes what the reported statistics are worth
+    without changing their names -- the cap alone is documented as shifting the
+    acceptance delta by ~+0.1 pp -- and all of them lived only on
+    ``GateResult.metrics``, which nothing persists.  A decision that omits them
+    is not comparable to another run's.
+    """
+    runner = BenchmarkGateRunner(
+        config=SpeedLMConfig(model="model"),
+        trace_source=FakeTraceSource((_trace(),)),
+        suite_dir=tmp_path / "suite",
+        stock_draft="stock",
+        endpoint=FakeEndpoint(),
+        metrics_source=FakeMetricsSource(_normal_scrapes()),
+        replay_executor=FakeReplayExecutor(),
+        replay_concurrency=4,
+        benchmark_max_tokens=256,
+        correctness_max_tokens=64,
+        training_context_hashes=frozenset(),
+        clock=FakeClock(),
+    )
+
+    result = runner.benchmark(
+        tmp_path / "candidate",
+        timeout_seconds=30,
+        should_abort=lambda: False,
+    )
+
+    assert result.decision is not None
+    record = result.decision.to_dict()
+    assert record["benchmark_max_tokens"] == 256
+    assert record["replay_concurrency"] == 4
+    assert record["correctness_max_tokens"] == 64
+    assert record["num_contexts"] == result.metrics["num_contexts"]
+    assert record["suite_hash"] == result.metrics["suite_hash"]
+    # The baseline the delta is *against*, which moves on every promotion.
+    assert record["stock_draft"] == "stock"
+
+
+def test_the_decision_records_the_baseline_the_gate_actually_resolved(
+    tmp_path: Path,
+) -> None:
+    endpoint = FakeEndpoint()
+    baselines = iter(("first-baseline", "second-baseline"))
+    runner = BenchmarkGateRunner(
+        config=SpeedLMConfig(model="model"),
+        trace_source=FakeTraceSource((_trace(),)),
+        suite_dir=tmp_path / "suite",
+        stock_draft=lambda: next(baselines),
+        endpoint=endpoint,
+        metrics_source=FakeMetricsSource(_normal_scrapes() + _normal_scrapes()),
+        replay_executor=FakeReplayExecutor(),
+        training_context_hashes=frozenset(),
+        clock=FakeClock(),
+    )
+
+    first = runner.benchmark(
+        tmp_path / "candidate", timeout_seconds=30, should_abort=lambda: False
+    )
+    second = runner.benchmark(
+        tmp_path / "candidate", timeout_seconds=30, should_abort=lambda: False
+    )
+
+    assert first.decision is not None and second.decision is not None
+    assert first.decision.stock_draft == "first-baseline"
+    assert second.decision.stock_draft == "second-baseline"
+    assert endpoint.activations[0] == "first-baseline"
+    assert "second-baseline" in endpoint.activations
+
+
+@pytest.mark.parametrize("resolved", [None, "", 7])
+def test_an_unresolvable_stock_draft_fails_closed(
+    tmp_path: Path,
+    resolved: object,
+) -> None:
+    """No baseline is not a comparison, so it must not become a benchmark."""
+    runner = BenchmarkGateRunner(
+        config=SpeedLMConfig(model="model"),
+        trace_source=FakeTraceSource((_trace(),)),
+        suite_dir=tmp_path / "suite",
+        stock_draft=lambda: resolved,  # type: ignore[return-value]
+        endpoint=FakeEndpoint(),
+        metrics_source=FakeMetricsSource(_normal_scrapes()),
+        replay_executor=FakeReplayExecutor(),
+        training_context_hashes=frozenset(),
+        clock=FakeClock(),
+    )
+
+    with pytest.raises(ValueError, match="stock draft"):
+        runner.benchmark(
+            tmp_path / "candidate",
+            timeout_seconds=30,
+            should_abort=lambda: False,
+        )

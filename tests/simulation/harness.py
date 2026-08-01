@@ -17,6 +17,7 @@ from typing import Any
 
 from simulation.engine import DraftProfile, SimulatedEngine
 from speedlm.config import (
+    IdleTuningConfig,
     PromotionConfig,
     SamplingConfig,
     SpeedLMConfig,
@@ -24,7 +25,7 @@ from speedlm.config import (
 )
 from speedlm.gate.runner import BenchmarkGateRunner
 from speedlm.gateway.activity import ActivityTracker
-from speedlm.traces.store import TraceRecord
+from speedlm.traces.store import TraceRecord, TraceStats
 from speedlm.training.base import BackendInfo
 from speedlm.tuner.artifacts import ArtifactRegistry
 from speedlm.tuner.idle import IdleDetector
@@ -410,13 +411,54 @@ def simulation_config(
     *,
     model: str = "sim/verifier-8b",
     promotion: PromotionConfig | None = None,
+    idle_threshold_seconds: float = 300.0,
+    tuning: IdleTuningConfig | None = None,
 ) -> SpeedLMConfig:
     """A production :class:`~speedlm.config.SpeedLMConfig` for the simulation."""
+    kwargs: dict[str, Any] = {}
+    if tuning is not None:
+        kwargs["tuning"] = tuning
     return SpeedLMConfig(
         model=model,
         sampling=SamplingConfig(temperature=0.0, top_p=1.0, seed=0),
         promotion=promotion or PromotionConfig(),
+        idle_threshold_seconds=idle_threshold_seconds,
+        **kwargs,
     )
+
+
+@dataclass
+class SimulatedTraceBuffer:
+    """A :class:`~speedlm.tuner.service.TraceStatsSource` the test advances.
+
+    The scheduler dedupes on the *watermark* -- the buffer's whole
+    :class:`~speedlm.traces.store.TraceStats` tuple -- so "a request arrived
+    and was traced" has to be expressible as a change to it.  That is the whole
+    subject of the retry-cooldown tests: the request that preempts a cycle is
+    itself traced, so it advances this watermark and the next poll looks like a
+    brand-new opportunity even though nothing has changed.
+    """
+
+    count: int = 512
+    tokens: int = 65536
+    prunes: int = 0
+
+    def record_request(self, *, tokens: int = 128) -> None:
+        """Model one more served request landing in the trace buffer."""
+        self.count += 1
+        self.tokens += tokens
+
+    def stats(self) -> TraceStats:
+        return TraceStats(
+            count=self.count,
+            tokens=self.tokens,
+            oldest=0.0,
+            newest=float(self.count),
+        )
+
+    def prune(self) -> int:
+        self.prunes += 1
+        return 0
 
 
 def real_gate(
@@ -430,6 +472,8 @@ def real_gate(
     warmup_repeats: int = 1,
     held_out_fraction: float = 1.0,
     clock: Callable[[], float] | None = None,
+    endpoint: Any | None = None,
+    candidate_arm_first: bool = False,
 ) -> BenchmarkGateRunner:
     """The *production* gate runner, wired to the simulated engine over HTTP.
 
@@ -438,18 +482,26 @@ def real_gate(
     supplies benchmark records and training records separately, so there is
     genuinely no overlap to find.  A leakage *positive* is asserted elsewhere by
     handing the runner a hash set that does overlap.
+
+    ``endpoint`` overrides the default unconditional-activation endpoint.  A
+    test about *arm order* has to supply
+    :class:`simulation.production.SimulatedDraftEndpoint` instead, because the
+    saving the order exists to produce -- reusing the engine
+    ``CANDIDATE_STARTING`` already built -- is only expressible by an endpoint
+    that can decline to restart.
     """
     return BenchmarkGateRunner(
         config=config or simulation_config(),
         trace_source=RecordSource(tuple(records)),
         suite_dir=suite_dir,
         stock_draft=stock_draft,
-        endpoint=EngineEndpoint(engine),
+        endpoint=endpoint if endpoint is not None else EngineEndpoint(engine),
         metrics_source=EngineMetrics(engine),
         repeats=repeats,
         warmup_repeats=warmup_repeats,
         held_out_fraction=held_out_fraction,
         training_context_hashes=frozenset(),
+        candidate_arm_first=candidate_arm_first,
         clock=clock or (lambda: 0.0),
     )
 

@@ -228,6 +228,38 @@ class Decision:
     #: before ``min_divergence_token_index``; that subset is what gates.
     output_divergences: tuple[ContextDivergence, ...] = ()
 
+    # -- measurement context -------------------------------------------------
+    # What the numbers above were produced under.  Every field here changes the
+    # value of a reported statistic without changing its name, so a decision
+    # that omits them is not comparable to another decision: the gate knew all
+    # of them (they were on ``GateResult.metrics``) and none of them reached
+    # ``decision.json``, which is the only file ``speedlm gain`` reads.  All
+    # default to ``None`` -- "this record predates the field" -- so an archived
+    # decision stays readable and is never silently relabelled.
+
+    #: Output cap of the throughput/acceptance pass.  It bounds the acceptance
+    #: window as well as the wall clock; see
+    #: :attr:`speedlm.config.IdleTuningConfig.benchmark_max_tokens`, which
+    #: measures the bias as roughly +0.1 pp on the acceptance delta.
+    benchmark_max_tokens: int | None = None
+    #: Requests kept in flight per arm during that pass.  The gating throughput
+    #: statistic divides completion tokens by the *sum* of per-request
+    #: latencies, so its absolute value moves with how much the engine batched.
+    replay_concurrency: int | None = None
+    #: Output cap of the separate, single-stream correctness pass -- the one
+    #: that produces ``output_divergences``.
+    correctness_max_tokens: int | None = None
+    #: Identity of the frozen held-out suite both arms replayed.  Two deltas
+    #: measured over different suites are different measurements.
+    suite_hash: str | None = None
+    #: Contexts in that suite.
+    num_contexts: int | None = None
+    #: The draft the stock arm ran, i.e. the baseline this delta is *against*.
+    #: Recorded because it changes on every promotion: without it a reader
+    #: cannot tell improvement over the incumbent from improvement over the
+    #: original head.
+    stock_draft: str | None = None
+
     @property
     def output_early_divergences(self) -> int:
         """Divergences early enough to count against ``max_output_mismatches``."""
@@ -295,6 +327,12 @@ class Decision:
             "candidate_prometheus_decode_tok_per_sec": (
                 self.candidate_prometheus_decode_tok_per_sec
             ),
+            "benchmark_max_tokens": self.benchmark_max_tokens,
+            "replay_concurrency": self.replay_concurrency,
+            "correctness_max_tokens": self.correctness_max_tokens,
+            "suite_hash": self.suite_hash,
+            "num_contexts": self.num_contexts,
+            "stock_draft": self.stock_draft,
         }
 
 
@@ -429,6 +467,11 @@ def decide_promotion(
     candidate_repeat_metrics: Sequence[MetricsDelta] = (),
     stock_correctness: ReplayResult | None = None,
     candidate_correctness: ReplayResult | None = None,
+    benchmark_max_tokens: int | None = None,
+    replay_concurrency: int | None = None,
+    correctness_max_tokens: int | None = None,
+    num_contexts: int | None = None,
+    stock_draft: str | None = None,
 ) -> Decision:
     """Decide whether to promote the candidate head.
 
@@ -466,6 +509,19 @@ def decide_promotion(
             throughput replay is compared instead, which is what the unit tests
             do and what a caller that has not yet been updated will get.
         candidate_correctness: The same, for the candidate arm.
+        benchmark_max_tokens: Output cap the throughput/acceptance pass ran
+            under, recorded verbatim in the decision.  These last five are
+            *measurement context*: they change what the reported statistics are
+            worth without changing their names, and a decision that omits them
+            cannot be compared to another run.  Omitting one records ``None``,
+            which is what an archived decision written before the field existed
+            reads back as.
+        replay_concurrency: In-flight requests per arm during that pass.
+        correctness_max_tokens: Output cap of the correctness pass.
+        num_contexts: Contexts in the frozen suite both arms replayed.  The
+            suite's hash is taken from ``stock_replay``.
+        stock_draft: The draft the stock arm ran -- the baseline this delta is
+            measured against.
 
     Returns:
         A :class:`Decision` with verdict, reason, and per-repeat data.
@@ -584,6 +640,12 @@ def decide_promotion(
             candidate_acceptance_stdev=c_acc_sd,
             min_divergence_token_index=min_divergence_index,
             output_divergences=divergences,
+            benchmark_max_tokens=benchmark_max_tokens,
+            replay_concurrency=replay_concurrency,
+            correctness_max_tokens=correctness_max_tokens,
+            suite_hash=stock_replay.suite_hash or None,
+            num_contexts=num_contexts,
+            stock_draft=stock_draft,
         )
 
     def _reject(reason: Reason, **deltas: float | None) -> Decision:

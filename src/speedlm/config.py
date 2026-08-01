@@ -558,6 +558,17 @@ class IdleTuningConfig:
     training_port: int = 8_131
     scratch_quota_bytes: int = 5 * 1024 * 1024 * 1024
     shutdown_timeout_seconds: float = 30.0
+    #: Budget for ``restore``'s wake-instead-of-respawn fast path.
+    #:
+    #: The fast path is a wake, one readiness wait and one bounded canary.  It
+    #: is bounded separately from the restore deadline it runs inside so that a
+    #: fast path which hangs cannot eat the budget the full restart behind it
+    #: still needs.  120s is roughly twice a cold engine's launch-to-ready time
+    #: -- deliberately generous for something that normally completes in well
+    #: under a second -- and was previously unreachable from configuration, so
+    #: an operator on a slower host had no way to move it.  See
+    #: :data:`speedlm.gateway.control.DEFAULT_RESTORE_FAST_PATH_TIMEOUT_SECONDS`.
+    restore_fast_path_timeout_seconds: float = 120.0
     val_loss_prefilter: ValLossPreFilterConfig = field(default_factory=ValLossPreFilterConfig)
     #: In-place draft weight hot-swap.  When enabled, the controller attempts
     #: to swap the drafter's weights via collective-RPC instead of restarting
@@ -654,6 +665,11 @@ class IdleTuningConfig:
         _validate_float_gte(
             self.shutdown_timeout_seconds,
             "tuning.shutdown_timeout_seconds",
+            0.001,
+        )
+        _validate_float_gte(
+            self.restore_fast_path_timeout_seconds,
+            "tuning.restore_fast_path_timeout_seconds",
             0.001,
         )
         if not isinstance(self.draft_hot_swap_enabled, bool):
@@ -799,6 +815,9 @@ class SpeedLMConfig:
             "training_port": self.tuning.training_port,
             "scratch_quota_bytes": self.tuning.scratch_quota_bytes,
             "shutdown_timeout_seconds": self.tuning.shutdown_timeout_seconds,
+            "restore_fast_path_timeout_seconds": (
+                self.tuning.restore_fast_path_timeout_seconds
+            ),
             "draft_hot_swap_enabled": self.tuning.draft_hot_swap_enabled,
         }
         result["sampling"] = {
@@ -905,6 +924,7 @@ class SpeedLMConfig:
                 "training_port",
                 "scratch_quota_bytes",
                 "shutdown_timeout_seconds",
+                "restore_fast_path_timeout_seconds",
                 "draft_hot_swap_enabled",
                 "val_loss_prefilter",
             },

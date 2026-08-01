@@ -20,6 +20,7 @@ from speedlm.config import (
     startup_stall_seconds,
     startup_timeout_seconds,
 )
+from speedlm.gateway.control import DEFAULT_RESTORE_FAST_PATH_TIMEOUT_SECONDS
 
 # ---------------------------------------------------------------------------
 # speedlm_home
@@ -267,6 +268,8 @@ def test_idle_tuning_config_round_trip_without_machine_specific_paths() -> None:
         {"benchmark_repeats": 2},
         {"benchmark_concurrency": 0},
         {"benchmark_concurrency": "eight"},
+        {"restore_fast_path_timeout_seconds": 0},
+        {"restore_fast_path_timeout_seconds": "fast"},
         {"speculators_repo": ""},
         {"learning_rate": 1e-4},
     ],
@@ -555,3 +558,32 @@ def test_a_zero_retry_cooldown_is_allowed_to_restore_the_old_behaviour() -> None
 def test_invalid_benchmark_arm_order_is_rejected(value: object) -> None:
     with pytest.raises(ConfigError, match="benchmark_candidate_arm_first"):
         IdleTuningConfig(benchmark_candidate_arm_first=value)
+
+
+def test_restore_fast_path_timeout_is_configurable_and_defaults_unchanged() -> None:
+    """The knob existed on the controller but nothing could reach it.
+
+    Composition built ``RuntimeController`` without it, so the fast path was
+    pinned at the controller's own 120s default with no config key at all.  The
+    default must stay 120s -- wiring it up is not allowed to move behaviour --
+    and an operator on a slower host must now be able to raise it.
+    """
+    assert IdleTuningConfig().restore_fast_path_timeout_seconds == 120.0
+    assert (
+        IdleTuningConfig().restore_fast_path_timeout_seconds
+        == DEFAULT_RESTORE_FAST_PATH_TIMEOUT_SECONDS
+    )
+
+    config = SpeedLMConfig.from_dict(
+        {
+            "model": "org/model",
+            "tuning": {"restore_fast_path_timeout_seconds": 300.0},
+        }
+    )
+
+    assert config.tuning.restore_fast_path_timeout_seconds == 300.0
+    assert config.to_dict()["tuning"]["restore_fast_path_timeout_seconds"] == 300.0
+    assert (
+        SpeedLMConfig.from_dict(config.to_dict()).tuning
+        == config.tuning
+    )

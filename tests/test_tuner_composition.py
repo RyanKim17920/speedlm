@@ -311,7 +311,10 @@ def test_create_production_tuner_assembles_profile_bound_collaborators(
     config = _config(tmp_path, profile)
     captured: dict[str, Any] = {}
     state = object()
-    artifacts = object()
+    # A registry that answers ``active()``: the gate is now handed a
+    # resolver that consults it, not a value captured at composition time.
+    active_artifact: list[Any] = [None]
+    artifacts = SimpleNamespace(active=lambda: active_artifact[0])
     split = SimpleNamespace(
         suite_dir=tmp_path / "held-out",
         training_context_hashes=frozenset({"train-hash"}),
@@ -408,7 +411,22 @@ def test_create_production_tuner_assembles_profile_bound_collaborators(
     # The post-sleep memory precondition must demand exactly what the
     # hidden-state engine will be launched with, or it is decorative.
     assert captured["runtime"]["gpu_memory"].required_fraction == 0.80
-    assert captured["gate"]["stock_draft"] == "acme/active-draft"
+    # A knob that never leaves config is not a knob: this was pinned at the
+    # controller's own default with no way to reach it from a config file.
+    assert (
+        captured["runtime"]["restore_fast_path_timeout_seconds"]
+        == config.tuning.restore_fast_path_timeout_seconds
+    )
+    # The stock arm's baseline is resolved when the benchmark runs, not frozen
+    # here: with nothing promoted it is the startup draft, and after a
+    # promotion it has to follow the registry -- otherwise every cycle after
+    # the first reports gain over the original head instead of over what is
+    # actually serving, and the gate is the only safeguard there is.
+    stock_draft = captured["gate"]["stock_draft"]
+    assert callable(stock_draft)
+    assert stock_draft() == "acme/active-draft"
+    active_artifact[0] = SimpleNamespace(path=Path("/runs/artifacts/promoted"))
+    assert stock_draft() == Path("/runs/artifacts/promoted")
     # The gate replay was serialized until this reached it; a default that
     # never leaves composition is the same bug in a different place.
     assert captured["gate"]["repeats"] == config.tuning.benchmark_repeats

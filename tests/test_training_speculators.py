@@ -9,10 +9,13 @@ from pathlib import Path
 import pytest
 
 from speedlm.training.backends.eagle3 import (
+    DRAFT_COPY_CHUNK_BYTES,
+    MAX_SCRATCH_BYTES,
     Eagle3Backend,
     EmptySpeculatorsDatasetError,
     FinalAssistantMaskError,
     ScratchQuotaExceeded,
+    SpeculatorsDraftMaterializer,
     SpeculatorsPipelineConfig,
     TrainingError,
     persist_training_output,
@@ -876,3 +879,87 @@ def test_a_huge_training_log_is_bounded_and_keeps_both_ends() -> None:
     assert written.startswith("A" * 500)
     assert written.endswith("Z" * 500)
     assert "9000 bytes elided" in written
+
+
+# --- draft materialization copy -------------------------------------------
+
+
+def _materializer(quota: int = MAX_SCRATCH_BYTES) -> SpeculatorsDraftMaterializer:
+    return SpeculatorsDraftMaterializer(scratch_quota_bytes=quota)
+
+
+def test_materialize_copies_files_larger_than_one_chunk_byte_for_byte(
+    tmp_path: Path,
+) -> None:
+    """The copy is chunked for interruptibility, not for correctness.
+
+    A ~2 GB draft used to move 1 MiB at a time with a scratch-quota check on
+    both sides of every write, and that check walks the whole scratch tree --
+    thousands of full-tree walks on the cycle's critical path with serving
+    stopped.  Widening the chunk must not change what lands on disk, including
+    for a file that is not a whole number of chunks.
+    """
+    source = tmp_path / "checkpoint_best"
+    (source / "nested").mkdir(parents=True)
+    payload = bytes(range(256)) * (DRAFT_COPY_CHUNK_BYTES // 256) + b"tail"
+    (source / "model.safetensors").write_bytes(payload)
+    (source / "nested" / "config.json").write_bytes(b"{}")
+    # Still skipped: transient training state is not part of a draft.
+    (source / "optimizer_state_dict.pt").write_bytes(b"transient")
+
+    destination = _materializer().materialize(
+        source,
+        tmp_path / "draft",
+        timeout_seconds=60.0,
+        should_abort=lambda: False,
+    )
+
+    assert len(payload) > DRAFT_COPY_CHUNK_BYTES
+    assert (destination / "model.safetensors").read_bytes() == payload
+    assert (destination / "nested" / "config.json").read_bytes() == b"{}"
+    assert not (destination / "optimizer_state_dict.pt").exists()
+
+
+def test_materialize_still_honours_abort_and_removes_the_partial_draft(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "checkpoint_best"
+    source.mkdir()
+    (source / "model.safetensors").write_bytes(b"x" * (DRAFT_COPY_CHUNK_BYTES + 1))
+    destination = tmp_path / "draft"
+
+    with pytest.raises(TuningPreempted):
+        _materializer().materialize(
+            source,
+            destination,
+            timeout_seconds=60.0,
+            should_abort=lambda: True,
+        )
+
+    assert not destination.exists()
+
+
+def test_materialize_still_enforces_the_scratch_quota_mid_copy(
+    tmp_path: Path,
+) -> None:
+    """A quota breach caused by the copy itself must still be caught inside it.
+
+    The checkpoint moved from "twice per 1 MiB" to "once per chunk, plus once
+    after the last write", so this pins that the *inside* of a multi-chunk copy
+    is still guarded rather than deferred to the caller.
+    """
+    source = tmp_path / "checkpoint_best"
+    source.mkdir()
+    (source / "model.safetensors").write_bytes(b"x" * (3 * DRAFT_COPY_CHUNK_BYTES))
+    destination = tmp_path / "draft"
+
+    with pytest.raises(ScratchQuotaExceeded) as raised:
+        _materializer(quota=DRAFT_COPY_CHUNK_BYTES).materialize(
+            source,
+            destination,
+            timeout_seconds=60.0,
+            should_abort=lambda: False,
+        )
+
+    assert raised.value.used_bytes > DRAFT_COPY_CHUNK_BYTES
+    assert not destination.exists()

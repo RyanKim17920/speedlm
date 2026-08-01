@@ -15,7 +15,7 @@ import urllib.request
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 from speedlm.training.backends.speculators_runner import (
     ProcessResult,
@@ -53,6 +53,23 @@ logger = logging.getLogger(__name__)
 #: than a Speculators run emits normally, and small enough that a pathological
 #: run cannot fill the scratch quota with its own diagnostics.
 MAX_TRAINING_LOG_BYTES = 2 * 1024 * 1024
+
+#: Bytes moved between two checkpoints while copying one materialized draft file.
+#:
+#: The unit here is not the read size, it is how often the copy stops to check
+#: the scratch quota -- and that check is expensive: :func:`scratch_usage`
+#: ``rglob``s and ``stat``s the entire scratch tree on every call.  At the
+#: previous 1 MiB, with a check on *both* sides of every write, a ~2 GB draft
+#: paid roughly four thousand full-tree walks, all of them on the cycle's
+#: critical path with serving stopped (the materialize/validate/publish tail
+#: measured ~153s).
+#:
+#: 16 MiB keeps every property the small chunk had -- bounded memory, and a
+#: deadline/abort/quota checkpoint *inside* the copy so a large file is still
+#: interruptible and still cannot silently blow the quota -- while cutting the
+#: number of walks by 32x.  The trailing checkpoint after the loop is what
+#: keeps the last write covered, so nothing is merely deferred to the caller.
+DRAFT_COPY_CHUNK_BYTES: Final = 16 * 1024 * 1024
 
 DEFAULT_SPECULATORS_REPO = Path(
     os.environ.get("SPEEDLM_SPECULATORS_REPO", "speculators")
@@ -1311,11 +1328,12 @@ def _copy(
     timeout: float,
 ) -> None:
     with source.open("rb") as input_file, destination.open("xb") as output_file:
-        while chunk := input_file.read(1024 * 1024):
+        while chunk := input_file.read(DRAFT_COPY_CHUNK_BYTES):
             _deadline(started, timeout, "draft materialization")
             _abort(guard, "draft materialization")
             output_file.write(chunk)
-            _abort(guard, "draft materialization")
+    _deadline(started, timeout, "draft materialization")
+    _abort(guard, "draft materialization")
 
 
 def _check_hidden_state_layers(
@@ -1441,6 +1459,7 @@ def _health(url: str, timeout: float) -> bool:
 __all__ = [
     "DEFAULT_SPECULATORS_PYTHON",
     "DEFAULT_SPECULATORS_REPO",
+    "DRAFT_COPY_CHUNK_BYTES",
     "MAX_SCRATCH_BYTES",
     "DraftMaterializer",
     "DraftValidator",
