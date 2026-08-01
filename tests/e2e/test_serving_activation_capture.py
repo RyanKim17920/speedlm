@@ -102,6 +102,8 @@ from speedlm.activation_capture.compare import (
 )
 from speedlm.activation_capture.hf_reference import (
     HFReferenceResult,
+    assert_reference_fits,
+    checkpoint_parameter_count,
     compare_to_hf_reference,
     loaded_reference_model,
     reference_residual_stream,
@@ -1381,6 +1383,7 @@ def _prepare_hf_reference(verifier: str) -> _HFReferenceSetup:
     #: params ~= total_size / 2.  Falls back to CPU if the index is absent.
     num_parameters = _checkpoint_parameter_count(model_dir)
 
+    free_device_bytes = _free_device_bytes()
     forced = os.environ.get("SPEEDLM_E2E_HF_REFERENCE_DEVICE")
     if forced in ("cuda", "cpu"):
         device = forced
@@ -1389,7 +1392,22 @@ def _prepare_hf_reference(verifier: str) -> _HFReferenceSetup:
     else:
         device = select_reference_device(
             num_parameters=num_parameters,
-            free_device_bytes=_free_device_bytes(),
+            free_device_bytes=free_device_bytes,
+        )
+    #: The fit check runs on the CHOSEN device, including when an operator
+    #: forced it: forcing ``cuda`` for a checkpoint whose fp32 copy does not
+    #: fit must produce a legible refusal naming the arithmetic, not an OOM
+    #: kill that says nothing.  It also catches the case no device choice can
+    #: rescue — an mxfp4 20B whose fp32 copy is 83.66 GB exceeds both an 80 GiB
+    #: H100 and this node's ~63 GB of free host RAM, so ``cpu`` is not a
+    #: fallback, it is a second way to die.
+    if num_parameters is not None:
+        assert_reference_fits(
+            str(model_dir),
+            num_parameters=num_parameters,
+            free_device_bytes=free_device_bytes,
+            free_host_bytes=os.sysconf("SC_AVPHYS_PAGES") * os.sysconf("SC_PAGE_SIZE"),
+            device=device,
         )
     logger.info(
         "HF fp32 reference: %d params, device=%s, %d layers",
@@ -1451,23 +1469,25 @@ def _run_hf_reference(
 
 
 def _checkpoint_parameter_count(model_dir: Path) -> int | None:
-    """Estimate the parameter count from the safetensors index, or ``None``.
+    """Delegate to :func:`hf_reference.checkpoint_parameter_count`.
 
-    ``metadata.total_size`` is the checkpoint's byte count; these verifiers ship
-    in bf16, so two bytes per parameter.  Returning ``None`` on any doubt keeps
+    The estimate used to live here: ``metadata.total_size`` from the
+    safetensors index is the checkpoint's byte count, these verifiers ship in
+    bf16, so two bytes per parameter.  Returning ``None`` on any doubt keeps
     the device choice conservative (CPU) rather than guessing high and OOMing.
+
+    **The quantized case is why it moved into the module.**  That estimate is
+    wrong for an mxfp4 checkpoint, and wrong in the dangerous direction: each
+    stored ``*_blocks`` byte holds two e2m1 nibbles, so gpt-oss-20b's
+    ``13,761,316,904`` on-disk bytes dequantize to ``20,914,757,184``
+    parameters while ``total_size // 2`` answers ``6,880,658,452`` — a 3.04x
+    **undercount** that would pick ``cuda`` for an 83.66 GB fp32 copy and OOM
+    an 80 GiB H100.  The corrected count needs the shard shapes, and it is
+    needed by ``hf_reference`` itself (for
+    :func:`assert_reference_fits`) as well as here, so a single
+    implementation lives there and this stays a thin adapter.
     """
-    index = model_dir / "model.safetensors.index.json"
-    if not index.is_file():
-        return None
-    try:
-        raw = json.loads(index.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    total = raw.get("metadata", {}).get("total_size")
-    if not isinstance(total, int) or total <= 0:
-        return None
-    return total // 2
+    return checkpoint_parameter_count(str(model_dir))
 
 
 # ---------------------------------------------------------------------------

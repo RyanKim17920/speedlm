@@ -14,6 +14,7 @@ from speedlm.tuner.eagle3 import (
     Eagle3Config,
     ScratchQuotaExceeded,
     TrainingError,
+    derive_scratch_quota_bytes,
 )
 from speedlm.tuner.idle import ActivitySource, IdleDetector, TuningPreempted
 from speedlm.tuner.orchestrator import (
@@ -61,4 +62,5 @@ __all__ = [
     "TunerStateMachine",
     "TuningPreempted",
     "derive_benchmark_timeout",
+    "derive_scratch_quota_bytes",
 ]

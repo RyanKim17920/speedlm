@@ -29,7 +29,12 @@ from speedlm.training.backends.speculators_runner import (
     process_output,
 )
 from speedlm.training.check_prepared_dataset import _column
-from speedlm.tuner.eagle3 import scratch_usage
+from speedlm.tuner.eagle3 import (
+    SCRATCH_HEADROOM_BYTES,
+    SHARD_BYTES_PER_ROW,
+    derive_scratch_quota_bytes,
+    scratch_usage,
+)
 from speedlm.tuner.idle import TuningPreempted
 
 
@@ -1175,3 +1180,238 @@ def test_a_satisfied_verifier_pin_still_reaches_the_manifest(
     assert params["verifier_revision"] == pinned.verifier_revision
     assert "verifier_revision_requested" not in params
     assert not (work / STAGE_LOG_DIR_NAME / "provenance").exists()
+
+
+# ---------------------------------------------------------------------------
+# Job 369325: a quota trip that deleted a live writer's tree and then reported
+# its own cleanup's OSError instead of the quota breach.
+# ---------------------------------------------------------------------------
+
+
+def _extraction_backend(
+    tmp_path: Path,
+    pipeline: SpeculatorsPipelineConfig,
+    runner: _FakeRunner,
+    *,
+    quota: int,
+) -> tuple[Eagle3Backend, Path]:
+    """Build a backend whose scratch quota a single shard will overrun."""
+    return _backend(tmp_path, replace(pipeline, scratch_quota_bytes=quota), runner)
+
+
+def test_the_quota_trip_stops_the_server_before_deleting_its_output_tree(
+    tmp_path: Path,
+    pipeline: SpeculatorsPipelineConfig,
+) -> None:
+    """The writers must be gone before ``hidden-states`` is removed.
+
+    Job 369325 deleted the tree from inside ``SubprocessRunner.run``'s poll
+    loop, i.e. while the vLLM hidden-state server and the Speculators client
+    were both still writing ``cmpl-*.safetensors`` and ``*.safetensors.lock``
+    into it.  That is what produced ``[Errno 39] Directory not empty`` on our
+    side and a ``FileNotFoundError`` from ``vllm_client.py:144`` on theirs.
+    Neither race is reachable if the tree is quiet before it is removed, so the
+    ordering -- not the retry -- is the fix under test here.
+    """
+    runner = _FakeRunner()
+    #: Roomy enough for the prepare stage's own artifacts, so the trip below is
+    #: unambiguously extraction's.
+    backend, work = _extraction_backend(tmp_path, pipeline, runner, quota=1_000_000)
+    destination = work / "hidden-states"
+    observed: list[tuple[str, bool]] = []
+
+    original_terminate = runner.terminate
+
+    def recording_terminate(
+        process: RunningProcess, *, grace_seconds: float
+    ) -> ProcessResult:
+        observed.append(("terminate", destination.exists()))
+        return original_terminate(process, grace_seconds=grace_seconds)
+
+    runner.terminate = recording_terminate  # type: ignore[method-assign]
+
+    def overrun(
+        argv: tuple[str, ...], should_abort: Callable[[], bool]
+    ) -> ProcessResult:
+        output = Path(argv[argv.index("--output") + 1])
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "hs_0.safetensors").write_bytes(b"x" * 2_000_000)
+        should_abort()
+        raise AssertionError("quota guard did not raise")
+
+    prepared = backend.prepare(work, should_abort=lambda: False)
+    runner.effects.append(overrun)
+
+    with pytest.raises(ScratchQuotaExceeded):
+        backend.extract(prepared, work, should_abort=lambda: False)
+
+    #: The first terminate is the quota guard's.  ``True`` means the tree was
+    #: still present when the server was shut down, i.e. the shutdown came
+    #: first.  A regression to delete-then-terminate flips this to ``False``.
+    assert observed, "the hidden-state server was never terminated"
+    assert observed[0] == ("terminate", True)
+    assert not destination.exists()
+
+
+def test_a_stuck_cleanup_cannot_replace_the_quota_breach_it_is_cleaning_up(
+    tmp_path: Path,
+    pipeline: SpeculatorsPipelineConfig,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A leftover lock file must not become the cycle's reported error.
+
+    Job 369325's operator saw ``[Errno 39] Directory not empty`` in the gateway
+    log, the SLURM output and the cycle result; the ``ScratchQuotaExceeded``
+    that actually ended the run survived only in
+    ``stage-logs/scratch-quota/failure.json``.  A cleanup that cannot finish is
+    still evidence, so it is recorded -- but it may not be the diagnosis.
+    """
+    runner = _FakeRunner()
+    backend, work = _extraction_backend(tmp_path, pipeline, runner, quota=4096)
+
+    def unremovable(path: Path, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        raise OSError(39, "Directory not empty", str(path))
+
+    monkeypatch.setattr(
+        "speedlm.training.backends.eagle3.shutil.rmtree", unremovable, raising=True
+    )
+
+    def overrun(
+        argv: tuple[str, ...], should_abort: Callable[[], bool]
+    ) -> ProcessResult:
+        output = Path(argv[argv.index("--output") + 1])
+        output.mkdir(parents=True, exist_ok=True)
+        (output / "hs_0.safetensors").write_bytes(b"x" * 8192)
+        (output / "hs_1.safetensors.lock").write_bytes(b"")
+        should_abort()
+        raise AssertionError("quota guard did not raise")
+
+    runner.effects.append(overrun)
+
+    with pytest.raises(ScratchQuotaExceeded) as raised:
+        backend.prepare(work, should_abort=lambda: False)
+
+    #: The breach survives cleanup, with its own numbers intact.
+    assert raised.value.used_bytes > 4096
+    assert raised.value.quota_bytes == 4096
+    #: And the cleanup failure is kept, not swallowed.
+    assert raised.value.cleanup_errors, "the cleanup failure was discarded"
+    assert any(
+        "Directory not empty" in note for note in raised.value.cleanup_errors
+    ), raised.value.cleanup_errors
+    assert any(
+        "Directory not empty" in note
+        for note in getattr(raised.value, "__notes__", [])
+    )
+
+
+def test_a_tree_whose_contents_reappear_is_retried_then_still_raises(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``_remove_tree`` absorbs a lost rmdir race without hiding a real one."""
+    from speedlm.training.backends import eagle3 as backend_module
+
+    target = tmp_path / "hidden-states"
+    target.mkdir()
+    (target / "hs_0.safetensors").write_bytes(b"x")
+    attempts: list[int] = []
+    real_rmtree = backend_module.shutil.rmtree
+
+    def flaky(path: Path, *args: object, **kwargs: object) -> None:
+        attempts.append(1)
+        if len(attempts) == 1:
+            #: Exactly the observed failure: the walk emptied the directory and
+            #: a writer recreated a lock file before the final ``rmdir``.
+            (Path(path) / "hs_1.safetensors.lock").write_bytes(b"")
+            raise OSError(39, "Directory not empty", str(path))
+        real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(backend_module.shutil, "rmtree", flaky)
+    backend_module._remove_tree(target)
+
+    assert len(attempts) == 2
+    assert not target.exists()
+
+    #: The retry is bounded, and the last attempt is unguarded: a tree that
+    #: genuinely cannot be removed still raises the same OSError it always did.
+    stubborn = tmp_path / "stubborn"
+    stubborn.mkdir()
+    (stubborn / "f").write_bytes(b"x")
+    attempts.clear()
+
+    def always(path: Path, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        attempts.append(1)
+        raise OSError(39, "Directory not empty", str(path))
+
+    monkeypatch.setattr(backend_module.shutil, "rmtree", always)
+    with pytest.raises(OSError, match="Directory not empty"):
+        backend_module._remove_tree(stubborn)
+    assert len(attempts) == backend_module._REMOVE_TREE_ATTEMPTS
+
+
+# ---------------------------------------------------------------------------
+# The quota itself: derived from the shard count, not picked.
+# ---------------------------------------------------------------------------
+
+
+def test_the_scratch_quota_is_derived_from_the_shard_count() -> None:
+    """One shard per leased row, plus a fixed non-shard headroom."""
+    assert derive_scratch_quota_bytes(1) == SHARD_BYTES_PER_ROW + SCRATCH_HEADROOM_BYTES
+    assert derive_scratch_quota_bytes(256) == 256 * SHARD_BYTES_PER_ROW + (
+        SCRATCH_HEADROOM_BYTES
+    )
+    #: The arithmetic that job 369325 needed and did not have: its window was
+    #: 512 records, so 512 x 32 MiB + 1 GiB = 17 GiB.
+    assert derive_scratch_quota_bytes(512) == 17 * 1024**3
+    assert derive_scratch_quota_bytes(512) <= MAX_SCRATCH_BYTES
+
+
+def test_the_derived_quota_covers_what_job_369325_actually_wrote() -> None:
+    """The failing run's measured demand must fit inside the derived quota.
+
+    Job 369325 leased 409 rows and aborted at 5,384,048,233 bytes against a
+    5 GiB quota -- a 0.29 % overshoot that looked like a rounding accident.  It
+    was not.  The 64 sampled shards averaged 15.8 MB, so the shards alone
+    needed 409 x 15.8 MB, and the configured 512-record window would have
+    needed 512 x 15.8 MB.  Both must sit inside the derived quota with room,
+    or the derivation has not fixed anything.
+    """
+    observed_mean_shard_bytes = 15_800_000
+    observed_max_shard_bytes = 31_460_688
+
+    assert observed_max_shard_bytes <= SHARD_BYTES_PER_ROW
+
+    leased = 409 * observed_mean_shard_bytes
+    full_window = 512 * observed_mean_shard_bytes
+    quota = derive_scratch_quota_bytes(512)
+
+    assert leased > 5 * 1024**3, "the aborted run was under-provisioned, not unlucky"
+    assert full_window < quota
+    #: Headroom, not a hairline: the derived quota is more than double the
+    #: measured demand of the run that failed.
+    assert quota > 2 * full_window
+
+
+def test_a_window_that_cannot_be_provisioned_is_an_error_not_a_clamp() -> None:
+    """Silently clamping to the ceiling would recreate the original bug."""
+    too_wide = (MAX_SCRATCH_BYTES // SHARD_BYTES_PER_ROW) + 1
+    with pytest.raises(ValueError, match="exceeds MAX_SCRATCH_BYTES"):
+        derive_scratch_quota_bytes(too_wide)
+
+    for bad in (0, -1):
+        with pytest.raises(ValueError, match="must be a positive integer"):
+            derive_scratch_quota_bytes(bad)
+    with pytest.raises(ValueError, match="must be a positive integer"):
+        derive_scratch_quota_bytes(True)  # noqa: FBT003
+
+
+def test_the_shipped_default_quota_matches_the_shipped_default_window() -> None:
+    """The default config must be usable, which job 369325's was not."""
+    from speedlm.config import IdleTuningConfig
+
+    defaults = IdleTuningConfig()
+    assert defaults.training_window_records == 256
+    assert defaults.scratch_quota_bytes == derive_scratch_quota_bytes(256)

@@ -178,6 +178,7 @@ if TYPE_CHECKING:
     # torch/safetensors/vllm/transformers (see pyproject.toml), so this module
     # keeps a torch-free import surface for the project venv.
     from collections.abc import Iterator
+    from pathlib import Path
 
     from torch import Tensor
 
@@ -226,6 +227,41 @@ def bf16_relative_tolerance(aux_layer_idx: int) -> float:
 # ---------------------------------------------------------------------------
 # Result types
 # ---------------------------------------------------------------------------
+
+
+class ReferenceUnavailable(RuntimeError):
+    """The fp32 reference cannot be computed for this checkpoint here.
+
+    Raised instead of returning ``None`` or silently downgrading the reference
+    to a narrower dtype.  This leg exists to answer "is the captured tensor the
+    right *quantity*"; a reference that quietly stopped being an independent
+    fp32 recomputation answers nothing while still reporting numbers, which is
+    strictly worse than not running.  Every instance carries an actionable
+    message: the cause, the arithmetic behind it, and the concrete remedy.
+
+    Args:
+        message: the actionable text, as described above.
+        model_dir: the checkpoint the refusal is about, when known.
+        required_bytes: the fp32 footprint that could not be met, when the
+            refusal is a memory refusal.
+        available_bytes: the budget that was actually free, when known.
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        model_dir: str | None = None,
+        required_bytes: int | None = None,
+        available_bytes: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        #: The checkpoint this refusal is about, or ``None``.
+        self.model_dir = model_dir
+        #: fp32 bytes the reference would have needed, or ``None``.
+        self.required_bytes = required_bytes
+        #: Bytes actually available on the chosen device, or ``None``.
+        self.available_bytes = available_bytes
 
 
 @dataclass(frozen=True)
@@ -459,11 +495,23 @@ def cosine_similarity(captured: Tensor, reference: Tensor) -> float:
 # ---------------------------------------------------------------------------
 
 
+#: fp32 bytes per parameter.
+FP32_BYTES_PER_PARAMETER: int = 4
+
+#: Multiplier over raw fp32 weight bytes covering activations, the RoPE cache
+#: and allocator fragmentation.  Named rather than repeated so
+#: :func:`select_reference_device` and :func:`assert_reference_fits` cannot
+#: drift into answering "does it fit" two different ways — a device chosen
+#: under one budget and admitted under another is exactly the OOM this module
+#: is meant to turn into a legible refusal.
+REFERENCE_DEVICE_HEADROOM_FRACTION: float = 1.35
+
+
 def select_reference_device(
     *,
     num_parameters: int,
     free_device_bytes: int | None,
-    headroom_fraction: float = 1.35,
+    headroom_fraction: float = REFERENCE_DEVICE_HEADROOM_FRACTION,
 ) -> str:
     """Choose ``"cuda"`` or ``"cpu"`` for the fp32 reference forward.
 
@@ -493,8 +541,109 @@ def select_reference_device(
     """
     if free_device_bytes is None:
         return "cpu"
-    required = int(num_parameters * 4 * headroom_fraction)
+    required = int(
+        num_parameters * FP32_BYTES_PER_PARAMETER * headroom_fraction
+    )
     return "cuda" if free_device_bytes >= required else "cpu"
+
+
+def reference_fp32_bytes(num_parameters: int) -> int:
+    """Return the raw fp32 weight footprint of *num_parameters* parameters.
+
+    Raises:
+        ValueError: if *num_parameters* is negative.
+    """
+    if num_parameters < 0:
+        raise ValueError(f"num_parameters must be >= 0, got {num_parameters}")
+    return num_parameters * FP32_BYTES_PER_PARAMETER
+
+
+def assert_reference_fits(
+    model_dir: str,
+    *,
+    num_parameters: int,
+    free_device_bytes: int | None,
+    free_host_bytes: int | None,
+    device: str,
+) -> None:
+    """Refuse, legibly, when the fp32 reference cannot fit on *device*.
+
+    **Why this raises rather than degrades.**  The two silent alternatives are
+    both worse than a refusal.  Downgrading to bf16 would keep producing
+    numbers while destroying the one property that makes this leg evidence —
+    it would no longer be an independent fp32 recomputation, it would be a
+    second bf16 computation, and the comparison would report a tolerance it no
+    longer earns.  Returning ``None`` would make the whole leg vanish into the
+    ``hf_reference is None`` branch, which the e2e harness treats as "the leg
+    did not run"; a checkpoint that *cannot* be referenced on this node is a
+    different fact from a leg that was switched off, and it must be said out
+    loud.
+
+    **Why the arithmetic is in the message.**  The alternative failure mode is
+    an OOM kill or a raw allocator error, neither of which tells the reader
+    whether the checkpoint is too big, the node too small, or the parameter
+    count miscounted.  Printing ``params x 4 B`` against the measured free
+    bytes makes all three distinguishable from the failure text alone.
+
+    Args:
+        model_dir: the checkpoint, quoted in the message.
+        num_parameters: **dequantized** parameter count, from
+            :func:`checkpoint_parameter_count`.
+        free_device_bytes: free VRAM, or ``None`` when no device is available.
+        free_host_bytes: free host RAM, or ``None`` when it could not be read.
+        device: the device already chosen, ``"cuda"`` or ``"cpu"``.
+
+    Raises:
+        ReferenceUnavailable: when the fp32 footprint exceeds the chosen
+            device's budget.
+        ValueError: if *device* is neither ``"cuda"`` nor ``"cpu"``.
+    """
+    if device not in ("cuda", "cpu"):
+        raise ValueError(f"device must be 'cuda' or 'cpu', got {device!r}")
+
+    required = reference_fp32_bytes(num_parameters)
+    #: On device the budget carries the same headroom the device choice used,
+    #: so an operator forcing ``cuda`` is judged against the identical bar the
+    #: automatic path would have applied.  On host the raw footprint is
+    #: compared directly: the fp32 staging copy is the dominant term there and
+    #: there is no allocator reserve to model.
+    if device == "cuda":
+        budgeted = int(required * REFERENCE_DEVICE_HEADROOM_FRACTION)
+        available = free_device_bytes
+    else:
+        budgeted = required
+        available = free_host_bytes
+    if available is None:
+        raise ReferenceUnavailable(
+            f"fp32 reference for {model_dir} needs "
+            f"{num_parameters:,} params x {FP32_BYTES_PER_PARAMETER} B = "
+            f"{required / 1e9:.2f} GB, but the free memory on device={device} "
+            f"could not be read, so the fit cannot be checked; refusing rather "
+            f"than risking an OOM kill that would report nothing. Set "
+            f"SPEEDLM_E2E_HF_REFERENCE_DEVICE explicitly on a node whose free "
+            f"memory is readable, or run the reference on a larger-memory node.",
+            model_dir=model_dir,
+            required_bytes=required,
+        )
+    if budgeted > available:
+        raise ReferenceUnavailable(
+            f"fp32 reference for {model_dir} needs "
+            f"{num_parameters:,} params x {FP32_BYTES_PER_PARAMETER} B = "
+            f"{required / 1e9:.2f} GB"
+            + (
+                f" ({budgeted / 1e9:.2f} GB with the "
+                f"{REFERENCE_DEVICE_HEADROOM_FRACTION}x activation headroom)"
+                if device == "cuda"
+                else ""
+            )
+            + f", but device={device} has {available / 1e9:.1f} GB free; the "
+            f"fp32 leg cannot run for this checkpoint on this node. Shard it "
+            f"across GPUs (that is what `accelerate` would actually be for) or "
+            f"run the reference on a larger-memory node.",
+            model_dir=model_dir,
+            required_bytes=required,
+            available_bytes=available,
+        )
 
 
 #: Checkpoint dtypes that a float32 load widens *exactly*, so the weights may be
@@ -527,6 +676,135 @@ def _checkpoint_dtype(model_dir: str) -> str:
     return ""
 
 
+def _checkpoint_quantization(model_dir: str) -> str:
+    """Return the checkpoint's declared quant method, or ``""`` when absent.
+
+    Reads ``quantization_config.quant_method`` from ``config.json`` and
+    lowercases it.  Mirrors :func:`_checkpoint_dtype` exactly, including its
+    "return ``''`` on any doubt" rationale: ``""`` means *unquantized*, which
+    routes :func:`loaded_reference_model` down the plain float32 load it has
+    always taken.  A wrong *positive* answer here would swap in a quantizer's
+    own dequantization path, so the doubt case must be the one that changes
+    nothing.
+
+    Verified on ``openai/gpt-oss-20b``: its ``quantization_config`` is
+    ``{"quant_method": "mxfp4", "modules_to_not_convert": [...]}`` and there is
+    no top-level or ``text_config`` ``dtype``/``torch_dtype`` key at all — which
+    is precisely why the dtype probe alone cannot tell this checkpoint apart
+    from an ordinary fp32 one.
+    """
+    import json
+    from pathlib import Path
+
+    path = Path(model_dir) / "config.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+    for section in (raw, raw.get("text_config")):
+        if isinstance(section, dict):
+            config = section.get("quantization_config")
+            if isinstance(config, dict):
+                method = config.get("quant_method")
+                if isinstance(method, str):
+                    return method.lower()
+    return ""
+
+
+def checkpoint_parameter_count(model_dir: str) -> int | None:
+    """Count the checkpoint's **dequantized** parameters, or ``None`` on doubt.
+
+    Public because the number is not a detail of one caller: the e2e harness
+    uses it to pick a device and this module uses it to refuse, and those two
+    must not disagree about how big the model is.
+
+    **Unquantized checkpoints** keep the cheap estimate: ``metadata.total_size``
+    from ``model.safetensors.index.json`` is the on-disk byte count of a bf16
+    checkpoint, so ``total_size // 2`` is the parameter count.
+
+    **mxfp4 checkpoints break that estimate badly, and silently.**  Measured on
+    ``openai/gpt-oss-20b`` by summing the real safetensors shards: the
+    shards store ``11,956,805,184`` raw elements in ``13,761,316,904`` bytes,
+    but each ``*_blocks`` byte packs **two** e2m1 nibbles and each ``*_scales``
+    entry is a block exponent rather than a parameter, so the count that
+    actually gets materialized in memory is ``20,914,757,184``.  The index
+    estimate gives ``13,761,316,904 // 2 = 6,880,658,452`` — an **undercount of
+    3.04x**.  Acting on it would answer "cuda" for a model whose fp32 copy is
+    83.66 GB and OOM an 80 GiB H100.
+
+    So for mxfp4 the shards are opened and the elements counted directly:
+    ``*_blocks`` contributes ``2x`` its element count, ``*_scales`` contributes
+    ``0``, everything else contributes its own element count.
+
+    Args:
+        model_dir: resolved local snapshot directory for the verifier.
+
+    Returns:
+        The dequantized parameter count, or ``None`` when the checkpoint's
+        metadata could not be read — which keeps the caller conservative
+        rather than guessing.
+    """
+    import json
+    from pathlib import Path
+
+    directory = Path(model_dir)
+    if _checkpoint_quantization(model_dir) == "mxfp4":
+        return _mxfp4_parameter_count(directory)
+
+    index = directory / "model.safetensors.index.json"
+    if not index.is_file():
+        return None
+    try:
+        raw = json.loads(index.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    total = raw.get("metadata", {}).get("total_size")
+    if not isinstance(total, int) or total <= 0:
+        return None
+    return total // 2
+
+
+def _mxfp4_parameter_count(directory: Path) -> int | None:
+    """Sum the dequantized element count of an mxfp4 checkpoint's shards.
+
+    Only the tensor *shapes* are read, via ``get_slice(k).get_shape()``, so
+    this never materializes a weight.
+
+    Returns:
+        The dequantized parameter count, or ``None`` when no shard could be
+        read.
+    """
+    #: safetensors ships in the vLLM venv, not the project venv; kept lazy so
+    #: this module's import surface stays torch-free.
+    from safetensors import safe_open
+
+    shards = sorted(directory.glob("*.safetensors"))
+    if not shards:
+        return None
+    total = 0
+    for shard in shards:
+        try:
+            with safe_open(str(shard), framework="pt") as handle:
+                for key in handle.keys():  # noqa: SIM118 - safetensors API
+                    shape = handle.get_slice(key).get_shape()
+                    elements = 1
+                    for dim in shape:
+                        elements *= int(dim)
+                    if key.endswith("_scales"):
+                        #: A per-block e8m0 exponent, not a parameter: it is
+                        #: consumed by the unpacking and does not survive into
+                        #: the dequantized model.
+                        continue
+                    if key.endswith("_blocks"):
+                        #: uint8 storage holding TWO e2m1 nibbles per byte.
+                        total += 2 * elements
+                    else:
+                        total += elements
+        except (OSError, ValueError):
+            return None
+    return total
+
+
 @contextmanager
 def loaded_reference_model(model_dir: str, *, device: str = "cpu") -> Iterator[Any]:
     """Load the fp32 reference once and free it deterministically on exit.
@@ -550,6 +828,11 @@ def loaded_reference_model(model_dir: str, *, device: str = "cpu") -> Iterator[A
     Yields:
         The loaded ``AutoModelForCausalLM``, in eval mode, on *device*, with
         float32 arithmetic.
+
+    Raises:
+        ReferenceUnavailable: if the checkpoint declares a quantizer this
+            module has not been shown to dequantize losslessly, or if the load
+            fails on a missing optional dependency.
     """
     import torch  # lazy: only present in the vLLM venv
 
@@ -578,14 +861,90 @@ def loaded_reference_model(model_dir: str, *, device: str = "cpu") -> Iterator[A
         if device == "cuda" and checkpoint_dtype in _EXACTLY_WIDENED_TO_FP32
         else torch.float32
     )
-    model = AutoModelForCausalLM.from_pretrained(
-        model_dir,
-        dtype=load_dtype,
-        attn_implementation="eager",
-    )
+
+    #: ``quantization_config=Mxfp4Config(dequantize=True)`` is set for
+    #: INDEPENDENCE, not for convenience.  Left to itself the loader decides
+    #: at runtime: with ``accelerate`` installed control reaches the capability
+    #: gates (``transformers/quantizers/quantizer_mxfp4.py:91-147``), and
+    #: because ``kernels`` is absent and the checkpoint is pre-quantized it
+    #: logs "we will default to dequantizing the model to bf16" and sets
+    #: ``dequantize=True`` itself.  Same weights — but implicitly, and
+    #: contingent on ``kernels`` never being installed.  If ``kernels`` WERE
+    #: installed the loader would instead run the native mxfp4 triton kernels,
+    #: i.e. the *same quantized arithmetic vLLM runs*, and this leg would stop
+    #: being an independent derivation at all.  Setting it explicitly PINS the
+    #: load to transformers' own ``convert_moe_packed_tensors`` unpacking.
+    #: That it also bypasses the ``accelerate`` requirement
+    #: (``quantizer_mxfp4.py:72-76`` returns before the import check when
+    #: ``dequantize`` is set) is a side effect, not the reason.
+    #:
+    #: The dequantization is bf16 yet the reference stays genuinely fp32:
+    #: an mxfp4 element is an e2m1 significand (<=2 significant bits) times an
+    #: e8m0 power-of-two block scale, so the product carries at most 2
+    #: significant bits and bf16 holds 8.  Verified empirically:
+    #: ``convert_moe_packed_tensors(b, s, dtype=bfloat16).float()`` is
+    #: ``torch.equal`` to the fp32 dequantization, max abs diff 0.0.  bf16 then
+    #: widened to fp32 is therefore bit-identical to fp32 throughout.
+    quantization = _checkpoint_quantization(model_dir)
+    load_kwargs: dict[str, Any] = {}
+    if quantization == "mxfp4":
+        #: The per-module mypy override for ``transformers`` (see pyproject)
+        #: already covers this import; no inline ignore is needed here.
+        from transformers import Mxfp4Config
+
+        load_kwargs["quantization_config"] = Mxfp4Config(dequantize=True)
+    elif quantization:
+        raise ReferenceUnavailable(
+            f"checkpoint {model_dir} declares quant_method={quantization!r}, "
+            f"which this reference has not been shown to dequantize losslessly. "
+            f"Only 'mxfp4' is handled, and only because its e2m1-times-e8m0 "
+            f"unpacking was proved bit-exact into fp32. An unrecognised "
+            f"quantizer may dequantize lossily, and a lossy reference is not a "
+            f"reference — it would report a tolerance it does not earn. Either "
+            f"add {quantization!r} here with the same bit-exactness argument, "
+            f"or run the reference leg against an unquantized snapshot of this "
+            f"model.",
+            model_dir=model_dir,
+        )
+
+    try:
+        model = AutoModelForCausalLM.from_pretrained(
+            model_dir,
+            dtype=load_dtype,
+            attn_implementation="eager",
+            **load_kwargs,
+        )
+    except ImportError as error:
+        raise ReferenceUnavailable(
+            f"loading the fp32 reference for {model_dir} failed on a missing "
+            f"optional dependency: {error}. The usual candidate is "
+            f"`accelerate`, which transformers' mxfp4 quantizer demands before "
+            f"it reaches its capability gates "
+            f"(quantizer_mxfp4.py:72-76). It can be installed with "
+            f"`/admin/home/ryan.kim/speedlm/.preflight/venvs/vllm/bin/pip "
+            f"install accelerate`, but do NOT expect that to be sufficient or "
+            f"even the right fix: with `kernels` absent the quantizer then just "
+            f"defaults to dequantizing to bf16 anyway, i.e. it reaches the "
+            f"SAME weights this module already pins explicitly via "
+            f"Mxfp4Config(dequantize=True), while making the choice implicit "
+            f"and contingent on `kernels` never appearing. Diagnose what "
+            f"actually failed to import before installing anything.",
+            model_dir=model_dir,
+        ) from error
     model.eval()
     model.to(device)
-    if load_dtype is not torch.float32:
+    #: The upcast must run for quantized checkpoints too, and the dtype probe
+    #: alone will not trigger it.  gpt-oss-20b's config.json declares no
+    #: ``dtype``/``torch_dtype`` at all, so ``_checkpoint_dtype`` returns
+    #: ``""``, ``load_dtype`` is already ``torch.float32``, and the
+    #: ``load_dtype is not torch.float32`` test below is False.  But
+    #: ``dequantize_convertops`` (``transformers/integrations/mxfp4.py:546``)
+    #: calls ``convert_moe_packed_tensors`` with no dtype and that function
+    #: defaults to ``torch.bfloat16`` (``mxfp4.py:337``) — so the MoE expert
+    #: weights come back bf16 regardless of the requested dtype.  Without
+    #: forcing the upcast they would sit at bf16 inside a nominally fp32 model
+    #: and this leg would silently stop being an fp32 reference.
+    if load_dtype is not torch.float32 or quantization:
         model.float()
 
     try:

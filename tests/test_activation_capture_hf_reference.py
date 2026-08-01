@@ -30,12 +30,19 @@ from speedlm.activation_capture.hf_reference import (
     BF16_DEPTH_OFFSET,
     BF16_UNIT_ROUNDOFF,
     DISCRIMINATION_MARGIN,
+    FP32_BYTES_PER_PARAMETER,
+    REFERENCE_DEVICE_HEADROOM_FRACTION,
     HFReferenceLayer,
     HFReferenceResult,
+    ReferenceUnavailable,
+    _checkpoint_quantization,
     _derive_reference_verdict,
+    assert_reference_fits,
     bf16_relative_tolerance,
+    checkpoint_parameter_count,
     compare_to_hf_reference,
     cosine_similarity,
+    reference_fp32_bytes,
     reference_residual_stream,
     select_reference_device,
 )
@@ -155,6 +162,318 @@ class TestSelectReferenceDevice:
             )
             == "cpu"
         )
+
+
+# ---------------------------------------------------------------------------
+# Quantized checkpoints (no torch)
+# ---------------------------------------------------------------------------
+
+
+def _write_config(directory: Any, payload: Any) -> str:
+    """Write ``config.json`` into *directory* and return the directory path."""
+    path = directory / "config.json"
+    if isinstance(payload, str):
+        path.write_text(payload, encoding="utf-8")
+    else:
+        path.write_text(json.dumps(payload), encoding="utf-8")
+    return str(directory)
+
+
+class TestCheckpointQuantization:
+    """``""`` must mean "unquantized", i.e. the load path that changes nothing."""
+
+    def test_mxfp4_config_is_reported(self, tmp_path: Any) -> None:
+        #: The real shape of ``openai/gpt-oss-20b``'s config.json: a
+        #: quantization_config with no top-level dtype anywhere, which is why
+        #: the dtype probe alone cannot tell it from an fp32 checkpoint.
+        model_dir = _write_config(
+            tmp_path,
+            {
+                "num_hidden_layers": 24,
+                "quantization_config": {
+                    "quant_method": "mxfp4",
+                    "modules_to_not_convert": [
+                        "model.layers.*.self_attn",
+                        "model.layers.*.mlp.router",
+                        "model.embed_tokens",
+                        "lm_head",
+                    ],
+                },
+            },
+        )
+        assert _checkpoint_quantization(model_dir) == "mxfp4"
+
+    def test_the_method_is_lowercased(self, tmp_path: Any) -> None:
+        model_dir = _write_config(
+            tmp_path, {"quantization_config": {"quant_method": "MXFP4"}}
+        )
+        assert _checkpoint_quantization(model_dir) == "mxfp4"
+
+    def test_nested_text_config_is_searched(self, tmp_path: Any) -> None:
+        model_dir = _write_config(
+            tmp_path,
+            {"text_config": {"quantization_config": {"quant_method": "awq"}}},
+        )
+        assert _checkpoint_quantization(model_dir) == "awq"
+
+    def test_plain_config_is_empty(self, tmp_path: Any) -> None:
+        model_dir = _write_config(
+            tmp_path, {"dtype": "bfloat16", "num_hidden_layers": 36}
+        )
+        assert _checkpoint_quantization(model_dir) == ""
+
+    def test_missing_file_is_empty(self, tmp_path: Any) -> None:
+        assert _checkpoint_quantization(str(tmp_path / "absent")) == ""
+
+    def test_malformed_json_is_empty(self, tmp_path: Any) -> None:
+        """Doubt must resolve to the load path that has always been taken."""
+        model_dir = _write_config(tmp_path, "{not json at all")
+        assert _checkpoint_quantization(model_dir) == ""
+
+    def test_a_non_string_method_is_empty(self, tmp_path: Any) -> None:
+        model_dir = _write_config(
+            tmp_path, {"quantization_config": {"quant_method": 4}}
+        )
+        assert _checkpoint_quantization(model_dir) == ""
+
+
+class TestCheckpointParameterCount:
+    def test_index_estimate_is_half_the_byte_count(self, tmp_path: Any) -> None:
+        """bf16 checkpoints: two bytes per parameter."""
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"metadata": {"total_size": 16_384_000_000}}),
+            encoding="utf-8",
+        )
+        assert checkpoint_parameter_count(str(tmp_path)) == 8_192_000_000
+
+    def test_missing_index_is_none(self, tmp_path: Any) -> None:
+        assert checkpoint_parameter_count(str(tmp_path)) is None
+
+    def test_malformed_index_is_none(self, tmp_path: Any) -> None:
+        (tmp_path / "model.safetensors.index.json").write_text(
+            "{broken", encoding="utf-8"
+        )
+        assert checkpoint_parameter_count(str(tmp_path)) is None
+
+    def test_nonpositive_total_size_is_none(self, tmp_path: Any) -> None:
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"metadata": {"total_size": 0}}), encoding="utf-8"
+        )
+        assert checkpoint_parameter_count(str(tmp_path)) is None
+
+    def test_mxfp4_counts_two_elements_per_stored_block_byte(
+        self, tmp_path: Any
+    ) -> None:
+        """The arithmetic the index estimate gets wrong by 3.04x on gpt-oss-20b.
+
+        A real (tiny) safetensors file is written rather than a mock, because
+        the claim under test is about the ``get_slice(...).get_shape()`` surface
+        and the ``_blocks`` / ``_scales`` naming convention — a mock would only
+        restate this test's own assumptions back to it.
+
+        ``_blocks`` is uint8 storage holding TWO e2m1 nibbles per byte, so it
+        contributes ``2x`` its element count.  ``_scales`` is a per-block e8m0
+        exponent consumed by the unpacking, so it contributes ``0``.
+        """
+        torch_mod = pytest.importorskip("torch")
+        safetensors_torch = pytest.importorskip("safetensors.torch")
+
+        tensors = {
+            #: 4 x 8 = 32 stored bytes -> 64 dequantized elements.
+            "model.layers.0.mlp.experts.gate_up_proj_blocks": torch_mod.zeros(
+                4, 8, dtype=torch_mod.uint8
+            ),
+            #: 4 x 2 = 8 block exponents -> 0 parameters.
+            "model.layers.0.mlp.experts.gate_up_proj_scales": torch_mod.zeros(
+                4, 2, dtype=torch_mod.uint8
+            ),
+            #: Untouched by the quantizer -> 3 x 5 = 15 parameters.
+            "model.layers.0.self_attn.q_proj.weight": torch_mod.zeros(
+                3, 5, dtype=torch_mod.float32
+            ),
+        }
+        safetensors_torch.save_file(
+            tensors, str(tmp_path / "model-00001-of-00001.safetensors")
+        )
+        _write_config(tmp_path, {"quantization_config": {"quant_method": "mxfp4"}})
+
+        assert checkpoint_parameter_count(str(tmp_path)) == 2 * 32 + 0 + 15
+
+    def test_mxfp4_ignores_the_index_estimate_entirely(
+        self, tmp_path: Any
+    ) -> None:
+        """An index present alongside mxfp4 shards must not win.
+
+        This is the trap: gpt-oss-20b HAS an index, its ``total_size // 2``
+        answers 6,880,658,452 against a true 20,914,757,184, and acting on the
+        undercount picks ``cuda`` for an 83.66 GB fp32 copy.
+        """
+        torch_mod = pytest.importorskip("torch")
+        safetensors_torch = pytest.importorskip("safetensors.torch")
+
+        safetensors_torch.save_file(
+            {"w_blocks": torch_mod.zeros(10, 10, dtype=torch_mod.uint8)},
+            str(tmp_path / "model-00001-of-00001.safetensors"),
+        )
+        (tmp_path / "model.safetensors.index.json").write_text(
+            json.dumps({"metadata": {"total_size": 999_999_999}}), encoding="utf-8"
+        )
+        _write_config(tmp_path, {"quantization_config": {"quant_method": "mxfp4"}})
+
+        assert checkpoint_parameter_count(str(tmp_path)) == 200
+
+    def test_mxfp4_without_shards_is_none(self, tmp_path: Any) -> None:
+        pytest.importorskip("safetensors")
+        _write_config(tmp_path, {"quantization_config": {"quant_method": "mxfp4"}})
+        assert checkpoint_parameter_count(str(tmp_path)) is None
+
+
+# ---------------------------------------------------------------------------
+# fp32 memory feasibility (no torch)
+# ---------------------------------------------------------------------------
+
+#: gpt-oss-20b, measured by summing the real safetensors shards: 11,956,805,184
+#: raw stored elements dequantize to this, whose fp32 copy is 83.66 GB.
+_GPT_OSS_20B_DEQUANTIZED_PARAMS = 20_914_757_184
+
+
+class TestReferenceFp32Bytes:
+    def test_four_bytes_per_parameter(self) -> None:
+        assert FP32_BYTES_PER_PARAMETER == 4
+        assert reference_fp32_bytes(1_000) == 4_000
+
+    def test_gpt_oss_20b_is_eighty_three_gigabytes(self) -> None:
+        """The number the refusal message has to be able to quote."""
+        assert (
+            reference_fp32_bytes(_GPT_OSS_20B_DEQUANTIZED_PARAMS) / 1e9
+            == pytest.approx(83.66, abs=0.01)
+        )
+
+    def test_zero_is_zero(self) -> None:
+        assert reference_fp32_bytes(0) == 0
+
+    def test_negative_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="must be >= 0"):
+            reference_fp32_bytes(-1)
+
+
+class TestAssertReferenceFits:
+    """A reference that cannot be computed must raise, not degrade or vanish."""
+
+    def test_a_fitting_cuda_reference_passes(self) -> None:
+        assert_reference_fits(
+            "/models/qwen3-8b",
+            num_parameters=8_000_000_000,
+            free_device_bytes=70 * 1024**3,
+            free_host_bytes=60 * 1024**3,
+            device="cuda",
+        )
+
+    def test_a_fitting_cpu_reference_passes(self) -> None:
+        assert_reference_fits(
+            "/models/qwen3-8b",
+            num_parameters=8_000_000_000,
+            free_device_bytes=None,
+            free_host_bytes=60 * 1024**3,
+            device="cpu",
+        )
+
+    def test_cuda_refusal_shows_the_arithmetic(self) -> None:
+        with pytest.raises(ReferenceUnavailable) as excinfo:
+            assert_reference_fits(
+                "/models/gpt-oss-20b",
+                num_parameters=_GPT_OSS_20B_DEQUANTIZED_PARAMS,
+                free_device_bytes=79 * 1024**3,
+                free_host_bytes=63 * 1000**3,
+                device="cuda",
+            )
+        message = str(excinfo.value)
+        assert "/models/gpt-oss-20b" in message
+        assert "20,914,757,184 params x 4 B" in message
+        assert "83.66 GB" in message
+        assert "device=cuda" in message
+        #: The remedy must be named, not implied.
+        assert "larger-memory node" in message
+        assert excinfo.value.required_bytes == 83_659_028_736
+
+    def test_cpu_refusal_shows_the_arithmetic(self) -> None:
+        """CPU is not a fallback for this checkpoint; it is a second way to die."""
+        with pytest.raises(ReferenceUnavailable) as excinfo:
+            assert_reference_fits(
+                "/models/gpt-oss-20b",
+                num_parameters=_GPT_OSS_20B_DEQUANTIZED_PARAMS,
+                free_device_bytes=None,
+                free_host_bytes=63_000_000_000,
+                device="cpu",
+            )
+        message = str(excinfo.value)
+        assert "20,914,757,184 params x 4 B" in message
+        assert "83.66 GB" in message
+        assert "device=cpu has 63.0 GB free" in message
+        assert excinfo.value.available_bytes == 63_000_000_000
+
+    def test_a_forced_device_is_still_checked(self) -> None:
+        """An operator forcing cuda gets a refusal, not an OOM kill."""
+        with pytest.raises(ReferenceUnavailable, match="cannot run"):
+            assert_reference_fits(
+                "/models/gpt-oss-20b",
+                num_parameters=_GPT_OSS_20B_DEQUANTIZED_PARAMS,
+                free_device_bytes=80 * 1024**3,
+                free_host_bytes=10**15,
+                device="cuda",
+            )
+
+    def test_cuda_applies_the_same_headroom_as_the_device_choice(self) -> None:
+        """Raw weight bytes alone must not admit what select_reference_device rejects.
+
+        The two must answer "does it fit" the same way; a device chosen under
+        one budget and admitted under another is exactly the OOM this refusal
+        exists to prevent.
+        """
+        params = 8_000_000_000
+        raw = reference_fp32_bytes(params)
+        assert (
+            select_reference_device(
+                num_parameters=params, free_device_bytes=raw
+            )
+            == "cpu"
+        )
+        with pytest.raises(ReferenceUnavailable):
+            assert_reference_fits(
+                "/models/qwen3-8b",
+                num_parameters=params,
+                free_device_bytes=raw,
+                free_host_bytes=10**15,
+                device="cuda",
+            )
+        #: ...and it is admitted once the headroom is actually there.
+        assert_reference_fits(
+            "/models/qwen3-8b",
+            num_parameters=params,
+            free_device_bytes=int(raw * REFERENCE_DEVICE_HEADROOM_FRACTION),
+            free_host_bytes=10**15,
+            device="cuda",
+        )
+
+    def test_unreadable_free_memory_refuses_rather_than_guesses(self) -> None:
+        with pytest.raises(ReferenceUnavailable, match="could not be read"):
+            assert_reference_fits(
+                "/models/qwen3-8b",
+                num_parameters=8_000_000_000,
+                free_device_bytes=None,
+                free_host_bytes=None,
+                device="cpu",
+            )
+
+    def test_an_unknown_device_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="must be 'cuda' or 'cpu'"):
+            assert_reference_fits(
+                "/models/qwen3-8b",
+                num_parameters=1,
+                free_device_bytes=10**12,
+                free_host_bytes=10**12,
+                device="mps",
+            )
 
 
 # ---------------------------------------------------------------------------

@@ -13,7 +13,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
@@ -28,6 +28,8 @@ from speedlm.training.backends.speculators_runner import (
 from speedlm.training.masking import FinalAssistantMaskError, MaskPolicy
 from speedlm.tuner.eagle3 import (
     MAX_SCRATCH_BYTES,
+    SCRATCH_HEADROOM_BYTES,
+    SHARD_BYTES_PER_ROW,
     AbortCheck,
     BackendInfo,
     DraftMaterializer,
@@ -46,11 +48,18 @@ from speedlm.tuner.eagle3 import (
     TrainingError,
     TrainingResult,
     TrainingRowRenderer,
+    derive_scratch_quota_bytes,
     scratch_usage,
 )
 from speedlm.tuner.idle import TuningPreempted
 
 logger = logging.getLogger(__name__)
+
+#: Passes :func:`_remove_tree` makes at a directory whose contents reappear
+#: under it.  With the writers already stopped, one retry is enough for a
+#: process inside its SIGTERM grace period; three bounds the pathological case
+#: without turning a genuinely undeletable tree into a hang.
+_REMOVE_TREE_ATTEMPTS: Final = 3
 
 #: Per-stream cap on the persisted training log.  Two mebibytes is far more
 #: than a Speculators run emits normally, and small enough that a pathological
@@ -553,7 +562,7 @@ class FilesystemTraceSnapshotLeaser:
             preserve_failure_evidence(
                 destination.parent, "trace-snapshot-lease", error, outputs=(destination,)
             )
-            _remove(destination)
+            _discard((destination,), primary=error)
             raise
 
 
@@ -653,8 +662,7 @@ class SpeculatorsTrainingRowRenderer:
             preserve_failure_evidence(
                 scratch, _ROW_RENDER_STAGE, error, outputs=(destination, data)
             )
-            _remove(destination)
-            _remove(data)
+            _discard((destination, data), primary=error)
             raise
 
     def _zero_row(
@@ -731,11 +739,40 @@ class SpeculatorsHiddenStateExtractor:
         if row_count is None:
             raise Eagle3Error("training row count was not recorded before extraction")
         scratch = destination.parent
+        server: RunningProcess | None = None
+
+        def stop_server() -> ProcessResult | None:
+            """Terminate the hidden-state server once, persisting its output.
+
+            Idempotent by design: the quota guard, the health-check failure
+            path, the failure handler and the ``finally`` below all call it, and
+            only the first does the work.  The vLLM launcher's own output lives
+            in the returned ``ProcessResult`` and nowhere else; dropping it left
+            the extraction server's side of every failure unexaminable.
+
+            Returns:
+                The terminated server's output, or ``None`` if it was already
+                stopped.
+            """
+            nonlocal server
+            running, server = server, None
+            if running is None:
+                return None
+            stopped = self.runner.terminate(
+                running,
+                grace_seconds=self.config.server_shutdown_timeout_seconds,
+            )
+            persist_stage_output(scratch, "hidden-state-server", stopped)
+            return stopped
+
         guard = _guard(
-            scratch, self.config.scratch_quota_bytes, should_abort, (destination,)
+            scratch,
+            self.config.scratch_quota_bytes,
+            should_abort,
+            (destination,),
+            stop=stop_server,
         )
         started = self.clock()
-        server: RunningProcess | None = None
         try:
             verifier = self.resolver.verifier(guard, scratch)
             server = self.runner.start(
@@ -772,13 +809,10 @@ class SpeculatorsHiddenStateExtractor:
             ):
                 returncode = self.runner.check_running(server, should_abort=guard)
                 if returncode is not None:
-                    stopped = self.runner.terminate(
-                        server,
-                        grace_seconds=self.config.server_shutdown_timeout_seconds,
-                    )
+                    stopped = stop_server()
                     raise TrainingError(
                         f"vLLM hidden-state server exited with status {returncode}",
-                        stderr=stopped.stderr,
+                        stderr=stopped.stderr if stopped is not None else "",
                     )
                 _deadline(started, timeout_seconds, "vLLM health check")
                 self.sleeper(self.config.health_poll_interval_seconds)
@@ -819,26 +853,21 @@ class SpeculatorsHiddenStateExtractor:
             _check_hidden_state_layers(destination, len(layers), generated)
             return destination
         except BaseException as error:
-            # Order matters: the inventory of what extraction produced has to
-            # be taken while the shards are still there.
+            # Order matters twice over.  The inventory of what extraction
+            # produced has to be taken while the shards are still there, so it
+            # comes first -- and the server has to be gone before the shards
+            # are deleted, because it writes ``cmpl-*.safetensors`` and their
+            # ``.lock`` siblings straight into ``destination``.  Deleting under
+            # a live server is what turned job 369325's quota trip into an
+            # ``Errno 39`` that replaced its own root cause.
             preserve_failure_evidence(
                 scratch, _EXTRACTION_STAGE, error, outputs=(destination,)
             )
-            _remove(destination)
+            _stop_quietly(stop_server, primary=error)
+            _discard((destination,), primary=error)
             raise
         finally:
-            if server is not None:
-                # The vLLM launcher's own output lives in this ProcessResult and
-                # nowhere else; dropping it left the extraction server's side of
-                # every failure unexaminable.
-                persist_stage_output(
-                    scratch,
-                    "hidden-state-server",
-                    self.runner.terminate(
-                        server,
-                        grace_seconds=self.config.server_shutdown_timeout_seconds,
-                    ),
-                )
+            stop_server()
 
 
 class SpeculatorsTrainingProcess:
@@ -953,8 +982,7 @@ class SpeculatorsTrainingProcess:
                 error,
                 outputs=(destination, scratch / "warm-start-pinned"),
             )
-            _remove(destination)
-            _remove(scratch / "warm-start-pinned")
+            _discard((destination, scratch / "warm-start-pinned"), primary=error)
             raise
 
 
@@ -1016,7 +1044,7 @@ class SpeculatorsDraftMaterializer:
                 outputs=(destination,),
             )
             _writable(destination)
-            _remove(destination)
+            _discard((destination,), primary=error)
             raise
 
 
@@ -1181,7 +1209,10 @@ class Eagle3Backend(Eagle3Adapter):
                 error,
                 outputs=tuple(work_dir / name for name in _TRANSIENT_NAMES),
             )
-            _cleanup_transients(work_dir)
+            #: ``primary=error`` so a stray lock or temp file left behind by a
+            #: stage's subprocess cannot substitute an ``OSError`` for the
+            #: quota breach that is the actual reason this cycle is ending.
+            _cleanup_transients(work_dir, primary=error)
             raise
 
 
@@ -1366,7 +1397,7 @@ def _pin_warm_start(
         preserve_failure_evidence(
             destination.parent, "warm-start-pinning", error, outputs=(destination,)
         )
-        _remove(destination)
+        _discard((destination,), primary=error)
         raise TrainingError(
             f"warm-start config is not a Speculators draft: {config_path}",
             stderr=str(error),
@@ -1375,7 +1406,7 @@ def _pin_warm_start(
         preserve_failure_evidence(
             destination.parent, "warm-start-pinning", error, outputs=(destination,)
         )
-        _remove(destination)
+        _discard((destination,), primary=error)
         raise
 
 
@@ -1595,7 +1626,22 @@ def _guard(
     quota: int,
     should_abort: AbortCheck,
     cleanup: Sequence[Path],
+    stop: Callable[[], object] | None = None,
 ) -> AbortCheck:
+    """Return an abort check that also enforces the scratch quota.
+
+    Args:
+        scratch: the cycle's scratch directory, re-walked on every check.
+        quota: the byte ceiling; see
+            :func:`speedlm.tuner.eagle3.derive_scratch_quota_bytes`.
+        should_abort: the preemption check this one wraps.
+        cleanup: stage outputs a quota trip removes on top of the transients.
+        stop: shuts down the subprocesses that are writing into *scratch*.
+            Optional only because most stages have no live writer at the moment
+            their guard fires; the stage that does -- hidden-state extraction --
+            must pass one.  See the rationale inside.
+    """
+
     def check() -> bool:
         used = scratch_usage(scratch)
         if used > quota:
@@ -1610,9 +1656,23 @@ def _guard(
                 error,
                 outputs=(*cleanup, *(scratch / name for name in _TRANSIENT_NAMES)),
             )
-            for path in cleanup:
-                _remove(path)
-            _cleanup_transients(scratch)
+            #: Stop the writers BEFORE deleting the tree they are writing into.
+            #:
+            #: This check runs from inside ``SubprocessRunner.run``'s poll loop,
+            #: so on job 369325 both the vLLM hidden-state server and the
+            #: Speculators data-generation client were still alive and still
+            #: creating ``cmpl-*.safetensors`` and sibling ``*.safetensors.lock``
+            #: files in ``hidden-states`` while ``rmtree`` walked it.  Deleting
+            #: first does not merely risk ``Errno 39`` on our side; it also
+            #: provokes the client's own ``os.remove(lock_path)`` at
+            #: ``speculators/data_generation/vllm_client.py:144`` into a
+            #: ``FileNotFoundError``, in vendored code we cannot patch.  Both
+            #: races disappear if the tree is quiet before it is removed, which
+            #: is why the ordering matters more than the ``rmtree`` retry.
+            if stop is not None:
+                _stop_quietly(stop, primary=error)
+            _discard(cleanup, primary=error)
+            _cleanup_transients(scratch, primary=error)
             raise error
         return should_abort()
 
@@ -1711,8 +1771,84 @@ def _remove(path: Path) -> None:
     if path.is_symlink() or path.is_file():
         path.unlink(missing_ok=True)
     elif path.is_dir():
+        _remove_tree(path)
+
+
+def _remove_tree(path: Path) -> None:
+    """Delete a directory tree, re-trying entries that reappear under the walk.
+
+    Job 369325: a scratch-quota trip removed ``hidden-states`` while the
+    Speculators data-generation client and the vLLM hidden-state server were
+    both still running, and ``shutil.rmtree`` raised
+    ``OSError: [Errno 39] Directory not empty`` on a single leftover 0-byte
+    ``*.safetensors.lock``.  ``rmtree`` enumerates a directory and then
+    ``rmdir``s it; a writer that creates one file in that gap is enough.
+
+    The real fix is ordering -- :func:`_guard` and the extraction stage now
+    stop their writers *before* deleting the tree, so nothing should be
+    creating files here at all.  This is the belt to that braces, for the
+    handful of paths the ordering fix cannot reach (a process in its SIGTERM
+    grace period, an NFS client flushing).
+
+    It is not a weakening: the final attempt is unguarded, so a tree that
+    genuinely cannot be removed still raises the same ``OSError`` it always
+    did.
+
+    Raises:
+        OSError: if the tree still exists after :data:`_REMOVE_TREE_ATTEMPTS`.
+    """
+    for attempt in range(_REMOVE_TREE_ATTEMPTS):
+        if not path.exists():
+            return
         _writable(path)
-        shutil.rmtree(path)
+        try:
+            shutil.rmtree(path)
+        except OSError:
+            if attempt == _REMOVE_TREE_ATTEMPTS - 1:
+                raise
+        else:
+            return
+
+
+def _discard(paths: Iterable[Path], *, primary: BaseException) -> None:
+    """Remove *paths* without ever letting cleanup replace *primary*.
+
+    ``preserve_failure_evidence`` already refuses to let *writing* evidence
+    mask the failure it documents.  Deletion had no such treatment, so job
+    369325 reported ``[Errno 39] Directory not empty`` -- its own cleanup's
+    secondary symptom -- while the ``ScratchQuotaExceeded`` that caused the
+    abort survived only in ``stage-logs/scratch-quota/failure.json``, invisible
+    to the cycle result, the gateway log and the SLURM output.
+
+    A cleanup failure is still evidence, so it is recorded on the primary
+    exception as a note and in :attr:`Eagle3Error.cleanup_errors` rather than
+    discarded.  What it may not do is become the reported error.
+    """
+    for path in paths:
+        try:
+            _remove(path)
+        except OSError as error:
+            _note(primary, f"cleanup could not remove {path}: {error}")
+
+
+def _stop_quietly(stop: Callable[[], object], *, primary: BaseException) -> None:
+    """Run *stop* on a failure path, recording rather than raising its errors.
+
+    Same contract as :func:`_discard`: shutting the stage's processes down is
+    housekeeping on the way out of a failure, and housekeeping must not become
+    the failure.
+    """
+    try:
+        stop()
+    except Exception as error:  # noqa: BLE001 - see docstring
+        _note(primary, f"could not stop the stage's processes: {error}")
+
+
+def _note(primary: BaseException, message: str) -> None:
+    """Attach *message* to *primary* without changing its type."""
+    primary.add_note(message)
+    if isinstance(primary, Eagle3Error):
+        primary.cleanup_errors = (*primary.cleanup_errors, message)
 
 
 def _writable(path: Path) -> None:
@@ -1757,9 +1893,24 @@ def _parse_val_loss(checkpoint_best: Path) -> float | None:
     return float(loss)
 
 
-def _cleanup_transients(work_dir: Path) -> None:
-    for name in _TRANSIENT_NAMES:
-        _remove(work_dir / name)
+def _cleanup_transients(
+    work_dir: Path, *, primary: BaseException | None = None
+) -> None:
+    """Remove every transient stage output beneath *work_dir*.
+
+    Args:
+        work_dir: the cycle's scratch directory.
+        primary: the failure this cleanup is running on behalf of.  When given,
+            removal errors are recorded on it via :func:`_discard` instead of
+            replacing it.  ``None`` keeps the old raise-on-failure behaviour for
+            the success paths, where there is no primary error to protect.
+    """
+    paths = [work_dir / name for name in _TRANSIENT_NAMES]
+    if primary is None:
+        for path in paths:
+            _remove(path)
+        return
+    _discard(paths, primary=primary)
 
 
 def _health(url: str, timeout: float) -> bool:
@@ -1779,6 +1930,9 @@ __all__ = [
     "DEFAULT_SPECULATORS_REPO",
     "DRAFT_COPY_CHUNK_BYTES",
     "MAX_SCRATCH_BYTES",
+    "SHARD_BYTES_PER_ROW",
+    "SCRATCH_HEADROOM_BYTES",
+    "derive_scratch_quota_bytes",
     "DraftMaterializer",
     "DraftValidator",
     "Eagle3Adapter",

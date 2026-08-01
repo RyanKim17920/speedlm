@@ -720,7 +720,27 @@ class IdleTuningConfig:
     #: ``from_dict`` for the migration error the old key now raises.
     extraction_concurrency: int = 8
     training_port: int = 8_131
-    scratch_quota_bytes: int = 5 * 1024 * 1024 * 1024
+    #: Hard byte limit on the per-cycle scratch directory.
+    #:
+    #: Derived, not chosen: scratch is sized by the hidden-state shards, one
+    #: per leased training row, and the lease is bounded by
+    #: ``training_window_records``.  This default is
+    #: ``speedlm.tuner.eagle3.derive_scratch_quota_bytes(256)`` -- the default
+    #: window -- written out as a literal because importing that module at
+    #: class-definition time would invert the existing lazy import in
+    #: ``__post_init__``::
+    #:
+    #:     256 rows x 32 MiB/row + 1 GiB headroom = 9 GiB = 9,663,676,416
+    #:
+    #: The previous default was a flat 5 GiB, and job 369325 died on it: every
+    #: archived real run had overridden it to 20 GiB, so the one run that
+    #: accepted the default aborted at 5,384,048,233 bytes -- a 0.29 %
+    #: overshoot that disguised a ~21 % under-provision.  A default that no
+    #: real workload can use is not a safe default.
+    #:
+    #: A run that raises ``training_window_records`` must raise this with it;
+    #: ``derive_scratch_quota_bytes`` is the function that says by how much.
+    scratch_quota_bytes: int = 9 * 1024 * 1024 * 1024
     shutdown_timeout_seconds: float = 30.0
     #: Budget for ``restore``'s wake-instead-of-respawn fast path.
     #:

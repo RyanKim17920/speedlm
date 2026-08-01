@@ -24,11 +24,97 @@ from speedlm.training.masking import FinalAssistantMaskError, MaskPolicy
 # should typically be smaller.
 MAX_SCRATCH_BYTES = 20 * 1024 * 1024 * 1024
 
+#: Byte budget charged to one leased training row's hidden-state shard.
+#:
+#: Extraction writes exactly one ``hs_<index>.safetensors`` per leased row --
+#: ``data_generation_offline.py --max-samples`` is the leased row count -- and a
+#: shard is ``tokens_in_row x (num_aux_layers + 1) x hidden_size x 2`` bytes.
+#: For gpt-oss-20b (``hidden_size`` 2880, three aux layers plus the appended
+#: target layer) that is ``4 x 2880 x 2 = 23,040`` bytes per token, so 32 MiB
+#: buys a ~1,456-token row.  The number is not a guess: job 369325's failure
+#: inventory sampled 64 shards with a mean of 15.8 MB and a **maximum of
+#: 31,460,688 B**, and 32 MiB is that maximum rounded up to a power of two.
+#:
+#: It is a budget, not a bound.  ``sequence_length`` permits rows several times
+#: longer, which is what :data:`SCRATCH_HEADROOM_BYTES` and the
+#: :data:`MAX_SCRATCH_BYTES` ceiling above it are for.
+SHARD_BYTES_PER_ROW = 32 * 1024 * 1024
+
+#: Scratch occupied by everything that is not a hidden-state shard.
+#:
+#: At the moment job 369325 aborted, its inventory held 2,096,091 B of trace
+#: snapshot, 1,951,186 B of rendered conversations and 1,252,347 B of training
+#: rows -- 5.3 MB in total.  Those three are negligible; the term this constant
+#: actually covers is ``speculators-training``, the trainer's checkpoint and
+#: optimizer state, which had not been created yet when that run died and so
+#: was never measured.  1 GiB is therefore rounded up hard rather than fitted,
+#: which is the honest treatment of a term with no observation behind it.
+SCRATCH_HEADROOM_BYTES = 1024 * 1024 * 1024
+
+
+def derive_scratch_quota_bytes(training_window_records: int) -> int:
+    """Return the scratch quota a *training_window_records*-row cycle needs.
+
+    The quota is derived from the one thing that actually sizes scratch --
+    the number of hidden-state shards, which equals the number of leased
+    training rows, which is bounded above by ``tuning.training_window_records``
+    -- rather than picked as a round number::
+
+        quota = training_window_records * SHARD_BYTES_PER_ROW
+                + SCRATCH_HEADROOM_BYTES
+
+    Job 369325 is the worked example of getting this wrong.  It leased 409 rows
+    against a 5 GiB (5,368,709,120 B) quota and aborted at 5,384,048,233 B, a
+    0.29 % overshoot that read like a rounding accident.  It was not: at the
+    observed 15.8 MB mean shard those 409 rows needed ``409 x 15.8 MB =
+    6.47 GB``, so the run was ~21 % under-provisioned on the mean and would
+    have needed ``512 x 15.8 MB = 8.09 GB`` had the window filled.  The quota
+    was not marginally too small, it could never have completed.
+
+    Args:
+        training_window_records: the configured lease ceiling in records.
+
+    Returns:
+        The derived quota in bytes.
+
+    Raises:
+        ValueError: if *training_window_records* is not a positive integer, or
+            if the derived quota exceeds :data:`MAX_SCRATCH_BYTES` -- a window
+            that cannot be provisioned within the hard ceiling is a
+            configuration error, not something to silently clamp.
+    """
+    if isinstance(training_window_records, bool) or not isinstance(
+        training_window_records, int
+    ):
+        raise ValueError("training_window_records must be a positive integer")
+    if training_window_records <= 0:
+        raise ValueError(
+            f"training_window_records must be a positive integer, "
+            f"got {training_window_records}"
+        )
+    derived = training_window_records * SHARD_BYTES_PER_ROW + SCRATCH_HEADROOM_BYTES
+    if derived > MAX_SCRATCH_BYTES:
+        raise ValueError(
+            f"a {training_window_records}-record window needs {derived} bytes of "
+            f"scratch, which exceeds MAX_SCRATCH_BYTES ({MAX_SCRATCH_BYTES}); "
+            f"lower tuning.training_window_records or raise the ceiling"
+        )
+    return derived
+
+
 AbortCheck = Callable[[], bool]
 
 
 class Eagle3Error(RuntimeError):
     """Base class for EAGLE-3 adapter failures."""
+
+    #: Cleanup failures that occurred *while this error was propagating*.
+    #:
+    #: Job 369325 lost its root cause because cleanup raised on the way out and
+    #: the secondary ``OSError`` replaced the ``ScratchQuotaExceeded`` it was
+    #: cleaning up after.  Cleanup problems are now recorded here (and as
+    #: exception notes) instead of being allowed to become the reported error.
+    cleanup_errors: tuple[str, ...] = ()
 
 
 class AuxLayerCountMismatch(Eagle3Error):
