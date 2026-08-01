@@ -33,6 +33,7 @@ from speedlm.activation_capture.compare import (
     LayerComparison,
     PrefixCacheResult,
     _detect_rel_error_trend,
+    align_prompt_rows,
     build_result,
     check_pre_norm,
     check_within_tolerance,
@@ -1098,33 +1099,106 @@ class TestSliceBeforeDrafter:
 
 
 class TestTokenAlignment:
-    """Test that captured/offline token alignment works correctly."""
+    """Exercise the real aligner, ``compare.align_prompt_rows``.
 
-    def test_equal_lengths_pass_through(self) -> None:
-        cap = torch.randn(12, 2880)
-        off = torch.randn(12, 2880)
-        assert cap.shape[0] == off.shape[0]
-        # _align_token_count would return them unchanged
+    The predecessors of these tests re-implemented ``cap[: off.shape[0]]``
+    inline and asserted on their own re-implementation, so they were true no
+    matter what the shipped function did.  Worse, the quantity they treated as
+    "the prompt" was the *offline* row count, baking the bug into the tests.
+    Every test below calls the shipped function and passes the prompt token
+    count as an independent third value.
+    """
 
-    def test_captured_longer_is_trimmed(self) -> None:
-        cap = torch.randn(28, 2880)  # prompt + generated
-        off = torch.randn(12, 2880)  # prompt only
-        trimmed = cap[: off.shape[0]]
-        assert trimmed.shape == off.shape
-        assert trimmed.shape[0] == 12
+    def test_trims_both_sides_to_the_prompt(self) -> None:
+        # 18 prompt rows; capture also holds 30 generated rows, offline also
+        # holds 6 template-assistant rows.  Neither tail is comparable.
+        cap = torch.randn(48, 128)
+        off = torch.randn(24, 128)
+        c, o = align_prompt_rows(cap, off, 18)
+        assert c.shape == (18, 128)
+        assert o.shape == (18, 128)
+        assert torch.equal(c, cap[:18])
+        assert torch.equal(o, off[:18])
 
-    def test_captured_shorter_raises(self) -> None:
-        cap = torch.randn(6, 2880)
-        off = torch.randn(12, 2880)
-        # Captured has fewer rows — this should be detected as a mismatch
-        assert cap.shape[0] < off.shape[0]
+    def test_offline_row_count_is_not_the_prompt_length(self) -> None:
+        """The offline stack's tail must be dropped, not compared.
+
+        This is the exact shape of GPU job 369218: the offline path renders
+        the assistant turn into the conversation, so its rows outnumber the
+        prompt.  The aligner must not treat ``offline.shape[0]`` as the
+        prompt length.
+        """
+        cap = torch.randn(48, 128)
+        off = torch.randn(24, 128)
+        _, o = align_prompt_rows(cap, off, 18)
+        assert o.shape[0] == 18, (
+            "aligner kept the offline template-assistant rows; those tokens "
+            "were never fed to the serving engine"
+        )
+
+    def test_equal_lengths_still_trim_to_prompt(self) -> None:
+        cap = torch.randn(24, 128)
+        off = torch.randn(24, 128)
+        c, o = align_prompt_rows(cap, off, 18)
+        assert c.shape[0] == 18
+        assert o.shape[0] == 18
+
+    def test_captured_shorter_than_prompt_raises(self) -> None:
+        with pytest.raises(ValueError, match="captured has fewer rows"):
+            align_prompt_rows(torch.randn(6, 128), torch.randn(24, 128), 18)
+
+    def test_offline_shorter_than_prompt_raises(self) -> None:
+        with pytest.raises(ValueError, match="offline has fewer rows"):
+            align_prompt_rows(torch.randn(48, 128), torch.randn(12, 128), 18)
+
+    def test_non_positive_prompt_length_raises(self) -> None:
+        with pytest.raises(ValueError, match="must be positive"):
+            align_prompt_rows(torch.randn(48, 128), torch.randn(24, 128), 0)
 
     def test_bf16_alignment_preserves_dtype(self) -> None:
-        cap = torch.randn(16, 2880, dtype=torch.bfloat16)
-        off = torch.randn(12, 2880, dtype=torch.bfloat16)
-        trimmed = cap[: off.shape[0]]
-        assert trimmed.dtype == torch.bfloat16
-        assert trimmed.shape == (12, 2880)
+        cap = torch.randn(48, 128, dtype=torch.bfloat16)
+        off = torch.randn(24, 128, dtype=torch.bfloat16)
+        c, o = align_prompt_rows(cap, off, 18)
+        assert c.dtype == torch.bfloat16
+        assert o.dtype == torch.bfloat16
+        assert c.shape == (18, 128)
+
+
+class TestDivergentTailRegression:
+    """Regression for GPU job 369218 (Qwen3-8B, verdict FAIL_tolerance).
+
+    Signature reproduced from the real artifacts: the first 18 rows of the
+    capture are *bit-identical* to offline (proving the capture point is
+    correct), and rows 18-23 are unrelated because the serving engine
+    generated its own tokens while the offline path ran the chat template's
+    assistant turn.  Comparing all 24 rows produced mean_rel_error 0.12-0.23
+    against a 0.10 tolerance; comparing the 18 shared rows must be exact.
+    """
+
+    @staticmethod
+    def _stacks() -> tuple[torch.Tensor, torch.Tensor]:
+        torch.manual_seed(0)
+        shared = torch.randn(18, 64)
+        captured = torch.cat([shared, torch.randn(30, 64)], dim=0)
+        offline = torch.cat([shared, torch.randn(6, 64)], dim=0)
+        return captured, offline
+
+    def test_comparing_the_divergent_tail_fails(self) -> None:
+        """The OLD behaviour — trim captured to offline — must fail."""
+        captured, offline = self._stacks()
+        old_captured = captured[: offline.shape[0]]
+        result = build_result({2: old_captured}, {2: offline})
+        assert result.verdict == "FAIL_tolerance"
+
+    def test_prompt_aligned_comparison_is_exact(self) -> None:
+        """The NEW behaviour — trim both to the prompt — must be exact."""
+        captured, offline = self._stacks()
+        c, o = align_prompt_rows(captured, offline, 18)
+        result = build_result(
+            {2: c}, {2: o}, captured_final_pre_norm=c, offline_final_pre_norm=o
+        )
+        assert result.verdict == "PASS"
+        assert result.layers[0].mean_rel_error == 0.0
 
 
 # ---------------------------------------------------------------------------

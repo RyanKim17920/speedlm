@@ -414,6 +414,69 @@ def compare_layerwise(
     return results
 
 
+def align_prompt_rows(
+    captured: Tensor,
+    offline: Tensor,
+    num_prompt_tokens: int,
+) -> tuple[Tensor, Tensor]:
+    """Trim both stacks to the first *num_prompt_tokens* rows.
+
+    **The two paths do not run the same token sequence past the prompt.**
+
+    * Serving capture records every scheduled token: the ``num_prompt_tokens``
+      prompt rows produced by the prefill, followed by one row per token the
+      model *itself sampled*.
+    * Offline extraction runs the fully-rendered conversation through
+      ``prepare_data.py``, which requires an assistant turn.  Its rows are the
+      prompt rows followed by the rows of the *template's* assistant turn.
+
+    Only the leading ``num_prompt_tokens`` rows are the same tokens on both
+    sides.  Everything after that is "what the model said" vs. "what the
+    template said" -- two different token sequences, whose hidden states have
+    no reason to agree and which therefore must never be compared.
+
+    Trimming only the *captured* side down to ``offline.shape[0]`` (the old
+    behaviour) does exactly that: it silently pads the comparison out with
+    mismatched-token rows.  How many such rows there are is a property of the
+    verifier's chat template, not of the capture, which is why the same code
+    passed on one model and failed on another.  gpt-oss-20b renders an empty
+    assistant turn to nothing; Qwen3 renders it to
+    ``<think>\\n\\n</think>\\n\\n<|im_end|>\\n`` -- six extra rows, a quarter of
+    a 24-row comparison, every one of them garbage.
+
+    Args:
+        captured: serving-capture rows, ``(>= num_prompt_tokens, H)``.
+        offline: offline-extraction rows, ``(>= num_prompt_tokens, H)``.
+        num_prompt_tokens: number of tokens in the prompt actually fed to the
+            serving engine (its ``usage.prompt_tokens``).  This is *not*
+            ``offline.shape[0]``.
+
+    Returns:
+        ``(captured[:n], offline[:n])`` with ``n = num_prompt_tokens``.
+
+    Raises:
+        ValueError: if *num_prompt_tokens* is not positive, or if either
+            tensor has fewer than *num_prompt_tokens* rows.
+    """
+    if num_prompt_tokens <= 0:
+        raise ValueError(
+            f"num_prompt_tokens must be positive, got {num_prompt_tokens}"
+        )
+    if captured.shape[0] < num_prompt_tokens:
+        raise ValueError(
+            f"captured has fewer rows ({captured.shape[0]}) than the prompt "
+            f"({num_prompt_tokens}) — cannot align; a prefix-cache hit or a "
+            f"dropped prefill would look like this"
+        )
+    if offline.shape[0] < num_prompt_tokens:
+        raise ValueError(
+            f"offline has fewer rows ({offline.shape[0]}) than the prompt "
+            f"({num_prompt_tokens}) — cannot align; the offline path did not "
+            f"re-run the full prompt"
+        )
+    return captured[:num_prompt_tokens], offline[:num_prompt_tokens]
+
+
 def check_pre_norm(
     captured_final: Tensor | None,
     offline_final: Tensor | None,
@@ -426,6 +489,14 @@ def check_pre_norm(
     Uses *relative* error as the primary check (consistent with the layerwise
     verdict).  Falls back to absolute tolerance only when the reference
     magnitude is essentially zero.
+
+    **This is a tolerance check, not a structural one.**  Both sides collect
+    the final decoder layer at the same point (``hidden_states + residual``,
+    before the next norm — vLLM ``model_executor/models/interfaces.py:1337``),
+    so this never distinguishes pre-norm from post-norm.  It is the layerwise
+    relative-error test applied to one extra layer, and it goes ``False`` for
+    every reason that test does.  Do not read ``pre_norm_match=False`` as
+    evidence of a normalization-point bug.
 
     Returns ``None`` if either tensor is absent (i.e., the final layer could
     not be collected).

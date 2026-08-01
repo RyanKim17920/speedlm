@@ -36,6 +36,7 @@ import pytest
 
 from speedlm.activation_capture.compare import (
     PrefixCacheResult,
+    align_prompt_rows,
     build_result,
 )
 from speedlm.activation_capture.offline_extract import (
@@ -423,8 +424,10 @@ def _get_served_model_id(url: str) -> str:
     return model_ids[0]
 
 
-def _send_prompt(url: str, prompt: str, *, served_model_id: str) -> str:
-    """Send a single chat completion request and return the output text.
+def _send_prompt(
+    url: str, prompt: str, *, served_model_id: str
+) -> tuple[str, int]:
+    """Send a single chat completion request.
 
     Uses /v1/chat/completions with a messages array so that vLLM applies
     the model's chat template — matching the offline extraction path, which
@@ -432,6 +435,13 @@ def _send_prompt(url: str, prompt: str, *, served_model_id: str) -> str:
 
     ``served_model_id`` must be the exact id from /v1/models (the resolved
     snapshot path), not a friendly repo id like "openai/gpt-oss-20b".
+
+    Returns:
+        ``(output_text, prompt_token_count)``.  ``prompt_token_count`` is the
+        engine's own ``usage.prompt_tokens``: the number of rows the prefill
+        produced, and the only row range whose tokens the offline path also
+        ran.  It is emphatically NOT the offline tensor's row count — see
+        :func:`speedlm.activation_capture.compare.align_prompt_rows`.
     """
     with httpx.Client(timeout=120.0, trust_env=False) as client:
         resp = client.post(
@@ -460,7 +470,16 @@ def _send_prompt(url: str, prompt: str, *, served_model_id: str) -> str:
             ) from None
         resp.raise_for_status()
         data = resp.json()
-    return data["choices"][0]["message"]["content"]
+    usage = data.get("usage") or {}
+    prompt_tokens = usage.get("prompt_tokens")
+    if not isinstance(prompt_tokens, int) or prompt_tokens <= 0:
+        raise AssertionError(
+            "chat completion response carried no usable usage.prompt_tokens "
+            f"({prompt_tokens!r}); the comparison cannot know how many "
+            "captured rows are prompt rows and would silently compare "
+            "generated tokens against template tokens"
+        )
+    return data["choices"][0]["message"]["content"], prompt_tokens
 
 
 def _collective_rpc(
@@ -595,25 +614,15 @@ def _align_token_count(
     offline: torch.Tensor,
     prompt_token_count: int,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Align captured and offline tensors to the same token range.
+    """Align captured and offline tensors to the prompt token range.
 
-    Offline extraction re-runs the prompt as a prefill, producing exactly
-    ``prompt_token_count`` rows.  Serving-time capture records all scheduled
-    tokens (prompt + generated), so it may have more rows.  We trim the
-    captured tensor to the first ``prompt_token_count`` rows.
-
-    Returns (captured_trimmed, offline) — both (N, H).
+    Thin wrapper over
+    :func:`speedlm.activation_capture.compare.align_prompt_rows`, which owns
+    the (unit-tested) semantics.  Both sides are trimmed to
+    ``prompt_token_count``; see that function for why trimming only the
+    captured side to ``offline.shape[0]`` is wrong.
     """
-    if captured.shape[0] == offline.shape[0]:
-        return captured, offline
-    if captured.shape[0] > offline.shape[0]:
-        return captured[:offline.shape[0]], offline
-    # Captured has fewer rows — likely prefix-cache hit or a bug.
-    # Report the mismatch rather than fudging.
-    raise ValueError(
-        f"captured has fewer rows ({captured.shape[0]}) than offline "
-        f"({offline.shape[0]}) — cannot align"
-    )
+    return align_prompt_rows(captured, offline, prompt_token_count)
 
 
 def _split_offline_layers(
@@ -755,7 +764,10 @@ def test_stage0_activation_capture() -> None:
 
         # Step 2: Activate capture via collective_rpc, send prompt, flush
         _collective_rpc(vllm_proc, port, "activate_capture", str(capture_dir))
-        _send_prompt(url, prompt, served_model_id=served_model_id)
+        _, prompt_token_count = _send_prompt(
+            url, prompt, served_model_id=served_model_id
+        )
+        logger.info("Engine reported %d prompt tokens", prompt_token_count)
         # Small pause to let the hook buffer finish
         time.sleep(0.5)
         _collective_rpc(vllm_proc, port, "flush_capture")
@@ -852,12 +864,17 @@ def test_stage0_activation_capture() -> None:
         f"vs offline {offline_final_idx}"
     )
 
-    # Determine the prompt token count (from offline shape)
-    prompt_token_count: int | None = None
-    for t in offline_drafter.values():
-        prompt_token_count = t.shape[0]
-        break
-    assert prompt_token_count is not None
+    # The comparable row range is the PROMPT, and only the prompt.  The
+    # engine's own usage.prompt_tokens is the authority; the offline row count
+    # is not — it also covers the assistant turn that prepare_data.py renders
+    # into the conversation, whose tokens the serving engine never saw.  See
+    # ``align_prompt_rows``.
+    offline_rows = next(iter(offline_drafter.values())).shape[0]
+    logger.info(
+        "Aligning on %d prompt rows (offline stack has %d rows; the extra "
+        "%d are the template's assistant turn and are NOT comparable)",
+        prompt_token_count, offline_rows, offline_rows - prompt_token_count,
+    )
 
     # Align drafter-input layers (same key set on both sides)
     aligned_captured: dict[int, torch.Tensor] = {}
@@ -867,10 +884,10 @@ def test_stage0_activation_capture() -> None:
         off = offline_drafter[idx]
         try:
             c_aligned, o_aligned = _align_token_count(cap, off, prompt_token_count)
-            aligned_captured[idx] = c_aligned
-            aligned_offline[idx] = o_aligned
         except ValueError as exc:
-            logger.warning("Cannot align layer %d: %s", idx, exc)
+            raise AssertionError(f"cannot align layer {idx}: {exc}") from exc
+        aligned_captured[idx] = c_aligned
+        aligned_offline[idx] = o_aligned
 
     # Align the regression-target (final layer) separately
     captured_final: torch.Tensor | None = None
@@ -881,7 +898,7 @@ def test_stage0_activation_capture() -> None:
                 captured_regression, offline_regression, prompt_token_count,
             )
         except ValueError as exc:
-            logger.warning("Cannot align final layer: %s", exc)
+            raise AssertionError(f"cannot align final layer: {exc}") from exc
     # Phase 5: Build verdict
     prefix_cache = PrefixCacheResult(
         prompt_token_count=prompt_token_count,
@@ -980,7 +997,9 @@ def test_prefix_cache_coverage() -> None:
 
         # Send same prompt twice; second should hit prefix cache
         _send_prompt(url, prompt, served_model_id=served_model_id)
-        _send_prompt(url, prompt, served_model_id=served_model_id)
+        _, prompt_token_count = _send_prompt(
+            url, prompt, served_model_id=served_model_id
+        )
 
         time.sleep(0.5)
         _collective_rpc(vllm_proc, port, "flush_capture")
@@ -988,11 +1007,9 @@ def test_prefix_cache_coverage() -> None:
         # Load captured results to measure row counts
         captured = _load_captured_safetensors(capture_dir)
         total_rows = sum(t.shape[0] for t in captured.values())
-        # Approximate word count for prompt_token_count
-        word_count = len(prompt.split())
 
         result = PrefixCacheResult(
-            prompt_token_count=word_count,
+            prompt_token_count=prompt_token_count,
             captured_row_count=total_rows,
             cache_hit=True,
             rows_missing=0,

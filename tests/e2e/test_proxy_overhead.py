@@ -59,6 +59,17 @@ VLLM = VLLM_VENV / "bin" / "vllm"
 
 MODEL_DEFAULT = "Qwen/Qwen3.5-2B"
 MAX_TOKENS = 64
+
+# Delta fields that carry a generated token.  A reasoning model served with a
+# reasoning parser (Qwen3-8B + --reasoning-parser qwen3, gpt-oss-20b + harmony)
+# routes its tokens out of `content` and into a reasoning field whose name is
+# not stable across vLLM releases: 0.25.1 streams `delta.reasoning`, while
+# earlier builds and the non-streaming schema use `reasoning_content`.  All of
+# them are real decoded tokens delivered over the same SSE path, so all of them
+# are valid timing anchors for a proxy-overhead measurement.  Accepting only
+# ("content", "reasoning_content") silently discarded every event of a Qwen3-8B
+# stream and made the benchmark unmeasurable.
+TOKEN_DELTA_FIELDS = ("content", "reasoning_content", "reasoning", "thinking")
 WARMUP_COUNT = 3
 LATENCY_REPEATS = 8
 CONCURRENCY_REPEATS = 4
@@ -210,7 +221,12 @@ def _measure_streaming(
 ) -> list[dict[str, Any]]:
     """Measure first token and gaps between token-bearing SSE events.
 
-    vLLM normally emits one generated token per content-bearing SSE event.
+    vLLM normally emits one generated token per token-bearing SSE event.  A
+    token counts whether it lands in `content` or in a reasoning field (see
+    TOKEN_DELTA_FIELDS) -- both are decoded on the same path and delivered over
+    the same stream, so both time the proxy identically.  What is measured is
+    delivery latency, not answer quality.
+
     The raw interval distribution is retained in the JSON artifact.  If an
     HTTP layer coalesces events, near-zero gaps faithfully expose that delivery
     behavior; completion-token throughput still uses authoritative API usage.
@@ -252,7 +268,7 @@ def _measure_streaming(
                         continue
                     token_bearing = token_bearing or any(
                         isinstance(delta.get(field), str) and bool(delta[field])
-                        for field in ("content", "reasoning_content")
+                        for field in TOKEN_DELTA_FIELDS
                     )
                 if not token_bearing:
                     continue

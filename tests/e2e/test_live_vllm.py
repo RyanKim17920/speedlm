@@ -37,6 +37,24 @@ SPEEDLM = _resolve_speedlm()
 VLLM_VENV = Path("/admin/home/ryan.kim/speedlm/.preflight/venvs/vllm")
 VLLM = VLLM_VENV / "bin" / "vllm"
 
+# Reasoning models route their tokens out of `content` into a reasoning field
+# whose name is not stable across vLLM releases (0.25.1 uses `reasoning` in
+# both the streaming delta and the non-streaming message; older builds use
+# `reasoning_content`).
+REASONING_FIELDS = ("reasoning_content", "reasoning", "thinking")
+
+# Token budgets.  Every model this suite is pointed at now reasons before it
+# answers -- Qwen3-8B under --reasoning-parser qwen3, gpt-oss-20b under the
+# harmony template -- and reasoning tokens are billed against max_tokens.  A
+# budget sized for a non-reasoning model is spent entirely inside the thinking
+# block, so generation stops at finish_reason="length" having emitted no
+# content and, fatally for the tool check, no tool call.  These budgets leave
+# room to think *and* then produce the answer; a non-reasoning model simply
+# stops early and is unaffected.
+NONSTREAM_MAX_TOKENS = 384
+STREAM_MAX_TOKENS = 512
+TOOL_MAX_TOKENS = 512
+
 
 def _require_live_e2e() -> None:
     if os.environ.get("SPEEDLM_E2E") != "1":
@@ -201,7 +219,7 @@ def _stream_chat(
         if isinstance(choice, dict)
         for delta in [choice.get("delta")]
         if isinstance(delta, dict)
-        for field in ("reasoning_content", "reasoning", "thinking")
+        for field in REASONING_FIELDS
         for delta_value in [delta.get(field)]
         if isinstance(delta_value, str)
     )
@@ -387,7 +405,7 @@ def test_speedlm_against_live_vllm() -> None:
                 "temperature": 0.2,
                 "top_p": 0.85,
                 "seed": 123,
-                "max_tokens": 32,
+                "max_tokens": NONSTREAM_MAX_TOKENS,
             }
             nonstream = _post_json(
                 client,
@@ -400,16 +418,29 @@ def test_speedlm_against_live_vllm() -> None:
             nonstream_reasoning = next(
                 (
                     nonstream_message[field]
-                    for field in ("reasoning_content", "reasoning", "thinking")
+                    for field in REASONING_FIELDS
                     if isinstance(nonstream_message.get(field), str)
                 ),
                 None,
             )
+            nonstream_finish = nonstream["choices"][0].get("finish_reason")
             assert (
                 isinstance(nonstream_content, str) and nonstream_content.strip()
             ) or (
                 isinstance(nonstream_reasoning, str) and nonstream_reasoning.strip()
-            )
+            ), f"response carried neither content nor reasoning: {nonstream_message}"
+            # Distinguish "the model reasoned and then answered" from "the model
+            # never got past thinking".  An empty `content` is only legitimate
+            # when generation stopped of its own accord; if it stopped because
+            # the budget ran out, the answer was truncated away and the trace
+            # equality checks below would be comparing "" against "".
+            if not (isinstance(nonstream_content, str) and nonstream_content.strip()):
+                assert nonstream_finish != "length", (
+                    "model exhausted max_tokens inside its reasoning block and "
+                    f"never emitted content (finish_reason={nonstream_finish!r}, "
+                    f"completion_tokens={nonstream['usage']['completion_tokens']}); "
+                    f"raise NONSTREAM_MAX_TOKENS (currently {NONSTREAM_MAX_TOKENS})"
+                )
 
             stream_payload = {
                 "model": model,
@@ -425,7 +456,7 @@ def test_speedlm_against_live_vllm() -> None:
                 "temperature": 0.3,
                 "top_p": 0.9,
                 "seed": 456,
-                "max_tokens": 96,
+                "max_tokens": STREAM_MAX_TOKENS,
                 "stream": True,
                 "stream_options": {"include_usage": True},
             }
@@ -466,7 +497,7 @@ def test_speedlm_against_live_vllm() -> None:
                 "temperature": 0.0,
                 "top_p": 1.0,
                 "seed": 789,
-                "max_tokens": 64,
+                "max_tokens": TOOL_MAX_TOKENS,
             }
             tool = _post_json(
                 client,
@@ -474,8 +505,22 @@ def test_speedlm_against_live_vllm() -> None:
                 tool_payload,
                 artifact_dir / "tool-response.txt",
             )
-            tool_calls = tool["choices"][0]["message"].get("tool_calls")
-            assert isinstance(tool_calls, list) and tool_calls
+            tool_choice = tool["choices"][0]
+            tool_calls = tool_choice["message"].get("tool_calls")
+            # A forced tool_choice was sent, so exactly one outcome is correct:
+            # a tool call comes back.  This still fails hard when the gateway
+            # drops or mangles the call -- the message only tells the two
+            # causes apart, it never excuses either.
+            assert isinstance(tool_calls, list) and tool_calls, (
+                "forced tool_choice produced no tool_calls "
+                f"(finish_reason={tool_choice.get('finish_reason')!r}, "
+                f"completion_tokens={tool['usage']['completion_tokens']}, "
+                f"max_tokens={TOOL_MAX_TOKENS}); "
+                "finish_reason='length' means the model burned its budget "
+                "reasoning and never reached the call -- raise TOOL_MAX_TOKENS; "
+                "any other finish_reason means the call was lost in transit. "
+                f"message={tool_choice['message']}"
+            )
             assert tool_calls[0]["function"]["name"] == "get_temperature"
             json.loads(tool_calls[0]["function"]["arguments"])
 
