@@ -7,7 +7,7 @@ from typing import Any
 
 import pytest
 
-from speedlm.gate.decide import Reason, Verdict
+from speedlm.gate.decide import DispersionBasis, Reason, Verdict
 from speedlm.report import (
     GainStatus,
     GatewayState,
@@ -15,6 +15,7 @@ from speedlm.report import (
     build_status_report,
     find_latest_decision,
     load_decision,
+    parse_decision,
 )
 from speedlm.storage import resolve_layout
 
@@ -783,3 +784,416 @@ def test_a_decision_predating_the_measurement_context_stays_readable(
     assert decision.num_contexts is None
     assert decision.stock_draft is None
     assert build_gain_report(now=2_001.0).status is GainStatus.MEASURED
+
+
+# ---------------------------------------------------------------------------
+# status — serving-unrestored is an incident, not a status
+# ---------------------------------------------------------------------------
+
+
+def _write_scheduler(home_dir: Path, **overrides: Any) -> Path:
+    runs = home_dir / "runs"
+    runs.mkdir(parents=True, exist_ok=True)
+    record: dict[str, Any] = {
+        "schema_version": 1,
+        "enabled": True,
+        "lifecycle": "running",
+        "last_result": {"outcome": "rolled_back", "error": None},
+        "last_error": None,
+    }
+    record.update(overrides)
+    path = runs / "scheduler.json"
+    path.write_text(json.dumps(record), encoding="utf-8")
+    return path
+
+
+def test_status_shouts_when_the_scheduler_reports_serving_unrestored(
+    home: Path,
+) -> None:
+    _write_scheduler(home, serving_unrestored=True)
+
+    report = build_status_report(now=1_000.0)
+    payload = report.to_dict()["scheduler"]
+    text = report.render_text()
+
+    assert report.scheduler.serving_unrestored is True
+    assert isinstance(payload, dict)
+    assert payload["serving_unrestored"] is True
+    assert "SERVING    : NOT RESTORED" in text
+    assert "the active pointer does not name" in text
+
+
+def test_status_stays_quiet_when_serving_was_restored(home: Path) -> None:
+    _write_scheduler(home, serving_unrestored=False)
+
+    report = build_status_report(now=1_000.0)
+    text = report.render_text()
+
+    assert report.scheduler.serving_unrestored is False
+    assert "NOT RESTORED" not in text
+
+
+def test_a_scheduler_record_predating_the_field_reads_back_as_unknown(
+    home: Path,
+) -> None:
+    """Absent is ``None``, not ``False``.
+
+    A scheduler that never reported the condition is not evidence that the
+    condition is absent, and flattening the two would let an old record
+    reassure a reader about something it never checked.
+    """
+    _write_scheduler(home)
+
+    report = build_status_report(now=1_000.0)
+    payload = report.to_dict()["scheduler"]
+
+    assert report.scheduler.serving_unrestored is None
+    assert isinstance(payload, dict)
+    assert payload["serving_unrestored"] is None
+    assert "NOT RESTORED" not in report.render_text()
+
+
+def test_a_non_boolean_serving_unrestored_is_not_believed(home: Path) -> None:
+    _write_scheduler(home, serving_unrestored="yes")
+
+    report = build_status_report(now=1_000.0)
+
+    assert report.scheduler.serving_unrestored is None
+
+
+# ---------------------------------------------------------------------------
+# gain — the quoted gain may not be the gain being delivered
+# ---------------------------------------------------------------------------
+
+
+def _write_unrestored_marker(home_dir: Path, payload: object) -> Path:
+    runs = home_dir / "runs"
+    runs.mkdir(parents=True, exist_ok=True)
+    path = runs / "serving-unrestored.json"
+    path.write_text(
+        payload if isinstance(payload, str) else json.dumps(payload),
+        encoding="utf-8",
+    )
+    return path
+
+
+def test_gain_banners_a_measured_gain_that_is_not_being_delivered(
+    home: Path,
+) -> None:
+    """A perfectly good measurement still gets the banner.
+
+    The measurement is not what is wrong -- what is wrong is that the engine is
+    not serving the draft it was measured for -- so the status stays
+    ``MEASURED`` and the incident is reported beside it.
+    """
+    _write_decision(home, _decision_dict())
+    _write_unrestored_marker(
+        home,
+        {
+            "schema_version": 1,
+            "detected_at": 950.0,
+            "expected_active_draft": "artifact-7",
+            "error": "runtime restore failed: engine did not come back",
+        },
+    )
+
+    report = build_gain_report(now=1_000.0)
+    text = report.render_text()
+
+    assert report.status is GainStatus.MEASURED
+    assert report.serving_unrestored is not None
+    assert report.serving_unrestored.expected_active_draft == "artifact-7"
+    assert "SERVING NOT RESTORED" in text
+    assert "is NOT being delivered" in text
+    assert "artifact-7" in text
+    assert "engine did not come back" in text
+    # The banner precedes every number it qualifies.
+    assert text.index("SERVING NOT RESTORED") < text.index("acceptance delta")
+
+
+def test_gain_banner_json_shape(home: Path) -> None:
+    _write_decision(home, _decision_dict())
+    _write_unrestored_marker(
+        home,
+        {"schema_version": 1, "detected_at": 950.0, "expected_active_draft": "a-7"},
+    )
+
+    payload = json.loads(build_gain_report(now=1_000.0).to_json())
+
+    assert payload["status"] == "measured"
+    assert payload["serving_unrestored"]["expected_active_draft"] == "a-7"
+    assert payload["serving_unrestored"]["detected_at"] == 950.0
+    assert payload["serving_unrestored"]["error"] is None
+
+
+def test_gain_banner_survives_an_unreadable_marker(home: Path) -> None:
+    """Presence is the signal; a corrupt payload must not silence it."""
+    _write_decision(home, _decision_dict())
+    _write_unrestored_marker(home, "{truncated")
+
+    report = build_gain_report(now=1_000.0)
+    text = report.render_text()
+
+    assert report.serving_unrestored is not None
+    assert report.serving_unrestored.expected_active_draft is None
+    assert "SERVING NOT RESTORED" in text
+    assert "the active pointer names unknown" in text
+
+
+def test_gain_banners_even_when_nothing_was_ever_measured(home: Path) -> None:
+    _write_unrestored_marker(
+        home, {"schema_version": 1, "expected_active_draft": "artifact-7"}
+    )
+
+    report = build_gain_report(now=1_000.0)
+
+    assert report.status is GainStatus.NO_GATE_RUN
+    assert "SERVING NOT RESTORED" in report.render_text()
+
+
+def test_gain_has_no_banner_when_serving_is_sound(home: Path) -> None:
+    _write_decision(home, _decision_dict())
+
+    report = build_gain_report(now=1_000.0)
+    payload = json.loads(report.to_json())
+
+    assert report.serving_unrestored is None
+    assert payload["serving_unrestored"] is None
+    assert "SERVING NOT RESTORED" not in report.render_text()
+
+
+# ---------------------------------------------------------------------------
+# gain — dispersion must not read as a tight measurement
+# ---------------------------------------------------------------------------
+
+
+def _varying_repeats(count: int) -> list[dict[str, Any]]:
+    return [
+        {
+            "repeat_index": i,
+            "stock_tok_per_sec": 100.0 + i,
+            "candidate_tok_per_sec": 112.0 - i,
+            "stock_acceptance_rate": 0.62 + i / 1000.0,
+            "candidate_acceptance_rate": 0.68 - i / 1000.0,
+            "invalid_rate": 0.0,
+            "output_mismatches": 0,
+        }
+        for i in range(count)
+    ]
+
+
+def test_gain_degenerate_dispersion_never_prints_a_bare_delta(home: Path) -> None:
+    """Five bit-identical repeats are no measurement, and must not read as one.
+
+    This is job 369162's shape: greedy replay over a frozen suite returned the
+    same counters every repeat, so the acceptance stdev was exactly ``0.0``.
+    Printing ``-0.57 pp`` alone would be read as a superbly resolved number.
+    """
+    _write_decision(home, _decision_dict(num_repeats=5))
+
+    report = build_gain_report(now=1_000.0)
+    text = report.render_text()
+
+    assert report.decision is not None
+    assert (
+        "acceptance delta  : +6.00 pp "
+        "(no variance observed across 5 identical repeats; "
+        "threshold >= 1.00 pp)" in text
+    )
+    # No standard error is offered where none exists.
+    assert "+6.00 pp +/-" not in text
+
+
+def test_gain_measured_dispersion_prints_the_standard_error(home: Path) -> None:
+    _write_decision(
+        home, _decision_dict(num_repeats=4, per_repeat=_varying_repeats(4))
+    )
+
+    report = build_gain_report(now=1_000.0)
+    text = report.render_text()
+
+    assert report.decision is not None
+    assert "acceptance delta  : +6.00 pp +/- " in text
+    assert "(n=4; threshold >= 1.00 pp)" in text
+    assert "throughput delta  : +12.00% +/- " in text
+    assert "(n=4; threshold >= 2.00%)" in text
+    assert "no variance observed" not in text
+
+
+def test_gain_unsampled_dispersion_says_there_was_nothing_to_disperse(
+    home: Path,
+) -> None:
+    _write_decision(
+        home, _decision_dict(num_repeats=1, per_repeat=_varying_repeats(1))
+    )
+
+    report = build_gain_report(now=1_000.0)
+    text = report.render_text()
+
+    assert "acceptance delta  : +6.00 pp (no dispersion: 1 repeat(s);" in text
+    assert "throughput delta  : +12.00% (no dispersion: 1 repeat(s);" in text
+
+
+def test_gain_json_publishes_a_null_standard_error_when_degenerate(
+    home: Path,
+) -> None:
+    """``null``, never ``0.0``: a consumer dividing by it must fail loudly."""
+    _write_decision(home, _decision_dict(num_repeats=5))
+
+    payload = json.loads(build_gain_report(now=1_000.0).to_json())
+    measurement = payload["measurement"]
+
+    assert measurement["acceptance_dispersion"] == "degenerate"
+    assert measurement["acceptance_delta_standard_error_pp"] is None
+    assert measurement["throughput_dispersion"] == "degenerate"
+    assert measurement["throughput_delta_standard_error_pct"] is None
+
+
+def test_gain_json_publishes_the_standard_error_when_measured(home: Path) -> None:
+    _write_decision(
+        home, _decision_dict(num_repeats=4, per_repeat=_varying_repeats(4))
+    )
+
+    measurement = json.loads(build_gain_report(now=1_000.0).to_json())["measurement"]
+
+    assert measurement["acceptance_dispersion"] == "measured"
+    assert measurement["acceptance_delta_standard_error_pp"] > 0.0
+    assert measurement["throughput_dispersion"] == "measured"
+    assert measurement["throughput_delta_standard_error_pct"] > 0.0
+
+
+# ---------------------------------------------------------------------------
+# gain — measurement context
+# ---------------------------------------------------------------------------
+
+
+def test_gain_renders_the_context_two_runs_must_share_to_be_comparable(
+    home: Path,
+) -> None:
+    payload = _decision_dict()
+    payload.update(
+        {
+            "suite_hash": "e945cac6e677",
+            "num_contexts": 103,
+            "stock_draft": "RedHatAI/Qwen3-8B-speculator.eagle3",
+            "benchmark_max_tokens": 512,
+            "replay_concurrency": 8,
+            "correctness_max_tokens": 128,
+        }
+    )
+    _write_decision(home, payload)
+
+    report = build_gain_report(now=1_000.0)
+    text = report.render_text()
+    context = json.loads(report.to_json())["measurement_context"]
+
+    assert "suite             : e945cac6e677 (103 contexts)" in text
+    assert "baseline draft    : RedHatAI/Qwen3-8B-speculator.eagle3" in text
+    assert "replay            : concurrency 8, max 512 tokens" in text
+    # Bounds only the separate correctness replay, so it is machine-readable
+    # rather than spent on a line the operator does not need.
+    assert "correctness" not in text
+    assert context["correctness_max_tokens"] == 128
+
+
+def test_gain_context_is_reported_for_an_aborted_decision_too(home: Path) -> None:
+    """It describes the attempt, not the result."""
+    payload = _decision_dict(
+        verdict="reject",
+        reason="high_invalid_rate",
+        acceptance_delta_pp=None,
+        throughput_delta_pct=None,
+    )
+    payload["suite_hash"] = "e945cac6e677"
+    _write_decision(home, payload)
+
+    report = build_gain_report(now=1_000.0)
+
+    assert report.deltas_measured is False
+    assert "suite             : e945cac6e677" in report.render_text()
+
+
+def test_gain_omits_context_lines_a_legacy_decision_never_recorded(
+    home: Path,
+) -> None:
+    _write_decision(home, _decision_dict())
+
+    report = build_gain_report(now=1_000.0)
+    text = report.render_text()
+    context = json.loads(report.to_json())["measurement_context"]
+
+    assert "suite             :" not in text
+    assert "baseline draft    :" not in text
+    assert "replay            :" not in text
+    assert set(context.values()) == {None}
+
+
+# ---------------------------------------------------------------------------
+# gain — archived artifacts
+# ---------------------------------------------------------------------------
+
+#: Real gate decisions from completed GPU runs.  They predate every field added
+#: above, which is exactly why they are the test: the dispersion figures are
+#: *derived* from ``per_repeat``, so an archived record must report the same
+#: basis the gate would have, without carrying any of the new keys.
+_ARCHIVE_ROOT = Path("/data/ryan.kim/speedlm-runs")
+_ARCHIVED_DECISIONS = sorted(
+    _ARCHIVE_ROOT.glob(
+        "*/results/live-idle-tuning/speedlm_home/runs/*/decision.json"
+    )
+)
+
+
+@pytest.mark.skipif(
+    not _ARCHIVED_DECISIONS, reason="no archived gate decisions on this host"
+)
+@pytest.mark.parametrize(
+    "path", _ARCHIVED_DECISIONS, ids=lambda p: p.parent.name[:8]
+)
+def test_archived_decisions_round_trip_without_the_new_keys(path: Path) -> None:
+    record = json.loads(path.read_text(encoding="utf-8"))
+    assert "acceptance_dispersion" not in record, (
+        "this fixture is only meaningful while it predates the field"
+    )
+
+    decision = load_decision(path)
+
+    # Derived, so they exist even though the file never stored them.
+    assert decision.acceptance_dispersion in set(DispersionBasis)
+    assert decision.throughput_dispersion in set(DispersionBasis)
+    # And the invariant that motivated the enum: no zero standard errors.
+    for basis, error in (
+        (decision.acceptance_dispersion, decision.acceptance_delta_standard_error_pp),
+        (
+            decision.throughput_dispersion,
+            decision.throughput_delta_standard_error_pct,
+        ),
+    ):
+        if basis is DispersionBasis.MEASURED:
+            assert error is None or error > 0.0
+        else:
+            assert error is None
+
+    # Re-serialising and re-parsing must be a fixed point.
+    assert parse_decision(decision.to_dict(), source=path).to_dict() == decision.to_dict()
+
+
+@pytest.mark.skipif(
+    not _ARCHIVED_DECISIONS, reason="no archived gate decisions on this host"
+)
+@pytest.mark.parametrize(
+    "path", _ARCHIVED_DECISIONS, ids=lambda p: p.parent.name[:8]
+)
+def test_archived_homes_render_a_gain_report(path: Path) -> None:
+    archived_home = path.parent.parent.parent
+    report = build_gain_report(home=archived_home, now=1_000.0)
+    text = report.render_text()
+
+    assert report.status in {GainStatus.MEASURED, GainStatus.NOT_MEASURED}
+    assert "SERVING NOT RESTORED" not in text
+    if report.deltas_measured:
+        assert "acceptance delta  :" in text
+        # Whatever the basis, the delta is qualified -- never bare.
+        for label in ("acceptance delta  :", "throughput delta  :"):
+            line = next(ln for ln in text.splitlines() if ln.startswith(label))
+            assert "no variance observed" in line or "+/-" in line

@@ -34,6 +34,7 @@ from speedlm.gate.decide import (
     LEGACY_THROUGHPUT_STATISTIC,
     ContextDivergence,
     Decision,
+    DispersionBasis,
     Reason,
     RepeatSummary,
     Verdict,
@@ -62,6 +63,10 @@ STATE_FILE_NAME: Final = "state.json"
 SCHEDULER_FILE_NAME: Final = "scheduler.json"
 EVENTS_FILE_NAME: Final = "events.jsonl"
 DECISION_FILE_NAME: Final = "decision.json"
+#: Durable marker written by ``TunerOrchestrator._mark_serving_unrestored`` when
+#: a rollback could not return the engine to the active draft.  It lives beside
+#: ``scheduler.json`` and is removed by the first restore that succeeds.
+SERVING_UNRESTORED_FILE_NAME: Final = "serving-unrestored.json"
 
 #: Reasons for which the gate aborted before it could measure comparable deltas.
 #: Legacy decisions may carry zeroes for these reasons; new decisions use nulls.
@@ -482,6 +487,11 @@ class SchedulerStatus:
     detail: str
     enabled: bool | None = None
     lifecycle: str | None = None
+    #: Whether the engine is serving a draft the active pointer does not name.
+    #: ``None`` when the record predates the field -- which is *not* the same as
+    #: ``False``: an older scheduler never reported the condition at all, so the
+    #: honest reading is "unknown", never "fine".
+    serving_unrestored: bool | None = None
     last_watermark: Mapping[str, object] | None = None
     last_result: Mapping[str, object] | None = None
     last_error: str | None = None
@@ -499,6 +509,7 @@ class SchedulerStatus:
             "detail": self.detail,
             "enabled": self.enabled,
             "lifecycle": self.lifecycle,
+            "serving_unrestored": self.serving_unrestored,
             "last_watermark": (
                 dict(self.last_watermark) if self.last_watermark is not None else None
             ),
@@ -542,11 +553,15 @@ def read_scheduler_status(layout: Layout) -> SchedulerStatus:
         )
     watermark = record.get("last_watermark")
     result = record.get("last_result")
+    raw_unrestored = record.get("serving_unrestored")
     return SchedulerStatus(
         present=True,
         detail=f"{lifecycle} ({'enabled' if enabled else 'disabled'})",
         enabled=enabled,
         lifecycle=lifecycle,
+        serving_unrestored=(
+            raw_unrestored if isinstance(raw_unrestored, bool) else None
+        ),
         last_watermark=watermark if isinstance(watermark, dict) else None,
         last_result=result if isinstance(result, dict) else None,
         last_error=_optional_str(record.get("last_error")),
@@ -752,6 +767,16 @@ class StatusReport:
                 outcome = _optional_str(self.scheduler.last_result.get("outcome"))
                 if outcome is not None:
                     lines.append(f"  last cycle : {outcome}")
+            # An incident, not a status: say so where nobody can skim past it.
+            if self.scheduler.serving_unrestored:
+                lines.append(
+                    "  SERVING    : NOT RESTORED -- the engine is serving a draft "
+                    "the active pointer does not name"
+                )
+                lines.append(
+                    "               (answers are unaffected; throughput is "
+                    "unvalidated until the tuner recovers)"
+                )
             if self.scheduler.last_error is not None:
                 lines.append(f"  last error : {self.scheduler.last_error}")
             if self.scheduler.updated_at is not None:
@@ -1128,17 +1153,102 @@ def load_decision(path: Path) -> Decision:
 
 
 # ---------------------------------------------------------------------------
+# serving-unrestored marker
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class ServingUnrestoredMarker:
+    """A rollback left the engine on a draft the active pointer does not name.
+
+    Read from ``<runs>/serving-unrestored.json``.  Its mere *presence* is the
+    signal; every payload field is optional so that a truncated or partially
+    written marker still reports the incident rather than being discarded.  The
+    condition outlives the cycle that caused it -- the state machine ends a
+    preempted cycle at ``READY`` and has nowhere to carry "the cycle is over
+    *and* serving is wrong" -- which is why it is a file and not a state.
+    """
+
+    source_path: Path
+    detected_at: float | None = None
+    expected_active_draft: str | None = None
+    error: str | None = None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "source_path": str(self.source_path),
+            "detected_at": self.detected_at,
+            "expected_active_draft": self.expected_active_draft,
+            "error": self.error,
+        }
+
+
+def read_serving_unrestored(layout: Layout) -> ServingUnrestoredMarker | None:
+    """Return the serving-unrestored marker, or ``None`` when serving is sound.
+
+    An unreadable marker is still a marker: it is reported with empty detail
+    rather than swallowed, because the file only ever exists while the incident
+    holds and losing it would turn a live warning into silence.
+    """
+    path = layout.runs_dir / SERVING_UNRESTORED_FILE_NAME
+    if not path.is_file():
+        return None
+    try:
+        record = _read_json_object(path)
+    except ReportError:
+        return ServingUnrestoredMarker(source_path=path)
+    return ServingUnrestoredMarker(
+        source_path=path,
+        detected_at=_optional_float(record.get("detected_at")),
+        expected_active_draft=_optional_str(record.get("expected_active_draft")),
+        error=_optional_str(record.get("error")),
+    )
+
+
+# ---------------------------------------------------------------------------
 # gain report
 # ---------------------------------------------------------------------------
 
 
 class GainStatus(StrEnum):
-    """Whether a real, trustworthy measurement exists."""
+    """Whether a real, trustworthy measurement exists.
+
+    Deliberately *not* extended with a ``serving_unrestored`` member.  This enum
+    answers one question -- "is there a number, and was it measured" -- and the
+    four members are mutually exclusive answers to it.  Whether the engine is
+    currently delivering that number is an orthogonal fact: a serving-unrestored
+    incident can coexist with any of these four, so folding it in would force a
+    choice between reporting the incident and reporting the measurement, and
+    would silently reclassify a perfectly good ``MEASURED`` decision.  It is
+    carried alongside, on :attr:`GainReport.serving_unrestored`.
+    """
 
     MEASURED = "measured"
     NOT_MEASURED = "not_measured"
     NO_GATE_RUN = "no_gate_run"
     UNREADABLE = "unreadable"
+
+
+def _dispersion_fragments(
+    basis: DispersionBasis,
+    standard_error: float | None,
+    *,
+    repeats: int,
+    unit: str,
+) -> tuple[str, str]:
+    """Render a delta's dispersion as ``(suffix, note)`` text fragments.
+
+    ``suffix`` follows the delta itself and is empty unless a standard error
+    genuinely exists; ``note`` always says something, so the degenerate case can
+    never render as a bare number that reads like a tight measurement.
+    """
+    if basis is DispersionBasis.DEGENERATE:
+        return "", f"no variance observed across {repeats} identical repeats"
+    if basis is DispersionBasis.UNSAMPLED:
+        return "", f"no dispersion: {repeats} repeat(s)"
+    if standard_error is None:
+        return "", f"n={repeats}, standard error unavailable"
+    return f" +/- {standard_error:.3f}{unit}", f"n={repeats}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -1150,6 +1260,10 @@ class GainReport:
     source_path: Path | None = None
     source_mtime: float | None = None
     decision: Decision | None = None
+    #: Set when ``<runs>/serving-unrestored.json`` exists, i.e. the gain below
+    #: was measured for a draft the engine is not currently serving.  Reported
+    #: beside the measurement rather than as a :class:`GainStatus`; see there.
+    serving_unrestored: ServingUnrestoredMarker | None = None
     generated_at: float = 0.0
 
     # -- derived honesty predicates ----------------------------------------
@@ -1186,6 +1300,11 @@ class GainReport:
             "acceptance_available": self.acceptance_available,
             "counter_reset": self.counter_reset,
             "deltas_measured": self.deltas_measured,
+            "serving_unrestored": (
+                None
+                if self.serving_unrestored is None
+                else self.serving_unrestored.to_dict()
+            ),
             "verdict": None,
             "reason": None,
             "reason_detail": None,
@@ -1204,14 +1323,38 @@ class GainReport:
             "min_acceptance_delta_pp": decision.min_acceptance_delta_pp,
             "min_throughput_delta_pct": decision.min_throughput_delta_pct,
         }
+        # What the deltas were measured *over*.  Emitted even for an aborted
+        # decision: it describes the attempt, not the result, and it is what
+        # makes two runs comparable at all.  Every entry is ``None`` on records
+        # written before the gate persisted its measurement context.
+        result["measurement_context"] = {
+            "suite_hash": decision.suite_hash,
+            "num_contexts": decision.num_contexts,
+            "stock_draft": decision.stock_draft,
+            "benchmark_max_tokens": decision.benchmark_max_tokens,
+            "replay_concurrency": decision.replay_concurrency,
+            "correctness_max_tokens": decision.correctness_max_tokens,
+        }
         if self.deltas_measured:
             result["measurement"] = {
                 "stock_acceptance": decision.stock_avg_acceptance,
                 "candidate_acceptance": decision.candidate_avg_acceptance,
                 "acceptance_delta_pp": decision.acceptance_delta_pp,
+                # A zero standard deviation and a small one are different
+                # facts; the basis says which this is, and the standard error
+                # is ``null`` -- never ``0.0`` -- when there is no measurement
+                # behind it.  See ``gate.decide.DispersionBasis``.
+                "acceptance_dispersion": decision.acceptance_dispersion.value,
+                "acceptance_delta_standard_error_pp": (
+                    decision.acceptance_delta_standard_error_pp
+                ),
                 "stock_tok_per_sec": decision.stock_avg_tok_per_sec,
                 "candidate_tok_per_sec": decision.candidate_avg_tok_per_sec,
                 "throughput_delta_pct": decision.throughput_delta_pct,
+                "throughput_dispersion": decision.throughput_dispersion.value,
+                "throughput_delta_standard_error_pct": (
+                    decision.throughput_delta_standard_error_pct
+                ),
             }
             result["per_repeat"] = [
                 {
@@ -1230,8 +1373,71 @@ class GainReport:
     def to_json(self, *, indent: int | None = 2) -> str:
         return json.dumps(self.to_dict(), indent=indent, sort_keys=True)
 
+    def _serving_unrestored_banner(self) -> list[str]:
+        """Say up front when the quoted gain is not what is being delivered."""
+        marker = self.serving_unrestored
+        if marker is None:
+            return []
+        expected = marker.expected_active_draft or "unknown"
+        lines = [
+            "!! SERVING NOT RESTORED -- the gain below is NOT being delivered.",
+            f"!! The engine is answering live traffic with whichever draft an "
+            f"abandoned cycle left loaded; the active pointer names {expected}.",
+            "!! Speculative decoding is lossless, so answers are unaffected, but "
+            "throughput is unvalidated until the tuner recovers.",
+        ]
+        if marker.error is not None:
+            lines.append(f"!! Restore failed with: {marker.error}")
+        lines.append(f"!! Marker: {marker.source_path}")
+        return lines
+
+    @staticmethod
+    def _measurement_context_lines(decision: Decision) -> list[str]:
+        """Render only the context an operator needs to compare two runs.
+
+        Deliberately a subset of what the gate persists.  ``suite_hash`` plus
+        ``num_contexts`` identify the held-out suite -- two deltas measured over
+        different suites are different measurements; ``stock_draft`` names the
+        baseline the delta is *against*, which changes on every promotion; and
+        the replay pair fixes the throughput operating point, so a tok/s figure
+        from concurrency 8 is not comparable to one from concurrency 1.
+        ``correctness_max_tokens`` bounds only the separate correctness replay
+        and moves none of the quoted numbers, so it stays in ``to_dict()`` for
+        tooling rather than costing the reader a line here.
+        """
+        lines: list[str] = []
+        if decision.suite_hash is not None:
+            contexts = (
+                "" if decision.num_contexts is None else f" ({decision.num_contexts} contexts)"
+            )
+            lines.append(f"suite             : {decision.suite_hash}{contexts}")
+        if decision.stock_draft is not None:
+            lines.append(f"baseline draft    : {decision.stock_draft}")
+        if (
+            decision.replay_concurrency is not None
+            or decision.benchmark_max_tokens is not None
+        ):
+            concurrency = (
+                "unknown"
+                if decision.replay_concurrency is None
+                else str(decision.replay_concurrency)
+            )
+            max_tokens = (
+                "unknown"
+                if decision.benchmark_max_tokens is None
+                else str(decision.benchmark_max_tokens)
+            )
+            lines.append(
+                f"replay            : concurrency {concurrency}, "
+                f"max {max_tokens} tokens"
+            )
+        return lines
+
     def render_text(self) -> str:
         lines = ["SpeedLM gain"]
+        # First, before any number: whatever follows may not be what is being
+        # served.  A banner under the figures would be read after them.
+        lines.extend(self._serving_unrestored_banner())
         if self.source_path is not None:
             lines.append(f"source            : {self.source_path}")
             if self.source_mtime is not None:
@@ -1252,6 +1458,7 @@ class GainReport:
             f"({_REASON_EXPLANATIONS[decision.reason]})"
         )
         lines.append(f"repeats           : {decision.num_repeats}")
+        lines.extend(self._measurement_context_lines(decision))
 
         if not self.deltas_measured:
             lines.append("acceptance        : not measured")
@@ -1270,9 +1477,17 @@ class GainReport:
         lines.append(
             f"acceptance cand   : {decision.candidate_avg_acceptance * 100:.2f}%"
         )
+        repeats = len(decision.per_repeat)
+        acceptance_suffix, acceptance_note = _dispersion_fragments(
+            decision.acceptance_dispersion,
+            decision.acceptance_delta_standard_error_pp,
+            repeats=repeats,
+            unit=" pp",
+        )
         lines.append(
-            f"acceptance delta  : {acceptance_delta_pp:+.2f} pp "
-            f"(threshold >= {decision.min_acceptance_delta_pp:.2f} pp)"
+            f"acceptance delta  : {acceptance_delta_pp:+.2f} pp{acceptance_suffix} "
+            f"({acceptance_note}; threshold >= "
+            f"{decision.min_acceptance_delta_pp:.2f} pp)"
         )
         lines.append(
             f"throughput stock  : {decision.stock_avg_tok_per_sec:.2f} tok/s"
@@ -1280,9 +1495,16 @@ class GainReport:
         lines.append(
             f"throughput cand   : {decision.candidate_avg_tok_per_sec:.2f} tok/s"
         )
+        throughput_suffix, throughput_note = _dispersion_fragments(
+            decision.throughput_dispersion,
+            decision.throughput_delta_standard_error_pct,
+            repeats=repeats,
+            unit="%",
+        )
         lines.append(
-            f"throughput delta  : {throughput_delta_pct:+.2f}% "
-            f"(threshold >= {decision.min_throughput_delta_pct:.2f}%)"
+            f"throughput delta  : {throughput_delta_pct:+.2f}%{throughput_suffix} "
+            f"({throughput_note}; threshold >= "
+            f"{decision.min_throughput_delta_pct:.2f}%)"
         )
         if decision.per_repeat:
             lines.append("per-repeat:")
@@ -1338,6 +1560,10 @@ def build_gain_report(
     """Load the most recent gate decision and report it without embellishment."""
     layout = resolve_layout(home)
     timestamp = time.time() if now is None else now
+    # Read before the decision, and attached to every outcome below: whether a
+    # gain is being *delivered* is independent of whether one was *measured*,
+    # and the incident is worth reporting even when there is no number at all.
+    unrestored = read_serving_unrestored(layout)
 
     path = find_latest_decision(layout)
     if path is None:
@@ -1347,6 +1573,7 @@ def build_gain_report(
                 "No gate has ever run: there is no completed benchmark in "
                 f"{layout.runs_dir}, so there is no measured gain to report."
             ),
+            serving_unrestored=unrestored,
             generated_at=timestamp,
         )
 
@@ -1365,6 +1592,7 @@ def build_gain_report(
             ),
             source_path=path,
             source_mtime=mtime_val,
+            serving_unrestored=unrestored,
             generated_at=timestamp,
         )
 
@@ -1386,6 +1614,7 @@ def build_gain_report(
             ),
             source_path=path,
             source_mtime=mtime_val,
+            serving_unrestored=unrestored,
             generated_at=timestamp,
         )
 
@@ -1402,5 +1631,6 @@ def build_gain_report(
         source_path=path,
         source_mtime=mtime_val,
         decision=decision,
+        serving_unrestored=unrestored,
         generated_at=timestamp,
     )

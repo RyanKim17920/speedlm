@@ -305,7 +305,11 @@ Fields: `schema_version` (=1), `enabled`, `lifecycle`, `serving_unrestored`,
 gate_acceptance}`), `last_error`.
 Watermark sub-fields: `count, tokens, oldest, newest, unknown_token_records`
 (`:120-124`). The reader treats the file as unusable if `enabled` is not a bool
-or `lifecycle` is missing (`src/speedlm/report.py:536-542`).
+or `lifecycle` is missing (`src/speedlm/report.py:547-553`). `serving_unrestored`
+is read back as `bool | None`, where `None` means the record predates the field —
+never `False`, which would let an old record reassure a reader about a condition
+it never checked. `speedlm status` prints a `SERVING : NOT RESTORED` line when it
+is true.
 
 `gate_acceptance` is non-null only on a `promoted` cycle that produced a
 decision, and carries `{candidate_rate, candidate_stdev, stock_rate,
@@ -335,6 +339,14 @@ that succeeds. Fields: `schema_version` (=1), `detected_at`,
 `expected_active_draft`, `error`. It is durable on purpose: the state machine
 ends a preempted cycle at `READY` and so has nowhere to carry "the cycle is over
 *and* serving is wrong", and the condition must survive a process restart.
+
+`speedlm gain` reads this file directly (`speedlm.report.read_serving_unrestored`)
+and prints a `SERVING NOT RESTORED` banner *above* every figure, because a
+measured gain that is not being delivered is worse than no figure at all. It is
+carried on `GainReport.serving_unrestored`, not as a `GainStatus` member: the
+incident is orthogonal to whether a measurement exists and can coexist with any
+of the four statuses. Presence is the signal — an unreadable payload still
+banners.
 
 ### `decision.json` — `<run_dir>/decision.json`
 
