@@ -289,6 +289,7 @@ def _runner(
     ) = frozenset(),
     clock: Callable[[], float] | None = None,
     events: list[str] | None = None,
+    candidate_arm_first: bool = False,
 ) -> tuple[BenchmarkGateRunner, FakeEndpoint, FakeReplayExecutor, FakeTraceSource]:
     endpoint = FakeEndpoint()
     replay_executor = replay or FakeReplayExecutor()
@@ -304,6 +305,7 @@ def _runner(
         metrics_source=FakeMetricsSource(scrapes, events=events),
         replay_executor=replay_executor,
         training_context_hashes=training_context_hashes,
+        candidate_arm_first=candidate_arm_first,
         clock=clock or FakeClock(),
     )
     return runner, endpoint, replay_executor, traces
@@ -1187,3 +1189,89 @@ def test_a_reset_inside_one_repeat_window_invalidates_the_arm(
 
     assert result.decision is not None
     assert result.decision.reason is Reason.COUNTER_RESET
+
+
+def _candidate_first_scrapes(**kwargs: object) -> list[str]:
+    """``_normal_scrapes`` with the two arm ladders swapped.
+
+    The metrics source hands out scrapes in call order, so measuring the
+    candidate first means it must be fed the candidate's ladder first.
+    """
+    scrapes = _normal_scrapes(**kwargs)  # type: ignore[arg-type]
+    half = len(scrapes) // 2
+    return [*scrapes[half:], *scrapes[:half]]
+
+
+def test_candidate_first_reuses_the_running_engine_and_ends_on_stock(
+    tmp_path: Path,
+) -> None:
+    """A rejection must leave stock serving, so the rollback has nothing to do."""
+    candidate = tmp_path / "candidate"
+    runner, endpoint, _, _ = _runner(
+        tmp_path,
+        scrapes=_candidate_first_scrapes(
+            candidate_generated=90,
+            candidate_elapsed_ns=1_000_000_000,
+            candidate_accepted=50,
+            candidate_rejected=50,
+        ),
+        candidate_arm_first=True,
+    )
+
+    result = runner.benchmark(
+        candidate,
+        timeout_seconds=30,
+        should_abort=lambda: False,
+    )
+
+    assert result.passed is False
+    assert endpoint.activations == [candidate, "stock"]
+
+
+def test_candidate_first_puts_the_candidate_back_when_the_gate_passes(
+    tmp_path: Path,
+) -> None:
+    """The orchestrator promotes by waking, not restarting, so it must be running."""
+    candidate = tmp_path / "candidate"
+    runner, endpoint, _, _ = _runner(
+        tmp_path,
+        scrapes=_candidate_first_scrapes(),
+        candidate_arm_first=True,
+    )
+
+    result = runner.benchmark(
+        candidate,
+        timeout_seconds=30,
+        should_abort=lambda: False,
+    )
+
+    assert result.passed is True
+    assert endpoint.activations == [candidate, "stock", candidate]
+
+
+def test_stock_first_order_is_still_available(tmp_path: Path) -> None:
+    candidate = tmp_path / "candidate"
+    runner, endpoint, _, _ = _runner(
+        tmp_path,
+        scrapes=_normal_scrapes(),
+        candidate_arm_first=False,
+    )
+
+    result = runner.benchmark(
+        candidate,
+        timeout_seconds=30,
+        should_abort=lambda: False,
+    )
+
+    assert result.passed is True
+    # No trailing re-activation: this order already ends on the candidate.
+    assert endpoint.activations == ["stock", candidate]
+
+
+def test_candidate_arm_first_must_be_a_bool(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="candidate_arm_first must be a bool"):
+        _runner(
+            tmp_path,
+            scrapes=_normal_scrapes(),
+            candidate_arm_first="yes",  # type: ignore[arg-type]
+        )

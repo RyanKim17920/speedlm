@@ -347,6 +347,17 @@ def create_production_tuner(
         epochs=tuning.epochs,
         port=tuning.training_port,
         concurrency=tuning.extraction_concurrency,
+        # The two halves of the same knob.  ``concurrency`` is how many
+        # requests ``data_generation_offline.py`` keeps in flight;
+        # ``max_num_seqs`` is how many the hidden-state engine will schedule at
+        # once, and it was never wired -- so the engine ran at the dataclass
+        # default of 1 and every prefill the client issued serialized behind
+        # the previous one.  On job 369040 that made 408 extraction prefills a
+        # strictly sequential queue against a client driving four.  Setting the
+        # scheduler width to the offered load is what makes the configured
+        # concurrency mean anything; it cannot exceed what the client sends, so
+        # it adds no memory pressure beyond the requests already in flight.
+        max_num_seqs=tuning.extraction_concurrency,
         scratch_quota_bytes=tuning.scratch_quota_bytes,
     )
     backend = Eagle3Backend.from_speculators(
@@ -376,6 +387,7 @@ def create_production_tuner(
         url=child_url,
         process=process,
         http=http,
+        runtime=runtime,
     )
     gate = BenchmarkGateRunner(
         config=config,
@@ -390,6 +402,7 @@ def create_production_tuner(
         benchmark_max_tokens=tuning.benchmark_max_tokens,
         held_out_fraction=tuning.held_out_fraction,
         training_context_hashes=lambda: split.training_context_hashes,
+        candidate_arm_first=tuning.benchmark_candidate_arm_first,
     )
     return create_tuner_service(
         config,
@@ -442,9 +455,19 @@ class _CaptureBarrier:
 
 @dataclass(slots=True)
 class _DraftEndpoint:
+    """Select the draft one vLLM child serves, on behalf of the gate.
+
+    This restarts the *same* child that :class:`RuntimeController` manages, so
+    the two must not keep independent ideas of what is running.  ``runtime`` is
+    both the source of truth consulted before a restart and the object told
+    about one afterwards; leaving it ``None`` restores the unconditional
+    restart behaviour and is what a test that owns no controller should do.
+    """
+
     url: str
     process: ThreadsafeProcessControl
     http: VLLMControlClient
+    runtime: RuntimeController | None = None
 
     def activate(
         self,
@@ -455,11 +478,28 @@ class _DraftEndpoint:
     ) -> None:
         if should_abort():
             raise ControlAborted("draft activation aborted")
+        # The benchmark's first arm asks for a draft the cycle has *already*
+        # started -- CANDIDATE_STARTING spends a full engine launch on it -- so
+        # activating unconditionally threw that engine away and paid a second
+        # launch for the identical configuration.  Readiness is still confirmed
+        # on the cheap path, so the arm never begins against an engine that
+        # cannot answer.
+        if self.runtime is not None and self.runtime.matches_running_draft(draft):
+            self.http.wait_ready(
+                timeout_seconds=timeout_seconds,
+                should_abort=should_abort,
+            )
+            logger.info("draft %s is already serving; skipping engine restart", draft)
+            return
         self.process.restart(draft, timeout_seconds=timeout_seconds)
         self.http.wait_ready(
             timeout_seconds=timeout_seconds,
             should_abort=should_abort,
         )
+        # Only after the replacement child is ready: an unfinished restart must
+        # not be recorded as the engine's identity.
+        if self.runtime is not None:
+            self.runtime.note_external_restart(draft)
 
 
 class _MetricsSource:

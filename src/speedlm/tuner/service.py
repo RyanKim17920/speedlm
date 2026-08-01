@@ -34,6 +34,37 @@ DEFAULT_MIN_TRACE_RECORDS = 32
 DEFAULT_MIN_CORPUS_RECORDS = 256
 SCHEDULER_STATUS_FILE = "scheduler.json"
 
+#: Consecutive idle polls required before arming, when config carries no
+#: preference.  One preserves the historical single-sample behaviour; the
+#: production default lives on
+#: :attr:`speedlm.config.IdleTuningConfig.idle_confirmations`.
+DEFAULT_IDLE_CONFIRMATIONS = 1
+
+#: Quiet period after an unproductive cycle, when config carries no preference.
+#: Zero preserves the historical "retry as soon as the watermark moves"
+#: behaviour; see :attr:`speedlm.config.IdleTuningConfig.retry_cooldown_seconds`.
+DEFAULT_RETRY_COOLDOWN_SECONDS = 0.0
+
+#: Outcomes that arm the retry cooldown.
+#:
+#: These are the cycles that spent engine restarts without producing a
+#: measurement: the gateway was not really idle, or the cycle could not
+#: complete.  Repeating them immediately re-pays the restart to reach the same
+#: conclusion, which is what job 369040 did 9.2s after a preempted cycle.
+#:
+#: PROMOTED, REJECTED and VAL_LOSS_NOT_IMPROVED are deliberately absent: those
+#: cycles produced a real result, and the existing watermark dedupe already
+#: stops them from repeating on unchanged traces.
+COOLDOWN_OUTCOMES: frozenset[CycleOutcome] = frozenset(
+    {
+        CycleOutcome.PREEMPTED,
+        CycleOutcome.BENCHMARK_ABORTED,
+        CycleOutcome.BENCHMARK_TIMED_OUT,
+        CycleOutcome.FAILED,
+        CycleOutcome.FINAL_ASSISTANT_MASK_ERROR,
+    }
+)
+
 
 class TunerServiceConfigurationError(ValueError):
     """Raised when service dependencies disagree with the selected profile."""
@@ -251,6 +282,8 @@ class TunerService:
         min_trace_records: int = DEFAULT_MIN_TRACE_RECORDS,
         min_corpus_records: int = DEFAULT_MIN_CORPUS_RECORDS,
         poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
+        idle_confirmations: int | None = None,
+        retry_cooldown_seconds: float | None = None,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
         status_path: Path | None = None,
@@ -278,11 +311,44 @@ class TunerService:
         ):
             raise TunerServiceConfigurationError("poll_interval_seconds must be a positive number")
 
+        tuning = getattr(config, "tuning", None)
+        if idle_confirmations is None:
+            idle_confirmations = getattr(
+                tuning, "idle_confirmations", DEFAULT_IDLE_CONFIRMATIONS
+            )
+        if retry_cooldown_seconds is None:
+            retry_cooldown_seconds = getattr(
+                tuning, "retry_cooldown_seconds", DEFAULT_RETRY_COOLDOWN_SECONDS
+            )
+        if (
+            isinstance(idle_confirmations, bool)
+            or not isinstance(idle_confirmations, int)
+            or idle_confirmations < 1
+        ):
+            raise TunerServiceConfigurationError(
+                "idle_confirmations must be a positive integer"
+            )
+        if (
+            isinstance(retry_cooldown_seconds, bool)
+            or not isinstance(retry_cooldown_seconds, (int, float))
+            or retry_cooldown_seconds < 0
+        ):
+            raise TunerServiceConfigurationError(
+                "retry_cooldown_seconds must be a non-negative number"
+            )
+
         self._enabled = enabled
         self._traces = traces
         self._min_trace_records = min_trace_records
         self._min_corpus_records = min_corpus_records
         self._poll_interval_seconds = float(poll_interval_seconds)
+        self._idle_confirmations = int(idle_confirmations)
+        self._retry_cooldown_seconds = float(retry_cooldown_seconds)
+        #: Consecutive polls so far that observed an idle gateway.
+        self._idle_streak = 0
+        #: Monotonic instant before which no new cycle may be attempted.
+        self._cooldown_until: float | None = None
+        self._clock = clock
         self._stop_requested = Event()
         self._startup_complete = Event()
         self._activation_requested = Event()
@@ -460,7 +526,16 @@ class TunerService:
             self._startup_complete.set()
 
     def _poll_once(self) -> None:
+        if self._in_cooldown():
+            self._idle_streak = 0
+            return
         if not self._idle.should_tune or self._stop_requested.is_set():
+            # One busy sample resets the window: the confirmations must be
+            # *consecutive* or they measure nothing a single sample did not.
+            self._idle_streak = 0
+            return
+        self._idle_streak += 1
+        if self._idle_streak < self._idle_confirmations:
             return
 
         try:
@@ -478,11 +553,13 @@ class TunerService:
         ):
             return
 
+        self._idle_streak = 0
         self._record_attempt(watermark)
         try:
             result = self._orchestrator.run_once()
         except Exception as exc:
             self._last_attempted = watermark
+            self._arm_cooldown("cycle exception")
             logger.exception("idle tuning cycle raised an exception")
             self._record_error(exc)
             self._recover_serving("cycle exception")
@@ -490,6 +567,8 @@ class TunerService:
 
         if result.outcome is not CycleOutcome.NOT_IDLE:
             self._last_attempted = watermark
+        if result.outcome in COOLDOWN_OUTCOMES:
+            self._arm_cooldown(result.outcome.value)
         self._prune_traces()
         self._record_result(result)
         if result.outcome in {
@@ -513,6 +592,40 @@ class TunerService:
             logger.info("idle tuning cycle preempted by serving activity")
         elif result.outcome is not CycleOutcome.NOT_IDLE:
             logger.info("idle tuning cycle completed: %s", result.outcome.value)
+
+    def _in_cooldown(self) -> bool:
+        """Whether a previous unproductive cycle still bars a new attempt.
+
+        The cooldown expires by wall progress alone, so an expired one is
+        cleared here rather than being re-tested on every later poll.
+        """
+        until = self._cooldown_until
+        if until is None:
+            return False
+        if self._clock() < until:
+            return True
+        self._cooldown_until = None
+        logger.info("idle tuning retry cooldown expired")
+        return False
+
+    def _arm_cooldown(self, reason: str) -> None:
+        """Bar the next attempt for the configured quiet period.
+
+        Deliberately *not* gated on the trace watermark.  The watermark dedupe
+        cannot see this case at all: the request that preempts a cycle is
+        itself traced, so it advances the watermark and the next poll looks
+        like a brand-new opportunity even though nothing about the situation
+        has changed.
+        """
+        if self._retry_cooldown_seconds <= 0:
+            return
+        self._cooldown_until = self._clock() + self._retry_cooldown_seconds
+        self._idle_streak = 0
+        logger.info(
+            "idle tuning cycle ended as %s; suppressing retries for %gs",
+            reason,
+            self._retry_cooldown_seconds,
+        )
 
     def _prune_traces(self) -> None:
         """Apply the buffer's retention policy between cycles.
@@ -602,6 +715,15 @@ class TunerService:
 
     def _scheduler_payload_locked(self, now: float) -> dict[str, object]:
         result = self._last_status_result
+        # Published so an operator reading scheduler.json can tell "idle and
+        # waiting for traces" from "suppressed after an unproductive cycle".
+        # Without it the two look identical from outside the process.
+        cooldown_until = self._cooldown_until
+        cooldown_remaining = (
+            max(0.0, cooldown_until - self._clock())
+            if cooldown_until is not None
+            else None
+        )
         return {
             "schema_version": 1,
             "enabled": self._enabled,
@@ -612,6 +734,7 @@ class TunerService:
             "last_attempt_at": self._last_attempt_at,
             "last_result_at": self._last_result_at,
             "last_error_at": self._last_error_at,
+            "cooldown_remaining_seconds": cooldown_remaining,
             "last_watermark": (
                 self._last_status_watermark.to_dict()
                 if self._last_status_watermark is not None

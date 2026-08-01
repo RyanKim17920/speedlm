@@ -24,6 +24,7 @@ from speedlm.gateway.control import (
     GPUMemoryProbeError,
     NvidiaSmiMemoryProbe,
     RuntimeController,
+    ServiceRecoveryError,
 )
 from speedlm.tuner.idle import IdleDetector
 from speedlm.tuner.orchestrator import RuntimeController as RuntimeControllerProtocol
@@ -436,6 +437,7 @@ def test_restore_restarts_supplied_draft_and_confirms_readiness() -> None:
 
 def test_restore_retries_after_process_failure_so_child_is_not_left_stopped() -> None:
     rig = make_rig()
+    other = Path("/artifacts/other")
     original_restart = rig.process.restart
     failed = False
 
@@ -451,11 +453,110 @@ def test_restore_retries_after_process_failure_so_child_is_not_left_stopped() ->
     rig.process.restart = fail_once  # type: ignore[method-assign]
 
     with pytest.raises(RuntimeError, match="transient restart failure"):
-        rig.controller.restore("base-draft", timeout_seconds=2.0)
+        rig.controller.restore(other, timeout_seconds=2.0)
 
     assert rig.process.running
-    assert rig.process.running_draft == "base-draft"
-    assert [call.draft for call in rig.process.calls] == ["base-draft", "base-draft"]
+    assert rig.process.running_draft == other
+    assert [call.draft for call in rig.process.calls] == [other, other]
+
+
+def test_restore_wakes_instead_of_respawning_when_the_draft_already_runs() -> None:
+    """The preempted-cycle case: nothing was mutated, so nothing must respawn."""
+    rig = make_rig()
+    quiesce(rig)
+    rig.controller.sleep(timeout_seconds=2.0, should_abort=lambda: False)
+
+    rig.controller.restore("base-draft", timeout_seconds=600.0)
+
+    assert rig.process.calls == []
+    assert rig.http.post_calls[-1].endpoint == VLLM_WAKE_ENDPOINT
+    assert rig.http.sleeping_waits[-1][0] is False
+    assert rig.http.canary_timeouts  # the engine had to prove it can serve
+    # The follow-up wake the orchestrator always issues is now a no-op.
+    rig.controller.wake(timeout_seconds=3.0)
+    assert rig.process.calls == []
+    assert rig.admission.admitting
+
+
+def test_restore_restarts_when_the_running_draft_is_not_the_active_one() -> None:
+    rig = make_rig()
+    candidate = Path("/artifacts/candidate")
+    rig.controller.start_candidate(
+        candidate,
+        timeout_seconds=5.0,
+        should_abort=lambda: False,
+    )
+
+    rig.controller.restore("base-draft", timeout_seconds=600.0)
+
+    assert [call.draft for call in rig.process.calls] == [candidate, "base-draft"]
+
+
+def test_restore_restarts_when_the_engine_cannot_prove_it_still_serves() -> None:
+    """A bookkeeping match is not enough; the canary is the real evidence."""
+    rig = make_rig()
+    rig.http.fail_canary_count = 1
+
+    rig.controller.restore("base-draft", timeout_seconds=600.0)
+
+    assert [call.draft for call in rig.process.calls] == ["base-draft"]
+
+
+def test_restore_restarts_after_a_hot_swap_that_may_have_mutated_the_engine() -> None:
+    """A failed in-place swap leaves the draft name intact but the engine suspect."""
+    swap = FakeDraftSwap(error=DraftSwapCorrupted("half applied"))
+    rig = make_rig(draft_swap=swap)
+    candidate = Path("/artifacts/candidate")
+    # Every restart fails, so nothing replaces the possibly-mutated process and
+    # the controller is left holding pre-swap bookkeeping it must not believe.
+    rig.process.fail_drafts = {candidate, "base-draft"}
+
+    with pytest.raises(ServiceRecoveryError):
+        rig.controller.start_candidate(
+            candidate,
+            timeout_seconds=5.0,
+            should_abort=lambda: False,
+        )
+
+    assert not rig.controller.matches_running_draft("base-draft")
+    restarts_before = len(rig.process.calls)
+    rig.process.fail_drafts = set()
+
+    rig.controller.restore("base-draft", timeout_seconds=600.0)
+
+    assert len(rig.process.calls) == restarts_before + 1
+    assert rig.process.calls[-1].draft == "base-draft"
+    assert rig.controller.matches_running_draft("base-draft")
+
+
+def test_note_external_restart_lets_the_controller_track_the_gate_s_activations() -> None:
+    rig = make_rig()
+    candidate = Path("/artifacts/candidate")
+
+    assert rig.controller.matches_running_draft("base-draft")
+    rig.controller.note_external_restart(candidate)
+
+    assert not rig.controller.matches_running_draft("base-draft")
+    assert rig.controller.matches_running_draft(candidate)
+    assert rig.controller.running_draft == candidate
+
+    # ...and a restore back to stock must respawn, because stock is gone.
+    rig.controller.restore("base-draft", timeout_seconds=600.0)
+    assert [call.draft for call in rig.process.calls] == ["base-draft"]
+
+
+def test_note_external_restart_rejects_an_empty_draft() -> None:
+    rig = make_rig()
+    with pytest.raises(ValueError, match="draft must be non-empty"):
+        rig.controller.note_external_restart("")
+
+
+def test_matches_running_draft_is_false_while_the_engine_sleeps() -> None:
+    rig = make_rig()
+    quiesce(rig)
+    rig.controller.sleep(timeout_seconds=2.0, should_abort=lambda: False)
+
+    assert not rig.controller.matches_running_draft("base-draft")
 
 
 def test_wake_calls_endpoint_confirms_readiness_and_reopens_admission() -> None:
@@ -533,13 +634,14 @@ def test_candidate_start_honors_timeout_and_rolls_back() -> None:
 
 def test_restore_honors_timeout_but_recovers_service() -> None:
     rig = make_rig()
+    other = Path("/artifacts/other")
     rig.process.advance_restart = 0.2
 
     with pytest.raises(ControlTimeout, match="restore timed out"):
-        rig.controller.restore("base-draft", timeout_seconds=0.1)
+        rig.controller.restore(other, timeout_seconds=0.1)
 
     assert rig.process.running
-    assert rig.process.running_draft == "base-draft"
+    assert rig.process.running_draft == other
 
 
 def test_wake_honors_timeout_but_recovers_service() -> None:

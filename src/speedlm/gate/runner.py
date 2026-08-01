@@ -297,6 +297,7 @@ class BenchmarkGateRunner:
         benchmark_max_tokens: int = DEFAULT_BENCHMARK_MAX_TOKENS,
         held_out_fraction: float = 0.2,
         training_context_hashes: TrainingHashes | None = None,
+        candidate_arm_first: bool = False,
         clock: Clock = time.monotonic,
     ) -> None:
         if isinstance(repeats, bool) or not isinstance(repeats, int) or repeats < 3:
@@ -353,6 +354,13 @@ class BenchmarkGateRunner:
         self._benchmark_max_tokens = benchmark_max_tokens
         self._held_out_fraction = float(held_out_fraction)
         self._training_context_hashes = training_context_hashes
+        # Defaults to the historical stock-first order so that constructing a
+        # runner directly keeps measuring what it always did.  Production wires
+        # this from ``tuning.benchmark_candidate_arm_first``, which defaults to
+        # true and carries the rationale and the bias disclosure.
+        if not isinstance(candidate_arm_first, bool):
+            raise ValueError("candidate_arm_first must be a bool")
+        self._candidate_arm_first = candidate_arm_first
         self._clock = clock
 
     def benchmark(
@@ -418,41 +426,44 @@ class BenchmarkGateRunner:
                 lambda _timeout: self._check_suite_leakage(suite),
             )
 
-            stage(
-                "stock activation",
-                lambda available: self._endpoint.activate(
-                    self._stock_draft,
-                    timeout_seconds=available,
-                    should_abort=should_abort,
-                ),
-            )
-            # Warm the freshly restarted engine before the measurement window
-            # opens.  Activation restarts vLLM, so the first suite pass pays
-            # one-time JIT compilation of the speculative-decoding kernels; that
-            # cost belongs to neither arm's steady state.  The warmup runs
-            # *before* the pre-scrape, which keeps it out of the Prometheus
-            # window as well as out of ``per_repeat``.
-            stock_warmup = stage(
-                "stock warmup",
-                lambda available: self._warmup(suite, available, should_abort),
-            )
-            stock_arm = self._measure_arm("stock", suite, stage, scrape, should_abort)
+            def activate(arm: str, draft: DraftReference) -> None:
+                stage(
+                    f"{arm} activation",
+                    lambda available: self._endpoint.activate(
+                        draft,
+                        timeout_seconds=available,
+                        should_abort=should_abort,
+                    ),
+                )
 
-            stage(
-                "candidate activation",
-                lambda available: self._endpoint.activate(
-                    candidate_draft,
-                    timeout_seconds=available,
-                    should_abort=should_abort,
-                ),
-            )
-            candidate_warmup = stage(
-                "candidate warmup",
-                lambda available: self._warmup(suite, available, should_abort),
-            )
-            candidate_arm = self._measure_arm(
-                "candidate", suite, stage, scrape, should_abort
-            )
+            def run_arm(
+                arm: str, draft: DraftReference
+            ) -> tuple[ReplayResult | None, _ArmMeasurement]:
+                activate(arm, draft)
+                # Warm the freshly restarted engine before the measurement
+                # window opens.  Activation restarts vLLM, so the first suite
+                # pass pays one-time JIT compilation of the speculative-decoding
+                # kernels; that cost belongs to neither arm's steady state.  The
+                # warmup runs *before* the pre-scrape, which keeps it out of the
+                # Prometheus window as well as out of ``per_repeat``.  It is
+                # also what keeps the two arms comparable when the arm order is
+                # reversed: each arm pays its own cold start.
+                warmup = stage(
+                    f"{arm} warmup",
+                    lambda available: self._warmup(suite, available, should_abort),
+                )
+                return warmup, self._measure_arm(arm, suite, stage, scrape, should_abort)
+
+            # Running the candidate first reuses the engine that the cycle's
+            # CANDIDATE_STARTING phase already built, and leaves the benchmark
+            # ending on stock -- which is what a rejection wants serving anyway.
+            # See ``tuning.benchmark_candidate_arm_first``.
+            if self._candidate_arm_first:
+                candidate_warmup, candidate_arm = run_arm("candidate", candidate_draft)
+                stock_warmup, stock_arm = run_arm("stock", self._stock_draft)
+            else:
+                stock_warmup, stock_arm = run_arm("stock", self._stock_draft)
+                candidate_warmup, candidate_arm = run_arm("candidate", candidate_draft)
 
             decision = stage(
                 "promotion decision",
@@ -469,6 +480,19 @@ class BenchmarkGateRunner:
                     candidate_correctness=candidate_arm.correctness,
                 ),
             )
+            # Candidate-first ends the benchmark on the *stock* draft, which is
+            # exactly what a rejection wants left serving -- that is where the
+            # rollback restart goes away.  A promotion is the one case that
+            # still needs the candidate back: the orchestrator promotes by
+            # flipping the durable pointer and waking, never by restarting, so
+            # whatever is running when this returns is what serves live traffic.
+            #
+            # It is inside the try on purpose.  If the candidate cannot be put
+            # back, the abort/timeout handlers below report a non-passing gate,
+            # which is the fail-closed answer: a candidate that cannot be made
+            # to serve must not be promoted.
+            if self._candidate_arm_first and decision.verdict is Verdict.PROMOTE:
+                activate("candidate", candidate_draft)
         except BenchmarkAborted as exc:
             from speedlm.tuner.orchestrator import GateFailure  # noqa: PLC0415
 

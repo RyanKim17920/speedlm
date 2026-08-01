@@ -50,7 +50,19 @@ select = ["E", "F", "I", "UP", "B", "SIM"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+# -ra prints the reason for every non-passing outcome (skipped, xfailed, xpassed,
+# failed, errored) on EVERY run. Without it, plain "-q" reported e.g.
+# "1109 passed" while >200 tests were silently skipped, including whole modules
+# that collected as zero tests behind a module-level pytest.importorskip. A skip
+# is a test that did not run; it has to be visible or the suite reports green for
+# coverage it does not have.
+#
+# Deliberately NOT adding `-m "not e2e"`: deselected tests print no reason at all
+# and are invisible to -ra, which is exactly the failure mode being fixed here.
+# The e2e tests are gated on environment variables and GPU availability, so with
+# -ra they now announce themselves by name and reason on every run, and they stay
+# runnable by simply setting those variables.
+addopts = "-q -ra"
 pythonpath = ["src"]
 markers = [
     "e2e: real end-to-end tests that require a live GPU and vLLM server",

@@ -141,3 +141,54 @@ def test_active_pointer_swap_is_valid_json(tmp_path: Path) -> None:
         "history": [],
         "updated_at": 7.0,
     }
+
+
+def test_publish_hashes_the_tree_exactly_twice(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One pass to name the artifact, one to verify the copy -- and no more.
+
+    The third pass came from returning through ``get``, which re-hashed a tree
+    that had just been verified and sealed.  On a 2 GB draft that was ~2 GB of
+    reads with the gateway's admission gate closed.
+    """
+    hashed: list[Path] = []
+    real = artifacts.hash_directory
+
+    def counting(path: Path) -> str:
+        hashed.append(path)
+        return real(path)
+
+    monkeypatch.setattr(artifacts, "hash_directory", counting)
+    registry = ArtifactRegistry(tmp_path / "registry")
+
+    artifact = registry.publish(_source(tmp_path / "candidate", "data"), _spec())
+
+    assert len(hashed) == 2
+    # ...and the published artifact is still the verified one.
+    assert artifact.path == tmp_path / "registry" / "artifacts" / artifact.artifact_id
+    assert artifact.manifest.artifact_id == artifact.artifact_id
+    assert registry.get(artifact.artifact_id).path == artifact.path
+
+
+def test_publish_still_rejects_a_copy_that_did_not_land_intact(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The verification pass that survived is the one that catches a bad copy."""
+    real = artifacts.hash_directory
+    seen: list[Path] = []
+
+    def corrupt_copy(path: Path) -> str:
+        seen.append(path)
+        # The second call is the post-copy verification of the temp tree.
+        return real(path) if len(seen) == 1 else "b" * 64
+
+    monkeypatch.setattr(artifacts, "hash_directory", corrupt_copy)
+    registry = ArtifactRegistry(tmp_path / "registry")
+
+    with pytest.raises(ArtifactError, match="artifact changed while publishing"):
+        registry.publish(_source(tmp_path / "candidate", "data"), _spec())
+
+    assert list((tmp_path / "registry" / "artifacts").iterdir()) == []

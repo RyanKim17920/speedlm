@@ -31,23 +31,44 @@ from pathlib import Path
 import httpx
 import pytest
 
-torch = pytest.importorskip("torch")
-
-from safetensors import safe_open  # noqa: E402
-
-from speedlm.activation_capture.compare import (  # noqa: E402
+from speedlm.activation_capture.compare import (
     PrefixCacheResult,
     build_result,
 )
-from speedlm.activation_capture.offline_extract import (  # noqa: E402
+from speedlm.activation_capture.offline_extract import (
     extract as _run_offline_extract,
 )
-from speedlm.gateway.control import (  # noqa: E402
+from speedlm.gateway.control import (
     GPUMemoryPrecondition,
     NvidiaSmiMemoryProbe,
 )
 
-pytestmark = pytest.mark.e2e
+# torch and safetensors live in the vLLM venv, not the project venv. These are
+# imported defensively rather than via a module-level ``pytest.importorskip``:
+# importorskip aborts collection, so the whole file reported as zero tests on
+# the project venv -- a silent pass, not a skip. The skip is declared as a
+# ``pytestmark`` below so both tests always collect and are reported.
+try:
+    import torch
+except ImportError:  # pragma: no cover - depends on the interpreter in use
+    torch = None  # type: ignore[assignment]
+
+try:
+    from safetensors import safe_open
+except ImportError:  # pragma: no cover - depends on the interpreter in use
+    safe_open = None  # type: ignore[assignment]
+
+pytestmark = [
+    pytest.mark.e2e,
+    pytest.mark.skipif(
+        torch is None or safe_open is None,
+        reason=(
+            "torch/safetensors are not installed in the project venv; run with "
+            "PYTHONPATH=/admin/home/ryan.kim/speedlm/.preflight/venvs/vllm/"
+            "lib/python3.12/site-packages to execute these tests"
+        ),
+    ),
+]
 
 logger = logging.getLogger(__name__)
 

@@ -261,7 +261,21 @@ class ArtifactRegistry:
             if not committed and temp_path.exists():
                 _make_tree_writable(temp_path)
                 shutil.rmtree(temp_path, ignore_errors=True)
-        return self.get(artifact_id)
+        # Deliberately not ``self.get(artifact_id)``: that would be a third full
+        # SHA-256 pass over the tree, on top of the source hash and the
+        # post-copy verification hash above.  For a 2 GB EAGLE-3 draft each pass
+        # is ~2 GB of reads, and all three run while the gateway's admission
+        # gate is closed -- so the redundancy was paid for in serving downtime.
+        #
+        # The integrity guarantee is unchanged, because the dropped pass never
+        # added one.  ``copied_hash`` already proved that this exact tree hashes
+        # to ``artifact_id``; ``_make_tree_read_only`` then sealed it, and
+        # ``os.rename`` is atomic and moves the very inode that was verified.
+        # Nothing in between can alter content: the manifest sidecar is excluded
+        # from the hash by :func:`hash_directory`, and permissions are not
+        # hashed.  ``get`` still re-hashes on every *later* read, which is where
+        # a bit-rot or tamper check belongs.
+        return Artifact(path=target, manifest=manifest)
 
     def get(self, artifact_id: str) -> Artifact:
         """Load and content-verify a published artifact."""

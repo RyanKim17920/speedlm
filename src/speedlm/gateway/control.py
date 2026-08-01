@@ -33,6 +33,17 @@ VLLM_SLEEP_MODE: Final = "wait"
 DEFAULT_POLL_INTERVAL_SECONDS: Final = 0.05
 DEFAULT_RECOVERY_TIMEOUT_SECONDS: Final = 600.0
 
+#: Budget for :meth:`RuntimeController.restore`'s wake-in-place fast path.
+#:
+#: The fast path is a wake (measured WAKING->READY at 0.04s), one readiness
+#: wait and one bounded canary completion.  It is bounded separately from the
+#: restore deadline it runs inside so that a fast path which hangs cannot eat
+#: the budget the full restart behind it still needs: on expiry the restart
+#: runs with whatever the caller's own deadline still holds.  120s is roughly
+#: twice a cold engine's launch->ready time, i.e. deliberately generous for an
+#: operation that normally completes in well under a second.
+DEFAULT_RESTORE_FAST_PATH_TIMEOUT_SECONDS: Final = 120.0
+
 # Device-memory observation. ``nvidia-smi`` is the only reading available to
 # this process: the gateway venv deliberately does not depend on torch (see the
 # pinned-stack note in pyproject.toml), and even where torch is importable,
@@ -495,11 +506,18 @@ class RuntimeController:
         capture_barrier: CaptureBarrier | None = None,
         gpu_memory: GPUMemoryPrecondition | None = None,
         draft_swap_http: DraftSwapHTTP | None = None,
+        restore_fast_path_timeout_seconds: float = (
+            DEFAULT_RESTORE_FAST_PATH_TIMEOUT_SECONDS
+        ),
     ) -> None:
         if not str(active_draft):
             raise ValueError("active draft must be non-empty")
         _validate_timeout(poll_interval_seconds, name="poll interval")
         _validate_timeout(recovery_timeout_seconds, name="recovery timeout")
+        _validate_timeout(
+            restore_fast_path_timeout_seconds,
+            name="restore fast path timeout",
+        )
         self._activity = activity
         self._admission = admission
         self._http = http
@@ -512,9 +530,16 @@ class RuntimeController:
         self._recovery_timeout_seconds = recovery_timeout_seconds
         self._capture_barrier = capture_barrier
         self._gpu_memory = gpu_memory
+        self._restore_fast_path_timeout_seconds = restore_fast_path_timeout_seconds
         self._admissions_stopped = False
         self._sleeping = False
         self._draft_swap_http: DraftSwapHTTP | None = draft_swap_http
+        # Whether anything may have altered the *contents* of the running
+        # engine since it was last launched. ``_running_draft`` records which
+        # draft the child was configured with; this records whether that record
+        # can still be believed. Only a full restart clears it, because only a
+        # restart replaces the process the mutation happened inside.
+        self._engine_may_be_mutated = False
 
     def quiesce(
         self,
@@ -683,17 +708,87 @@ class RuntimeController:
         self._http.wait_ready(timeout_seconds=deadline.remaining())
         deadline.check()
 
+    @property
+    def running_draft(self) -> DraftReference:
+        """The draft the managed child is currently configured with."""
+        return self._running_draft
+
+    def matches_running_draft(self, draft: DraftReference) -> bool:
+        """Whether the live, awake engine already serves *draft*.
+
+        This is the shared predicate behind every "do not restart what is
+        already running" decision, so that the controller and the benchmark's
+        endpoint cannot disagree about what the child is doing. It is false
+        whenever the engine is asleep -- its weights are offloaded, so it
+        serves nothing -- or may have been mutated in place by a failed
+        hot-swap.
+        """
+        return self._is_configured_with(draft) and not self._sleeping
+
+    def _is_configured_with(self, draft: DraftReference) -> bool:
+        """Whether the child process was launched with *draft* and untouched.
+
+        Says nothing about whether the engine is awake. The comparison is on
+        the string form: the same directory reaches this controller as a
+        :class:`~pathlib.Path` from the artifact registry and as a ``str`` from
+        a profile's warm-start draft, and those denote the same engine.
+        """
+        if self._engine_may_be_mutated:
+            return False
+        return str(self._running_draft) == str(draft)
+
+    def note_external_restart(self, draft: DraftReference) -> None:
+        """Record that another component restarted the managed child.
+
+        The benchmark gate drives ``ThreadsafeProcessControl`` directly when it
+        activates an arm, so without this the controller's ``_running_draft``
+        would silently describe an engine that no longer exists -- and every
+        decision built on it, including :meth:`restore`'s fast path below,
+        would be reasoning about the wrong process. Callers must call this only
+        *after* the replacement child has proved ready.
+        """
+        if not str(draft):
+            raise ValueError("draft must be non-empty")
+        self._running_draft = draft
+        self._sleeping = False
+        self._engine_may_be_mutated = False
+
     def restore(
         self,
         active_draft: DraftReference,
         *,
         timeout_seconds: float,
     ) -> None:
-        """Reliably restart on the supplied durable active draft."""
+        """Return the child to the supplied durable active draft.
+
+        A restart is a genuine fork/exec of vLLM -- measured at ~62.5s to
+        launch-ready and ~100-105s including teardown -- and it is pure
+        downtime, because ``restore`` only ever runs while the gateway's gate is
+        closed. On job 369040 an idle cycle that was preempted 0.1s into
+        extraction, having mutated nothing but one ``mkdir``, still paid 104.5s
+        for a rollback that had nothing to roll back.
+
+        So the restart is now conditional, on exactly the evidence that makes it
+        unnecessary: :meth:`matches_running_draft` says the child is already
+        configured with *active_draft*, is not asleep, and has not been touched
+        in place. That is a claim about bookkeeping, so it is not trusted on its
+        own -- the fast path additionally makes the engine *prove* it can serve,
+        with a readiness wait and one bounded canary completion, before it is
+        accepted. Anything less than a clean pass falls through to the restart.
+
+        This is deliberately asymmetric. A skipped restart that should have
+        happened would leave the wrong draft serving live traffic, which is far
+        worse than 100s of downtime, so every uncertainty resolves towards the
+        restart: unknown draft, sleeping engine, possible in-place mutation,
+        readiness failure, canary failure, or the fast path exceeding its own
+        (separately budgeted) deadline.
+        """
         if not str(active_draft):
             raise ValueError("active draft must be non-empty")
         self._active_draft = active_draft
         deadline = self._deadline(timeout_seconds, "restore")
+        if self._restore_in_place(active_draft, deadline):
+            return
         try:
             self._restart_and_wait(active_draft, deadline)
         except Exception as error:
@@ -702,6 +797,60 @@ class RuntimeController:
             self._recover_or_raise("restore", error)
             raise
         self._running_draft = active_draft
+        self._sleeping = False
+
+    def _restore_in_place(
+        self,
+        active_draft: DraftReference,
+        deadline: _Deadline,
+    ) -> bool:
+        """Try to satisfy :meth:`restore` by waking, not respawning.
+
+        Returns ``True`` only when the running engine has proved it already
+        serves *active_draft*. Every failure returns ``False`` so the caller
+        restarts, and none of them raise: a fast path that cannot be confirmed
+        is an ordinary negative result, not a cycle failure.
+        """
+        if not self._is_configured_with(active_draft):
+            return False
+        try:
+            budget = min(
+                deadline.remaining(),
+                self._restore_fast_path_timeout_seconds,
+            )
+            fast = self._deadline(budget, "restore fast path")
+            if self._sleeping:
+                self._wake_now(fast)
+            self._http.wait_ready(timeout_seconds=fast.remaining())
+            fast.check()
+            self._http.canary(timeout_seconds=fast.remaining())
+            fast.check()
+        except Exception:
+            logger.warning(
+                "restore could not confirm the running engine still serves %s; "
+                "falling back to a full restart",
+                active_draft,
+                exc_info=True,
+            )
+            return False
+        logger.info(
+            "restore reused the running engine for %s without a restart",
+            active_draft,
+        )
+        return True
+
+    def _wake_now(self, deadline: _Deadline) -> None:
+        """Wake the sleeping child without touching admission."""
+        self._http.post(
+            VLLM_WAKE_ENDPOINT,
+            timeout_seconds=deadline.remaining(),
+        )
+        self._http.wait_sleeping(
+            False,
+            timeout_seconds=deadline.remaining(),
+            should_abort=lambda: False,
+        )
+        deadline.check()
         self._sleeping = False
 
     def wake(self, *, timeout_seconds: float) -> None:
@@ -776,6 +925,8 @@ class RuntimeController:
         deadline.check()
         self._http.wait_ready(timeout_seconds=deadline.remaining())
         deadline.check()
+        # A fresh process cannot carry a previous one's in-place mutation.
+        self._engine_may_be_mutated = False
 
     def _try_hot_swap(
         self, draft_directory: DraftReference, deadline: _Deadline
@@ -838,6 +989,10 @@ class RuntimeController:
         phase: str,
     ) -> None:
         """Close the gate after a swap that may have broken the live engine."""
+        # ``_running_draft`` still names the pre-swap draft, but the engine may
+        # no longer agree with it, so no cheap path may believe it again until
+        # a restart has replaced the process.
+        self._engine_may_be_mutated = True
         self._stop_admitting()
         logger.error(
             "draft hot-swap failed during %s for %s (%s: %s); the engine may be "

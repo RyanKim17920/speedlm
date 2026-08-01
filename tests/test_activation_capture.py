@@ -4,20 +4,28 @@ These tests exercise the comparison, tolerance, verdict, and serialization
 pathways using synthetic tensors — no GPU required.
 
 Skipped when torch is not installed (torch lives in the vLLM venv, not the
-project venv).
+project venv). The skip is declared with a module-level ``pytestmark`` rather
+than ``pytest.importorskip`` on purpose: ``importorskip`` aborts collection, so
+the whole file reported as ZERO tests under the project venv and the suite still
+printed green. With ``pytestmark`` the file always collects and every test is
+reported as an explicit skip.
+
+To actually execute these tests, put the vLLM venv on the path:
+
+    PYTHONPATH=/admin/home/ryan.kim/speedlm/.preflight/venvs/vllm/lib/python3.12/site-packages \\
+        .venv/bin/python -m pytest tests/test_activation_capture.py -q
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import math
 from pathlib import Path
 
 import pytest
 
-torch = pytest.importorskip("torch")
-
-from speedlm.activation_capture.compare import (  # noqa: E402
+from speedlm.activation_capture.compare import (
     DEFAULT_RELATIVE_TOLERANCE,
     DEFAULT_TOLERANCE,
     ComparisonResult,
@@ -29,6 +37,22 @@ from speedlm.activation_capture.compare import (  # noqa: E402
     check_within_tolerance,
     compare_layerwise,
     derive_verdict,
+)
+
+try:  # torch lives in the vLLM venv, not the project venv.
+    import torch
+except ImportError:  # pragma: no cover - depends on the interpreter in use
+    torch = None  # type: ignore[assignment]
+
+_HAS_SAFETENSORS = importlib.util.find_spec("safetensors") is not None
+
+pytestmark = pytest.mark.skipif(
+    torch is None,
+    reason=(
+        "torch is not installed in the project venv; run with "
+        "PYTHONPATH=/admin/home/ryan.kim/speedlm/.preflight/venvs/vllm/"
+        "lib/python3.12/site-packages to execute these tests"
+    ),
 )
 
 # ---------------------------------------------------------------------------
@@ -885,12 +909,19 @@ class TestSafetensorsIO:
     """Round-trip through real safetensors files on tmp_path.
 
     These tests write actual safetensors files and read them back through
-    the loaders used by the e2e test and offline_extract.  They use
-    pytest.importorskip so they skip cleanly when torch/safetensors are
-    unavailable in the project venv.
+    the loaders used by the e2e test and offline_extract.
+
+    The safetensors requirement is declared as a class-scoped ``pytestmark``.
+    It used to be a ``pytest.importorskip`` in the class body, which raised
+    ``Skipped`` during collection of the *module* and therefore silently
+    discarded every test in this file -- ``collected 0 items / 1 skipped`` --
+    on any interpreter without safetensors.
     """
 
-    safetensors = pytest.importorskip("safetensors")
+    pytestmark = pytest.mark.skipif(
+        not _HAS_SAFETENSORS,
+        reason="safetensors is not installed in the project venv (it lives in the vLLM venv)",
+    )
 
     def test_captured_loader_roundtrip(self, tmp_path: Path) -> None:
         """_load_captured_safetensors can read a file we wrote."""

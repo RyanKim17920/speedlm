@@ -11,7 +11,7 @@ from threading import Event, Lock
 import pytest
 
 import speedlm.tuner.service as service_module
-from speedlm.config import SpeedLMConfig
+from speedlm.config import IdleTuningConfig, SpeedLMConfig
 from speedlm.gateway.activity import ActivityTracker
 from speedlm.traces.store import TraceStats
 from speedlm.training.base import BackendInfo
@@ -268,10 +268,25 @@ class StartupRunner:
         return self.recovery_errors
 
 
-def _config() -> SpeedLMConfig:
+def _config(
+    *,
+    idle_confirmations: int = 1,
+    retry_cooldown_seconds: float = 0.0,
+) -> SpeedLMConfig:
+    """A config whose scheduling guards are off unless a test asks for them.
+
+    The production defaults (three confirmations, a 600s cooldown) are asserted
+    directly in ``tests/test_config.py`` and exercised here by the tests that
+    name them; leaving them on everywhere would only add poll latency to every
+    other test in this module.
+    """
     return SpeedLMConfig(
         model=VERIFIER,
         idle_threshold_seconds=0.01,
+        tuning=IdleTuningConfig(
+            idle_confirmations=idle_confirmations,
+            retry_cooldown_seconds=retry_cooldown_seconds,
+        ),
     )
 
 
@@ -978,3 +993,228 @@ def test_benchmark_abort_is_logged_as_preemption(
     assert not [
         record for record in caplog.records if record.levelno >= logging.ERROR
     ]
+
+
+class _StepClock:
+    """A monotonic clock the test advances explicitly."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
+def _stepped_service(
+    runner: object,
+    *,
+    clock: _StepClock,
+    activity: ActivityTracker,
+    traces: FakeTraces,
+    idle_confirmations: int = 1,
+    retry_cooldown_seconds: float = 0.0,
+) -> TunerService:
+    """A service driven one ``_poll_once`` at a time on a controlled clock."""
+    return TunerService(
+        _config(
+            idle_confirmations=idle_confirmations,
+            retry_cooldown_seconds=retry_cooldown_seconds,
+        ),
+        activity=activity,
+        traces=traces,
+        orchestrator_factory=lambda cycle_activity: _runner_for(
+            cycle_activity,
+            runner,  # type: ignore[arg-type]
+        ),
+        enabled=True,
+        min_trace_records=2,
+        min_corpus_records=2,
+        poll_interval_seconds=0.005,
+        clock=clock,
+    )
+
+
+def test_a_preempted_cycle_suppresses_retries_until_the_cooldown_expires() -> None:
+    """The preempting request's own trace record must not re-arm the cycle.
+
+    This is exactly job 369040: the watermark dedupe cannot see this case,
+    because the request that preempted the cycle is itself traced.
+    """
+    runner = FixedOutcomeRunner(CycleOutcome.PREEMPTED)
+    clock = _StepClock()
+    activity = ActivityTracker(clock=clock)
+    traces = FakeTraces(2)
+    service = _stepped_service(
+        runner,
+        clock=clock,
+        activity=activity,
+        traces=traces,
+        retry_cooldown_seconds=60.0,
+    )
+
+    clock.now = 100.0
+    service._poll_once()
+    assert runner.calls == 1
+
+    # The preempting request advances the watermark, defeating the dedupe.
+    traces.set_count(3)
+    clock.now = 109.2
+    service._poll_once()
+    assert runner.calls == 1
+
+    clock.now = 161.0
+    service._poll_once()
+    assert runner.calls == 2
+
+
+def test_a_measured_rejection_does_not_arm_the_cooldown() -> None:
+    """A cycle that produced a real result is not what the cooldown is for."""
+    runner = FixedOutcomeRunner(CycleOutcome.REJECTED)
+    clock = _StepClock()
+    activity = ActivityTracker(clock=clock)
+    traces = FakeTraces(2)
+    service = _stepped_service(
+        runner,
+        clock=clock,
+        activity=activity,
+        traces=traces,
+        retry_cooldown_seconds=60.0,
+    )
+
+    clock.now = 100.0
+    service._poll_once()
+    traces.set_count(3)
+    clock.now = 101.0
+    service._poll_once()
+
+    assert runner.calls == 2
+
+
+def test_a_cycle_exception_arms_the_cooldown_too() -> None:
+    runner = ExplodingRunner()
+    clock = _StepClock()
+    activity = ActivityTracker(clock=clock)
+    traces = FakeTraces(2)
+    service = _stepped_service(
+        runner,
+        clock=clock,
+        activity=activity,
+        traces=traces,
+        retry_cooldown_seconds=60.0,
+    )
+
+    clock.now = 100.0
+    service._poll_once()
+    assert runner.calls == 1
+
+    traces.set_count(3)
+    clock.now = 110.0
+    service._poll_once()
+    assert runner.calls == 1
+
+
+def test_the_cooldown_is_published_for_an_operator_to_read(tmp_path: Path) -> None:
+    runner = FixedOutcomeRunner(CycleOutcome.PREEMPTED)
+    clock = _StepClock()
+    activity = ActivityTracker(clock=clock)
+    service = TunerService(
+        _config(retry_cooldown_seconds=60.0),
+        activity=activity,
+        traces=FakeTraces(2),
+        orchestrator_factory=lambda cycle_activity: _runner_for(
+            cycle_activity,
+            runner,  # type: ignore[arg-type]
+        ),
+        enabled=True,
+        min_trace_records=2,
+        min_corpus_records=2,
+        poll_interval_seconds=0.005,
+        clock=clock,
+        status_path=tmp_path / "scheduler.json",
+    )
+
+    clock.now = 100.0
+    service._poll_once()
+
+    payload = json.loads((tmp_path / "scheduler.json").read_text(encoding="utf-8"))
+    assert payload["cooldown_remaining_seconds"] == pytest.approx(60.0)
+
+
+def test_idle_must_be_confirmed_on_consecutive_polls_before_a_cycle_arms() -> None:
+    runner = FixedOutcomeRunner(CycleOutcome.REJECTED)
+    clock = _StepClock()
+    activity = ActivityTracker(clock=clock)
+    service = _stepped_service(
+        runner,
+        clock=clock,
+        activity=activity,
+        traces=FakeTraces(2),
+        idle_confirmations=3,
+    )
+
+    clock.now = 100.0
+    service._poll_once()
+    assert runner.calls == 0
+    service._poll_once()
+    assert runner.calls == 0
+    service._poll_once()
+    assert runner.calls == 1
+
+
+def test_one_busy_poll_resets_the_idle_confirmation_streak() -> None:
+    runner = FixedOutcomeRunner(CycleOutcome.REJECTED)
+    clock = _StepClock()
+    activity = ActivityTracker(clock=clock)
+    service = _stepped_service(
+        runner,
+        clock=clock,
+        activity=activity,
+        traces=FakeTraces(2),
+        idle_confirmations=3,
+    )
+
+    clock.now = 100.0
+    service._poll_once()
+    service._poll_once()
+
+    activity.begin()
+    service._poll_once()
+    activity.end()
+    clock.now = 200.0
+
+    service._poll_once()
+    service._poll_once()
+    assert runner.calls == 0
+    service._poll_once()
+    assert runner.calls == 1
+
+
+@pytest.mark.parametrize(
+    ("field_name", "value", "message"),
+    [
+        ("idle_confirmations", 0, "idle_confirmations must be a positive integer"),
+        ("idle_confirmations", True, "idle_confirmations must be a positive integer"),
+        (
+            "retry_cooldown_seconds",
+            -1.0,
+            "retry_cooldown_seconds must be a non-negative number",
+        ),
+    ],
+)
+def test_invalid_scheduling_guards_are_rejected(
+    field_name: str,
+    value: object,
+    message: str,
+) -> None:
+    with pytest.raises(TunerServiceConfigurationError, match=message):
+        TunerService(
+            _config(),
+            activity=ActivityTracker(),
+            traces=FakeTraces(2),
+            orchestrator_factory=lambda cycle_activity: _runner_for(
+                cycle_activity,
+                FixedOutcomeRunner(CycleOutcome.REJECTED),  # type: ignore[arg-type]
+            ),
+            enabled=True,
+            **{field_name: value},  # type: ignore[arg-type]
+        )

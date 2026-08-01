@@ -390,6 +390,36 @@ class IdleTuningConfig:
     #: corpus too small to produce a meaningful gradient step.
     min_corpus_records: int = 256
     poll_interval_seconds: float = 1.0
+    #: Consecutive idle polls required before a cycle may arm.
+    #:
+    #: ``IdleDetector.should_tune`` is an instantaneous predicate over one
+    #: reading of the activity watermark, and arming commits the gateway to a
+    #: quiesce/sleep/train/benchmark sequence that costs tens of minutes of
+    #: closed-gate time.  Job 369040 armed on a single sample and was preempted
+    #: 0.1s into extraction, paying a full rollback restart for a cycle that had
+    #: done no work.  Requiring the reading to repeat turns one sample into a
+    #: short observation window, at a cost of
+    #: ``(idle_confirmations - 1) * poll_interval_seconds`` of extra latency
+    #: before a genuinely idle system starts tuning.
+    #:
+    #: Three, against the default 1.0s poll, is two extra seconds -- negligible
+    #: beside the cycle it guards, and enough to reject a gap between two bursts
+    #: of the same conversation.  Set to 1 to restore single-sample arming.
+    idle_confirmations: int = 3
+    #: Quiet period enforced after a cycle that was preempted or failed.
+    #:
+    #: The only thing stopping back-to-back attempts was the watermark dedupe in
+    #: :class:`speedlm.tuner.service.TunerService`, and a preempting request
+    #: writes its own trace record -- which advances the watermark and so
+    #: defeats the dedupe by construction.  Job 369040 re-armed 9.2s after a
+    #: preempted cycle and paid a second full rollback.  A cycle that has just
+    #: proved the system is not actually idle (or not actually healthy) must
+    #: wait before spending another engine restart on the same conclusion.
+    #:
+    #: 600s is well short of a cycle's own duration, so a genuinely idle machine
+    #: loses at most one attempt window; it applies only to PREEMPTED/FAILED
+    #: outcomes, so a normal promote or reject is never delayed.
+    retry_cooldown_seconds: float = 600.0
     held_out_fraction: float = 0.2
     #: Scored suite passes per arm.  Five, not three, because the gate's
     #: throughput regression guard is only as trustworthy as its standard
@@ -466,6 +496,25 @@ class IdleTuningConfig:
     #: prompts and cap are shared), and the gating statistic is an arm-to-arm
     #: ratio, so a common-mode inflation cancels out of the threshold.
     benchmark_max_tokens: int = 512
+    #: Whether the gate measures the candidate arm before the stock arm.
+    #:
+    #: The benchmark's first act used to be an activation onto the *stock*
+    #: draft, which threw away the engine ``CANDIDATE_STARTING`` had just spent
+    #: ~110s building and left the benchmark ending on the candidate -- so a
+    #: rejecting cycle then paid a third restart to roll back.  Running the
+    #: candidate arm first reuses the engine that is already up and ends the
+    #: benchmark on stock, which is exactly the draft a rejection wants left
+    #: serving: two of the four per-cycle vLLM startups disappear (~213s).
+    #:
+    #: The tradeoff is order bias: whichever arm runs first meets a colder
+    #: machine.  Each arm already restarts the engine and runs its own warmup
+    #: pass before its measurement window opens, which is what the existing
+    #: stock-first order relied on, so the mitigation is unchanged -- only which
+    #: arm it protects moves.  The residual bias is in the *conservative*
+    #: direction: any cold-start cost now lands on the candidate, so it can only
+    #: make the gate reject a good draft, never promote a bad one.  Set to false
+    #: to restore the historical stock-first order at the cost of two restarts.
+    benchmark_candidate_arm_first: bool = True
     #: How many of the newest trace records one cycle may train on.
     #:
     #: Trace selection is a sliding window, not a full rescan: without a bound
@@ -530,7 +579,18 @@ class IdleTuningConfig:
             or not 0 < self.held_out_fraction < 1
         ):
             raise ConfigError("tuning.held_out_fraction must be in (0, 1)")
+        _validate_int_gte(self.idle_confirmations, "tuning.idle_confirmations", 1)
+        _validate_float_gte(
+            self.retry_cooldown_seconds,
+            "tuning.retry_cooldown_seconds",
+            0,
+        )
         _validate_int_gte(self.benchmark_repeats, "tuning.benchmark_repeats", 3)
+        if not isinstance(self.benchmark_candidate_arm_first, bool):
+            raise ConfigError(
+                "tuning.benchmark_candidate_arm_first must be a bool, "
+                f"got {type(self.benchmark_candidate_arm_first).__name__!r}"
+            )
         _validate_int_gte(
             self.benchmark_concurrency,
             "tuning.benchmark_concurrency",
@@ -716,8 +776,13 @@ class SpeedLMConfig:
             "min_trace_records": self.tuning.min_trace_records,
             "min_corpus_records": self.tuning.min_corpus_records,
             "poll_interval_seconds": self.tuning.poll_interval_seconds,
+            "idle_confirmations": self.tuning.idle_confirmations,
+            "retry_cooldown_seconds": self.tuning.retry_cooldown_seconds,
             "held_out_fraction": self.tuning.held_out_fraction,
             "benchmark_repeats": self.tuning.benchmark_repeats,
+            "benchmark_candidate_arm_first": (
+                self.tuning.benchmark_candidate_arm_first
+            ),
             "benchmark_concurrency": self.tuning.benchmark_concurrency,
             "correctness_max_tokens": self.tuning.correctness_max_tokens,
             "benchmark_max_tokens": self.tuning.benchmark_max_tokens,
@@ -819,8 +884,11 @@ class SpeedLMConfig:
                 "min_trace_records",
                 "min_corpus_records",
                 "poll_interval_seconds",
+                "idle_confirmations",
+                "retry_cooldown_seconds",
                 "held_out_fraction",
                 "benchmark_repeats",
+                "benchmark_candidate_arm_first",
                 "benchmark_concurrency",
                 "correctness_max_tokens",
                 "benchmark_max_tokens",

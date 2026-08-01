@@ -6,7 +6,7 @@ import asyncio
 import builtins
 import importlib
 import json
-from dataclasses import replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -15,6 +15,7 @@ import pytest
 
 import speedlm.tuner.composition as composition
 from speedlm.config import IdleTuningConfig, SpeedLMConfig
+from speedlm.gateway.control import ControlAborted
 from speedlm.gateway.vllm_http import VLLMDraftSwapClient
 from speedlm.profiles import ModelProfile
 from speedlm.storage import ensure_layout
@@ -426,6 +427,15 @@ def test_create_production_tuner_assembles_profile_bound_collaborators(
         != config.tuning.extraction_concurrency
     )
     assert captured["pipeline"]["concurrency"] == config.tuning.extraction_concurrency
+    # ...and the extraction engine must be allowed to *schedule* what the
+    # extraction client sends it.  Unwired, ``max_num_seqs`` stayed at the
+    # backend dataclass default of 1 and every prefill serialized behind the
+    # previous one no matter what ``concurrency`` was set to.
+    assert captured["pipeline"]["max_num_seqs"] == config.tuning.extraction_concurrency
+    assert (
+        captured["gate"]["candidate_arm_first"]
+        == config.tuning.benchmark_candidate_arm_first
+    )
     assert (
         captured["gate"]["benchmark_max_tokens"]
         == config.tuning.benchmark_max_tokens
@@ -828,3 +838,114 @@ def test_the_swap_client_is_wired_only_when_the_flag_is_on(
     else:
         assert isinstance(swap, VLLMDraftSwapClient)
         assert swap.control is http
+
+
+@dataclass
+class _RecordingProcess:
+    restarts: list[object] = field(default_factory=list)
+
+    def restart(self, draft: object, *, timeout_seconds: float) -> None:
+        del timeout_seconds
+        self.restarts.append(draft)
+
+
+@dataclass
+class _RecordingHTTP:
+    ready_calls: int = 0
+
+    def wait_ready(
+        self,
+        *,
+        timeout_seconds: float,
+        should_abort: object = None,
+    ) -> None:
+        del timeout_seconds, should_abort
+        self.ready_calls += 1
+
+
+@dataclass
+class _FakeRuntimeView:
+    """The two-method slice of ``RuntimeController`` the endpoint consults."""
+
+    running: object
+    notified: list[object] = field(default_factory=list)
+
+    def matches_running_draft(self, draft: object) -> bool:
+        return str(self.running) == str(draft)
+
+    def note_external_restart(self, draft: object) -> None:
+        self.notified.append(draft)
+        self.running = draft
+
+
+def _endpoint(runtime: object | None) -> tuple[object, _RecordingProcess, _RecordingHTTP]:
+    process = _RecordingProcess()
+    http = _RecordingHTTP()
+    endpoint = composition._DraftEndpoint(
+        url="http://127.0.0.1:8765",
+        process=process,  # type: ignore[arg-type]
+        http=http,  # type: ignore[arg-type]
+        runtime=runtime,  # type: ignore[arg-type]
+    )
+    return endpoint, process, http
+
+
+def test_activating_the_draft_that_already_runs_skips_the_engine_restart() -> None:
+    """The candidate arm must reuse the engine CANDIDATE_STARTING just built."""
+    runtime = _FakeRuntimeView(running=Path("/artifacts/candidate"))
+    endpoint, process, http = _endpoint(runtime)
+
+    endpoint.activate(  # type: ignore[attr-defined]
+        Path("/artifacts/candidate"),
+        timeout_seconds=30.0,
+        should_abort=lambda: False,
+    )
+
+    assert process.restarts == []
+    # Readiness is still confirmed: the arm never measures a mute engine.
+    assert http.ready_calls == 1
+    assert runtime.notified == []
+
+
+def test_activating_a_different_draft_restarts_and_tells_the_controller() -> None:
+    runtime = _FakeRuntimeView(running=Path("/artifacts/candidate"))
+    endpoint, process, http = _endpoint(runtime)
+
+    endpoint.activate(  # type: ignore[attr-defined]
+        "stock",
+        timeout_seconds=30.0,
+        should_abort=lambda: False,
+    )
+
+    assert process.restarts == ["stock"]
+    assert http.ready_calls == 1
+    # Without this the controller would still believe the candidate is running
+    # and would skip the rollback restart it genuinely needs.
+    assert runtime.notified == ["stock"]
+
+
+def test_an_endpoint_without_a_controller_always_restarts() -> None:
+    endpoint, process, _ = _endpoint(None)
+
+    endpoint.activate(  # type: ignore[attr-defined]
+        "stock",
+        timeout_seconds=30.0,
+        should_abort=lambda: False,
+    )
+
+    assert process.restarts == ["stock"]
+
+
+def test_an_aborted_activation_never_touches_the_engine() -> None:
+    runtime = _FakeRuntimeView(running="stock")
+    endpoint, process, http = _endpoint(runtime)
+
+    with pytest.raises(ControlAborted):
+        endpoint.activate(  # type: ignore[attr-defined]
+            "stock",
+            timeout_seconds=30.0,
+            should_abort=lambda: True,
+        )
+
+    assert process.restarts == []
+    assert http.ready_calls == 0

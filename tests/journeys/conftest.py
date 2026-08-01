@@ -107,18 +107,23 @@ def assert_clean_cli_result(
     assert "Traceback (most recent call last)" not in result.output
 
 
-@pytest.fixture()
-def fake_vllm_bin(tmp_path: Path) -> Path:
-    bin_dir = tmp_path / "fake-bin"
-    bin_dir.mkdir()
-    executable = bin_dir / "vllm"
-    executable.write_text(
-        """#!/usr/bin/env python3
+#: The child ``vllm serve`` stand-in the journeys launch on PATH.
+#:
+#: Routing is on the *parsed* path, not on the raw request target.  The gateway
+#: proxy builds its upstream URL with ``httpx.URL.copy_with(query=b"")``, which
+#: renders an empty query as a trailing ``?`` -- so a proxied ``GET /health``
+#: arrives here as ``GET /health?``.  Real vLLM is an ASGI app and routes it
+#: correctly; a ``BaseHTTPRequestHandler`` that compares ``self.path`` to
+#: ``"/health"`` does not, and answers 404 to every request the gateway
+#: forwards.  That, not any sandbox restriction, is why these journeys were
+#: skipped.
+_FAKE_VLLM_SOURCE = '''#!/usr/bin/env python3
 import json
 import os
 import signal
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 
 def option(name):
@@ -130,6 +135,29 @@ host = option("--host")
 port = int(option("--port"))
 model = sys.argv[2]
 
+# Cumulative, monotonic, and reset only by restarting this process -- the same
+# contract real vLLM counters have.
+counters = {"prompt_tokens": 0.0, "generation_tokens": 0.0, "decode_seconds": 0.0,
+            "drafts": 0.0, "draft_tokens": 0.0, "accepted_tokens": 0.0}
+sleeping = [False]
+
+
+def exposition():
+    labels = '{engine="0",model_name="%s"}' % model
+    return "".join(
+        "# TYPE %s %s\\n%s%s %s\\n" % (name, kind, name, labels, value)
+        for name, kind, value in (
+            ("vllm:prompt_tokens_total", "counter", counters["prompt_tokens"]),
+            ("vllm:generation_tokens_total", "counter", counters["generation_tokens"]),
+            ("vllm:request_decode_time_seconds_sum", "histogram", counters["decode_seconds"]),
+            ("vllm:spec_decode_num_drafts_total", "counter", counters["drafts"]),
+            ("vllm:spec_decode_num_draft_tokens_total", "counter", counters["draft_tokens"]),
+            ("vllm:spec_decode_num_accepted_tokens_total", "counter", counters["accepted_tokens"]),
+            ("vllm:num_requests_running", "gauge", 0.0),
+            ("vllm:num_requests_waiting", "gauge", 0.0),
+        )
+    )
+
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -137,26 +165,58 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, format, *args):
         return
 
+    @property
+    def route(self):
+        # See _FAKE_VLLM_SOURCE: the gateway forwards "/health?", not "/health".
+        return urlsplit(self.path).path
+
     def send_json(self, status, payload):
-        body = json.dumps(payload).encode()
+        self.send_body(status, "application/json", json.dumps(payload).encode())
+
+    def send_body(self, status, content_type, body):
         self.send_response(status)
-        self.send_header("content-type", "application/json")
+        self.send_header("content-type", content_type)
         self.send_header("content-length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
     def do_GET(self):
-        if self.path == "/health":
-            self.send_json(200, {"status": "ok"})
+        route = self.route
+        if route == "/health":
+            self.send_json(200 if not sleeping[0] else 503, {"status": "ok"})
+        elif route == "/metrics":
+            self.send_body(200, "text/plain; version=0.0.4", exposition().encode())
+        elif route == "/is_sleeping":
+            self.send_json(200, {"is_sleeping": sleeping[0]})
+        elif route == "/v1/models":
+            self.send_json(200, {"object": "list", "data": [{"id": model, "object": "model"}]})
         else:
             self.send_json(404, {"error": "not found"})
 
     def do_POST(self):
+        route = self.route
         length = int(self.headers.get("content-length", "0"))
-        request = json.loads(self.rfile.read(length))
-        if self.path != "/v1/chat/completions":
+        request = json.loads(self.rfile.read(length)) if length else {}
+        if route == "/sleep":
+            sleeping[0] = True
+            self.send_json(200, {"status": "ok"})
+            return
+        if route == "/wake_up":
+            sleeping[0] = False
+            self.send_json(200, {"status": "ok"})
+            return
+        if route == "/collective_rpc":
+            self.send_json(200, {"results": [None]})
+            return
+        if route != "/v1/chat/completions":
             self.send_json(404, {"error": "not found"})
             return
+        counters["prompt_tokens"] += 4
+        counters["generation_tokens"] += 2
+        counters["decode_seconds"] += 0.01
+        counters["drafts"] += 1
+        counters["draft_tokens"] += 4
+        counters["accepted_tokens"] += 2
         self.send_json(
             200,
             {
@@ -178,9 +238,15 @@ class Handler(BaseHTTPRequestHandler):
 signal.signal(signal.SIGTERM, lambda _signum, _frame: os._exit(0))
 server = ThreadingHTTPServer((host, port), Handler)
 server.serve_forever()
-""",
-        encoding="utf-8",
-    )
+'''
+
+
+@pytest.fixture()
+def fake_vllm_bin(tmp_path: Path) -> Path:
+    bin_dir = tmp_path / "fake-bin"
+    bin_dir.mkdir()
+    executable = bin_dir / "vllm"
+    executable.write_text(_FAKE_VLLM_SOURCE, encoding="utf-8")
     executable.chmod(0o755)
     return bin_dir
 
@@ -190,8 +256,11 @@ def reserve_port() -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.bind(("127.0.0.1", 0))
             return int(sock.getsockname()[1])
-    except PermissionError:
-        pytest.skip("host sandbox forbids loopback sockets required by the serve journey")
+    except PermissionError as exc:
+        # Kept as a *precise*, self-diagnosing skip rather than a blanket one:
+        # loopback binding works on this host, and the journeys that were once
+        # skipped for it were actually failing for an unrelated fixture bug.
+        pytest.skip(f"host forbids binding a loopback socket ({exc}); serve journeys need one")
 
 
 def request_json(

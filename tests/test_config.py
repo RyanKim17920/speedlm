@@ -506,3 +506,52 @@ def test_the_two_concurrency_knobs_are_independent() -> None:
 def test_invalid_extraction_concurrency_is_rejected(value: object) -> None:
     with pytest.raises(ConfigError, match="extraction_concurrency"):
         IdleTuningConfig(extraction_concurrency=value)
+
+
+# ---------------------------------------------------------------------------
+# Downtime guards: idle confirmation, retry cooldown, benchmark arm order
+# ---------------------------------------------------------------------------
+
+
+def test_scheduling_guards_default_to_the_documented_values() -> None:
+    tuning = SpeedLMConfig(model="m").tuning
+    assert tuning.idle_confirmations == 3
+    assert tuning.retry_cooldown_seconds == 600.0
+    assert tuning.benchmark_candidate_arm_first is True
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("idle_confirmations", 5),
+        ("retry_cooldown_seconds", 30.0),
+        ("benchmark_candidate_arm_first", False),
+    ],
+)
+def test_scheduling_guards_round_trip(key: str, value: object) -> None:
+    configured = SpeedLMConfig.from_dict({"model": "org/model", "tuning": {key: value}})
+    assert getattr(configured.tuning, key) == value
+    assert configured.to_dict()["tuning"][key] == value
+    assert getattr(SpeedLMConfig.from_dict(configured.to_dict()).tuning, key) == value
+
+
+@pytest.mark.parametrize("value", [0, -1, "x", 1.5, True])
+def test_invalid_idle_confirmations_is_rejected(value: object) -> None:
+    with pytest.raises(ConfigError, match="idle_confirmations"):
+        IdleTuningConfig(idle_confirmations=value)
+
+
+@pytest.mark.parametrize("value", [-1.0, "x", None])
+def test_invalid_retry_cooldown_is_rejected(value: object) -> None:
+    with pytest.raises(ConfigError, match="retry_cooldown_seconds"):
+        IdleTuningConfig(retry_cooldown_seconds=value)
+
+
+def test_a_zero_retry_cooldown_is_allowed_to_restore_the_old_behaviour() -> None:
+    assert IdleTuningConfig(retry_cooldown_seconds=0.0).retry_cooldown_seconds == 0.0
+
+
+@pytest.mark.parametrize("value", ["yes", 1, None])
+def test_invalid_benchmark_arm_order_is_rejected(value: object) -> None:
+    with pytest.raises(ConfigError, match="benchmark_candidate_arm_first"):
+        IdleTuningConfig(benchmark_candidate_arm_first=value)
