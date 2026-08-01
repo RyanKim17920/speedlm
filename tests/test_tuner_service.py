@@ -272,6 +272,7 @@ def _config(
     *,
     idle_confirmations: int = 1,
     retry_cooldown_seconds: float = 0.0,
+    serving_recovery_interval_seconds: float = 0.0,
 ) -> SpeedLMConfig:
     """A config whose scheduling guards are off unless a test asks for them.
 
@@ -286,6 +287,7 @@ def _config(
         tuning=IdleTuningConfig(
             idle_confirmations=idle_confirmations,
             retry_cooldown_seconds=retry_cooldown_seconds,
+            serving_recovery_interval_seconds=serving_recovery_interval_seconds,
         ),
     )
 
@@ -1111,6 +1113,142 @@ def test_a_cycle_exception_arms_the_cooldown_too() -> None:
     clock.now = 110.0
     service._poll_once()
     assert runner.calls == 1
+
+
+@dataclass
+class UnrestoredRunner:
+    """An orchestrator whose cycle ended with serving on the wrong draft.
+
+    Models the shape :class:`~speedlm.tuner.orchestrator.TunerOrchestrator`
+    exposes for this condition: the cycle result says ``serving_restored`` is
+    false, and the durable condition stays readable afterwards on
+    ``serving_unrestored`` until a ``recover`` clears it.
+    """
+
+    outcome: CycleOutcome = CycleOutcome.PREEMPTED
+    #: Recoveries that fail before one succeeds.
+    failing_recoveries: int = 0
+    calls: int = 0
+    recoveries: int = 0
+    serving_unrestored: bool = False
+
+    def run_once(self) -> CycleResult:
+        self.calls += 1
+        self.serving_unrestored = True
+        return CycleResult(
+            self.outcome,
+            error="preempted; cleanup: runtime restore failed: boom",
+            serving_restored=False,
+        )
+
+    def recover(self) -> tuple[str, ...]:
+        self.recoveries += 1
+        if self.failing_recoveries > 0:
+            self.failing_recoveries -= 1
+            return ("runtime restore failed: boom",)
+        self.serving_unrestored = False
+        return ()
+
+
+def test_a_cycle_that_could_not_restore_serving_is_recovered_at_once() -> None:
+    """``_recover_serving`` used to be reachable only from ``FAILED``.
+
+    A preemption whose rollback could not respawn leaves an unvalidated draft
+    answering live traffic under a pointer that names the incumbent, and that
+    is the one condition where doing nothing is not an option.
+    """
+    runner = UnrestoredRunner()
+    clock = _StepClock()
+    activity = ActivityTracker(clock=clock)
+    service = _stepped_service(
+        runner,
+        clock=clock,
+        activity=activity,
+        traces=FakeTraces(2),
+        retry_cooldown_seconds=600.0,
+    )
+
+    clock.now = 100.0
+    service._poll_once()
+
+    assert runner.calls == 1
+    assert runner.recoveries == 1
+    assert runner.serving_unrestored is False
+
+
+def test_an_unrestored_restore_is_retried_ahead_of_the_retry_cooldown() -> None:
+    """600s of cooldown must not be 600s of serving the wrong draft.
+
+    ``PREEMPTED`` arms the cooldown, and the cooldown is the first thing
+    ``_poll_once`` checks -- so a restore failure that survives its first
+    re-attempt would otherwise wait out the whole quiet period.
+    """
+    runner = UnrestoredRunner(failing_recoveries=2)
+    clock = _StepClock()
+    activity = ActivityTracker(clock=clock)
+    traces = FakeTraces(2)
+    service = _stepped_service(
+        runner,
+        clock=clock,
+        activity=activity,
+        traces=traces,
+        retry_cooldown_seconds=600.0,
+    )
+
+    clock.now = 100.0
+    service._poll_once()
+    assert runner.calls == 1
+    assert runner.recoveries == 1
+    assert runner.serving_unrestored is True
+
+    # Deep inside the cooldown window, and it retries anyway.
+    traces.set_count(3)
+    clock.now = 130.0
+    service._poll_once()
+    assert runner.recoveries == 2
+    # But it does not start a second cycle on top of a broken runtime.
+    assert runner.calls == 1
+
+    clock.now = 160.0
+    service._poll_once()
+    assert runner.recoveries == 3
+    assert runner.serving_unrestored is False
+
+
+def test_unrestored_serving_is_published_for_an_operator_to_read(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    runner = UnrestoredRunner(failing_recoveries=1)
+    clock = _StepClock()
+    activity = ActivityTracker(clock=clock)
+    service = TunerService(
+        _config(retry_cooldown_seconds=600.0),
+        activity=activity,
+        traces=FakeTraces(2),
+        orchestrator_factory=lambda cycle_activity: _runner_for(
+            cycle_activity,
+            runner,  # type: ignore[arg-type]
+        ),
+        enabled=True,
+        min_trace_records=2,
+        min_corpus_records=2,
+        poll_interval_seconds=0.005,
+        clock=clock,
+        status_path=tmp_path / "scheduler.json",
+    )
+
+    clock.now = 100.0
+    with caplog.at_level(logging.INFO, logger="speedlm.tuner.service"):
+        service._poll_once()
+
+    payload = json.loads((tmp_path / "scheduler.json").read_text(encoding="utf-8"))
+    assert payload["serving_unrestored"] is True
+    assert payload["last_result"]["serving_restored"] is False
+    assert any(
+        record.levelno >= logging.ERROR and "SERVING NOT RESTORED" in record.getMessage()
+        for record in caplog.records
+    )
 
 
 def test_the_cooldown_is_published_for_an_operator_to_read(tmp_path: Path) -> None:

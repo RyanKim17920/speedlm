@@ -5,6 +5,7 @@ from __future__ import annotations
 import gzip
 import logging
 import re
+import time
 import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -35,6 +36,20 @@ DECISION_FILE_NAME: Final = "decision.json"
 #: the gate scraped.  It sits next to ``decision.json`` so a decision and the
 #: evidence behind it are always found together.
 METRICS_DIR_NAME: Final = "gate-metrics"
+
+#: Marker recorded, next to ``state.json``, while serving is known to be on a
+#: draft the durable active pointer does not name.
+#:
+#: This condition cannot be carried by :class:`~speedlm.tuner.state.TunerState`,
+#: and that is the whole reason the marker exists.  ``READY`` is where a
+#: preempted cycle legitimately ends, so the state machine has nowhere to put
+#: "the cycle is over *and* serving is wrong"; before this file existed the only
+#: record was a substring inside ``CycleResult.error``, which
+#: :class:`~speedlm.tuner.service.TunerService` did not read and no restart
+#: survived.  A durable file survives both, and it is what
+#: :meth:`TunerOrchestrator.recover` consults to know it must try again even
+#: from ``READY``.
+SERVING_UNRESTORED_FILE_NAME: Final = "serving-unrestored.json"
 
 _SAFE_LABEL: Final = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
@@ -443,6 +458,20 @@ class CycleResult:
     #: Where the gate decision was persisted, when the gate produced one.
     decision_path: Path | None = None
     val_loss: float | None = None
+    #: Whether serving was left on the draft the durable active pointer names.
+    #:
+    #: Deliberately a field of its own rather than another ``CycleOutcome``.
+    #: The outcome answers "why did this cycle end", which is a fact about the
+    #: cycle; this answers "what is the engine serving now", which is a fact
+    #: about the runtime and outlives the cycle entirely.  Folding the second
+    #: into the first is what produced the defect: a preemption whose rollback
+    #: could not respawn reported ``PREEMPTED`` -- true, and the reason the
+    #: cycle stopped -- while an unvalidated draft answered live traffic under
+    #: a pointer naming the incumbent.  Keeping them orthogonal also means
+    #: every outcome can carry the flag, including the ``PROMOTED`` and
+    #: ``NOT_IDLE`` paths where a *previous* cycle's failure is still
+    #: outstanding.
+    serving_restored: bool = True
 
 
 class TunerOrchestrator:
@@ -472,18 +501,37 @@ class TunerOrchestrator:
         self._timeouts = timeouts
         self._run_id_factory = run_id_factory
         self._val_loss_prefilter = val_loss_prefilter
+        # Beside ``state.json``, not under ``work_root``: the condition belongs
+        # to the runtime, not to the run that happened to expose it, and it has
+        # to be findable without knowing which run directory was last written.
+        self._unrestored_path = state.state_path.parent / SERVING_UNRESTORED_FILE_NAME
+
+    @property
+    def serving_unrestored(self) -> bool:
+        """Whether a recorded restore failure is still outstanding.
+
+        Read from the durable marker rather than from memory, so it survives a
+        process restart -- the supervisor relaunches the child vLLM, but from
+        *its* view of the active draft, which is exactly the bookkeeping this
+        condition says cannot be trusted.
+        """
+        return self._unrestored_path.exists()
 
     def run_once(self) -> CycleResult:
         """Poll idle state and, when eligible, execute one complete tuning cycle."""
-        if self._state.state is not TunerState.READY:
+        if self._state.state is not TunerState.READY or self.serving_unrestored:
             recovery_errors = self.recover()
             if recovery_errors:
                 return CycleResult(
                     outcome=CycleOutcome.FAILED,
                     error="; ".join(recovery_errors),
+                    serving_restored=not self.serving_unrestored,
                 )
         if not self._idle.should_tune:
-            return CycleResult(outcome=CycleOutcome.NOT_IDLE)
+            return CycleResult(
+                outcome=CycleOutcome.NOT_IDLE,
+                serving_restored=not self.serving_unrestored,
+            )
 
         guard = self._idle.arm()
         work_dir = self._work_root / self._run_id_factory()
@@ -589,6 +637,7 @@ class TunerOrchestrator:
                         artifact_id=artifact_id,
                         error="; ".join(cleanup_errors) if cleanup_errors else None,
                         val_loss=val_loss,
+                        serving_restored=not self.serving_unrestored,
                     )
             guard.check()
 
@@ -646,6 +695,7 @@ class TunerOrchestrator:
                     error="; ".join(cleanup_errors) if cleanup_errors else None,
                     decision_path=decision_path,
                     val_loss=val_loss,
+                    serving_restored=not self.serving_unrestored,
                 )
 
             self._state.transition(
@@ -663,6 +713,7 @@ class TunerOrchestrator:
                 gate=gate_result,
                 decision_path=decision_path,
                 val_loss=val_loss,
+                serving_restored=not self.serving_unrestored,
             )
         except FinalAssistantMaskError as exc:
             cleanup_errors = self._rollback_after_failure(pointer_changed)
@@ -670,6 +721,7 @@ class TunerOrchestrator:
                 outcome=CycleOutcome.FINAL_ASSISTANT_MASK_ERROR,
                 artifact_id=artifact_id,
                 error=_combine_error(exc, cleanup_errors),
+                serving_restored=not self.serving_unrestored,
             )
         except TuningPreempted as exc:
             cleanup_errors = self._rollback_after_failure(pointer_changed)
@@ -677,6 +729,7 @@ class TunerOrchestrator:
                 outcome=CycleOutcome.PREEMPTED,
                 artifact_id=artifact_id,
                 error=_combine_error(exc, cleanup_errors),
+                serving_restored=not self.serving_unrestored,
             )
         except Exception as exc:
             cleanup_errors = self._rollback_after_failure(pointer_changed)
@@ -684,6 +737,7 @@ class TunerOrchestrator:
                 outcome=CycleOutcome.FAILED,
                 artifact_id=artifact_id,
                 error=_combine_error(exc, cleanup_errors),
+                serving_restored=not self.serving_unrestored,
             )
 
     def _prepare_draft_hot_swap(self) -> None:
@@ -779,9 +833,25 @@ class TunerOrchestrator:
         return write_decision(run_dir, gate_result.decision)
 
     def recover(self) -> tuple[str, ...]:
-        """Restore the durable active draft after an interrupted process."""
+        """Restore the durable active draft after an interrupted process.
+
+        Also the re-attempt path for a cycle that *finished* with serving on the
+        wrong draft.  That case reaches here at ``READY`` -- the cycle really did
+        end, and ``READY`` is the honest state for it -- so the early return can
+        no longer be conditioned on the state alone: it is conditioned on the
+        state *and* the durable marker.  Without the second half nothing ever
+        retried the restore, which is what let an abandoned candidate keep
+        answering live traffic indefinitely.
+        """
         if self._state.state is TunerState.READY:
-            return ()
+            if not self.serving_unrestored:
+                return ()
+            logger.error(
+                "re-attempting a restore that previously failed; serving is "
+                "still on a draft the active pointer does not name"
+            )
+            error = self._restore_serving()
+            return () if error is None else (error,)
         errors: list[str] = []
         if self._state.state not in {TunerState.ROLLING_BACK, TunerState.WAKING}:
             try:
@@ -792,15 +862,18 @@ class TunerOrchestrator:
             except Exception as exc:
                 errors.append(f"state recovery failed: {exc}")
         if self._state.state is TunerState.ROLLING_BACK:
+            restore_error = self._restore_serving()
+            if restore_error is not None:
+                errors.append(restore_error)
             try:
-                self._runtime.restore(
-                    self._active_draft(),
-                    timeout_seconds=self._timeouts.restore,
+                self._state.transition(
+                    TunerState.WAKING,
+                    reason=(
+                        "runtime restored"
+                        if restore_error is None
+                        else f"SERVING NOT RESTORED: {restore_error}"
+                    ),
                 )
-            except Exception as exc:
-                errors.append(f"runtime restore failed: {exc}")
-            try:
-                self._state.transition(TunerState.WAKING, reason="runtime restored")
             except Exception as exc:
                 errors.append(f"state recovery failed: {exc}")
         if self._state.state is TunerState.WAKING:
@@ -834,22 +907,53 @@ class TunerOrchestrator:
         return tuple(errors)
 
     def _finish_rollback(self, pointer_changed: bool) -> tuple[str, ...]:
+        """Undo the cycle's effects and hand serving back, loudly if it cannot.
+
+        The wake at the end runs *even when the restore failed*, which is a
+        deliberate choice and the one worth arguing.  Waking is what reopens the
+        gateway's admission gate (``RuntimeController.wake`` ->
+        ``AdmissionGate._start_admitting``), so skipping it would keep admission
+        closed -- and this system never refuses traffic, it only queues it:
+        ``speedlm.gateway.proxy`` waits on admission in an unbounded loop.  A
+        closed gate is therefore an unbounded outage for every client, not a
+        polite 503.
+
+        What it would be buying is bounded by comparison.  The draft head is a
+        *proposer*: vLLM's verifier accepts or rejects every drafted token, so a
+        wrong or unvalidated draft changes speed, not answers.  (This is the
+        same losslessness ``PromotionConfig.min_divergence_token_index``
+        documents from the other side.)  So the choice is between a total
+        outage of unknown duration and a throughput regression of bounded size,
+        and the regression wins -- but only because it is made loud here and
+        retried promptly by
+        :meth:`speedlm.tuner.service.TunerService._recover_unrestored_serving`,
+        which re-attempts ahead of the retry cooldown rather than behind it.
+
+        If the draft head were ever able to change *outputs* -- a non-lossless
+        speculative mode, a swap that also moved the verifier -- this trade
+        reverses and admission should stay closed.  It is the losslessness that
+        makes serving-on-the-wrong-draft survivable, not the cost of downtime.
+        """
         errors: list[str] = []
         if pointer_changed:
             try:
                 self._artifacts.rollback()
             except Exception as exc:
                 errors.append(f"active pointer rollback failed: {exc}")
+        restore_error: str | None = None
         if self._state.state is TunerState.ROLLING_BACK:
+            restore_error = self._restore_serving()
+            if restore_error is not None:
+                errors.append(restore_error)
             try:
-                self._runtime.restore(
-                    self._active_draft(),
-                    timeout_seconds=self._timeouts.restore,
+                self._state.transition(
+                    TunerState.WAKING,
+                    reason=(
+                        "active draft restored"
+                        if restore_error is None
+                        else f"SERVING NOT RESTORED: {restore_error}"
+                    ),
                 )
-            except Exception as exc:
-                errors.append(f"runtime restore failed: {exc}")
-            try:
-                self._state.transition(TunerState.WAKING, reason="active draft restored")
             except Exception as exc:
                 errors.append(f"state rollback failed: {exc}")
         if self._state.state is TunerState.WAKING:
@@ -858,10 +962,89 @@ class TunerOrchestrator:
             except Exception as exc:
                 errors.append(f"runtime wake failed: {exc}")
             try:
-                self._state.transition(TunerState.READY, reason="serving restored")
+                self._state.transition(
+                    TunerState.READY,
+                    reason=(
+                        "serving restored"
+                        if not self.serving_unrestored
+                        else "SERVING NOT RESTORED: admission reopened onto a "
+                        "draft the active pointer does not name"
+                    ),
+                )
             except Exception as exc:
                 errors.append(f"state rollback failed: {exc}")
         return tuple(errors)
+
+    def _restore_serving(self) -> str | None:
+        """Put the engine back on the durable active draft, recording failure.
+
+        Returns the error message when the restore did not take, and ``None``
+        when it did.  Success clears the durable marker, so the condition can
+        only ever be outstanding while it is still true -- there is no separate
+        "all clear" path that could forget to run.
+        """
+        try:
+            self._runtime.restore(
+                self._active_draft(),
+                timeout_seconds=self._timeouts.restore,
+            )
+        except Exception as exc:
+            message = f"runtime restore failed: {exc}"
+            self._mark_serving_unrestored(message)
+            return message
+        self._clear_serving_unrestored()
+        return None
+
+    def _mark_serving_unrestored(self, error: str) -> None:
+        """Record, durably and at ERROR level, that serving is on a wrong draft.
+
+        Marking must never itself raise: it runs on a cleanup path that is
+        already handling one failure, and a marker that cannot be written is
+        strictly less bad than a cleanup that aborts partway through.  The log
+        line is emitted first for exactly that reason -- it is the half that
+        cannot fail on a full disk.
+        """
+        try:
+            expected = str(self._active_draft())
+        except Exception:
+            expected = "unknown"
+        logger.error(
+            "SERVING NOT RESTORED: could not return the engine to the active "
+            "draft %s (%s). Live traffic is being answered by whichever draft "
+            "the abandoned cycle left loaded, which the durable active pointer "
+            "does not name. Speculative decoding is lossless, so answers are "
+            "unaffected, but throughput is unvalidated until this clears.",
+            expected,
+            error,
+        )
+        try:
+            atomic_write_json(
+                self._unrestored_path,
+                {
+                    "schema_version": 1,
+                    "detected_at": time.time(),
+                    "expected_active_draft": expected,
+                    "error": error,
+                },
+            )
+        except OSError as exc:
+            logger.warning(
+                "could not persist the serving-unrestored marker %s: %s",
+                self._unrestored_path,
+                exc,
+            )
+
+    def _clear_serving_unrestored(self) -> None:
+        try:
+            self._unrestored_path.unlink(missing_ok=True)
+        except OSError as exc:
+            # Leaving it behind only costs a redundant restore attempt on the
+            # next poll, which is the safe direction to fail in.
+            logger.warning(
+                "could not clear the serving-unrestored marker %s: %s",
+                self._unrestored_path,
+                exc,
+            )
 
     def _active_draft(self) -> DraftReference:
         active = self._artifacts.active()

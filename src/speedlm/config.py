@@ -420,6 +420,26 @@ class IdleTuningConfig:
     #: loses at most one attempt window; it applies only to PREEMPTED/FAILED
     #: outcomes, so a normal promote or reject is never delayed.
     retry_cooldown_seconds: float = 600.0
+    #: Minimum gap between re-attempts of a restore that has already failed.
+    #:
+    #: Deliberately *not* the retry cooldown above, and deliberately much
+    #: shorter.  The cooldown exists to stop a healthy system from re-paying an
+    #: engine restart to reach a conclusion it just reached; this exists for the
+    #: opposite situation, where the engine is serving a draft the durable
+    #: active pointer does not name and every second of delay is a second of
+    #: unvalidated throughput.  ``PREEMPTED`` arms the 600s cooldown, so a
+    #: preemption whose rollback could not respawn would otherwise wait out the
+    #: whole quiet period before anything looked at it again --
+    #: :meth:`speedlm.tuner.service.TunerService._recover_unrestored_serving`
+    #: therefore runs *ahead* of the cooldown check and is paced by this knob
+    #: instead.
+    #:
+    #: 30s is a floor, not a schedule.  A real re-attempt is a vLLM restart at
+    #: ~100-105s, so the interval is only reachable at all when the restore
+    #: fails fast -- an engine that is refusing immediately, which is precisely
+    #: the case that would otherwise spin at the 1s poll interval and fill the
+    #: log.  Set to 0 to retry on every poll.
+    serving_recovery_interval_seconds: float = 30.0
     held_out_fraction: float = 0.2
     #: Scored suite passes per arm.  Five, not three, because the gate's
     #: throughput regression guard is only as trustworthy as its standard
@@ -594,6 +614,11 @@ class IdleTuningConfig:
         _validate_float_gte(
             self.retry_cooldown_seconds,
             "tuning.retry_cooldown_seconds",
+            0,
+        )
+        _validate_float_gte(
+            self.serving_recovery_interval_seconds,
+            "tuning.serving_recovery_interval_seconds",
             0,
         )
         _validate_int_gte(self.benchmark_repeats, "tuning.benchmark_repeats", 3)
@@ -794,6 +819,9 @@ class SpeedLMConfig:
             "poll_interval_seconds": self.tuning.poll_interval_seconds,
             "idle_confirmations": self.tuning.idle_confirmations,
             "retry_cooldown_seconds": self.tuning.retry_cooldown_seconds,
+            "serving_recovery_interval_seconds": (
+                self.tuning.serving_recovery_interval_seconds
+            ),
             "held_out_fraction": self.tuning.held_out_fraction,
             "benchmark_repeats": self.tuning.benchmark_repeats,
             "benchmark_candidate_arm_first": (
@@ -905,6 +933,7 @@ class SpeedLMConfig:
                 "poll_interval_seconds",
                 "idle_confirmations",
                 "retry_cooldown_seconds",
+                "serving_recovery_interval_seconds",
                 "held_out_fraction",
                 "benchmark_repeats",
                 "benchmark_candidate_arm_first",

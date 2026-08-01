@@ -34,6 +34,7 @@ from speedlm.tuner.orchestrator import (
     BENCHMARK_SECONDS_PER_TOKEN,
     DECISION_FILE_NAME,
     METRICS_DIR_NAME,
+    SERVING_UNRESTORED_FILE_NAME,
     BenchmarkGate,
     CycleOutcome,
     DecisionPersistError,
@@ -167,6 +168,9 @@ class FakeValidator:
 class FakeRuntime:
     activity: FakeActivity
     preempt_on_sleep: bool = False
+    #: Make :meth:`restore` raise until it has been called this many times.
+    #: ``None`` means "never fail"; a large number means "never recovers".
+    fail_restores: int = 0
     calls: list[str] = field(default_factory=list)
 
     def quiesce(
@@ -192,6 +196,9 @@ class FakeRuntime:
 
     def restore(self, active_draft: Path | str, *, timeout_seconds: float) -> None:
         self.calls.append(f"restore:{Path(active_draft).name}")
+        if self.fail_restores > 0:
+            self.fail_restores -= 1
+            raise RuntimeError("simulated launch failure for the rollback")
 
     def wake(self, *, timeout_seconds: float) -> None:
         self.calls.append("wake")
@@ -536,6 +543,90 @@ def test_preemption_aborts_and_restores_serving(tmp_path: Path) -> None:
     assert state.state is TunerState.READY
     assert "start_candidate" not in runtime.calls
     assert runtime.calls[-1] == "wake"
+
+
+def test_a_preemption_whose_restore_fails_is_not_reported_as_merely_preempted(
+    tmp_path: Path,
+) -> None:
+    """The worst failure this system has, made observable.
+
+    A preemption that reaches the rollback and cannot respawn leaves the engine
+    loaded with the abandoned candidate while the durable pointer names stock.
+    Before this was fixed the only trace of that was a substring inside
+    ``result.error``: the outcome stayed ``PREEMPTED``, the state machine walked
+    to ``READY``, and ``TunerService`` -- which re-attempts recovery only for
+    ``FAILED`` -- never looked again.  So the cycle result must carry the fact
+    as its own typed field, and it must outlive the cycle in a durable marker,
+    because the state machine cannot carry it: ``READY`` is where the cycle
+    legitimately ends.
+    """
+    activity = FakeActivity()
+    runtime = FakeRuntime(activity, preempt_on_sleep=True, fail_restores=1)
+    orchestrator, state, _, _ = _orchestrator(
+        tmp_path,
+        activity=activity,
+        runtime=runtime,
+    )
+
+    result = orchestrator.run_once()
+
+    assert result.outcome is CycleOutcome.PREEMPTED
+    assert result.error is not None
+    assert "runtime restore failed" in result.error
+    # The fact itself, typed rather than spelled inside a message.
+    assert result.serving_restored is False
+    # And still outstanding after the cycle ended at READY, which is exactly
+    # the window in which the wrong draft answers live traffic.
+    assert state.state is TunerState.READY
+    assert orchestrator.serving_unrestored is True
+
+    marker = state.state_path.parent / SERVING_UNRESTORED_FILE_NAME
+    assert marker.exists()
+    record = json.loads(marker.read_text(encoding="utf-8"))
+    assert record["schema_version"] == 1
+    assert "runtime restore failed" in record["error"]
+
+    # The state journal says so too: "active draft restored" was a lie here.
+    events = state.events_path.read_text(encoding="utf-8")
+    assert "SERVING NOT RESTORED" in events
+
+
+def test_recover_re_attempts_a_failed_restore_from_ready(tmp_path: Path) -> None:
+    """``recover`` used to no-op at READY, so nothing ever retried the restore."""
+    activity = FakeActivity()
+    runtime = FakeRuntime(activity, preempt_on_sleep=True, fail_restores=1)
+    orchestrator, state, _, _ = _orchestrator(
+        tmp_path,
+        activity=activity,
+        runtime=runtime,
+    )
+    assert orchestrator.run_once().serving_restored is False
+    assert state.state is TunerState.READY
+
+    errors = orchestrator.recover()
+
+    assert errors == ()
+    assert orchestrator.serving_unrestored is False
+    assert not (state.state_path.parent / SERVING_UNRESTORED_FILE_NAME).exists()
+    # The retry is a real restore attempt, not just a cleared flag.
+    assert len([call for call in runtime.calls if call.startswith("restore:")]) == 2
+
+
+def test_a_restore_that_keeps_failing_keeps_reporting(tmp_path: Path) -> None:
+    activity = FakeActivity()
+    runtime = FakeRuntime(activity, preempt_on_sleep=True, fail_restores=99)
+    orchestrator, _, _, _ = _orchestrator(
+        tmp_path,
+        activity=activity,
+        runtime=runtime,
+    )
+    orchestrator.run_once()
+
+    errors = orchestrator.recover()
+
+    assert len(errors) == 1
+    assert "runtime restore failed" in errors[0]
+    assert orchestrator.serving_unrestored is True
 
 
 def test_training_stderr_is_surfaced_and_runtime_restored(tmp_path: Path) -> None:

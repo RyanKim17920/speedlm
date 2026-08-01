@@ -471,10 +471,38 @@ class _FakeHFConfig:
     dtype: str = "bfloat16"
 
 
-@dataclass
+#: The two runner topologies vLLM actually ships.  ``gpu_worker.py:384-398``
+#: picks between them on ``vllm_config.use_v2_model_runner``, and the runner
+#: attribute holding the proposer is renamed across the split:
+#: V1 ``GPUModelRunnerV1.drafter`` (``v1/worker/gpu_model_runner.py:571-634``)
+#: vs V2 ``GPUModelRunnerV2.speculator`` (``v1/worker/gpu/model_runner.py:194``).
+#: Fakes must model *one* of these at a time -- a fake carrying both would let
+#: a lookup that only knows one name pass, which is exactly how the first GPU
+#: run shipped broken.
+RUNNER_TOPOLOGIES: tuple[str, ...] = ("drafter", "speculator")
+
+
 class _FakeRunner:
-    model: object = None
-    drafter: object = None
+    """A model runner exposing the proposer under exactly one attribute name.
+
+    Accessing the *other* topology's attribute raises ``AttributeError``, the
+    same as the real runner classes, so a lookup hard-coded to one name cannot
+    silently satisfy itself against the wrong runner generation.
+    """
+
+    def __init__(
+        self,
+        model: object = None,
+        proposer: object = None,
+        *,
+        runner_attr: str = "speculator",
+    ) -> None:
+        if runner_attr not in RUNNER_TOPOLOGIES:
+            raise ValueError(f"unknown runner topology {runner_attr!r}")
+        self.model = model
+        self._runner_attr = runner_attr
+        if proposer is not None:
+            setattr(self, runner_attr, proposer)
 
 
 class _FakeProposer:
@@ -603,12 +631,19 @@ def _make_extension(
     drafter: _FakeDrafter,
     target: _FakeModule | None = None,
     hf_config: object | None = None,
+    runner_attr: str = "speculator",
 ):
-    """Build a CombinedWorkerExtension wired to fake runner/config objects."""
+    """Build a CombinedWorkerExtension wired to fake runner/config objects.
+
+    Defaults to the **V2** (``speculator``) topology because that is what a
+    current vLLM build actually selects; ``TestDrafterLookup`` pins both.
+    """
     from speedlm.gateway.draft_swap import CombinedWorkerExtension
 
     ext = object.__new__(CombinedWorkerExtension)
-    runner = _FakeRunner(model=target, drafter=_FakeProposer(drafter))
+    runner = _FakeRunner(
+        model=target, proposer=_FakeProposer(drafter), runner_attr=runner_attr
+    )
     object.__setattr__(ext, "model_runner", runner)
     object.__setattr__(
         ext,
@@ -1023,7 +1058,14 @@ class TestScopedReload:
 
 
 class TestHotSwapDraftRPC:
-    def _rig(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, config=None):
+    def _rig(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        config=None,
+        runner_attr: str = "speculator",
+    ):
         directory = _write_draft_dir(
             tmp_path, config=DRAFT_CONFIG if config is None else config
         )
@@ -1046,7 +1088,7 @@ class TestHotSwapDraftRPC:
         inner.layers = _FakeModule(weight=_FakeTensor((4096, 4096)))
         drafter.model = inner
         drafter.add_buffer("draft_id_to_target_id", _FakeTensor((32000,)))
-        ext = _make_extension(monkeypatch, drafter=drafter)
+        ext = _make_extension(monkeypatch, drafter=drafter, runner_attr=runner_attr)
         return ext, drafter, directory, calls
 
     def test_null_swap_loads_every_parameter(
@@ -1113,6 +1155,19 @@ class TestHotSwapDraftRPC:
         with pytest.raises(RuntimeError, match="no drafter model found"):
             ext.hot_swap_draft("/nowhere")
 
+    def test_v1_topology_still_works(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The same swap succeeds against a V1 (``drafter``) runner."""
+        ext, drafter, directory, _calls = self._rig(
+            tmp_path, monkeypatch, runner_attr="drafter"
+        )
+        assert ext.hot_swap_draft(str(directory)) == {
+            "swapped": True,
+            "parameters_loaded": 5,
+        }
+        assert drafter.load_calls != []
+
     def test_draft_info_is_json_serializable(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1138,9 +1193,109 @@ class TestHotSwapDraftRPC:
 
         ext = object.__new__(CombinedWorkerExtension)
         object.__setattr__(
-            ext, "model_runner", _FakeRunner(drafter=_FakeProposer(_Wrapper(drafter)))
+            ext, "model_runner", _FakeRunner(proposer=_FakeProposer(_Wrapper(drafter)))
         )
         assert ext._get_drafter_model() is drafter
+
+
+# ---------------------------------------------------------------------------
+# Runner topology
+# ---------------------------------------------------------------------------
+
+
+class TestDrafterLookup:
+    """Pin the *real* vLLM object graph the drafter lookup has to walk.
+
+    The first GPU run of hot-swap failed with a bare "no drafter model found"
+    while every unit test was green, because the fake modelled only the V1
+    ``runner.drafter`` topology and the engine had built a V2 runner exposing
+    ``runner.speculator``.  These tests assert both topologies resolve, and
+    that the constant listing them stays in sync with the lookup.
+    """
+
+    @staticmethod
+    def _ext(runner: object):
+        from speedlm.gateway.draft_swap import CombinedWorkerExtension
+
+        ext = object.__new__(CombinedWorkerExtension)
+        object.__setattr__(ext, "model_runner", runner)
+        return ext
+
+    @pytest.mark.parametrize("runner_attr", RUNNER_TOPOLOGIES)
+    def test_resolves_under_every_shipped_topology(self, runner_attr: str) -> None:
+        drafter = _FakeDrafter()
+        target = _FakeModule()
+        ext = self._ext(
+            _FakeRunner(
+                model=target,
+                proposer=_FakeProposer(drafter),
+                runner_attr=runner_attr,
+            )
+        )
+        assert ext._get_drafter_model() is drafter
+        assert ext._get_target_model() is target
+
+    @pytest.mark.parametrize("runner_attr", RUNNER_TOPOLOGIES)
+    def test_fake_exposes_only_its_own_topology(self, runner_attr: str) -> None:
+        """The fake must not carry both names -- that is what hid the bug."""
+        runner = _FakeRunner(proposer=_FakeProposer(_FakeDrafter()), runner_attr=runner_attr)
+        other = [a for a in RUNNER_TOPOLOGIES if a != runner_attr]
+        assert hasattr(runner, runner_attr)
+        assert all(not hasattr(runner, a) for a in other)
+
+    def test_constant_covers_both_runner_generations(self) -> None:
+        """``DRAFTER_ATTRS`` is the contract the fakes are parametrized over."""
+        from speedlm.gateway.draft_swap import DRAFTER_ATTRS
+
+        assert set(DRAFTER_ATTRS) == set(RUNNER_TOPOLOGIES)
+
+    @pytest.mark.parametrize("runner_attr", RUNNER_TOPOLOGIES)
+    def test_runner_preferred_by_having_a_proposer(self, runner_attr: str) -> None:
+        """A bare ``model_runner`` loses to a ``model_executor`` with a drafter."""
+        from speedlm.gateway.draft_swap import CombinedWorkerExtension
+
+        drafter = _FakeDrafter()
+        ext = object.__new__(CombinedWorkerExtension)
+        object.__setattr__(ext, "model_runner", _FakeRunner())
+        object.__setattr__(
+            ext,
+            "model_executor",
+            _FakeRunner(proposer=_FakeProposer(drafter), runner_attr=runner_attr),
+        )
+        assert ext._get_drafter_model() is drafter
+
+    def test_missing_drafter_error_names_what_it_tried(self) -> None:
+        """The failure must be self-explaining, not a bare sentinel string."""
+        ext = self._ext(_FakeRunner())
+
+        with pytest.raises(RuntimeError) as excinfo:
+            ext.draft_info()
+
+        message = str(excinfo.value)
+        assert "no drafter model found" in message
+        #: Both the runner attribute walked and both proposer names tried.
+        assert "model_runner" in message
+        assert "model_executor" in message
+        for attr in RUNNER_TOPOLOGIES:
+            assert attr in message
+        #: ...and the concrete type that *was* found, so the next failure says
+        #: whether the runner was absent or merely had no speculative config.
+        assert "_FakeRunner" in message
+
+    def test_error_reports_a_proposer_whose_model_is_unset(self) -> None:
+        """A lazily-constructed proposer must not look like an absent one."""
+        ext = self._ext(_FakeRunner(proposer=_FakeProposer(None)))
+
+        with pytest.raises(RuntimeError) as excinfo:
+            ext.draft_info()
+
+        message = str(excinfo.value)
+        assert "_FakeProposer(.model=None)" in message
+
+    def test_materialization_report_shares_the_diagnostic(self) -> None:
+        ext = self._ext(_FakeRunner())
+        with pytest.raises(RuntimeError, match="Tried runner attributes"):
+            ext.draft_materialization_report()
 
 
 # ---------------------------------------------------------------------------

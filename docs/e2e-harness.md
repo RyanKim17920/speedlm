@@ -297,16 +297,44 @@ Written by `TunerService._write_scheduler_status` (`src/speedlm/tuner/service.py
 payload `:716-759`). Write failures are logged, not raised (`:767-768`) — so an
 absent or stale file is not itself an error.
 
-Fields: `schema_version` (=1), `enabled`, `lifecycle`, `created_at`,
-`updated_at`, `lifecycle_changed_at`, `last_attempt_at`, `last_result_at`,
-`last_error_at`, `cooldown_remaining_seconds`, `last_watermark`, `last_result`
-(`{outcome, artifact_id, error, decision_path, val_loss}`), `last_error`.
+Fields: `schema_version` (=1), `enabled`, `lifecycle`, `serving_unrestored`,
+`created_at`, `updated_at`, `lifecycle_changed_at`, `last_attempt_at`,
+`last_result_at`, `last_error_at`, `cooldown_remaining_seconds`,
+`last_watermark`, `last_result`
+(`{outcome, artifact_id, error, decision_path, val_loss, serving_restored,
+gate_acceptance}`), `last_error`.
 Watermark sub-fields: `count, tokens, oldest, newest, unknown_token_records`
 (`:120-124`). The reader treats the file as unusable if `enabled` is not a bool
 or `lifecycle` is missing (`src/speedlm/report.py:536-542`).
 
+`gate_acceptance` is non-null only on a `promoted` cycle that produced a
+decision, and carries `{candidate_rate, candidate_stdev, stock_rate,
+stock_stdev, num_repeats, source: "gate_held_out_suite"}`. It is the gate's
+**held-out suite** measurement recorded at the moment of promotion so that a
+later comparison is possible at all — it is *not* a live figure and is not
+comparable to one without a control arm; see the docstring on
+`_gate_acceptance_baseline` in `src/speedlm/tuner/service.py`.
+
 **Read it for:** why the scheduler did or did not fire — `cooldown_remaining_seconds`
 and `last_watermark.count` answer "why no cycle yet".
+
+**`serving_unrestored: true` is an incident, not a status.** It means a cycle's
+rollback could not respawn the engine, so the child vLLM is loaded with a draft
+the durable active pointer does not name — live traffic is being answered by an
+unvalidated (or abandoned) draft head. Speculative decoding is lossless, so
+answers are unaffected and throughput is not; the tuner re-attempts the restore
+on every poll, paced by `tuning.serving_recovery_interval_seconds` and
+deliberately *ahead* of `tuning.retry_cooldown_seconds`, and starts no new cycle
+until it clears.
+
+### `serving-unrestored.json` — `<runs>/serving-unrestored.json`
+
+Present only while the condition above holds. Written by
+`TunerOrchestrator._mark_serving_unrestored` and removed by the first restore
+that succeeds. Fields: `schema_version` (=1), `detected_at`,
+`expected_active_draft`, `error`. It is durable on purpose: the state machine
+ends a preempted cycle at `READY` and so has nowhere to carry "the cycle is over
+*and* serving is wrong", and the condition must survive a process restart.
 
 ### `decision.json` — `<run_dir>/decision.json`
 

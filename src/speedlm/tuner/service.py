@@ -45,6 +45,12 @@ DEFAULT_IDLE_CONFIRMATIONS = 1
 #: behaviour; see :attr:`speedlm.config.IdleTuningConfig.retry_cooldown_seconds`.
 DEFAULT_RETRY_COOLDOWN_SECONDS = 0.0
 
+#: Pacing for re-attempts of a failed restore, when config carries no
+#: preference.  Zero means "retry on every poll", which is the fail-safe
+#: direction: the production default lives on
+#: :attr:`speedlm.config.IdleTuningConfig.serving_recovery_interval_seconds`.
+DEFAULT_SERVING_RECOVERY_INTERVAL_SECONDS = 0.0
+
 #: Outcomes that arm the retry cooldown.
 #:
 #: These are the cycles that spent engine restarts without producing a
@@ -87,7 +93,19 @@ class TraceStatsSource(Protocol):
 
 
 class CycleRunner(Protocol):
-    """Orchestrator surface needed by :class:`TunerService`."""
+    """Orchestrator surface needed by :class:`TunerService`.
+
+    One *optional* member extends this contract without being part of it, in
+    the same spirit as ``estimated_benchmark_seconds`` on the gate:
+
+    ``serving_unrestored``
+        A read-only ``bool`` saying whether the runner has an outstanding
+        restore failure -- serving left on a draft the durable active pointer
+        does not name.  Read defensively in
+        :meth:`TunerService._serving_unrestored`, so a runner that predates it
+        (or a test double that does not model a runtime) stays valid and reads
+        as "nothing outstanding".
+    """
 
     def run_once(self) -> CycleResult: ...
 
@@ -284,6 +302,7 @@ class TunerService:
         poll_interval_seconds: float = DEFAULT_POLL_INTERVAL_SECONDS,
         idle_confirmations: int | None = None,
         retry_cooldown_seconds: float | None = None,
+        serving_recovery_interval_seconds: float | None = None,
         clock: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], float] = time.time,
         status_path: Path | None = None,
@@ -320,6 +339,12 @@ class TunerService:
             retry_cooldown_seconds = getattr(
                 tuning, "retry_cooldown_seconds", DEFAULT_RETRY_COOLDOWN_SECONDS
             )
+        if serving_recovery_interval_seconds is None:
+            serving_recovery_interval_seconds = getattr(
+                tuning,
+                "serving_recovery_interval_seconds",
+                DEFAULT_SERVING_RECOVERY_INTERVAL_SECONDS,
+            )
         if (
             isinstance(idle_confirmations, bool)
             or not isinstance(idle_confirmations, int)
@@ -336,6 +361,14 @@ class TunerService:
             raise TunerServiceConfigurationError(
                 "retry_cooldown_seconds must be a non-negative number"
             )
+        if (
+            isinstance(serving_recovery_interval_seconds, bool)
+            or not isinstance(serving_recovery_interval_seconds, (int, float))
+            or serving_recovery_interval_seconds < 0
+        ):
+            raise TunerServiceConfigurationError(
+                "serving_recovery_interval_seconds must be a non-negative number"
+            )
 
         self._enabled = enabled
         self._traces = traces
@@ -344,10 +377,15 @@ class TunerService:
         self._poll_interval_seconds = float(poll_interval_seconds)
         self._idle_confirmations = int(idle_confirmations)
         self._retry_cooldown_seconds = float(retry_cooldown_seconds)
+        self._serving_recovery_interval_seconds = float(
+            serving_recovery_interval_seconds
+        )
         #: Consecutive polls so far that observed an idle gateway.
         self._idle_streak = 0
         #: Monotonic instant before which no new cycle may be attempted.
         self._cooldown_until: float | None = None
+        #: Monotonic instant before which no restore re-attempt may be made.
+        self._next_serving_recovery_at: float | None = None
         self._clock = clock
         self._stop_requested = Event()
         self._startup_complete = Event()
@@ -526,6 +564,14 @@ class TunerService:
             self._startup_complete.set()
 
     def _poll_once(self) -> None:
+        # Deliberately ahead of the cooldown check.  A cycle that could not
+        # restore serving arms the cooldown too -- PREEMPTED and FAILED are both
+        # in COOLDOWN_OUTCOMES -- so recovering behind it would mean up to
+        # ``retry_cooldown_seconds`` (600s by default) of an unvalidated draft
+        # answering live traffic before anything looked at it again.
+        if self._recover_unrestored_serving():
+            self._idle_streak = 0
+            return
         if self._in_cooldown():
             self._idle_streak = 0
             return
@@ -571,6 +617,24 @@ class TunerService:
             self._arm_cooldown(result.outcome.value)
         self._prune_traces()
         self._record_result(result)
+        # Checked before the outcome switch below, and independently of it.
+        # ``serving_restored`` is orthogonal to the outcome by construction --
+        # the cycle that exposed this was a perfectly ordinary PREEMPTED -- so
+        # keying recovery off the outcome is exactly the mistake being fixed.
+        if not getattr(result, "serving_restored", True):
+            logger.error(
+                "SERVING NOT RESTORED after a %s cycle: %s",
+                result.outcome.value,
+                result.error or "no error recorded",
+            )
+            self._next_serving_recovery_at = (
+                self._clock() + self._serving_recovery_interval_seconds
+            )
+            self._recover_serving("serving not restored")
+            # Republish: the recovery may have cleared the condition, and a
+            # status file that still says "unrestored" after it was fixed is
+            # its own kind of lie.
+            self._persist_scheduler_status()
         if result.outcome in {
             CycleOutcome.FAILED,
             CycleOutcome.FINAL_ASSISTANT_MASK_ERROR,
@@ -592,6 +656,46 @@ class TunerService:
             logger.info("idle tuning cycle preempted by serving activity")
         elif result.outcome is not CycleOutcome.NOT_IDLE:
             logger.info("idle tuning cycle completed: %s", result.outcome.value)
+
+    def _serving_unrestored(self) -> bool:
+        """Whether the runner still reports serving on an unexpected draft.
+
+        Read defensively: ``serving_unrestored`` is not part of
+        :class:`CycleRunner`, so a runner that predates it -- or a test double
+        that does not model the runtime -- reads as "nothing outstanding".
+        """
+        return bool(getattr(self._orchestrator, "serving_unrestored", False))
+
+    def _recover_unrestored_serving(self) -> bool:
+        """Re-attempt a restore that failed, before anything else this poll.
+
+        Returns ``True`` when the condition is outstanding, whether or not an
+        attempt was made this poll.  That return value also *suppresses the
+        cycle*: quiescing and sleeping the engine to train a new candidate on
+        top of a runtime that is already serving the wrong draft would add a
+        second fault to the first, and the candidate it produced would be
+        benchmarked against an incumbent arm that is not the incumbent.
+
+        Pacing is :attr:`~speedlm.config.IdleTuningConfig.serving_recovery_interval_seconds`
+        rather than the retry cooldown, for the reason documented there: the
+        cooldown protects a healthy system from wasted restarts, and this is not
+        a healthy system.
+        """
+        if not self._serving_unrestored():
+            self._next_serving_recovery_at = None
+            return False
+        now = self._clock()
+        next_at = self._next_serving_recovery_at
+        if next_at is not None and now < next_at:
+            return True
+        self._next_serving_recovery_at = now + self._serving_recovery_interval_seconds
+        logger.error(
+            "SERVING NOT RESTORED: re-attempting recovery before starting any "
+            "new tuning cycle"
+        )
+        self._recover_serving("serving not restored")
+        self._persist_scheduler_status()
+        return True
 
     def _in_cooldown(self) -> bool:
         """Whether a previous unproductive cycle still bars a new attempt.
@@ -728,6 +832,11 @@ class TunerService:
             "schema_version": 1,
             "enabled": self._enabled,
             "lifecycle": self._lifecycle,
+            # Top level, not buried in ``last_result``: this condition outlives
+            # the cycle that produced it, and an operator triaging "why is the
+            # system slow" must be able to see it without reasoning about which
+            # cycle was last.
+            "serving_unrestored": self._serving_unrestored(),
             "created_at": self._created_at,
             "updated_at": now,
             "lifecycle_changed_at": self._lifecycle_changed_at,
@@ -751,6 +860,8 @@ class TunerService:
                         else None
                     ),
                     "val_loss": result.val_loss,
+                    "serving_restored": getattr(result, "serving_restored", True),
+                    "gate_acceptance": _gate_acceptance_baseline(result),
                 }
                 if result is not None
                 else None
@@ -779,6 +890,80 @@ class TunerService:
                 context,
                 "; ".join(errors),
             )
+
+
+def _gate_acceptance_baseline(result: CycleResult) -> dict[str, object] | None:
+    """The acceptance the gate measured, published alongside the cycle result.
+
+    **This is not a post-promotion detector, and it is not the beginning of
+    one.**  It is the one piece of a detector that can be defended today: the
+    baseline number, captured at the moment of the decision, in the artifact an
+    operator actually reads.
+
+    A trustworthy detector was assessed and deliberately not built.  Watching
+    the live acceptance rate on the Prometheus scrape the gate already uses is
+    easy; deciding that a change in it means the *draft* regressed is not,
+    because the live number and the gate number are not measurements of the
+    same thing:
+
+    * **Different prompt mix.**  The gate replays a frozen 103-context held-out
+      suite.  Live acceptance is pooled over whatever traffic arrived, and
+      acceptance is strongly prompt-dependent -- a shift in the request mix
+      moves it with no change to the draft at all.
+    * **Different batch regime.**  The gate replays at
+      ``benchmark_concurrency`` (8) under a fixed
+      ``benchmark_max_tokens`` (512).  Live traffic has neither bound, and
+      ``benchmark_max_tokens``' own docstring measures the tail effect: -3.6 pp
+      (stock) / -5.6 pp (candidate) between a truncated and an untruncated pass.
+      That is several times any threshold worth firing on.
+    * **No paired control arm.**  The gate's entire validity comes from running
+      two arms over the *same* suite back to back.  Live serving has one arm, so
+      a regression and a traffic change are not distinguishable in principle,
+      not merely in this implementation.
+    * **The dispersion we have does not bound the one we would need.**  Measured
+      per-repeat acceptance stdev on job 369040 was 0.382 pp (stock) and
+      0.0995 pp (candidate).  Both are *within-engine, within-suite*: they
+      describe repeat-to-repeat noise on a fixed prompt set, and say nothing
+      about how far live acceptance wanders between two hours of real traffic.
+      Sizing a live threshold from them would be a category error, and would
+      produce a detector that fires on ordinary traffic drift.
+
+    An automatic reversion built on that would be worse than none.
+    ``ArtifactRegistry.rollback()`` is mechanically capable of it -- the pointer
+    keeps history -- but it is written for *in-cycle* failure, where the
+    orchestrator holds the engine and knows no traffic is being served.  Calling
+    it from a monitor would move the durable pointer underneath a live engine
+    that is still loaded with the old draft, recreating by design exactly the
+    pointer/engine disagreement the first half of this module works to prevent.
+
+    What a real detector would require, stated so the next attempt starts from
+    it: acceptance sampled per-request rather than pooled, bucketed by a stable
+    request feature (prompt length, template, route) so the mix is controlled
+    for; a pre-promotion live window on the incumbent to serve as the control
+    arm; and a threshold sized from *that* window's dispersion, not the gate's.
+    Absent all three, the honest product is this: record the number the gate
+    measured, so that a comparison is possible at all.
+
+    Returns ``None`` for every cycle that did not promote or did not measure --
+    an unmeasured cycle has no baseline, and inventing one is what this docstring
+    exists to prevent.
+    """
+    if result.outcome is not CycleOutcome.PROMOTED or result.gate is None:
+        return None
+    decision = result.gate.decision
+    if decision is None:
+        return None
+    return {
+        "candidate_rate": getattr(decision, "candidate_acceptance_rate", None),
+        "candidate_stdev": getattr(decision, "candidate_acceptance_stdev", None),
+        "stock_rate": getattr(decision, "stock_acceptance_rate", None),
+        "stock_stdev": getattr(decision, "stock_acceptance_stdev", None),
+        "num_repeats": getattr(decision, "num_repeats", None),
+        # Named so nobody reads it as a live figure.  The gate's suite, batch
+        # regime and token cap are not live serving's; see this function's
+        # docstring for why the two are not comparable without more machinery.
+        "source": "gate_held_out_suite",
+    }
 
 
 def _validate_backend_profile(

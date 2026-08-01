@@ -8,13 +8,13 @@ from typing import Any
 
 import pytest
 
-from speedlm.config import SamplingConfig, SpeedLMConfig
+from speedlm.config import IdleTuningConfig, SamplingConfig, SpeedLMConfig
 from speedlm.gate.replay import ReplayResult, RequestResult, RunResults
 from speedlm.gate.runner import BenchmarkGateRunner
 from speedlm.gate.suite import BenchmarkSuite
 from speedlm.gateway.activity import ActivityTracker
 from speedlm.report import load_decision
-from speedlm.traces.store import TraceRecord, TraceStore
+from speedlm.traces.store import TraceRecord, TraceStats, TraceStore
 from speedlm.training.base import BackendInfo
 from speedlm.tuner.artifacts import ArtifactRegistry, ArtifactSpec
 from speedlm.tuner.composition import active_draft_reference
@@ -24,6 +24,7 @@ from speedlm.tuner.orchestrator import (
     GateResult,
     TunerOrchestrator,
 )
+from speedlm.tuner.service import TunerService
 from speedlm.tuner.state import TunerState, TunerStateMachine
 
 
@@ -130,6 +131,8 @@ class _Runtime:
     clock_value: list[float]
     traffic_on_sleep: bool = False
     serving: Path | str | None = None
+    #: Restores that raise before one is allowed to succeed.
+    fail_restores: int = 0
     calls: list[str] = field(default_factory=list)
 
     def quiesce(
@@ -167,8 +170,13 @@ class _Runtime:
 
     def restore(self, active_draft: Path | str, *, timeout_seconds: float) -> None:
         assert timeout_seconds > 0
-        self.serving = active_draft
         self.calls.append("restore")
+        if self.fail_restores > 0:
+            self.fail_restores -= 1
+            # Deliberately does *not* move ``serving``: a restore that could not
+            # respawn leaves the engine on whatever the cycle last loaded.
+            raise RuntimeError("simulated launch failure for the rollback")
+        self.serving = active_draft
 
     def wake(self, *, timeout_seconds: float) -> None:
         assert timeout_seconds > 0
@@ -278,6 +286,121 @@ def test_mid_cycle_traffic_preempts_and_restores_previous_active_draft(
     assert artifacts.active_path.read_bytes() == active_before
     assert runtime.serving == baseline.path
     assert runtime.calls == ["quiesce", "sleep", "restore", "wake"]
+
+
+@dataclass
+class _StaticTraces:
+    """A trace-buffer stub whose watermark the test moves by hand."""
+
+    count: int
+
+    def stats(self) -> TraceStats:
+        return TraceStats(count=self.count, tokens=self.count * 16, oldest=0.0, newest=1.0)
+
+    def prune(self) -> int:
+        return 0
+
+
+def test_the_scheduler_re_attempts_a_restore_that_could_not_respawn(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole loop, not either half of it.
+
+    ``tests/test_tuner_orchestrator.py`` proves the orchestrator records the
+    condition and ``tests/test_tuner_service.py`` proves the scheduler acts on
+    it, but each does so against a stub of the other.  This wires the real
+    :class:`TunerOrchestrator` into the real :class:`TunerService` and asserts
+    the property that actually matters: an abandoned candidate does not keep
+    answering live traffic, and it does not have to wait out the 600s retry
+    cooldown that ``PREEMPTED`` arms.
+    """
+    monkeypatch.setenv("SPEEDLM_HOME", str(tmp_path))
+    runs = tmp_path / "runs"
+    artifacts = ArtifactRegistry(runs)
+    baseline_source = tmp_path / "baseline"
+    baseline_source.mkdir()
+    (baseline_source / "weights.bin").write_bytes(b"known-good")
+    baseline = artifacts.publish(
+        baseline_source,
+        ArtifactSpec(
+            verifier_model="verifier",
+            draft_model="draft",
+            base_draft="stock-draft",
+            trace_hash="baseline-traces",
+            training_params={"steps": 1},
+        ),
+    )
+    artifacts.promote(baseline.artifact_id, gate_passed=True)
+
+    now, activity, idle = _idle_pair()
+    runtime = _Runtime(
+        activity,
+        now,
+        traffic_on_sleep=True,
+        serving=baseline.path,
+        fail_restores=1,
+    )
+    state = TunerStateMachine(runs / "state")
+    orchestrator = TunerOrchestrator(
+        state=state,
+        idle=idle,
+        backend=_Backend(b"must-not-train"),
+        artifacts=artifacts,
+        runtime=runtime,
+        gate=_Gate(True),
+        work_root=runs,
+        run_id_factory=lambda: "unrestored-cycle",
+    )
+
+    clock = [0.0]
+    service = TunerService(
+        SpeedLMConfig(
+            model="verifier",
+            idle_threshold_seconds=0.01,
+            tuning=IdleTuningConfig(
+                idle_confirmations=1,
+                # The exact interaction under test: a preemption arms this, and
+                # the restore re-attempt must not be behind it.
+                retry_cooldown_seconds=600.0,
+                serving_recovery_interval_seconds=0.0,
+            ),
+        ),
+        activity=ActivityTracker(clock=lambda: clock[0]),
+        traces=_StaticTraces(64),
+        orchestrator_factory=lambda _activity: orchestrator,
+        enabled=True,
+        min_trace_records=2,
+        min_corpus_records=2,
+        poll_interval_seconds=0.005,
+        clock=lambda: clock[0],
+        status_path=runs / "scheduler.json",
+    )
+
+    clock[0] = 100.0
+    service._poll_once()
+
+    # The cycle was preempted and its rollback could not respawn -- reported as
+    # such, and as an ordinary PREEMPTED outcome, which is the point: nothing
+    # about the outcome distinguishes this cycle.
+    status = json.loads((runs / "scheduler.json").read_text(encoding="utf-8"))
+    assert status["last_result"]["outcome"] == CycleOutcome.PREEMPTED.value
+    assert status["last_result"]["serving_restored"] is False
+
+    # So the recovery cannot have been keyed off the outcome.  The same poll
+    # re-attempted the restore and it took -- 600 seconds earlier than the
+    # cooldown that this very outcome armed would have allowed.
+    assert runtime.calls == [
+        "quiesce",
+        "sleep",
+        "restore",
+        "wake",
+        "restore",
+    ]
+    assert runtime.serving == baseline.path
+    assert orchestrator.serving_unrestored is False
+    assert state.state is TunerState.READY
+    assert status["serving_unrestored"] is False
 
 
 # ---------------------------------------------------------------------------

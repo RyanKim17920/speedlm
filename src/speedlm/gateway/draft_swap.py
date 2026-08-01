@@ -20,7 +20,8 @@ attr)`` for the rest before doing ``worker_class.__bases__ += (extension,)``.
 The two mixins use disjoint names (``activate_``/``flush_``/``deactivate_``/
 ``_install_``/``_deactivate_``/``_buffer_``/``_extend_``/``capture_`` vs.
 ``hot_swap_``/``draft_``/``_apply_``/``_load_``/``_validate_``/``_target_``/
-``_stranded_``/``_get_drafter``/``_get_quantization``), except for the
+``_stranded_``/``_get_drafter``/``_get_quantization``/``_find_proposer``/
+``_require_drafter_model``), except for the
 deliberately shared
 lazy-init helpers (``_ensure_init``/``_get_lock``/``_get_pending``) which are
 inherited from a single definition in ``ActivationCaptureExtension`` and so
@@ -61,6 +62,24 @@ DRAFT_VOCAB_MAPPING_KEYS: Final[tuple[str, ...]] = ("d2t", "t2d")
 #: consolidated copy, and loading both double-counts tensors.  vLLM applies the
 #: same filter in ``default_loader.py:216-233``.
 SAFETENSORS_INDEX_FILE: Final[str] = "model.safetensors.index.json"
+
+#: Worker attributes that may hold the model runner, in preference order.
+RUNNER_ATTRS: Final[tuple[str, ...]] = ("model_runner", "model_executor")
+
+#: Runner attributes under which vLLM exposes the speculative proposer.  The
+#: name depends on which model runner the worker built
+#: (``gpu_worker.py:384-398`` branches on ``vllm_config.use_v2_model_runner``):
+#:
+#: * V1 ``GPUModelRunnerV1`` -> ``runner.drafter``, an ``EagleProposer``
+#:   (``v1/worker/gpu_model_runner.py:571-634``).
+#: * V2 ``GPUModelRunnerV2`` -> ``runner.speculator``, an ``EagleSpeculator``
+#:   (``v1/worker/gpu/model_runner.py:189-194`` via ``init_speculator``).
+#:
+#: Both hold the draft ``nn.Module`` on ``.model``, assigned during
+#: ``load_model`` (V2: ``v1/worker/gpu/spec_decode/speculator.py:152-160``),
+#: so only the *runner-side* attribute name differs.  Checking both keeps a
+#: single build working against either runner.
+DRAFTER_ATTRS: Final[tuple[str, ...]] = ("drafter", "speculator")
 
 #: Config fields that must match between the running drafter and a candidate
 #: for the in-place swap to be tensor-topology compatible.  Names are read
@@ -306,9 +325,7 @@ class DraftSwapExtension:
         """
         directory = Path(weights_path)
 
-        drafter = self._get_drafter_model()
-        if drafter is None:
-            raise RuntimeError("no drafter model found; hot-swap requires a draft model")
+        drafter = self._require_drafter_model()
 
         #: Load first so the vocab-mapping check can see the real tensor keys.
         new_weights = self._load_weights_file(weights_path)
@@ -327,9 +344,7 @@ class DraftSwapExtension:
         Used by the caller to validate compatibility before hot-swapping.
         All values are JSON-serializable.
         """
-        drafter = self._get_drafter_model()
-        if drafter is None:
-            raise RuntimeError("no drafter model found")
+        drafter = self._require_drafter_model()
 
         param_shapes: dict[str, list[int]] = {}
         param_dtypes: dict[str, str] = {}
@@ -351,14 +366,27 @@ class DraftSwapExtension:
 
     def _get_runner(self) -> Any:
         """Return the model runner, preferring whichever attribute has a drafter."""
-        for attr in ("model_runner", "model_executor"):
+        for attr in RUNNER_ATTRS:
             runner = getattr(self, attr, None)
-            if runner is not None and getattr(runner, "drafter", None) is not None:
+            if runner is not None and self._find_proposer(runner) is not None:
                 return runner
-        for attr in ("model_runner", "model_executor"):
+        for attr in RUNNER_ATTRS:
             runner = getattr(self, attr, None)
             if runner is not None:
                 return runner
+        return None
+
+    @staticmethod
+    def _find_proposer(runner: Any) -> Any:
+        """Return *runner*'s speculative proposer object, or ``None``.
+
+        See :data:`DRAFTER_ATTRS` -- the V1 and V2 model runners name this
+        attribute differently, so both are probed.
+        """
+        for attr in DRAFTER_ATTRS:
+            proposer = getattr(runner, attr, None)
+            if proposer is not None:
+                return proposer
         return None
 
     @staticmethod
@@ -386,10 +414,51 @@ class DraftSwapExtension:
         runner = self._get_runner()
         if runner is None:
             return None
-        drafter = getattr(runner, "drafter", None)
-        if drafter is None:
+        proposer = self._find_proposer(runner)
+        if proposer is None:
             return None
-        return self._unwrap(getattr(drafter, "model", None))
+        return self._unwrap(getattr(proposer, "model", None))
+
+    def _drafter_lookup_report(self) -> str:
+        """Describe what the drafter lookup walked, for a diagnostic failure.
+
+        A bare "no drafter model found" cannot distinguish "the engine has no
+        speculative config" from "the drafter hangs off an attribute this
+        build does not know about" -- the exact ambiguity that made the first
+        GPU run of hot-swap unreadable.  This renders the object graph that
+        *was* found so the next failure names its own cause.
+        """
+        parts: list[str] = []
+        for attr in RUNNER_ATTRS:
+            runner = getattr(self, attr, None)
+            if runner is None:
+                parts.append(f"self.{attr}=<absent>")
+                continue
+            found: list[str] = []
+            for name in DRAFTER_ATTRS:
+                proposer = getattr(runner, name, None)
+                if proposer is None:
+                    continue
+                model = getattr(proposer, "model", None)
+                model_desc = "None" if model is None else type(model).__name__
+                found.append(
+                    f"{name}={type(proposer).__name__}(.model={model_desc})"
+                )
+            detail = ", ".join(found) if found else "none of " + "/".join(DRAFTER_ATTRS)
+            parts.append(f"self.{attr}={type(runner).__name__} -> {detail}")
+        return "; ".join(parts)
+
+    def _require_drafter_model(self) -> Any:
+        """Return the drafter model, or raise a self-explaining ``RuntimeError``."""
+        drafter = self._get_drafter_model()
+        if drafter is None:
+            raise RuntimeError(
+                "no drafter model found; hot-swap requires an engine started "
+                f"with a speculative config. Tried runner attributes "
+                f"{list(RUNNER_ATTRS)} and drafter attributes "
+                f"{list(DRAFTER_ATTRS)}; found: {self._drafter_lookup_report()}"
+            )
+        return drafter
 
     def _get_target_model(self) -> Any:
         """Retrieve the verifier's (unwrapped) model object from the runner."""
@@ -655,9 +724,7 @@ class DraftSwapExtension:
             ``{"stranded": {"draft": [...], "target": [...]},
             "stranded_total": int}`` -- all JSON-serializable.
         """
-        drafter = self._get_drafter_model()
-        if drafter is None:
-            raise RuntimeError("no drafter model found")
+        drafter = self._require_drafter_model()
         stranded = self._stranded_on_meta(drafter)
         return {
             "stranded": stranded,

@@ -14,15 +14,17 @@ for once:
 1. Engine starts with ``CombinedWorkerExtension`` -- the injection log line
    must name both a swap method and a capture method (proves the inheritance
    merge took effect, not just that the module imported).
-2. ``draft_info`` returns non-empty parameter shapes.
+2. ``draft_info`` returns non-empty parameter shapes, and nothing is on the
+   meta device *before* any swap -- so a clean post-swap reading is not just
+   a broken probe.
 3. NULL SWAP: swap in the weights that are already loaded.  Reports
    ``swapped=True`` with a parameter count that matches the candidate payload,
-   and a greedy canary completion afterwards is token-identical to before.
-4. Nothing on the meta device afterwards -- drafter *or* target.
+   nothing is on the meta device afterwards -- drafter *or* target -- and a
+   greedy canary completion afterwards is token-identical to before.
+4. Speculative-decode counters advance after the swap.
 5. INCOMPATIBLE swap (doctored ``hidden_size``) is rejected with the running
    drafter untouched, and a canary still succeeds.
-6. Speculative-decode counters advance after the swap.
-7. Activation capture still works on the same engine after a swap.
+6. Activation capture still works on the same engine after a swap.
 
 **Deliberately out of scope.**  This test does not swap to a genuinely
 different *trained* drafter and compare its logits against a from-scratch
@@ -596,9 +598,9 @@ def _assert_capture_artifacts(capture_dir: Path) -> dict[str, Any]:
 def test_draft_hot_swap_on_live_engine() -> None:
     """Drive a real engine through a null swap, a rejected swap, and a capture.
 
-    One engine, seven phases, in order.  Each phase targets a way the shipped
-    code could fail while every unit test stayed green; see the module
-    docstring for the mapping.
+    One engine, six phases (some split into lettered sub-steps), in order.
+    Each phase targets a way the shipped code could fail while every unit
+    test stayed green; see the module docstring for the mapping.
     """
     verifier, drafter, artifact_root = _require_environment()
     drafter_dir = _resolve_drafter_dir(drafter)
@@ -677,7 +679,7 @@ def test_draft_hot_swap_on_live_engine() -> None:
             f"ActivationCaptureExtension did not make it into the worker MRO"
         )
 
-        # -- Phase 2: a real drafter is reachable ----------------------------
+        # -- Phase 2a: a real drafter is reachable ---------------------------
         # Failure mode: _get_drafter_model walks model_runner.drafter.model and
         # silently returns None (or an unwrapped CUDA-graph wrapper with no
         # parameters), which no unit test can detect because there is no real
@@ -698,6 +700,7 @@ def test_draft_hot_swap_on_live_engine() -> None:
             "quantization": info_before.get("quantization"),
         }
 
+        # -- Phase 2b: nothing is on meta before any swap --------------------
         # Baseline meta-device walk: proves the probe reports "clean" on a
         # healthy engine, so a clean post-swap reading is not just a broken probe.
         meta_before = _collective_rpc_one(port, "draft_materialization_report")
@@ -727,7 +730,7 @@ def test_draft_hot_swap_on_live_engine() -> None:
         )
         report["null_swap"] = swap
 
-        # -- Phase 4: nothing stranded on meta -------------------------------
+        # -- Phase 3c: nothing stranded on meta after the swap ---------------
         # Failure mode: the layerwise reload walked the drafter's *shared*
         # submodules and left the running verifier's embedding on the meta
         # device — the model then answers, wrongly, until it crashes.
@@ -741,7 +744,7 @@ def test_draft_hot_swap_on_live_engine() -> None:
             f"{meta_after['stranded']['target']}"
         )
 
-        # -- Phase 3c: canary after the swap must be token-identical ---------
+        # -- Phase 3d: canary after the swap must be token-identical ---------
         text_after, tokens_after = _canary(url, prompt, served_model_id=served_model_id)
         assert tokens_after == tokens_before, (
             f"null swap changed the greedy decode.  The weights did not change, "
@@ -755,7 +758,7 @@ def test_draft_hot_swap_on_live_engine() -> None:
         )
         report["canary_tokens"] = tokens_before
 
-        # -- Phase 6: the drafter still participates -------------------------
+        # -- Phase 4: the drafter still participates -------------------------
         # Failure mode: the swap "succeeds" but the drafter proposes nothing,
         # so the engine silently falls back to plain autoregressive decoding —
         # correct output, zero speedup, no error anywhere.
@@ -812,7 +815,7 @@ def test_draft_hot_swap_on_live_engine() -> None:
             f"before: {tokens_before}\nafter rejection: {tokens_rejected}"
         )
 
-        # -- Phase 7: activation capture still works post-swap ---------------
+        # -- Phase 6: activation capture still works post-swap ---------------
         # Failure mode: composing the two mixins regresses the shipped capture
         # feature (shared lazy-init state, or the swap invalidating the hooks).
         _collective_rpc(port, "activate_capture", str(capture_dir))
