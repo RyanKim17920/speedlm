@@ -2065,14 +2065,37 @@ def test_flush_capture_writes_meta_sidecar_source_is_shared() -> None:
 
 
 def test_install_hook_keeps_truncation_and_empty_guard() -> None:
-    """The copy dropped both; they must be present in the shared source."""
+    """The copy dropped both; they must survive in the shared source.
+
+    Asserted behaviourally rather than by bytecode introspection: the previous
+    version scanned ``_install_hook.__code__`` for the guard's message, which
+    pinned the truncation to one particular *location* instead of its effect,
+    and went red the moment the shared logic moved into ``_intercept_aux`` to
+    serve both runner generations.
+    """
     from speedlm.activation_capture.hook import ActivationCaptureExtension
     from speedlm.gateway.draft_swap import CombinedWorkerExtension
 
     assert (
         CombinedWorkerExtension._install_hook is ActivationCaptureExtension._install_hook
     )
-    wrapped = ActivationCaptureExtension._install_hook.__code__.co_consts
-    inner = [c for c in wrapped if hasattr(c, "co_consts")]
-    text = "".join(str(c) for fn in inner for c in fn.co_consts)
-    assert "aux_hidden_states is empty before drafter" in text
+    assert (
+        CombinedWorkerExtension._intercept_aux
+        is ActivationCaptureExtension._intercept_aux
+    )
+
+    ext = object.__new__(CombinedWorkerExtension)
+    ext._ensure_init()
+    ext._capture_active = True
+    ext.model_runner = _aux_runner((2, 18, 33), num_hidden_layers=36)
+    ext._extend_aux_layers()
+
+    # Truncation: the appended 4th entry is buffered, then removed in place.
+    aux = [_AuxTensor(t) for t in ("a", "b", "c", "final")]
+    ext._intercept_aux(aux)
+    assert len(aux) == 3
+    assert sorted(ext._get_pending()) == [2, 18, 33, 36]
+
+    # Empty guard: an empty list would make the drafter's torch.cat explode.
+    with pytest.raises(RuntimeError, match="empty before drafter"):
+        ext._intercept_aux([])

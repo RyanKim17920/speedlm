@@ -66,6 +66,7 @@ addopts = "-q -ra"
 pythonpath = ["src"]
 markers = [
     "e2e: real end-to-end tests that require a live GPU and vLLM server",
+    "no_torch: runs in the project venv too (uses torch-free fakes)",
 ]
 
 [tool.mypy]

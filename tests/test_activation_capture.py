@@ -21,6 +21,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import math
+import types
 from pathlib import Path
 
 import pytest
@@ -46,14 +47,28 @@ except ImportError:  # pragma: no cover - depends on the interpreter in use
 
 _HAS_SAFETENSORS = importlib.util.find_spec("safetensors") is not None
 
-pytestmark = pytest.mark.skipif(
-    torch is None,
-    reason=(
-        "torch is not installed in the project venv; run with "
-        "PYTHONPATH=/admin/home/ryan.kim/speedlm/.preflight/venvs/vllm/"
-        "lib/python3.12/site-packages to execute these tests"
-    ),
+_NO_TORCH_REASON = (
+    "torch is not installed in the project venv; run with "
+    "PYTHONPATH=/admin/home/ryan.kim/speedlm/.preflight/venvs/vllm/"
+    "lib/python3.12/site-packages to execute these tests"
 )
+
+
+@pytest.fixture(autouse=True)
+def _require_torch(request: pytest.FixtureRequest) -> None:
+    """Skip torch-dependent tests, but let ``no_torch`` ones through.
+
+    This replaces a module-level ``pytestmark`` skipif. Same collection
+    property (every test is collected and reported as an explicit skip rather
+    than vanishing, which is why ``pytest.importorskip`` was rejected), but a
+    module-level mark cannot be cancelled per class, and the runner-topology
+    tests below deliberately use torch-free fakes so they run in the PROJECT
+    venv too. A hook test that only executes under a hand-set PYTHONPATH is a
+    hook test that stays silent in the default suite -- which is exactly how
+    the V1-only hook shipped.
+    """
+    if torch is None and "no_torch" not in request.keywords:
+        pytest.skip(_NO_TORCH_REASON)
 
 # ---------------------------------------------------------------------------
 # SpeculativeConfig construction
@@ -760,6 +775,281 @@ class TestSerialization:
         result.write_json(out)
         data = json.loads(out.read_text())
         assert "rel_error_trend" in data
+
+
+# ---------------------------------------------------------------------------
+# Runner-topology hook installation (hook.py)
+# ---------------------------------------------------------------------------
+
+
+#: The two runner generations vLLM ships.  ``gpu_worker.py:384-398`` picks
+#: between them on ``vllm_config.use_v2_model_runner``, and the interception
+#: point differs: V1 ``gpu_model_runner.GPUModelRunner`` has ``_model_forward``
+#: (``:3783``); V2 ``gpu.model_runner.GPUModelRunner`` has NO ``_model_forward``
+#: and reads the aux list back off ``execute_model_state`` inside
+#: ``sample_tokens`` (``gpu/model_runner.py:1358-1369``).
+#:
+#: Fakes must model *one* of these at a time.  A fake carrying both would let a
+#: hook hard-coded to one generation pass, which is exactly how the V1-only
+#: ``_model_forward`` patch shipped: importing the V1 module SUCCEEDS on a V2
+#: build (both modules exist side by side), so the patch installed silently,
+#: buffered nothing, and never stripped the appended 4th aux entry -- the
+#: drafter's fc then got 4*H against a 3*H weight.
+RUNNER_GENERATIONS: tuple[str, ...] = ("v1", "v2")
+
+#: Matches the shipped Qwen3-8B target: 36 decoder layers, EAGLE-3 collecting
+#: three of them, so the extension appends index 36 as the 4th.
+_NUM_HIDDEN_LAYERS = 36
+_CANONICAL_AUX_LAYERS = (2, 18, 34)
+
+
+class _FakeAuxTensor:
+    """Stands in for a CUDA tensor: only ``detach().cpu()`` is exercised."""
+
+    def __init__(self, tag: str) -> None:
+        self.tag = tag
+
+    def detach(self) -> _FakeAuxTensor:
+        return self
+
+    def cpu(self) -> _FakeAuxTensor:
+        return self
+
+
+class _FakeInnerModel:
+    """Carries ``aux_hidden_state_layers`` (``interfaces.py:1326-1327``)."""
+
+    def __init__(self) -> None:
+        self.aux_hidden_state_layers: tuple[int, ...] = _CANONICAL_AUX_LAYERS
+
+
+class _FakeTargetModel:
+    """Top-level ``...ForCausalLM``; the attribute lives on ``.model``."""
+
+    def __init__(self) -> None:
+        self.model = _FakeInnerModel()
+
+    def set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
+        self.model.aux_hidden_state_layers = tuple(layers)
+
+
+class _FakeHFConfig:
+    num_hidden_layers = _NUM_HIDDEN_LAYERS
+
+
+class _FakeModelConfig:
+    hf_config = _FakeHFConfig()
+
+
+class _FakeVllmConfig:
+    model_config = _FakeModelConfig()
+
+
+def _make_runner_cls(generation: str) -> type:
+    """Build a FRESH runner class for one generation.
+
+    Fresh per call on purpose: the hook patches the runner *class*, so a shared
+    class would leak a monkeypatch across tests.
+    """
+    if generation not in RUNNER_GENERATIONS:
+        raise ValueError(f"unknown runner generation {generation!r}")
+
+    class _Base:
+        def __init__(self) -> None:
+            self.model = _FakeTargetModel()
+            self.vllm_config = _FakeVllmConfig()
+            #: How many aux entries the drafter actually received.
+            self.drafter_saw: int | None = None
+
+    if generation == "v1":
+
+        class _FakeV1Runner(_Base):
+            """V1: aux list is element 1 of ``_model_forward``'s return."""
+
+            def _model_forward(self, aux: list) -> tuple:
+                return ("hidden", aux)
+
+            def drive(self, aux: list) -> None:
+                _, returned = self._model_forward(aux)
+                self.drafter_saw = len(returned)
+
+        return _FakeV1Runner
+
+    class _FakeV2Runner(_Base):
+        """V2: no ``_model_forward``; aux arrives via ``execute_model_state``."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.execute_model_state: object | None = None
+
+        def sample_tokens(self) -> None:
+            #: Stands in for ``speculator.propose(..., aux_hidden_states, ...)``.
+            state = self.execute_model_state
+            self.drafter_saw = len(state.aux_hidden_states)  # type: ignore[union-attr]
+
+        def drive(self, aux: list) -> None:
+            self.execute_model_state = types.SimpleNamespace(aux_hidden_states=aux)
+            self.sample_tokens()
+
+    return _FakeV2Runner
+
+
+def _make_capture_extension(runner: object):
+    """Build an ActivationCaptureExtension bound to a fake runner.
+
+    Mirrors how vLLM injects the class: ``__init__`` is never called, the
+    extension is mixed into the worker and reaches the runner via
+    ``self.model_runner``.
+    """
+    from speedlm.activation_capture.hook import ActivationCaptureExtension
+
+    ext = object.__new__(ActivationCaptureExtension)
+    object.__setattr__(ext, "model_runner", runner)
+    #: Class-level defaults are shared across instances; reset the ones the
+    #: hook mutates so tests cannot bleed into each other.
+    for attr, value in (
+        ("_capture_active", False),
+        ("_capture_dir", None),
+        ("_original_model_forward", None),
+        ("_final_layer_idx", None),
+        ("_original_aux_layers", ()),
+        ("_patched_class", None),
+        ("_patched_attr", None),
+        ("_installed_wrapper", None),
+        ("_pending", None),
+        ("_lock", None),
+    ):
+        object.__setattr__(ext, attr, value)
+    return ext
+
+
+def _aux_batch(count: int) -> list:
+    return [_FakeAuxTensor(f"layer{i}") for i in range(count)]
+
+
+@pytest.mark.no_torch
+class TestRunnerTopologyHook:
+    """The hook must land on whichever runner generation is actually live."""
+
+    @pytest.mark.parametrize("generation", RUNNER_GENERATIONS)
+    def test_hook_lands_on_the_live_runner_class(
+        self, generation: str, tmp_path: Path
+    ) -> None:
+        """Resolution is against ``type(self.model_runner)``, not an import."""
+        runner_cls = _make_runner_cls(generation)
+        runner = runner_cls()
+        ext = _make_capture_extension(runner)
+
+        ext.activate_capture(str(tmp_path / "cap"))
+
+        assert ext._patched_class is runner_cls
+        assert ext._patched_attr == (
+            "_model_forward" if generation == "v1" else "sample_tokens"
+        )
+
+    @pytest.mark.parametrize("generation", RUNNER_GENERATIONS)
+    def test_drafter_sees_only_canonical_aux_layers(
+        self, generation: str, tmp_path: Path
+    ) -> None:
+        """The appended final layer is buffered, then stripped before the fc.
+
+        This is the regression: on V2 the strip never ran, so the drafter's
+        ``fc`` received 4*H against a 3*H weight and the engine died with
+        ``mat1 and mat2 shapes cannot be multiplied``.
+        """
+        runner = _make_runner_cls(generation)()
+        ext = _make_capture_extension(runner)
+        ext.activate_capture(str(tmp_path / "cap"))
+
+        # The engine now collects one extra layer.
+        assert runner.model.model.aux_hidden_state_layers == (
+            *_CANONICAL_AUX_LAYERS,
+            _NUM_HIDDEN_LAYERS,
+        )
+
+        runner.drive(_aux_batch(4))
+
+        assert runner.drafter_saw == len(_CANONICAL_AUX_LAYERS)
+        # All four -- including the appended final layer -- were buffered.
+        assert sorted(ext._get_pending()) == [
+            *_CANONICAL_AUX_LAYERS,
+            _NUM_HIDDEN_LAYERS,
+        ]
+
+    @pytest.mark.parametrize("generation", RUNNER_GENERATIONS)
+    def test_deactivate_restores_runner_and_aux_layers(
+        self, generation: str, tmp_path: Path
+    ) -> None:
+        """Deactivation must leave the engine exactly as it found it."""
+        runner_cls = _make_runner_cls(generation)
+        runner = runner_cls()
+        attr = "_model_forward" if generation == "v1" else "sample_tokens"
+        pristine = getattr(runner_cls, attr)
+        ext = _make_capture_extension(runner)
+
+        ext.activate_capture(str(tmp_path / "cap"))
+        assert getattr(runner_cls, attr) is not pristine
+
+        ext.deactivate_capture()
+
+        assert getattr(runner_cls, attr) is pristine
+        assert runner.model.model.aux_hidden_state_layers == _CANONICAL_AUX_LAYERS
+
+    @pytest.mark.parametrize("generation", RUNNER_GENERATIONS)
+    def test_reactivation_does_not_double_extend(
+        self, generation: str, tmp_path: Path
+    ) -> None:
+        """activate -> deactivate -> activate must still strip correctly.
+
+        Without the rollback, the second activation would see the final layer
+        already present, record the EXTENDED tuple as "original", and stop
+        stripping -- reintroducing the 4*H crash on a re-armed capture.
+        """
+        runner = _make_runner_cls(generation)()
+        ext = _make_capture_extension(runner)
+
+        ext.activate_capture(str(tmp_path / "cap"))
+        ext.deactivate_capture()
+        ext.activate_capture(str(tmp_path / "cap2"))
+
+        assert runner.model.model.aux_hidden_state_layers == (
+            *_CANONICAL_AUX_LAYERS,
+            _NUM_HIDDEN_LAYERS,
+        )
+        assert ext._original_aux_layers == _CANONICAL_AUX_LAYERS
+
+        runner.drive(_aux_batch(4))
+        assert runner.drafter_saw == len(_CANONICAL_AUX_LAYERS)
+
+    @pytest.mark.parametrize("generation", RUNNER_GENERATIONS)
+    def test_activate_twice_without_deactivate_is_idempotent(
+        self, generation: str, tmp_path: Path
+    ) -> None:
+        """A second activate_capture resets rather than compounding."""
+        runner = _make_runner_cls(generation)()
+        ext = _make_capture_extension(runner)
+
+        ext.activate_capture(str(tmp_path / "cap"))
+        ext.activate_capture(str(tmp_path / "cap"))
+
+        assert runner.model.model.aux_hidden_state_layers == (
+            *_CANONICAL_AUX_LAYERS,
+            _NUM_HIDDEN_LAYERS,
+        )
+        runner.drive(_aux_batch(4))
+        assert runner.drafter_saw == len(_CANONICAL_AUX_LAYERS)
+
+    def test_unknown_runner_topology_is_a_hard_error(self, tmp_path: Path) -> None:
+        """A third runner generation must fail loudly, not install nothing."""
+
+        class _FutureRunner:
+            def __init__(self) -> None:
+                self.model = _FakeTargetModel()
+                self.vllm_config = _FakeVllmConfig()
+
+        ext = _make_capture_extension(_FutureRunner())
+        with pytest.raises(RuntimeError, match="exposes none of"):
+            ext.activate_capture(str(tmp_path / "cap"))
 
 
 # ---------------------------------------------------------------------------
