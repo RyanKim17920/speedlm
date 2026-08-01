@@ -8,486 +8,710 @@ by using the layerwise reload infrastructure.
 ``--worker-extension-cls`` string.  This project already uses
 ``ActivationCaptureExtension`` for serving-time activation capture.
 Rather than requiring the caller to choose between the two, this module
-provides ``CombinedWorkerExtension`` -- a composite class that merges both
-extensions via multiple inheritance.  Register it via::
+provides ``CombinedWorkerExtension`` -- a subclass of *both*
+``ActivationCaptureExtension`` and ``DraftSwapExtension``.  Register it via::
 
     --worker-extension-cls speedlm.gateway.draft_swap.CombinedWorkerExtension
 
-The composite class merges both extension namespaces into one MRO chain.
-vLLM checks for attribute collisions at startup (``worker_base.py:268-275``);
-the two extensions use distinct method prefixes (``activate_``/``flush_``/
-``deactivate_``/``_install_``/``_deactivate_``/``_buffer_`` vs.
-``hot_swap_``/``_draft_``) so there are no conflicts.
+vLLM checks for attribute collisions at startup
+(``vllm/v1/worker/worker_base.py:261-286``): it iterates ``dir(extension)``,
+skips only names starting with ``__``, and asserts ``not hasattr(worker_class,
+attr)`` for the rest before doing ``worker_class.__bases__ += (extension,)``.
+The two mixins use disjoint names (``activate_``/``flush_``/``deactivate_``/
+``_install_``/``_deactivate_``/``_buffer_``/``_extend_``/``capture_`` vs.
+``hot_swap_``/``draft_``/``_apply_``/``_load_``/``_validate_``/``_target_``/
+``_get_drafter``/``_get_quantization``), except for the deliberately shared
+lazy-init helpers (``_ensure_init``/``_get_lock``/``_get_pending``) which are
+inherited from a single definition in ``ActivationCaptureExtension`` and so
+appear exactly once in ``dir()``.
 
 **What CANNOT be done:** swap a drafter whose architecture, shapes, or
 quantization differ from the currently loaded one.  The hot-swap is purely
 weight-oriented; the tensor topology and CUDA-graph bindings must already
-match.  The caller MUST validate compatibility before invoking the swap.
+match.  ``_validate_compatibility`` rejects such a candidate *before* any
+mutation happens.
 """
 
 from __future__ import annotations
 
+import json
 import logging
-import threading
-from typing import Any
+import re
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Final
+
+from speedlm.activation_capture.hook import ActivationCaptureExtension
 
 logger = logging.getLogger(__name__)
+
+
+#: Checkpoint tensor names carrying the EAGLE-3 draft<->target vocabulary
+#: mapping.  vLLM renames ``d2t`` to ``draft_id_to_target_id`` and drops
+#: ``t2d`` outright (``llama_eagle3.py:386-390``), but the project's own
+#: publisher requires both (``training/backends/eagle3.py`` ``_VALIDATE_DRAFT``),
+#: so a candidate missing either one did not come out of our pipeline.
+DRAFT_VOCAB_MAPPING_KEYS: Final[tuple[str, ...]] = ("d2t", "t2d")
+
+#: HF shard index emitted alongside multi-shard checkpoints.  When present it
+#: is authoritative: a directory may hold *both* per-shard files and a
+#: consolidated copy, and loading both double-counts tensors.  vLLM applies the
+#: same filter in ``default_loader.py:216-233``.
+SAFETENSORS_INDEX_FILE: Final[str] = "model.safetensors.index.json"
+
+#: Config fields that must match between the running drafter and a candidate
+#: for the in-place swap to be tensor-topology compatible.  Names are read
+#: from ``config.json`` rather than from checkpoint tensor names because vLLM
+#: FUSES ``q/k/v_proj`` into ``qkv_proj`` and ``gate/up_proj`` into
+#: ``gate_up_proj``, so a raw name set-diff against ``named_parameters()``
+#: reports both "missing" and "extra" params for a byte-identical drafter.
+DRAFT_SHAPE_FIELDS: Final[tuple[str, ...]] = (
+    "vocab_size",
+    "hidden_size",
+    "num_hidden_layers",
+    "draft_vocab_size",
+)
+
+
+# ---------------------------------------------------------------------------
+# Candidate directory inspection (torch-free)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class DraftConfigSummary:
+    """The subset of a drafter's config that governs swap compatibility.
+
+    Every field is optional because a candidate config may legitimately omit
+    one (e.g. ``draft_vocab_size`` is ``None`` when the drafter shares the
+    verifier's vocabulary).  A ``None`` on either side is treated as "unknown"
+    and skipped rather than as a mismatch -- the checks that matter
+    (``vocab_size``/``hidden_size``) are always present in both.
+    """
+
+    vocab_size: int | None = None
+    hidden_size: int | None = None
+    num_hidden_layers: int | None = None
+    draft_vocab_size: int | None = None
+    dtype: str | None = None
+
+
+def _as_int(value: object) -> int | None:
+    """Coerce a config value to ``int``, returning ``None`` when unusable."""
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_dtype(value: object) -> str | None:
+    """Reduce ``torch.bfloat16`` / ``"bfloat16"`` / ``torch.dtype`` to a name."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    return text.rsplit(".", 1)[-1].lower()
+
+
+def _natural_sort_key(path: Path) -> list[object]:
+    """Order ``model-00002-of-00010.safetensors`` after ``...-00001-...``.
+
+    Mirrors vLLM's ``weight_utils._natural_sort_key`` so that shard merge
+    order matches what the engine's own loader would have used.
+    """
+    return [
+        int(token) if token.isdigit() else token
+        for token in re.split(r"(\d+)", path.name)
+    ]
+
+
+def resolve_safetensors_shards(directory: Path) -> list[Path]:
+    """Resolve a candidate draft *directory* to its safetensors shard files.
+
+    ``hot_swap_draft`` receives a directory path (that is what the tuner
+    publishes and what ``RuntimeController._try_hot_swap`` passes), while
+    ``safetensors.torch.load_file`` takes exactly one file.  This bridges the
+    two the same way vLLM's ``DefaultModelLoader._prepare_weights`` does: a
+    non-recursive ``*.safetensors`` glob, natural-sorted, filtered through the
+    shard index when one exists.
+
+    A single ``.safetensors`` file is accepted directly so the RPC stays
+    usable against a file path.
+
+    Raises:
+        FileNotFoundError: if the path does not exist, or the directory holds
+            no ``*.safetensors`` file at all.
+        ValueError: if a file path with a non-safetensors suffix is given.
+    """
+    if directory.is_file():
+        if directory.suffix != ".safetensors":
+            raise ValueError(
+                f"draft weights path is a file but not safetensors: {directory}"
+            )
+        return [directory]
+
+    if not directory.is_dir():
+        raise FileNotFoundError(f"draft weights path does not exist: {directory}")
+
+    shards = sorted(directory.glob("*.safetensors"), key=_natural_sort_key)
+    if not shards:
+        raise FileNotFoundError(
+            f"no *.safetensors weight shards in draft directory {directory}; "
+            f"found instead: {sorted(p.name for p in directory.iterdir())[:10]}"
+        )
+
+    index_path = directory / SAFETENSORS_INDEX_FILE
+    if index_path.is_file():
+        indexed = _indexed_shard_names(index_path)
+        if indexed:
+            filtered = [shard for shard in shards if shard.name in indexed]
+            if not filtered:
+                raise FileNotFoundError(
+                    f"{SAFETENSORS_INDEX_FILE} in {directory} references "
+                    f"{sorted(indexed)[:5]} but none of those files are present"
+                )
+            shards = filtered
+
+    return shards
+
+
+def _indexed_shard_names(index_path: Path) -> set[str]:
+    """Read the shard file names listed in an HF safetensors index."""
+    try:
+        raw = json.loads(index_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        logger.warning("ignoring unreadable %s: %r", index_path, exc)
+        return set()
+    weight_map = raw.get("weight_map") if isinstance(raw, dict) else None
+    if not isinstance(weight_map, dict):
+        return set()
+    return {str(value) for value in weight_map.values()}
+
+
+def read_draft_config(directory: Path) -> DraftConfigSummary:
+    """Summarize the candidate draft directory's ``config.json``.
+
+    Speculators-format EAGLE-3 configs nest the transformer dimensions under
+    ``transformer_layer_config`` and keep the EAGLE-specific fields at the top
+    level; vLLM flattens them the same way in
+    ``transformers_utils/configs/speculators/base.py:59-64``.  This reproduces
+    that flattening so the summary is directly comparable against the running
+    drafter's ``hf_config``.
+
+    Raises:
+        FileNotFoundError: if the directory has no ``config.json``.
+        ValueError: if the config cannot be parsed or is not a JSON object.
+    """
+    path = directory / "config.json"
+    if not path.is_file():
+        raise FileNotFoundError(f"candidate draft has no config.json: {path}")
+
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"cannot read candidate draft config {path}: {exc!r}") from exc
+    if not isinstance(raw, dict):
+        raise ValueError(f"candidate draft config is not a JSON object: {path}")
+
+    nested = raw.get("transformer_layer_config")
+    layer: Mapping[str, object] = nested if isinstance(nested, dict) else {}
+
+    def pick(key: str) -> object:
+        return layer[key] if key in layer else raw.get(key)
+
+    dtype = pick("dtype")
+    if dtype is None:
+        dtype = pick("torch_dtype")
+
+    return DraftConfigSummary(
+        vocab_size=_as_int(pick("vocab_size")),
+        hidden_size=_as_int(pick("hidden_size")),
+        num_hidden_layers=_as_int(pick("num_hidden_layers")),
+        draft_vocab_size=_as_int(raw.get("draft_vocab_size")),
+        dtype=_normalize_dtype(dtype),
+    )
+
+
+def summarize_hf_config(hf_config: Any) -> DraftConfigSummary:
+    """Summarize the *running* drafter's already-flattened ``hf_config``."""
+    dtype = getattr(hf_config, "dtype", None)
+    if dtype is None:
+        dtype = getattr(hf_config, "torch_dtype", None)
+    return DraftConfigSummary(
+        vocab_size=_as_int(getattr(hf_config, "vocab_size", None)),
+        hidden_size=_as_int(getattr(hf_config, "hidden_size", None)),
+        num_hidden_layers=_as_int(getattr(hf_config, "num_hidden_layers", None)),
+        draft_vocab_size=_as_int(getattr(hf_config, "draft_vocab_size", None)),
+        dtype=_normalize_dtype(dtype),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Worker extension
+# ---------------------------------------------------------------------------
 
 
 class DraftSwapExtension:
     """vLLM worker extension for in-place draft weight hot-swapping.
 
-    Mixin for ``CombinedWorkerExtension``.  Do NOT register this directly via
-    ``--worker-extension-cls`` unless you do NOT need activation capture.
+    Base class for :class:`CombinedWorkerExtension`.  Registering this one
+    directly via ``--worker-extension-cls`` is supported and gives draft
+    hot-swap *without* activation capture.
 
-    Public methods are called via ``collective_rpc`` from the driver process.
+    Public methods are called via ``collective_rpc`` from the driver process,
+    so every argument and return value must be JSON-serializable
+    (``/collective_rpc`` passes string args only).
+
+    **Note:** vLLM never calls ``__init__`` on an extension -- it appends the
+    class to ``worker_class.__bases__``.  This class therefore holds no
+    instance state at all; the attributes below are bare annotations (not
+    assignments) so they do not appear in ``dir()`` and cannot trip vLLM's
+    attribute-collision assertion against the real worker attributes.
     """
 
-    #: Injected by vLLM at runtime via multiple inheritance into WorkerBase.
-    model_executor: Any  # noqa: RUF012
-    model_runner: Any  # noqa: RUF012
-    vllm_config: Any  # noqa: RUF012
+    #: Injected by vLLM at runtime via ``__bases__`` injection into WorkerBase.
+    model_executor: Any
+    model_runner: Any
+    vllm_config: Any
+
+    # -- collective_rpc handlers --
 
     def hot_swap_draft(self, weights_path: str) -> dict[str, Any]:
-        """Swap the drafter's draft weights from *weights_path* in place.
+        """Swap the drafter's weights from the directory *weights_path*.
 
-        Validates that the new weights match the current drafter's parameter
-        shapes, dtypes, and quantization before applying them.  Uses the
-        layerwise reload infrastructure so that CUDA-graph-captured tensor
-        pointers survive the swap.
+        *weights_path* is a candidate draft **directory** (the shape the tuner
+        publishes).  Shard resolution, merging, and compatibility validation
+        all happen here, worker-side.
 
-        Returns a dict with ``"swapped": True`` and the count of parameters
-        loaded on success.
+        Validation runs to completion before anything is mutated, so a
+        rejected candidate leaves the running drafter untouched.  The apply
+        step uses the layerwise reload infrastructure so CUDA-graph-captured
+        tensor pointers survive, and asserts afterwards that neither the
+        drafter nor the verifier was left stranded on the meta device.
 
-        Called via collective_rpc from the driver process.
+        Returns:
+            ``{"swapped": True, "parameters_loaded": int}``.
+
+        Raises:
+            RuntimeError: no drafter is loaded, or the swap left tensors on
+                the meta device.
+            FileNotFoundError / ValueError: the candidate is unusable or
+                incompatible (raised before any mutation).
         """
+        directory = Path(weights_path)
 
         drafter = self._get_drafter_model()
         if drafter is None:
             raise RuntimeError("no drafter model found; hot-swap requires a draft model")
 
-        # Load new weights from disk
+        #: Load first so the vocab-mapping check can see the real tensor keys.
         new_weights = self._load_weights_file(weights_path)
 
-        # Validate compatibility BEFORE touching anything
-        self._validate_compatibility(drafter, new_weights)
+        #: Validate compatibility BEFORE touching anything.
+        self._validate_compatibility(drafter, new_weights, directory)
 
-        # Apply weights in-place using layerwise reload
         count = self._apply_weights(drafter, new_weights)
 
-        logger.info(
-            "Hot-swapped %d drafter parameters from %s", count, weights_path
-        )
+        logger.info("Hot-swapped %d drafter parameters from %s", count, weights_path)
         return {"swapped": True, "parameters_loaded": count}
 
     def draft_info(self) -> dict[str, Any]:
         """Return metadata about the currently loaded drafter.
 
         Used by the caller to validate compatibility before hot-swapping.
-
-        Returns a dict with ``"num_parameters"``, ``"parameter_shapes"``,
-        ``"parameter_dtypes"``, and ``"quantization"``.
+        All values are JSON-serializable.
         """
-
         drafter = self._get_drafter_model()
         if drafter is None:
             raise RuntimeError("no drafter model found")
 
         param_shapes: dict[str, list[int]] = {}
         param_dtypes: dict[str, str] = {}
+        count = 0
         for name, param in drafter.named_parameters():
             param_shapes[name] = list(param.shape)
             param_dtypes[name] = str(param.dtype)
-
-        quantization = self._get_quantization()
+            count += 1
 
         return {
-            "num_parameters": sum(1 for _ in drafter.named_parameters()),
+            "num_parameters": count,
             "parameter_shapes": param_shapes,
             "parameter_dtypes": param_dtypes,
-            "quantization": quantization,
+            "quantization": self._get_quantization(),
+            "draft_config": asdict(summarize_hf_config(self._draft_hf_config())),
         }
 
-    # -- internal helpers --
+    # -- model lookup --
+
+    def _get_runner(self) -> Any:
+        """Return the model runner, preferring whichever attribute has a drafter."""
+        for attr in ("model_runner", "model_executor"):
+            runner = getattr(self, attr, None)
+            if runner is not None and getattr(runner, "drafter", None) is not None:
+                return runner
+        for attr in ("model_runner", "model_executor"):
+            runner = getattr(self, attr, None)
+            if runner is not None:
+                return runner
+        return None
+
+    @staticmethod
+    def _unwrap(model: Any) -> Any:
+        """Strip vLLM's CUDA-graph wrappers off a model reference.
+
+        ``gpu_model_runner.py:5359-5362`` replaces ``drafter.model`` with a
+        ``BreakableCUDAGraphWrapper``, which is *not* an ``nn.Module`` -- it
+        only forwards reads through ``__getattr__``.  Writes (which
+        ``initialize_layerwise_reload`` performs, e.g. ``_do_torchao_reload``)
+        would land on the wrapper instead of the model, so unwrap first.
+        """
+        for _ in range(8):
+            unwrap = getattr(model, "unwrap", None)
+            if not callable(unwrap):
+                break
+            inner = unwrap()
+            if inner is None or inner is model:
+                break
+            model = inner
+        return model
 
     def _get_drafter_model(self) -> Any:
-        """Retrieve the drafter's model object from the model runner."""
-        try:
-            runner = self.model_executor
-        except AttributeError:
-            try:
-                runner = self.model_runner
-            except AttributeError:
-                return None
-
+        """Retrieve the drafter's (unwrapped) model object from the runner."""
+        runner = self._get_runner()
+        if runner is None:
+            return None
         drafter = getattr(runner, "drafter", None)
         if drafter is None:
             return None
+        return self._unwrap(getattr(drafter, "model", None))
 
-        return getattr(drafter, "model", None)
+    def _get_target_model(self) -> Any:
+        """Retrieve the verifier's (unwrapped) model object from the runner."""
+        runner = self._get_runner()
+        if runner is None:
+            return None
+        return self._unwrap(getattr(runner, "model", None))
+
+    # -- weight loading --
 
     def _load_weights_file(self, path: str) -> dict[str, Any]:
-        """Load a safetensors weights file from *path*."""
-        from safetensors.torch import load_file as _load_file
+        """Load and merge every safetensors shard under the draft *path*.
 
-        return _load_file(path)
+        ``safetensors.safe_open`` handles is NOT iterable -- ``.keys()`` is the
+        only enumeration entry point (this mirrors
+        ``activation_capture/offline_extract.py`` and the ``_VALIDATE_DRAFT``
+        script in ``training/backends/eagle3.py``).
+        """
+        from safetensors import safe_open
+
+        shards = resolve_safetensors_shards(Path(path))
+
+        merged: dict[str, Any] = {}
+        for shard in shards:
+            with safe_open(str(shard), framework="pt") as handle:
+                for name in handle.keys():  # noqa: SIM118 -- safe_open is not iterable
+                    if name in merged:
+                        raise ValueError(
+                            f"tensor {name!r} appears in more than one shard under "
+                            f"{path}; refusing to guess which copy is current"
+                        )
+                    merged[name] = handle.get_tensor(name)
+
+        if not merged:
+            raise ValueError(
+                f"draft weight shards under {path} contain no tensors: "
+                f"{[s.name for s in shards]}"
+            )
+        return merged
+
+    # -- compatibility --
+
+    def _draft_hf_config(self) -> Any:
+        """Return the running drafter's HF config, or ``None`` if unavailable."""
+        config = getattr(self, "vllm_config", None)
+        spec = getattr(config, "speculative_config", None)
+        draft_cfg = getattr(spec, "draft_model_config", None)
+        return getattr(draft_cfg, "hf_config", None)
+
+    def _draft_model_config(self) -> Any:
+        """Return the ModelConfig ``finalize_layerwise_reload`` should use.
+
+        The drafter's own config is correct here: ``finalize_layerwise_reload``
+        only consults it when re-finalizing attention layers
+        (``reload/layerwise.py:279-281``), and those are the *draft* model's
+        attention layers.  Falls back to the target config so an older vLLM
+        without ``draft_model_config`` still finalizes.
+        """
+        config = getattr(self, "vllm_config", None)
+        spec = getattr(config, "speculative_config", None)
+        draft_cfg = getattr(spec, "draft_model_config", None)
+        if draft_cfg is not None:
+            return draft_cfg
+        return getattr(config, "model_config", None)
+
+    @staticmethod
+    def _requires_vocab_mapping(drafter: Any) -> bool:
+        """Whether the running drafter carries a draft->target vocab mapping.
+
+        Ground truth is the live buffer rather than the config: vLLM only
+        creates ``draft_id_to_target_id`` when the draft vocabulary is a
+        subset of the verifier's.
+        """
+        named_buffers = getattr(drafter, "named_buffers", None)
+        if not callable(named_buffers):
+            return False
+        return any("draft_id_to_target_id" in name for name, _ in named_buffers())
 
     def _validate_compatibility(
-        self, drafter: Any, new_weights: dict[str, Any]
+        self,
+        drafter: Any,
+        new_weights: Mapping[str, Any],
+        directory: Path,
     ) -> None:
-        """Raise if *new_weights* is incompatible with *drafter*."""
+        """Raise if the candidate under *directory* cannot replace *drafter*.
 
-        existing_params = {
-            name: param
-            for name, param in drafter.named_parameters()
+        This deliberately does NOT set-diff checkpoint tensor names against
+        ``drafter.named_parameters()``.  vLLM fuses ``q/k/v_proj`` into
+        ``qkv_proj`` and ``gate/up_proj`` into ``gate_up_proj`` while HF
+        checkpoints store them separately, and the EAGLE proposer *deletes*
+        the drafter's ``embed_tokens``/``lm_head`` and rebinds the verifier's
+        (``llm_base_proposer.py:1492-1494`` and ``:1545-1547``).  A name
+        set-diff therefore reports both "missing" and "extra" parameters for a
+        byte-identical drafter.  ``drafter.load_weights()`` already resolves
+        fusion correctly, so what is validated here is what the loader cannot
+        recover from: differing tensor topology, read from ``config.json``.
+        """
+        running_config = self._draft_hf_config()
+        if running_config is None:
+            raise RuntimeError(
+                "cannot read the running drafter's config "
+                "(vllm_config.speculative_config.draft_model_config.hf_config); "
+                "refusing to hot-swap unvalidated weights"
+            )
+
+        current = summarize_hf_config(running_config)
+        candidate = read_draft_config(directory)
+
+        for field_name in DRAFT_SHAPE_FIELDS:
+            want = getattr(current, field_name)
+            got = getattr(candidate, field_name)
+            if want is None or got is None:
+                continue
+            if want != got:
+                raise ValueError(
+                    f"draft {field_name} mismatch: running={want}, candidate={got} "
+                    f"({directory})"
+                )
+
+        if (
+            current.dtype is not None
+            and candidate.dtype is not None
+            and current.dtype != candidate.dtype
+        ):
+            raise ValueError(
+                f"draft dtype mismatch: running={current.dtype}, "
+                f"candidate={candidate.dtype} ({directory})"
+            )
+
+        if self._requires_vocab_mapping(drafter):
+            missing = [key for key in DRAFT_VOCAB_MAPPING_KEYS if key not in new_weights]
+            if missing:
+                raise ValueError(
+                    f"candidate draft is missing vocab mappings {missing}; the running "
+                    f"drafter has a draft_id_to_target_id buffer and needs them "
+                    f"({directory})"
+                )
+
+    # -- apply --
+
+    def _target_owned_submodules(self, drafter: Any) -> dict[str, Any]:
+        """Map drafter submodule paths that are *the verifier's* modules.
+
+        The EAGLE proposer shares the verifier's ``embed_tokens`` and
+        ``lm_head`` with the drafter by object identity
+        (``llm_base_proposer.py:1492-1494``, ``:1545-1547``).  They are
+        reachable from ``drafter.modules()`` but they are NOT the drafter's to
+        reload: ``initialize_layerwise_reload`` walks every module and calls
+        ``restore_layer_on_meta`` on each (``reload/layerwise.py:100-117``),
+        which would move the *running verifier's* embedding onto the meta
+        device and never restore it.
+
+        Only top-most matches are returned; detaching a parent detaches its
+        children with it.
+        """
+        target = self._get_target_model()
+        if target is None or not callable(getattr(target, "modules", None)):
+            return {}
+        if not callable(getattr(drafter, "named_modules", None)):
+            return {}
+
+        target_ids = {id(module) for module in target.modules()}
+        owned: dict[str, Any] = {}
+        for name, module in drafter.named_modules():
+            if name and id(module) in target_ids:
+                owned[name] = module
+
+        return {
+            name: module
+            for name, module in owned.items()
+            if not any(name.startswith(f"{other}.") for other in owned if other != name)
         }
 
-        # Check for missing parameters
-        missing = set(existing_params.keys()) - set(new_weights.keys())
-        if missing:
-            raise ValueError(
-                f"draft weights missing {len(missing)} parameters: "
-                f"{sorted(missing)[:5]}..."
+    @contextmanager
+    def _detached_submodules(
+        self, drafter: Any, owned: Mapping[str, Any]
+    ) -> Iterator[None]:
+        """Temporarily unbind *owned* submodules from *drafter*.
+
+        This is how target-owned modules are excluded from
+        ``initialize_layerwise_reload``'s ``model.modules()`` walk -- the vLLM
+        helper takes no exclusion argument, so the only way to scope it is to
+        make the modules unreachable for the duration.
+        """
+        detached: list[tuple[Any, str, Any]] = []
+        try:
+            for path in sorted(owned):
+                parent_path, _, attr = path.rpartition(".")
+                holder = drafter.get_submodule(parent_path) if parent_path else drafter
+                delattr(holder, attr)
+                detached.append((holder, attr, owned[path]))
+            yield
+        finally:
+            for holder, attr, module in reversed(detached):
+                setattr(holder, attr, module)
+
+    @staticmethod
+    def _drop_target_owned_weights(
+        new_weights: Mapping[str, Any], owned: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Drop candidate tensors destined for verifier-owned modules.
+
+        Loading them would write the candidate's embedding/head into the
+        *running verifier*.  vLLM applies the same substring exclusion via
+        ``AutoWeightsLoader(skip_substrs=...)`` in
+        ``llama_eagle3.py:419-432``.
+        """
+        if not owned:
+            return dict(new_weights)
+
+        leaves = {path.rpartition(".")[2] for path in owned}
+        kept: dict[str, Any] = {}
+        dropped: list[str] = []
+        for name, tensor in new_weights.items():
+            if any(leaf in name for leaf in leaves):
+                dropped.append(name)
+                continue
+            kept[name] = tensor
+
+        if dropped:
+            logger.warning(
+                "Dropping %d candidate tensors bound to verifier-shared modules %s: %s",
+                len(dropped),
+                sorted(leaves),
+                sorted(dropped)[:5],
+            )
+        return kept
+
+    def _assert_materialized(self, drafter: Any) -> None:
+        """Raise if the swap left drafter or verifier tensors on meta.
+
+        ``restore_layer_on_meta`` strips a layer's parameters and re-registers
+        meta-device placeholders; only a successful load materializes them
+        again.  Anything still on meta afterwards is a silently broken model,
+        so this is the post-condition that turns a partial swap into a loud
+        failure the caller can fall back from.
+        """
+        stranded: list[str] = []
+        for label, model in (("draft", drafter), ("target", self._get_target_model())):
+            if model is None:
+                continue
+            for accessor in ("named_parameters", "named_buffers"):
+                enumerate_tensors = getattr(model, accessor, None)
+                if not callable(enumerate_tensors):
+                    continue
+                for name, tensor in enumerate_tensors():
+                    device = getattr(tensor, "device", None)
+                    if getattr(device, "type", None) == "meta":
+                        stranded.append(f"{label}.{name}")
+
+        if stranded:
+            raise RuntimeError(
+                f"draft hot-swap left {len(stranded)} tensors on the meta device "
+                f"(model is unusable): {sorted(stranded)[:5]}"
             )
 
-        # Check for unexpected parameters
-        extra = set(new_weights.keys()) - set(existing_params.keys())
-        if extra:
-            raise ValueError(
-                f"draft weights contain {len(extra)} unexpected parameters: "
-                f"{sorted(extra)[:5]}..."
-            )
-
-        # Check shapes and dtypes
-        for name, new_param in new_weights.items():
-            existing = existing_params[name]
-            if new_param.shape != existing.shape:
-                raise ValueError(
-                    f"parameter {name!r} shape mismatch: "
-                    f"existing={tuple(existing.shape)}, "
-                    f"new={tuple(new_param.shape)}"
-                )
-            if new_param.dtype != existing.dtype:
-                raise ValueError(
-                    f"parameter {name!r} dtype mismatch: "
-                    f"existing={existing.dtype}, new={new_param.dtype}"
-                )
-
-    def _apply_weights(
-        self, drafter: Any, new_weights: dict[str, Any]
-    ) -> int:
+    def _apply_weights(self, drafter: Any, new_weights: Mapping[str, Any]) -> int:
         """Apply *new_weights* into *drafter* in-place, preserving CUDA graphs."""
         from vllm.model_executor.model_loader.reload.layerwise import (
             finalize_layerwise_reload,
             initialize_layerwise_reload,
         )
 
-        initialize_layerwise_reload(drafter)
+        owned = self._target_owned_submodules(drafter)
+        payload = self._drop_target_owned_weights(new_weights, owned)
+        model_config = self._draft_model_config()
 
-        weights_iter = new_weights.items()
-        loaded = drafter.load_weights(weights_iter)
+        with self._detached_submodules(drafter, owned):
+            initialize_layerwise_reload(drafter)
+            try:
+                loaded = drafter.load_weights(payload.items())
+            finally:
+                try:
+                    finalize_layerwise_reload(drafter, model_config)
+                except Exception:
+                    logger.exception(
+                        "finalize_layerwise_reload failed; weights may be partial"
+                    )
+                    raise
 
-        try:
-            model_config = getattr(self, "vllm_config", None)
-            model_config = model_config.model_config if model_config is not None else None
-            finalize_layerwise_reload(drafter, model_config)
-        except Exception:
-            logger.exception("finalize_layerwise_reload failed; weights may be partial")
-            raise
+        self._assert_materialized(drafter)
 
-        count = len(loaded) if loaded is not None else 0
+        if isinstance(loaded, (set, frozenset, list, tuple, dict)):
+            count = len(loaded)
+        else:
+            #: ``Eagle3LlamaForCausalLM.load_weights`` (``llama_eagle3.py:381-432``)
+            #: discards the ``AutoWeightsLoader`` result and returns ``None``, so
+            #: there is no loaded-name set to count.  Fall back to the number of
+            #: candidate tensors handed to the loader; ``_assert_materialized``
+            #: above is what proves they actually landed.
+            count = len(payload)
+
+        if count == 0:
+            raise RuntimeError(
+                "draft hot-swap loaded zero parameters; refusing to report success"
+            )
         return count
 
     def _get_quantization(self) -> str | None:
         """Read the drafter's quantization setting from the vLLM config."""
-        try:
-            config = getattr(self, "vllm_config", None)
-            if config is not None:
-                spec = getattr(config, "speculative_config", None)
-                if spec is not None:
-                    draft_cfg = getattr(spec, "draft_model_config", None)
-                    if draft_cfg is not None:
-                        return getattr(draft_cfg, "quantization", None)
-        except Exception:
-            pass
-        return None
+        config = getattr(self, "vllm_config", None)
+        spec = getattr(config, "speculative_config", None)
+        draft_cfg = getattr(spec, "draft_model_config", None)
+        quantization = getattr(draft_cfg, "quantization", None)
+        return str(quantization) if quantization is not None else None
 
 
-class CombinedWorkerExtension:  # noqa: RUF012
+class CombinedWorkerExtension(ActivationCaptureExtension, DraftSwapExtension):
     """Composite vLLM worker extension: activation capture + draft swap.
 
-    vLLM accepts a single ``--worker-extension-cls`` string.  This class
-    merges ``ActivationCaptureExtension`` and ``DraftSwapExtension`` into one
-    MRO chain so both sets of RPC-handled methods are available on the same
-    worker.
+    vLLM accepts a single ``--worker-extension-cls`` string, so this class
+    exists purely to merge :class:`~speedlm.activation_capture.hook.
+    ActivationCaptureExtension` and :class:`DraftSwapExtension` into one MRO.
+    It defines no members of its own -- every method has exactly one
+    implementation, in its owning base, so the two cannot drift apart.
 
     Register via ``--worker-extension-cls
     speedlm.gateway.draft_swap.CombinedWorkerExtension``.
 
-    The two extensions use non-overlapping method prefixes, so vLLM's
-    attribute-collision check (``worker_base.py:268-275``) will pass cleanly.
-
-    **Note:** vLLM does not call ``__init__`` on extension classes (it appends
-    the class to ``worker_class.__bases__``).  All mutable state uses class-level
-    defaults or lazy initialization (via ``_ensure_init``) to function without
-    ``__init__`` being invoked.
+    vLLM's attribute-collision check (``worker_base.py:261-286``) iterates
+    ``dir()`` of this class, which flattens the MRO, so the shared lazy-init
+    helpers appear once and the two disjoint method sets never collide with
+    each other.  The lazy class-default + ``_ensure_init()`` pattern is
+    inherited unchanged, which matters because vLLM appends this class to
+    ``worker_class.__bases__`` and never calls ``__init__``.
     """
-
-    # Class-level defaults for activation capture state.
-    _capture_active = False
-    _capture_dir: str | None = None
-    _original_model_forward: Any = None
-
-    # Mutable per-instance state — lazy-initialized on first use.
-    _pending: dict[int, list] | None = None
-    _lock: threading.Lock | None = None
-
-    def _ensure_init(self) -> None:
-        """Lazy initialization for mutable per-instance state.
-
-        vLLM never calls ``__init__`` (it appends the class to the worker's
-        base tuple).  This method guarantees the mutable defaults exist.
-        """
-        if self._lock is None:
-            self._lock = threading.Lock()
-        if self._pending is None:
-            self._pending = {}
-
-    def _get_lock(self) -> threading.Lock:
-        """Return the per-instance lock, initializing it lazily."""
-        self._ensure_init()
-        assert self._lock is not None  # guaranteed by _ensure_init
-        return self._lock
-
-    def _get_pending(self) -> dict[int, list]:
-        """Return the per-instance pending dict, initializing it lazily."""
-        self._ensure_init()
-        assert self._pending is not None  # guaranteed by _ensure_init
-        return self._pending
-
-    # -- ActivationCaptureExtension delegates --
-
-    def activate_capture(self, capture_dir: str) -> None:
-        self._ensure_init()
-        self._capture_active = True
-        self._capture_dir = capture_dir
-        import os
-
-        os.makedirs(capture_dir, exist_ok=True)
-        self._install_hook()
-        logger.info("Activation capture activated, output dir: %s", capture_dir)
-
-    def flush_capture(self) -> str:
-        self._ensure_init()
-        if not self._capture_active or self._capture_dir is None:
-            raise RuntimeError("capture is not active")
-        import os
-
-        import torch  # lazy: only available at runtime inside the vLLM venv
-
-        with self._get_lock():
-            pending = self._get_pending()
-            self._pending = {}
-
-        if not pending:
-            logger.warning("flush_capture called with no buffered data")
-
-        by_layer: dict[int, list] = {}
-        for layer_idx, tensors in pending.items():
-            by_layer[layer_idx] = tensors
-
-        saved: dict[str, Any] = {}
-        for lidx in sorted(by_layer.keys()):
-            layer_tensors = by_layer[lidx]
-            if len(layer_tensors) == 1:
-                stacked = layer_tensors[0]
-            else:
-                stacked = torch.cat(layer_tensors, dim=0)
-            saved[f"layer_{lidx}"] = stacked
-
-        path = os.path.join(self._capture_dir, "captured.safetensors")
-        import fcntl
-
-        lock_path = path + ".lock"
-        lock_fd = os.open(lock_path, os.O_WRONLY | os.O_CREAT, 0o644)
-        try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
-            from safetensors.torch import save_file
-
-            save_file(saved, path)
-        finally:
-            fcntl.flock(lock_fd, fcntl.LOCK_UN)
-            os.close(lock_fd)
-
-        os.remove(lock_path)
-        logger.info("Flushed %d layer activations to %s", len(saved), path)
-        return path
-
-    def deactivate_capture(self) -> None:
-        self._ensure_init()
-        self._capture_active = False
-        self._deactivate_impl()
-        logger.info("Activation capture deactivated")
-
-    def _install_hook(self) -> None:
-        from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-
-        original = GPUModelRunner._model_forward
-
-        def _wrapped_forward(self_ref: Any, *args: Any, **kwargs: Any) -> Any:
-            result = original(self_ref, *args, **kwargs)
-            if isinstance(result, tuple) and len(result) >= 2:
-                aux_hidden_states = result[1]
-                if isinstance(aux_hidden_states, list) and len(aux_hidden_states) > 0:
-                    self._buffer_aux(aux_hidden_states)
-            return result
-
-        self._original_model_forward = original
-        GPUModelRunner._model_forward = _wrapped_forward
-
-    def _deactivate_impl(self) -> None:
-        try:
-            from vllm.v1.worker.gpu_model_runner import GPUModelRunner
-
-            if hasattr(GPUModelRunner, "_model_forward"):
-                original = getattr(GPUModelRunner, "_model_forward", None)
-                if (original is not None
-                        and self._original_model_forward is not None
-                        and original.__name__ == "_wrapped_forward"):
-                    GPUModelRunner._model_forward = self._original_model_forward
-        except Exception:
-            logger.exception("Error removing _model_forward hook")
-
-    def _buffer_aux(self, aux_hidden_states: list) -> None:
-        self._ensure_init()
-        if not self._capture_active:
-            return
-        with self._get_lock():
-            pending = self._get_pending()
-            for i, tensor in enumerate(aux_hidden_states):
-                cpu_tensor = tensor.detach().cpu()
-                if i not in pending:
-                    pending[i] = []
-                pending[i].append(cpu_tensor)
-
-    # -- DraftSwapExtension delegates (same implementations) --
-
-    def hot_swap_draft(self, weights_path: str) -> dict[str, Any]:
-        drafter = self._get_drafter_model()
-        if drafter is None:
-            raise RuntimeError("no drafter model found; hot-swap requires a draft model")
-
-        new_weights = self._load_weights_file(weights_path)
-        self._validate_compatibility(drafter, new_weights)
-        count = self._apply_weights(drafter, new_weights)
-
-        logger.info(
-            "Hot-swapped %d drafter parameters from %s", count, weights_path
-        )
-        return {"swapped": True, "parameters_loaded": count}
-
-    def draft_info(self) -> dict[str, Any]:
-        drafter = self._get_drafter_model()
-        if drafter is None:
-            raise RuntimeError("no drafter model found")
-
-        param_shapes: dict[str, list[int]] = {}
-        param_dtypes: dict[str, str] = {}
-        for name, param in drafter.named_parameters():
-            param_shapes[name] = list(param.shape)
-            param_dtypes[name] = str(param.dtype)
-
-        quantization = self._get_quantization()
-
-        return {
-            "num_parameters": sum(1 for _ in drafter.named_parameters()),
-            "parameter_shapes": param_shapes,
-            "parameter_dtypes": param_dtypes,
-            "quantization": quantization,
-        }
-
-    def _get_drafter_model(self) -> Any:
-        try:
-            runner = self.model_executor  # type: ignore[attr-defined]
-        except AttributeError:
-            try:
-                runner = self.model_runner  # type: ignore[attr-defined]
-            except AttributeError:
-                return None
-        drafter = getattr(runner, "drafter", None)
-        if drafter is None:
-            return None
-        return getattr(drafter, "model", None)
-
-    def _load_weights_file(self, path: str) -> dict[str, Any]:
-        from safetensors.torch import load_file as _load_file
-        return _load_file(path)
-
-    def _validate_compatibility(
-        self, drafter: Any, new_weights: dict[str, Any]
-    ) -> None:
-        existing_params = {
-            name: param for name, param in drafter.named_parameters()
-        }
-
-        missing = set(existing_params.keys()) - set(new_weights.keys())
-        if missing:
-            raise ValueError(
-                f"draft weights missing {len(missing)} parameters: "
-                f"{sorted(missing)[:5]}..."
-            )
-
-        extra = set(new_weights.keys()) - set(existing_params.keys())
-        if extra:
-            raise ValueError(
-                f"draft weights contain {len(extra)} unexpected parameters: "
-                f"{sorted(extra)[:5]}..."
-            )
-
-        for name, new_param in new_weights.items():
-            existing = existing_params[name]
-            if new_param.shape != existing.shape:
-                raise ValueError(
-                    f"parameter {name!r} shape mismatch: "
-                    f"existing={tuple(existing.shape)}, "
-                    f"new={tuple(new_param.shape)}"
-                )
-            if new_param.dtype != existing.dtype:
-                raise ValueError(
-                    f"parameter {name!r} dtype mismatch: "
-                    f"existing={existing.dtype}, new={new_param.dtype}"
-                )
-
-    def _apply_weights(self, drafter: Any, new_weights: dict[str, Any]) -> int:
-        from vllm.model_executor.model_loader.reload.layerwise import (
-            finalize_layerwise_reload,
-            initialize_layerwise_reload,
-        )
-
-        initialize_layerwise_reload(drafter)
-        weights_iter = new_weights.items()
-        loaded = drafter.load_weights(weights_iter)
-
-        try:
-            model_config = getattr(self, "vllm_config", None)
-            model_config = model_config.model_config if model_config is not None else None
-            finalize_layerwise_reload(drafter, model_config)
-        except Exception:
-            logger.exception("finalize_layerwise_reload failed; weights may be partial")
-            raise
-
-        count = len(loaded) if loaded is not None else 0
-        return count
-
-    def _get_quantization(self) -> str | None:
-        try:
-            config = getattr(self, "vllm_config", None)
-            if config is not None:
-                spec = getattr(config, "speculative_config", None)
-                if spec is not None:
-                    draft_cfg = getattr(spec, "draft_model_config", None)
-                    if draft_cfg is not None:
-                        return getattr(draft_cfg, "quantization", None)
-        except Exception:
-            pass
-        return None

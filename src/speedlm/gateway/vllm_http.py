@@ -4,18 +4,27 @@ from __future__ import annotations
 
 import ipaddress
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import Any, Final
 
 import httpx
 
 from speedlm.gateway.control import (
+    DRAFT_SWAP_RESUME_TIMEOUT_SECONDS,
+    DRAFT_SWAP_RPC_METHOD,
+    VLLM_COLLECTIVE_RPC_ENDPOINT,
     VLLM_IS_SLEEPING_ENDPOINT,
+    VLLM_PAUSE_ENDPOINT,
+    VLLM_PAUSE_MODE,
+    VLLM_RESUME_ENDPOINT,
     VLLM_SLEEP_ENDPOINT,
     VLLM_WAKE_ENDPOINT,
     AbortCheck,
     ControlAborted,
     ControlTimeout,
+    DraftSwapCorrupted,
+    DraftSwapUnavailable,
 )
 
 VLLM_HEALTH_ENDPOINT: Final = "/health"
@@ -23,9 +32,29 @@ VLLM_MODELS_ENDPOINT: Final = "/v1/models"
 VLLM_COMPLETIONS_ENDPOINT: Final = "/v1/completions"
 VLLM_METRICS_ENDPOINT: Final = "/metrics"
 
+# Every dev-mode command this transport is allowed to issue. The set is an
+# allowlist rather than a denylist because ``VLLM_SERVER_DEV_MODE=1`` mounts a
+# whole management surface (weight transfer, cache resets, profiling) that this
+# gateway has no business reaching.
+_CONTROL_ENDPOINTS: Final = frozenset(
+    {
+        VLLM_SLEEP_ENDPOINT,
+        VLLM_WAKE_ENDPOINT,
+        VLLM_PAUSE_ENDPOINT,
+        VLLM_RESUME_ENDPOINT,
+        VLLM_COLLECTIVE_RPC_ENDPOINT,
+    }
+)
+
 DEFAULT_POLL_INTERVAL_SECONDS: Final = 0.05
 DEFAULT_ATTEMPT_TIMEOUT_SECONDS: Final = 2.0
 _CANARY_PROMPT: Final = "SpeedLM readiness"
+
+# HTTP statuses vLLM's routers produce *before* dispatching anything to the
+# engine: a malformed body, an absent route, or a wrong method. Every other
+# non-2xx (notably the 500 a worker-side raise is flattened into) says nothing
+# about whether the call took effect.
+_UNDISPATCHED_STATUSES: Final = frozenset({400, 404, 405, 501})
 
 
 def _no_abort() -> bool:
@@ -34,6 +63,24 @@ def _no_abort() -> bool:
 
 class VLLMControlError(RuntimeError):
     """Raised when vLLM rejects or violates its lifecycle HTTP contract."""
+
+
+class VLLMRequestNotDelivered(VLLMControlError):
+    """Raised when a request provably never reached the engine.
+
+    Either the transport failed before the bytes left this process, or a
+    router rejected the request before dispatching it.
+    """
+
+
+class VLLMRequestIndeterminate(VLLMControlError):
+    """Raised when a request reached the engine but its effect is unknown.
+
+    A worker-side raise arrives as an opaque HTTP 500 (the original exception
+    type is flattened on the way out of the engine core), so a validation
+    failure and a half-applied mutation are indistinguishable from here. The
+    caller must assume the worse of the two.
+    """
 
 
 class _Deadline:
@@ -93,6 +140,11 @@ class VLLMControlClient:
         self._sleeper = sleeper
         self._closed = False
 
+    @property
+    def clock(self) -> Callable[[], float]:
+        """The monotonic source collaborators must share to stay test-hermetic."""
+        return self._clock
+
     def close(self) -> None:
         if self._closed:
             return
@@ -115,7 +167,7 @@ class VLLMControlClient:
         query: Mapping[str, str] | None = None,
     ) -> None:
         """POST one supported lifecycle command and require a 2xx response."""
-        if endpoint not in {VLLM_SLEEP_ENDPOINT, VLLM_WAKE_ENDPOINT}:
+        if endpoint not in _CONTROL_ENDPOINTS:
             raise ValueError(f"unsupported vLLM control endpoint: {endpoint}")
         _validate_positive(timeout_seconds, "timeout")
         self._request_accepted(
@@ -124,6 +176,100 @@ class VLLMControlClient:
             timeout_seconds=timeout_seconds,
             params=query,
         )
+
+    def collective_rpc(
+        self,
+        method: str,
+        args: Sequence[str],
+        *,
+        timeout_seconds: float,
+    ) -> list[Any]:
+        """Invoke one worker-extension method and return its per-worker results.
+
+        vLLM's ``/collective_rpc`` route accepts only a string ``method`` and a
+        list of *string* ``args`` -- it forwards them verbatim and leaves any
+        deserialization to the worker -- so this signature deliberately cannot
+        express anything richer.
+
+        Raises:
+            VLLMRequestNotDelivered: The call provably never dispatched.
+            VLLMRequestIndeterminate: The call may or may not have taken effect.
+            VLLMControlError: The response violated the route's contract.
+        """
+        if not method:
+            raise ValueError("collective RPC method must be non-empty")
+        payload = [str(argument) for argument in args]
+        if any(not argument for argument in payload):
+            raise ValueError("collective RPC arguments must be non-empty strings")
+        _validate_positive(timeout_seconds, "timeout")
+        self._require_open()
+        try:
+            response = self._client.post(
+                self._url(VLLM_COLLECTIVE_RPC_ENDPOINT),
+                json={"method": method, "args": payload},
+                timeout=timeout_seconds,
+            )
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.UnsupportedProtocol) as exc:
+            raise VLLMRequestNotDelivered(
+                f"vLLM collective RPC {method!r} was never delivered: {exc}"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise VLLMRequestIndeterminate(
+                f"vLLM collective RPC {method!r} left an unknown outcome: {exc}"
+            ) from exc
+        if response.status_code in _UNDISPATCHED_STATUSES:
+            raise VLLMRequestNotDelivered(
+                f"vLLM rejected collective RPC {method!r} before dispatch "
+                f"with HTTP {response.status_code}"
+            )
+        if not response.is_success:
+            raise VLLMRequestIndeterminate(
+                f"vLLM collective RPC {method!r} failed with HTTP "
+                f"{response.status_code}; its effect on the engine is unknown"
+            )
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise VLLMControlError(
+                f"vLLM returned invalid JSON from {VLLM_COLLECTIVE_RPC_ENDPOINT}"
+            ) from exc
+        results = body.get("results") if isinstance(body, dict) else None
+        if not isinstance(results, list):
+            raise VLLMControlError(
+                f"vLLM collective RPC {method!r} response has no results list"
+            )
+        return results
+
+    def canary(self, *, timeout_seconds: float) -> None:
+        """Require one bounded completion to succeed against the live engine.
+
+        ``wait_ready`` proves the child is up and awake; this proves the model
+        it is currently holding can still produce a token. They are separate
+        questions after a weight mutation.
+        """
+        _validate_positive(timeout_seconds, "timeout")
+        deadline = _Deadline(
+            timeout_seconds,
+            clock=self._clock,
+            operation="vLLM serving canary",
+        )
+        model = self._model or self._discover_model(deadline)
+        if model is None:
+            raise VLLMControlError("vLLM exposed no model for the serving canary")
+        self._model = model
+        response = self._request_accepted(
+            "POST",
+            VLLM_COMPLETIONS_ENDPOINT,
+            timeout_seconds=deadline.remaining(),
+            json={
+                "model": model,
+                "prompt": _CANARY_PROMPT,
+                "max_tokens": 1,
+                "temperature": 0.0,
+                "stream": False,
+            },
+        )
+        _validate_canary(response)
 
     def wait_sleeping(
         self,
@@ -284,6 +430,7 @@ class VLLMControlClient:
         *,
         timeout_seconds: float,
         params: Mapping[str, str] | None = None,
+        json: Mapping[str, Any] | None = None,
     ) -> httpx.Response:
         self._require_open()
         try:
@@ -291,6 +438,7 @@ class VLLMControlClient:
                 method,
                 self._url(endpoint),
                 params=params,
+                json=json,
                 timeout=timeout_seconds,
             )
             response.raise_for_status()
@@ -321,6 +469,119 @@ class VLLMControlClient:
     def _require_open(self) -> None:
         if self._closed:
             raise VLLMControlError("vLLM control client is closed")
+
+
+@dataclass(frozen=True, slots=True)
+class VLLMDraftSwapClient:
+    """Pause, hot-swap the drafter, and resume one live vLLM engine.
+
+    Deliberately built on top of an existing :class:`VLLMControlClient` rather
+    than opening its own transport: that reuses the loopback-only validation
+    and the connection pool the gateway already owns, and keeps the dev-route
+    allowlist in one place.
+    """
+
+    control: VLLMControlClient
+    #: ``"wait"`` drains in-flight requests without discarding resident weights.
+    #: ``/sleep`` would also quiesce, but at level 1 it offloads the weights the
+    #: swap is about to mutate.
+    pause_mode: str = VLLM_PAUSE_MODE
+    resume_timeout_seconds: float = DRAFT_SWAP_RESUME_TIMEOUT_SECONDS
+
+    def __post_init__(self) -> None:
+        if not self.pause_mode:
+            raise ValueError("pause mode must be non-empty")
+        _validate_positive(self.resume_timeout_seconds, "resume timeout")
+
+    def hot_swap_draft(self, weights_path: str, *, timeout_seconds: float) -> None:
+        """Swap the drafter to the *directory* ``weights_path`` in place.
+
+        The directory is passed through verbatim: resolving it to shards is
+        worker-side work, and the route can only carry strings anyway.
+        """
+        if not weights_path:
+            raise ValueError("draft directory must be non-empty")
+        _validate_positive(timeout_seconds, "timeout")
+        deadline = _Deadline(
+            timeout_seconds,
+            clock=self.control.clock,
+            operation="draft hot-swap",
+        )
+        try:
+            self.control.post(
+                VLLM_PAUSE_ENDPOINT,
+                timeout_seconds=deadline.remaining(),
+                query={"mode": self.pause_mode, "clear_cache": "false"},
+            )
+        except (VLLMControlError, ControlTimeout) as exc:
+            raise DraftSwapUnavailable(
+                f"vLLM did not pause for a draft hot-swap: {exc}"
+            ) from exc
+        resume_error: Exception | None = None
+        try:
+            try:
+                self._swap(weights_path, deadline)
+            finally:
+                resume_error = self._resume()
+        except Exception:
+            if resume_error is not None:
+                raise DraftSwapCorrupted(
+                    "vLLM was not resumed after a failed draft hot-swap and may "
+                    f"still be paused: {resume_error}"
+                ) from resume_error
+            raise
+        if resume_error is not None:
+            raise DraftSwapCorrupted(
+                "the drafter was swapped but vLLM was not resumed and may still "
+                f"be paused: {resume_error}"
+            ) from resume_error
+
+    def _swap(self, weights_path: str, deadline: _Deadline) -> None:
+        try:
+            # Read the remaining budget outside the classifying ``try``: running
+            # out of time before the call is dispatched leaves the engine
+            # untouched, which is the benign half of the split below.
+            remaining = deadline.remaining()
+        except ControlTimeout as exc:
+            raise DraftSwapUnavailable(
+                f"the draft hot-swap ran out of time before dispatch: {exc}"
+            ) from exc
+        try:
+            results = self.control.collective_rpc(
+                DRAFT_SWAP_RPC_METHOD,
+                (weights_path,),
+                timeout_seconds=remaining,
+            )
+        except VLLMRequestNotDelivered as exc:
+            raise DraftSwapUnavailable(
+                f"vLLM did not dispatch the draft hot-swap: {exc}"
+            ) from exc
+        except (VLLMControlError, ControlTimeout) as exc:
+            # Includes the flattened HTTP 500 a worker-side raise becomes, so
+            # a shape-mismatch rejection and a half-written parameter tensor
+            # land here together. Only the pessimistic reading is safe.
+            raise DraftSwapCorrupted(
+                f"the draft hot-swap may have half-applied: {exc}"
+            ) from exc
+        if not results or not all(_is_swapped(result) for result in results):
+            raise DraftSwapCorrupted(
+                "the draft hot-swap RPC did not confirm every worker swapped: "
+                f"{results!r}"
+            )
+
+    def _resume(self) -> Exception | None:
+        try:
+            self.control.post(
+                VLLM_RESUME_ENDPOINT,
+                timeout_seconds=self.resume_timeout_seconds,
+            )
+        except Exception as exc:  # noqa: BLE001 - reported, never swallowed
+            return exc
+        return None
+
+
+def _is_swapped(result: Any) -> bool:
+    return isinstance(result, Mapping) and result.get("swapped") is True
 
 
 def _parse_sleep_state(response: httpx.Response) -> bool:

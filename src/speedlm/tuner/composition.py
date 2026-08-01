@@ -10,6 +10,7 @@ from collections.abc import Callable, Sequence
 from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Final
 
 from speedlm.config import SpeedLMConfig
 from speedlm.gate.runner import BenchmarkGateRunner
@@ -24,7 +25,7 @@ from speedlm.gateway.control import (
 )
 from speedlm.gateway.process import LOOPBACK_HOST, build_vllm_argv
 from speedlm.gateway.supervisor import ThreadsafeProcessControl
-from speedlm.gateway.vllm_http import VLLMControlClient
+from speedlm.gateway.vllm_http import VLLMControlClient, VLLMDraftSwapClient
 from speedlm.profiles import (
     ModelProfile,
     canonical_verifier_reference,
@@ -47,6 +48,14 @@ logger = logging.getLogger(__name__)
 
 DraftReference = Path | str
 AbortCheck = Callable[[], bool]
+
+WORKER_EXTENSION_OPTION: Final = "--worker-extension-cls"
+#: vLLM resolves this with ``qualname.rsplit(".", 1)`` then ``getattr``, so the
+#: dotted ``pkg.mod.Class`` form is the only one that works -- ``pkg.mod:Class``
+#: would try to import ``pkg`` and look up an attribute named ``mod:Class``.
+DRAFT_SWAP_WORKER_EXTENSION_CLS: Final = (
+    "speedlm.gateway.draft_swap.CombinedWorkerExtension"
+)
 
 
 class ProductionTuningError(RuntimeError):
@@ -206,6 +215,20 @@ def build_tuning_launch_plan(
         raise ProductionTuningError(
             "--speculative-config is owned by idle tuning; configure the model profile"
         )
+    hot_swap_enabled = config.tuning.draft_hot_swap_enabled
+    if hot_swap_enabled and _has_option(passthrough, WORKER_EXTENSION_OPTION):
+        # vLLM takes exactly one worker extension class and mixes it into the
+        # worker's bases; a second one has nowhere to go. Refusing here means
+        # the operator learns at startup validation instead of watching every
+        # engine launch fail with an attribute-collision assert.
+        raise ProductionTuningError(
+            f"tuning.draft_hot_swap_enabled needs {WORKER_EXTENSION_OPTION} "
+            f"{DRAFT_SWAP_WORKER_EXTENSION_CLS}, but vLLM accepts exactly one "
+            f"worker extension class and {WORKER_EXTENSION_OPTION} was already "
+            "passed through; drop the passthrough option (its capabilities are "
+            "already in the combined class) or disable "
+            "tuning.draft_hot_swap_enabled"
+        )
     _validate_training_environment(config)
 
     layout = ensure_layout(home)
@@ -248,6 +271,11 @@ def build_tuning_launch_plan(
             [
                 *base_passthrough,
                 "--enable-sleep-mode",
+                *(
+                    (WORKER_EXTENSION_OPTION, DRAFT_SWAP_WORKER_EXTENSION_CLS)
+                    if hot_swap_enabled
+                    else ()
+                ),
                 "--speculative-config",
                 json.dumps(speculative, separators=(",", ":"), sort_keys=True),
             ],
@@ -337,6 +365,11 @@ def create_production_tuner(
         gpu_memory=GPUMemoryPrecondition(
             probe=NvidiaSmiMemoryProbe(),
             required_fraction=pipeline.gpu_memory_utilization,
+        ),
+        # Off by default: without the worker extension registered, the swap RPC
+        # has no handler, so wiring a client in would only manufacture failures.
+        draft_swap_http=(
+            VLLMDraftSwapClient(http) if tuning.draft_hot_swap_enabled else None
         ),
     )
     endpoint = _DraftEndpoint(
@@ -504,6 +537,8 @@ def _option_value(
 
 
 __all__ = [
+    "DRAFT_SWAP_WORKER_EXTENSION_CLS",
+    "WORKER_EXTENSION_OPTION",
     "ProductionTuningError",
     "TuningLaunchPlan",
     "build_tuning_launch_plan",

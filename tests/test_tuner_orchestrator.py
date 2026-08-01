@@ -12,6 +12,8 @@ from speedlm.config import PromotionConfig
 from speedlm.gate.decide import Decision, Reason, Verdict, decide_promotion
 from speedlm.gate.metrics import MetricsDelta
 from speedlm.gate.replay import ReplayResult, RequestResult, RunResults
+from speedlm.gateway.control import DraftSwapCorrupted
+from speedlm.gateway.control import RuntimeController as RealRuntimeController
 from speedlm.report import GainStatus, build_gain_report, load_decision
 from speedlm.training.base import BackendInfo, SpeculatorBackend
 from speedlm.training.masking import FinalAssistantMaskError
@@ -984,3 +986,363 @@ def test_gate_without_an_estimator_still_gets_the_configured_ceiling(
 def test_default_benchmark_ceiling_is_no_longer_the_fixed_1800s() -> None:
     assert OrchestratorTimeouts().benchmark == BENCHMARK_MAX_SECONDS
     assert OrchestratorTimeouts().benchmark > 1_800.0
+
+
+# ---------------------------------------------------------------------------
+# Draft hot-swap sequencing
+#
+# The cycle sleeps vLLM at level 1 before training to release device memory,
+# and a level-1 sleep offloads the drafter's weights.  Weights that are not
+# resident cannot be overwritten, so ``start_candidate`` used to arrive at a
+# sleeping engine every single time and the swap was unreachable in production
+# no matter how it was implemented.  These tests pin the wake that fixes that,
+# and pin equally hard that it changes nothing when the feature is off.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class HotSwapRuntime(FakeRuntime):
+    """A runtime that advertises the optional hot-swap capability."""
+
+    #: Mirrors ``config.tuning.draft_hot_swap_enabled`` reaching the controller.
+    supports_draft_hot_swap: bool = True
+    #: Raised by :meth:`wake_for_swap`, to exercise the fallback.
+    wake_error: Exception | None = None
+
+    def wake_for_swap(self, *, timeout_seconds: float) -> None:
+        self.calls.append(f"wake_for_swap:{timeout_seconds:g}")
+        if self.wake_error is not None:
+            raise self.wake_error
+
+
+def test_flag_off_sequencing_is_byte_identical_to_today(tmp_path: Path) -> None:
+    activity = FakeActivity()
+    runtime = HotSwapRuntime(activity, supports_draft_hot_swap=False)
+    orchestrator, _, _, _ = _orchestrator(tmp_path, activity=activity, runtime=runtime)
+
+    result = orchestrator.run_once()
+
+    assert result.outcome is CycleOutcome.PROMOTED
+    # Exactly the order asserted by test_happy_path_reaches_promoting_then_ready.
+    assert runtime.calls == ["quiesce", "sleep", "start_candidate", "wake"]
+
+
+def test_a_runtime_without_the_capability_is_never_asked_to_wake(
+    tmp_path: Path,
+) -> None:
+    # The plain FakeRuntime has no ``wake_for_swap`` at all: the orchestrator
+    # must treat that as an ordinary runtime, not as a failure.
+    orchestrator, _, _, runtime = _orchestrator(tmp_path)
+
+    result = orchestrator.run_once()
+
+    assert result.outcome is CycleOutcome.PROMOTED
+    assert runtime.calls == ["quiesce", "sleep", "start_candidate", "wake"]
+
+
+def test_flag_on_wakes_for_the_swap_immediately_before_start_candidate(
+    tmp_path: Path,
+) -> None:
+    activity = FakeActivity()
+    runtime = HotSwapRuntime(activity)
+    orchestrator, state, _, _ = _orchestrator(
+        tmp_path,
+        activity=activity,
+        runtime=runtime,
+        timeouts=OrchestratorTimeouts(wake=31.0),
+    )
+
+    result = orchestrator.run_once()
+
+    assert result.outcome is CycleOutcome.PROMOTED
+    assert state.state is TunerState.READY
+    assert runtime.calls == [
+        "quiesce",
+        "sleep",
+        "wake_for_swap:31",
+        "start_candidate",
+        "wake",
+    ]
+
+
+def test_a_failed_wake_falls_back_to_the_full_restart_and_still_completes(
+    tmp_path: Path,
+) -> None:
+    activity = FakeActivity()
+    runtime = HotSwapRuntime(activity, wake_error=RuntimeError("wake_up refused"))
+    orchestrator, state, artifacts, _ = _orchestrator(
+        tmp_path,
+        activity=activity,
+        runtime=runtime,
+    )
+
+    result = orchestrator.run_once()
+
+    # start_candidate still runs, and it restarts because the engine is still
+    # asleep -- which is exactly the sequencing used before the wake existed.
+    assert result.outcome is CycleOutcome.PROMOTED
+    assert result.error is None
+    assert state.state is TunerState.READY
+    assert artifacts.active() is not None
+    assert runtime.calls == [
+        "quiesce",
+        "sleep",
+        "wake_for_swap:30",
+        "start_candidate",
+        "wake",
+    ]
+
+
+@dataclass
+class OrderedRuntime(HotSwapRuntime):
+    """Records its effects into a timeline shared with the backend."""
+
+    timeline: list[str] = field(default_factory=list)
+
+    def quiesce(
+        self, *, timeout_seconds: float, should_abort: Callable[[], bool]
+    ) -> None:
+        self.timeline.append("quiesce")
+        super().quiesce(timeout_seconds=timeout_seconds, should_abort=should_abort)
+
+    def sleep(
+        self, *, timeout_seconds: float, should_abort: Callable[[], bool]
+    ) -> None:
+        # Standing in for the controller's ``_await_gpu_memory``: sleep only
+        # returns once the device memory the trainer needs is actually free.
+        self.timeline.append("sleep")
+        self.timeline.append("gpu-memory-released")
+        super().sleep(timeout_seconds=timeout_seconds, should_abort=should_abort)
+
+    def wake_for_swap(self, *, timeout_seconds: float) -> None:
+        self.timeline.append("wake_for_swap")
+        super().wake_for_swap(timeout_seconds=timeout_seconds)
+
+    def start_candidate(
+        self,
+        draft_directory: Path,
+        *,
+        timeout_seconds: float,
+        should_abort: Callable[[], bool],
+    ) -> None:
+        self.timeline.append("start_candidate")
+        super().start_candidate(
+            draft_directory,
+            timeout_seconds=timeout_seconds,
+            should_abort=should_abort,
+        )
+
+
+@dataclass
+class OrderedBackend(FakeBackend):
+    """A backend that appends every GPU-consuming step to a shared timeline."""
+
+    timeline: list[str] = field(default_factory=list)
+
+    def prepare(
+        self, work_dir: Path, *, should_abort: Callable[[], bool]
+    ) -> PreparedData:
+        self.timeline.append("prepare")
+        return super().prepare(work_dir, should_abort=should_abort)
+
+    def extract(
+        self,
+        prepared: PreparedData,
+        work_dir: Path,
+        *,
+        should_abort: Callable[[], bool],
+    ) -> Path:
+        self.timeline.append("extract")
+        return super().extract(prepared, work_dir, should_abort=should_abort)
+
+    def train(
+        self,
+        extracted: Path,
+        work_dir: Path,
+        *,
+        should_abort: Callable[[], bool],
+    ) -> TrainingResult:
+        self.timeline.append("train")
+        return super().train(extracted, work_dir, should_abort=should_abort)
+
+    def validate(
+        self, draft_directory: Path, *, should_abort: Callable[[], bool]
+    ) -> None:
+        self.timeline.append("validate")
+        super().validate(draft_directory, should_abort=should_abort)
+
+
+@pytest.mark.parametrize("hot_swap", [False, True])
+def test_the_memory_release_still_precedes_every_training_step(
+    tmp_path: Path, hot_swap: bool
+) -> None:
+    """The wake must never move in front of the work the sleep exists for."""
+    timeline: list[str] = []
+    activity = FakeActivity()
+    runtime = OrderedRuntime(
+        activity,
+        supports_draft_hot_swap=hot_swap,
+        timeline=timeline,
+    )
+    backend = OrderedBackend(timeline=timeline)
+    orchestrator, _, _, _ = _orchestrator(
+        tmp_path,
+        activity=activity,
+        runtime=runtime,
+        backend=backend,
+    )
+
+    result = orchestrator.run_once()
+
+    assert result.outcome is CycleOutcome.PROMOTED
+    expected = [
+        "quiesce",
+        "sleep",
+        "gpu-memory-released",
+        "prepare",
+        "extract",
+        "train",
+        "validate",
+        *(["wake_for_swap"] if hot_swap else []),
+        "start_candidate",
+    ]
+    assert timeline == expected
+    # The invariant stated positively: nothing re-acquires device memory until
+    # the last training step has finished.
+    assert timeline.index("gpu-memory-released") < timeline.index("prepare")
+    if hot_swap:
+        assert timeline.index("validate") < timeline.index("wake_for_swap")
+
+
+# --- the real controller, to prove the path is actually reachable ----------
+
+
+@dataclass
+class RecordingAdmission:
+    calls: list[str] = field(default_factory=list)
+
+    def stop_admitting(self) -> None:
+        self.calls.append("stop")
+
+    def start_admitting(self) -> None:
+        self.calls.append("start")
+
+
+@dataclass
+class RecordingControlHTTP:
+    posts: list[str] = field(default_factory=list)
+
+    def post(
+        self,
+        endpoint: str,
+        *,
+        timeout_seconds: float,
+        query: Mapping[str, str] | None = None,
+    ) -> None:
+        self.posts.append(endpoint)
+
+    def wait_ready(self, *, timeout_seconds: float) -> None:
+        return None
+
+    def canary(self, *, timeout_seconds: float) -> None:
+        return None
+
+    def wait_sleeping(
+        self,
+        sleeping: bool,
+        *,
+        timeout_seconds: float,
+        should_abort: Callable[[], bool],
+    ) -> None:
+        return None
+
+
+@dataclass
+class RecordingProcess:
+    restarts: list[str] = field(default_factory=list)
+
+    def restart(self, draft: Path | str, *, timeout_seconds: float) -> None:
+        self.restarts.append(str(draft))
+
+
+@dataclass
+class RecordingDraftSwap:
+    swaps: list[str] = field(default_factory=list)
+    error: Exception | None = None
+
+    def hot_swap_draft(self, weights_path: str, *, timeout_seconds: float) -> None:
+        self.swaps.append(weights_path)
+        if self.error is not None:
+            raise self.error
+
+
+def _real_runtime(
+    *,
+    swap: RecordingDraftSwap | None,
+) -> tuple[RealRuntimeController, RecordingProcess, RecordingControlHTTP]:
+    http = RecordingControlHTTP()
+    process = RecordingProcess()
+    controller = RealRuntimeController(
+        activity=FakeActivity(),
+        admission=RecordingAdmission(),
+        http=http,
+        process=process,
+        active_draft="base-draft",
+        clock=lambda: 0.0,
+        sleeper=lambda seconds: None,
+        draft_swap_http=swap,
+    )
+    return controller, process, http
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_the_real_controller_reaches_the_swap_only_when_enabled(
+    tmp_path: Path, enabled: bool
+) -> None:
+    """End-to-end: an orchestrator cycle driving the production controller.
+
+    This is the test the blocker was invisible to before -- with the flag on,
+    the drafter is swapped and the child is never replaced; with it off, the
+    cycle restarts exactly as it always did.
+    """
+    swap = RecordingDraftSwap() if enabled else None
+    controller, process, http = _real_runtime(swap=swap)
+    orchestrator, state, artifacts, _ = _orchestrator(tmp_path, runtime=controller)
+
+    result = orchestrator.run_once()
+
+    assert result.outcome is CycleOutcome.PROMOTED
+    assert state.state is TunerState.READY
+    active = artifacts.active()
+    assert active is not None
+    if enabled:
+        assert swap is not None
+        assert swap.swaps == [str(active.path)]
+        # The whole point: no child process was replaced for the candidate.
+        assert process.restarts == []
+        # Sleep for training, then one mid-cycle wake, then the end-of-cycle
+        # wake finds the engine already awake and only reopens admission.
+        assert http.posts == ["/sleep", "/wake_up"]
+    else:
+        assert process.restarts == [str(active.path)]
+        # The restart is what ends the sleep, so the end-of-cycle wake has no
+        # engine left to wake -- unchanged from before this feature existed.
+        assert http.posts == ["/sleep"]
+
+
+def test_a_swap_failure_under_the_real_controller_restarts_the_child(
+    tmp_path: Path,
+) -> None:
+    swap = RecordingDraftSwap(error=DraftSwapCorrupted("half-applied"))
+    controller, process, _ = _real_runtime(swap=swap)
+    orchestrator, state, artifacts, _ = _orchestrator(tmp_path, runtime=controller)
+
+    result = orchestrator.run_once()
+
+    assert result.outcome is CycleOutcome.PROMOTED
+    assert state.state is TunerState.READY
+    active = artifacts.active()
+    assert active is not None
+    assert swap.swaps == [str(active.path)]
+    # A swap that may have half-applied must still leave a serving engine.
+    assert process.restarts == [str(active.path)]

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import gzip
+import logging
 import re
 import uuid
 from collections.abc import Callable, Mapping
@@ -19,6 +20,8 @@ from speedlm.training.masking import FinalAssistantMaskError
 from speedlm.tuner.artifacts import ArtifactRegistry, ArtifactSpec
 from speedlm.tuner.idle import IdleDetector, TuningPreempted
 from speedlm.tuner.state import TunerState, TunerStateMachine
+
+logger = logging.getLogger(__name__)
 
 AbortCheck = Callable[[], bool]
 DraftReference = Path | str
@@ -190,6 +193,21 @@ class RuntimeController(Protocol):
 
     Implementations must make all methods idempotent. ``restore`` must restart
     the child vLLM with the supplied active draft (or the configured base draft).
+
+    Two *optional* members extend this contract without being part of it, so
+    that an implementation which predates draft hot-swap -- or a test double --
+    stays a valid ``RuntimeController``. They are read defensively, in the same
+    spirit as ``estimated_benchmark_seconds`` on :class:`BenchmarkGate`:
+
+    ``supports_draft_hot_swap``
+        A read-only ``bool`` saying whether an in-place draft swap is wired up
+        at all. Absent or false means the orchestrator sequences exactly as it
+        always did.
+    ``wake_for_swap(*, timeout_seconds)``
+        Wake the sleeping engine *without* reopening gateway admission, so
+        that the following :meth:`start_candidate` can swap the drafter's
+        weights in place instead of restarting the child. Raising is a normal
+        outcome; the orchestrator falls back to the restart path.
     """
 
     def quiesce(
@@ -533,6 +551,7 @@ class TunerOrchestrator:
                 TunerState.CANDIDATE_STARTING,
                 reason=f"candidate {artifact_id} materialized",
             )
+            self._prepare_draft_hot_swap()
             self._runtime.start_candidate(
                 artifact.path,
                 timeout_seconds=self._timeouts.candidate_start,
@@ -620,6 +639,50 @@ class TunerOrchestrator:
                 outcome=CycleOutcome.FAILED,
                 artifact_id=artifact_id,
                 error=_combine_error(exc, cleanup_errors),
+            )
+
+    def _prepare_draft_hot_swap(self) -> None:
+        """Wake the engine here, and only here, so a hot-swap is reachable.
+
+        The cycle sleeps vLLM at level 1 *before* training, and that sleep is
+        load-bearing: it is what releases the device memory the training engine
+        then sizes itself from (``RuntimeController._await_gpu_memory``). But a
+        level-1 sleep offloads the drafter's weights, and weights that are not
+        resident cannot be overwritten -- so on arrival at
+        ``start_candidate`` the engine was always asleep and the swap was
+        unreachable no matter how it was implemented.
+
+        The fix is a wake placed at exactly the point a full restart would
+        otherwise have happened. That is what keeps the memory guarantee
+        intact: every training step has already finished by the time this runs,
+        and re-mapping the sleeping engine's own allocations costs no more
+        device memory than launching a replacement child would have. Nothing
+        about the sleep-before-training ordering moves.
+
+        Waking restores the weights resident at sleep time -- the stock active
+        draft -- so the candidate is applied *on top of* a woken engine rather
+        than replacing a configured one.
+
+        Every failure mode lands on the pre-existing full-restart path:
+        the runtime cannot swap (no endpoint, method absent), it can but the
+        wake failed, or the swap itself failed. In all three the engine stays
+        asleep or gets restarted by ``start_candidate``, which is what it did
+        before this method existed. It therefore never raises.
+        """
+        if not getattr(self._runtime, "supports_draft_hot_swap", False):
+            return
+        wake_for_swap = getattr(self._runtime, "wake_for_swap", None)
+        if not callable(wake_for_swap):
+            return
+        try:
+            wake_for_swap(timeout_seconds=self._timeouts.wake)
+        except Exception:
+            # Not a cycle failure: start_candidate restarts the child, which is
+            # exactly the sequencing this cycle would have used anyway.
+            logger.warning(
+                "could not wake vLLM for an in-place draft hot-swap; the "
+                "candidate will be started by a full restart instead",
+                exc_info=True,
             )
 
     def _benchmark_timeout(self) -> float:

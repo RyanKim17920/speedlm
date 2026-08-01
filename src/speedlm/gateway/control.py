@@ -78,6 +78,9 @@ class VLLMControlHTTP(Protocol):
     def wait_ready(self, *, timeout_seconds: float) -> None:
         """Return only after the child is ready to serve requests."""
 
+    def canary(self, *, timeout_seconds: float) -> None:
+        """Run one bounded completion, raising unless the child answers it."""
+
     def wait_sleeping(
         self,
         sleeping: bool,
@@ -106,7 +109,13 @@ class DraftSwapHTTP(Protocol):
     The implementation pauses generation, sends a collective-RPC to the
     drafter worker to swap weights in place via the layerwise reload helpers,
     and resumes generation.  Requires ``VLLM_SERVER_DEV_MODE=1`` so that the
-    ``/pause`` and ``/resume`` endpoints are available.
+    ``/pause``, ``/resume`` and ``/collective_rpc`` endpoints are available.
+
+    Failure is reported through two deliberately distinct exception types so
+    that the caller can tell a swap that provably never touched the engine
+    from one that may have left it half-mutated.  Anything a caller cannot
+    prove was rejected before dispatch must be reported as
+    :class:`DraftSwapCorrupted`.
     """
 
     def hot_swap_draft(
@@ -117,15 +126,52 @@ class DraftSwapHTTP(Protocol):
     ) -> None:
         """Swap the drafter's weights from *weights_path* in place.
 
-        Raises on shape mismatch, RPC failure, or timeout.
+        Args:
+            weights_path: The candidate draft *directory*.  Resolving it to
+                individual shards is the worker extension's job, so this
+                transport passes the directory through verbatim.
+            timeout_seconds: Budget for the pause and the swap RPC.  Resuming
+                gets its own independent budget: a swap that runs out of time
+                must still never leave the engine paused.
+
+        Raises:
+            DraftSwapUnavailable: The swap provably did not run.
+            DraftSwapCorrupted: The swap may have run, and the engine must be
+                treated as serving-broken until it has been restarted.
         """
 
 
-# vLLM dev-mode endpoints for pause/resume (VLLM_SERVER_DEV_MODE=1).
-# Mounted under the same origin as the health/completions endpoints.
+class DraftSwapUnavailable(RuntimeError):
+    """Raised when a hot-swap was rejected before any weight was touched.
+
+    This is an ordinary negative result: the engine is exactly as it was, so
+    the caller may quietly fall back to a full restart.
+    """
+
+
+class DraftSwapCorrupted(RuntimeError):
+    """Raised when a hot-swap may have left the engine unable to serve.
+
+    Covers a failure inside the weight application, an indeterminate RPC
+    outcome, a failed resume, and a post-swap verification that did not pass.
+    The engine must be restarted before it admits traffic again.
+    """
+
+
+# vLLM dev-mode endpoints, all gated behind ``VLLM_SERVER_DEV_MODE=1`` and
+# mounted under the same origin as the health/completions endpoints.
+# ``/pause`` and ``/resume`` come from vLLM's RLHF dev router; ``mode=wait``
+# drains in-flight requests without discarding the resident weights, which
+# ``/sleep`` at level 1 would.
 VLLM_PAUSE_ENDPOINT: Final = "/pause"
 VLLM_RESUME_ENDPOINT: Final = "/resume"
-VLLM_RPC_ENDPOINT: Final = "/rpc"
+VLLM_COLLECTIVE_RPC_ENDPOINT: Final = "/collective_rpc"
+VLLM_PAUSE_MODE: Final = "wait"
+#: Worker-side RPC implemented by ``speedlm.gateway.draft_swap``.
+DRAFT_SWAP_RPC_METHOD: Final = "hot_swap_draft"
+#: Resuming is a safety obligation, so it is budgeted independently of the
+#: swap deadline it may be cleaning up after.
+DRAFT_SWAP_RESUME_TIMEOUT_SECONDS: Final = 30.0
 
 
 class ControlAborted(RuntimeError):
@@ -550,8 +596,9 @@ class RuntimeController:
 
         If a ``draft_swap_http`` endpoint is configured and the engine is not
         sleeping, attempts an in-place hot-swap of the draft weights before
-        falling back to a full restart.  Any hot-swap failure is logged and
-        falls through to the restart path.
+        falling back to a full restart.  Any hot-swap failure leaves
+        ``_running_draft`` unchanged, so the restart below runs unconditionally;
+        a failure that may have broken the engine also closes admission first.
         """
         deadline = self._deadline(timeout_seconds, "candidate start")
         try:
@@ -580,6 +627,61 @@ class RuntimeController:
         except Exception as error:
             self._recover_or_raise("candidate start", error)
             raise
+
+    @property
+    def supports_draft_hot_swap(self) -> bool:
+        """Whether an in-place draft swap is wired up at all.
+
+        True exactly when ``tuning.draft_hot_swap_enabled`` is set, because
+        that flag is the only thing that supplies ``draft_swap_http``. Exposed
+        so a caller can decide whether the mid-cycle wake below is worth doing
+        without having to know about the config object.
+        """
+        return self._draft_swap_http is not None
+
+    def wake_for_swap(self, *, timeout_seconds: float) -> None:
+        """Wake vLLM mid-cycle, deliberately leaving admission closed.
+
+        :meth:`start_candidate` can only hot-swap an engine whose drafter
+        weights are resident, and level-1 sleep offloads exactly those weights.
+        So a cycle that slept to free device memory for training has to wake
+        before the swap is even expressible -- and it must wake *without*
+        reopening the gateway, which is the one thing :meth:`wake` also does.
+        Reopening here would let real traffic both preempt the idle cycle and
+        interleave with the benchmark that follows, so the two wakes cannot be
+        the same call.
+
+        The wake restores the weights that were resident at sleep time, i.e.
+        the stock active draft; the candidate is applied on top of it.
+
+        Failure is deliberately *not* recovered: leaving the controller's
+        sleeping bookkeeping untouched is what makes :meth:`start_candidate`
+        fall back to a full restart, which restores serving anyway. Recovering
+        here would restart the child twice for one failure.
+
+        Raises:
+            DraftSwapUnavailable: No swap endpoint is configured, so there is
+                nothing this wake could enable.
+        """
+        if self._draft_swap_http is None:
+            raise DraftSwapUnavailable(
+                "no draft hot-swap endpoint is configured for this controller"
+            )
+        deadline = self._deadline(timeout_seconds, "wake for swap")
+        if self._sleeping:
+            self._http.post(
+                VLLM_WAKE_ENDPOINT,
+                timeout_seconds=deadline.remaining(),
+            )
+            self._http.wait_sleeping(
+                False,
+                timeout_seconds=deadline.remaining(),
+                should_abort=lambda: False,
+            )
+            deadline.check()
+            self._sleeping = False
+        self._http.wait_ready(timeout_seconds=deadline.remaining())
+        deadline.check()
 
     def restore(
         self,
@@ -680,8 +782,20 @@ class RuntimeController:
     ) -> None:
         """Attempt an in-place draft weight hot-swap.
 
-        On any failure (shape mismatch, RPC error, missing endpoint) falls
-        through silently so the caller retries with a full restart.
+        Success is only recorded once the mutated engine has proved it can
+        still serve: ``wait_ready`` plus one bounded canary completion. An RPC
+        that reports success but produces a broken drafter is therefore a
+        failure here, not a silent regression the gate has to discover later.
+
+        Both failure modes leave ``_running_draft`` unchanged, which is what
+        makes :meth:`start_candidate` restart on the very next statement. They
+        differ in blast radius, so they differ in how loudly they report:
+
+        * A swap that provably never ran leaves the engine exactly as it was.
+          The restart is ordinary rollback, so a warning is enough.
+        * Anything else may have half-applied weights or failed verification.
+          The engine is serving-broken until the restart lands, so admission is
+          closed first and the failure is logged at error level.
         """
         swap_http = self._draft_swap_http
         if swap_http is None or self._sleeping:
@@ -693,15 +807,46 @@ class RuntimeController:
                 timeout_seconds=deadline.remaining(),
             )
             deadline.check()
-            self._running_draft = draft_directory
-            self._sleeping = False
-            logger.info("hot-swap succeeded for draft %s", draft_directory)
-        except Exception as exc:
+        except DraftSwapUnavailable as exc:
             logger.warning(
-                "hot-swap failed (%s); falling back to full restart: %s",
+                "draft hot-swap did not run for %s (%s: %s); the engine is "
+                "untouched and a full restart will follow",
+                draft_directory,
                 type(exc).__name__,
                 exc,
             )
+            return
+        except Exception as exc:
+            self._fail_hot_swap(draft_directory, exc, "weight application")
+            return
+        try:
+            self._http.wait_ready(timeout_seconds=deadline.remaining())
+            deadline.check()
+            self._http.canary(timeout_seconds=deadline.remaining())
+            deadline.check()
+        except Exception as exc:
+            self._fail_hot_swap(draft_directory, exc, "post-swap verification")
+            return
+        self._running_draft = draft_directory
+        self._sleeping = False
+        logger.info("hot-swap succeeded for draft %s", draft_directory)
+
+    def _fail_hot_swap(
+        self,
+        draft_directory: DraftReference,
+        error: Exception,
+        phase: str,
+    ) -> None:
+        """Close the gate after a swap that may have broken the live engine."""
+        self._stop_admitting()
+        logger.error(
+            "draft hot-swap failed during %s for %s (%s: %s); the engine may be "
+            "unable to serve, so admission is closed and a full restart is forced",
+            phase,
+            draft_directory,
+            type(error).__name__,
+            error,
+        )
 
     def _recover_or_raise(self, operation: str, error: Exception) -> None:
         try:

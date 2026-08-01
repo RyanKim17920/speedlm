@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import builtins
+import importlib
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -14,10 +15,13 @@ import pytest
 
 import speedlm.tuner.composition as composition
 from speedlm.config import IdleTuningConfig, SpeedLMConfig
+from speedlm.gateway.vllm_http import VLLMDraftSwapClient
 from speedlm.profiles import ModelProfile
 from speedlm.storage import ensure_layout
 from speedlm.tuner.artifacts import ArtifactRegistry, ArtifactSpec
 from speedlm.tuner.composition import (
+    DRAFT_SWAP_WORKER_EXTENSION_CLS,
+    WORKER_EXTENSION_OPTION,
     ProductionTuningError,
     build_tuning_launch_plan,
     create_production_tuner,
@@ -618,3 +622,194 @@ def test_a_local_verifier_path_is_its_own_pin(tmp_path: Path) -> None:
         )
         is None
     )
+
+
+# --- draft hot-swap wiring ------------------------------------------------
+
+
+def _hot_swap_config(tmp_path: Path, profile: ModelProfile) -> SpeedLMConfig:
+    config = _config(tmp_path, profile)
+    return replace(
+        config,
+        tuning=replace(config.tuning, draft_hot_swap_enabled=True),
+    )
+
+
+def test_the_hot_swap_flag_defaults_off_and_registers_no_worker_extension(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    config = _config(tmp_path, profile)
+    monkeypatch.setattr(composition, "resolve_profile", lambda *_args, **_kwargs: profile)
+
+    assert config.tuning.draft_hot_swap_enabled is False
+
+    plan = build_tuning_launch_plan(
+        config,
+        passthrough=(),
+        child_port=8_765,
+        home=tmp_path / "home",
+    )
+
+    assert WORKER_EXTENSION_OPTION not in plan.argv_factory("acme/candidate")
+
+
+def test_the_hot_swap_flag_registers_the_combined_extension_by_dotted_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    config = _hot_swap_config(tmp_path, profile)
+    monkeypatch.setattr(composition, "resolve_profile", lambda *_args, **_kwargs: profile)
+
+    plan = build_tuning_launch_plan(
+        config,
+        passthrough=(),
+        child_port=8_765,
+        home=tmp_path / "home",
+    )
+    argv = plan.argv_factory("acme/candidate")
+
+    index = argv.index(WORKER_EXTENSION_OPTION)
+    assert argv[index + 1] == DRAFT_SWAP_WORKER_EXTENSION_CLS
+    # vLLM resolves the class with rsplit(".", 1); a colon form silently fails.
+    assert ":" not in DRAFT_SWAP_WORKER_EXTENSION_CLS
+    assert argv.count(WORKER_EXTENSION_OPTION) == 1
+
+
+def test_the_combined_extension_dotted_path_actually_imports() -> None:
+    module_name, _, class_name = DRAFT_SWAP_WORKER_EXTENSION_CLS.rpartition(".")
+    module = importlib.import_module(module_name)
+
+    assert getattr(module, class_name).__name__ == class_name
+
+
+@pytest.mark.parametrize(
+    "passthrough",
+    [
+        (WORKER_EXTENSION_OPTION, "speedlm.activation_capture.hook.X"),
+        (f"{WORKER_EXTENSION_OPTION}=speedlm.activation_capture.hook.X",),
+    ],
+)
+def test_two_worker_extension_classes_are_refused_before_any_engine_starts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    passthrough: tuple[str, ...],
+) -> None:
+    profile = _profile()
+    config = _hot_swap_config(tmp_path, profile)
+    monkeypatch.setattr(composition, "resolve_profile", lambda *_args, **_kwargs: profile)
+
+    # vLLM accepts exactly one; discovering that at engine start would cost a
+    # full launch per candidate and surface as an attribute-collision assert.
+    with pytest.raises(ProductionTuningError, match="exactly one"):
+        build_tuning_launch_plan(
+            config,
+            passthrough=passthrough,
+            child_port=8_765,
+            home=tmp_path / "home",
+        )
+
+
+def test_a_passthrough_worker_extension_is_allowed_while_hot_swap_is_off(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    config = _config(tmp_path, profile)
+    monkeypatch.setattr(composition, "resolve_profile", lambda *_args, **_kwargs: profile)
+
+    plan = build_tuning_launch_plan(
+        config,
+        passthrough=(WORKER_EXTENSION_OPTION, "speedlm.activation_capture.hook.X"),
+        child_port=8_765,
+        home=tmp_path / "home",
+    )
+    argv = plan.argv_factory("acme/candidate")
+
+    assert argv.count(WORKER_EXTENSION_OPTION) == 1
+    assert DRAFT_SWAP_WORKER_EXTENSION_CLS not in argv
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_the_swap_client_is_wired_only_when_the_flag_is_on(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    enabled: bool,
+) -> None:
+    profile = _profile()
+    config = _config(tmp_path, profile)
+    if enabled:
+        config = replace(
+            config,
+            tuning=replace(config.tuning, draft_hot_swap_enabled=True),
+        )
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        composition,
+        "ensure_layout",
+        lambda _home: SimpleNamespace(runs_dir=tmp_path / "runs"),
+    )
+    monkeypatch.setattr(composition, "TunerStateMachine", lambda _path: object())
+    monkeypatch.setattr(composition, "ArtifactRegistry", lambda _path: object())
+    monkeypatch.setattr(
+        composition,
+        "HeldOutTraceSnapshotLeaser",
+        lambda _traces, **_kwargs: SimpleNamespace(
+            suite_dir=tmp_path / "held-out",
+            training_context_hashes=frozenset(),
+        ),
+    )
+    monkeypatch.setattr(
+        composition,
+        "SpeculatorsPipelineConfig",
+        lambda **_kwargs: SimpleNamespace(gpu_memory_utilization=0.80),
+    )
+    monkeypatch.setattr(
+        composition,
+        "Eagle3Backend",
+        SimpleNamespace(from_speculators=lambda _pipeline, **_kwargs: object()),
+    )
+
+    def build_runtime(**kwargs: object) -> object:
+        captured["runtime"] = kwargs
+        return object()
+
+    monkeypatch.setattr(composition, "RuntimeController", build_runtime)
+    monkeypatch.setattr(composition, "BenchmarkGateRunner", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        composition,
+        "create_tuner_service",
+        lambda _config, **_kwargs: object(),
+    )
+
+    http = object()
+    loop = asyncio.new_event_loop()
+    try:
+        create_production_tuner(
+            config,
+            profile=profile,
+            active_draft="acme/active-draft",
+            activity=object(),  # type: ignore[arg-type]
+            admission=object(),  # type: ignore[arg-type]
+            traces=object(),  # type: ignore[arg-type]
+            capture=object(),  # type: ignore[arg-type]
+            process=object(),  # type: ignore[arg-type]
+            http=http,  # type: ignore[arg-type]
+            child_url="http://127.0.0.1:8765",
+            loop=loop,
+            home=tmp_path / "home",
+        )
+    finally:
+        loop.close()
+
+    swap = captured["runtime"]["draft_swap_http"]
+    if not enabled:
+        # Wiring a client without the worker extension registered would only
+        # manufacture failures against an engine that has no RPC handler.
+        assert swap is None
+    else:
+        assert isinstance(swap, VLLMDraftSwapClient)
+        assert swap.control is http

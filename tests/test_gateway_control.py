@@ -17,6 +17,8 @@ from speedlm.gateway.control import (
     ControlAborted,
     ControlTimeout,
     DeviceMemory,
+    DraftSwapCorrupted,
+    DraftSwapUnavailable,
     GPUMemoryNotReleased,
     GPUMemoryPrecondition,
     GPUMemoryProbeError,
@@ -67,8 +69,10 @@ class FakeHTTP:
     clock: FakeClock
     post_calls: list[HTTPCall] = field(default_factory=list)
     ready_timeouts: list[float] = field(default_factory=list)
+    canary_timeouts: list[float] = field(default_factory=list)
     fail_post: set[str] = field(default_factory=set)
     fail_ready_count: int = 0
+    fail_canary_count: int = 0
     advance_post: float = 0.0
     advance_ready: float = 0.0
     sleeping_waits: list[tuple[bool, float]] = field(default_factory=list)
@@ -94,6 +98,12 @@ class FakeHTTP:
         if self.fail_ready_count:
             self.fail_ready_count -= 1
             raise RuntimeError("readiness failed")
+
+    def canary(self, *, timeout_seconds: float) -> None:
+        self.canary_timeouts.append(timeout_seconds)
+        if self.fail_canary_count:
+            self.fail_canary_count -= 1
+            raise RuntimeError("canary failed")
 
     def wait_sleeping(
         self,
@@ -141,6 +151,19 @@ class FakeProcess:
 
 
 @dataclass
+class FakeDraftSwap:
+    """A ``DraftSwapHTTP`` whose outcome each test chooses explicitly."""
+
+    calls: list[tuple[str, float]] = field(default_factory=list)
+    error: Exception | None = None
+
+    def hot_swap_draft(self, weights_path: str, *, timeout_seconds: float) -> None:
+        self.calls.append((weights_path, timeout_seconds))
+        if self.error is not None:
+            raise self.error
+
+
+@dataclass
 class Rig:
     controller: RuntimeController
     activity: ActivityTracker
@@ -148,12 +171,14 @@ class Rig:
     http: FakeHTTP
     process: FakeProcess
     clock: FakeClock
+    draft_swap: FakeDraftSwap | None = None
 
 
 def make_rig(
     *,
     active_draft: Path | str = "base-draft",
     gpu_memory: GPUMemoryPrecondition | None = None,
+    draft_swap: FakeDraftSwap | None = None,
 ) -> Rig:
     clock = FakeClock()
     activity = ActivityTracker(clock=clock)
@@ -171,8 +196,9 @@ def make_rig(
         poll_interval_seconds=0.1,
         recovery_timeout_seconds=5.0,
         gpu_memory=gpu_memory,
+        draft_swap_http=draft_swap,
     )
-    return Rig(controller, activity, admission, http, process, clock)
+    return Rig(controller, activity, admission, http, process, clock, draft_swap)
 
 
 def quiesce(rig: Rig) -> None:
@@ -784,3 +810,102 @@ def test_nvidia_smi_probe_reports_unusable_readings_as_probe_errors(
 
     with pytest.raises(GPUMemoryProbeError, match=match):
         NvidiaSmiMemoryProbe(environ={}).read()
+
+
+# --- draft hot-swap -------------------------------------------------------
+
+
+CANDIDATE_DRAFT = Path("/candidate/draft")
+
+
+def start_candidate(rig: Rig, draft: Path = CANDIDATE_DRAFT) -> None:
+    rig.controller.start_candidate(
+        draft,
+        timeout_seconds=10.0,
+        should_abort=lambda: False,
+    )
+
+
+def test_a_verified_hot_swap_replaces_the_restart() -> None:
+    rig = make_rig(draft_swap=FakeDraftSwap())
+
+    start_candidate(rig)
+
+    assert rig.draft_swap is not None
+    assert [call[0] for call in rig.draft_swap.calls] == [str(CANDIDATE_DRAFT)]
+    # The whole point of the swap is that the process is never replaced.
+    assert rig.process.calls == []
+    # Success is only recorded after the mutated engine answers a canary.
+    assert len(rig.http.canary_timeouts) == 1
+
+
+def test_a_hot_swap_that_never_ran_falls_back_to_a_quiet_restart() -> None:
+    rig = make_rig(
+        draft_swap=FakeDraftSwap(error=DraftSwapUnavailable("route is absent")),
+    )
+
+    start_candidate(rig)
+
+    assert [call.draft for call in rig.process.calls] == [CANDIDATE_DRAFT]
+    # Nothing was mutated, so the gate must not be slammed shut on the way out.
+    assert rig.admission.calls == []
+    assert rig.http.canary_timeouts == []
+
+
+def test_a_mid_mutation_failure_closes_admission_and_forces_the_restart() -> None:
+    rig = make_rig(
+        draft_swap=FakeDraftSwap(error=DraftSwapCorrupted("half-applied")),
+    )
+
+    start_candidate(rig)
+
+    assert rig.admission.calls[0] == "stop"
+    assert not rig.admission.admitting
+    assert [call.draft for call in rig.process.calls] == [CANDIDATE_DRAFT]
+    # A possibly-broken engine must never be verified into looking healthy.
+    assert rig.http.canary_timeouts == []
+
+
+def test_a_failed_canary_restarts_rather_than_recording_success() -> None:
+    rig = make_rig(draft_swap=FakeDraftSwap())
+    rig.http.fail_canary_count = 1
+
+    start_candidate(rig)
+
+    assert len(rig.http.canary_timeouts) == 1
+    assert [call.draft for call in rig.process.calls] == [CANDIDATE_DRAFT]
+    assert rig.admission.calls[0] == "stop"
+
+
+def test_a_failed_readiness_probe_restarts_rather_than_recording_success() -> None:
+    rig = make_rig(draft_swap=FakeDraftSwap())
+    rig.http.fail_ready_count = 1
+
+    start_candidate(rig)
+
+    # The canary is never reached: readiness gates it.
+    assert rig.http.canary_timeouts == []
+    assert [call.draft for call in rig.process.calls] == [CANDIDATE_DRAFT]
+    assert rig.admission.calls[0] == "stop"
+
+
+def test_no_swap_client_leaves_the_restart_path_exactly_as_it_was() -> None:
+    rig = make_rig()
+
+    start_candidate(rig)
+
+    assert [call.draft for call in rig.process.calls] == [CANDIDATE_DRAFT]
+    assert rig.http.canary_timeouts == []
+
+
+def test_a_sleeping_engine_is_never_hot_swapped() -> None:
+    rig = make_rig(draft_swap=FakeDraftSwap())
+    quiesce(rig)
+    rig.controller.sleep(timeout_seconds=10.0, should_abort=lambda: False)
+
+    start_candidate(rig)
+
+    assert rig.draft_swap is not None
+    # Swapping weights into an engine whose weights are offloaded is nonsense.
+    assert rig.draft_swap.calls == []
+    assert [call.draft for call in rig.process.calls] == [CANDIDATE_DRAFT]
