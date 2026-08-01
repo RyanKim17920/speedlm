@@ -346,7 +346,7 @@ def create_production_tuner(
         learning_rate=tuning.learning_rate,
         epochs=tuning.epochs,
         port=tuning.training_port,
-        concurrency=tuning.concurrency,
+        concurrency=tuning.extraction_concurrency,
         scratch_quota_bytes=tuning.scratch_quota_bytes,
     )
     backend = Eagle3Backend.from_speculators(
@@ -387,6 +387,7 @@ def create_production_tuner(
         repeats=tuning.benchmark_repeats,
         replay_concurrency=tuning.benchmark_concurrency,
         correctness_max_tokens=tuning.correctness_max_tokens,
+        benchmark_max_tokens=tuning.benchmark_max_tokens,
         held_out_fraction=tuning.held_out_fraction,
         training_context_hashes=lambda: split.training_context_hashes,
     )

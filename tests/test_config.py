@@ -436,3 +436,73 @@ def test_invalid_divergence_threshold_is_rejected(value: object) -> None:
 def test_invalid_correctness_max_tokens_is_rejected(value: object) -> None:
     with pytest.raises(ConfigError, match="correctness_max_tokens"):
         IdleTuningConfig(correctness_max_tokens=value)
+
+
+def test_benchmark_max_tokens_round_trips_and_defaults_to_the_served_cap() -> None:
+    """512 is the cap the live harness puts on production traffic."""
+    default = SpeedLMConfig(model="m")
+    assert default.tuning.benchmark_max_tokens == 512
+
+    configured = SpeedLMConfig.from_dict(
+        {"model": "org/model", "tuning": {"benchmark_max_tokens": 256}}
+    )
+    assert configured.tuning.benchmark_max_tokens == 256
+    assert configured.to_dict()["tuning"]["benchmark_max_tokens"] == 256
+    assert (
+        SpeedLMConfig.from_dict(configured.to_dict()).tuning.benchmark_max_tokens == 256
+    )
+
+
+@pytest.mark.parametrize("value", [0, -1, "x", 1.5])
+def test_invalid_benchmark_max_tokens_is_rejected(value: object) -> None:
+    with pytest.raises(ConfigError, match="benchmark_max_tokens"):
+        IdleTuningConfig(benchmark_max_tokens=value)
+
+
+# ---------------------------------------------------------------------------
+# The two concurrency knobs
+# ---------------------------------------------------------------------------
+
+
+def test_the_legacy_concurrency_key_is_rejected_with_both_alternatives() -> None:
+    """A config that lies about what ran must not load.
+
+    ``tuning.concurrency`` never reached the gate -- it is the Speculators
+    extraction degree -- but job 369006 set it to 4 and the archived config was
+    read as a statement about gate replay, which actually ran at 8.  Loading it
+    silently is what made that analysis nearly go wrong, so the key now fails
+    validation and the error names both knobs it could have meant.
+    """
+    with pytest.raises(ConfigError) as excinfo:
+        SpeedLMConfig.from_dict(
+            {"model": "org/model", "tuning": {"concurrency": 4}}
+        )
+
+    message = str(excinfo.value)
+    assert "tuning.concurrency" in message
+    assert "extraction_concurrency" in message
+    assert "benchmark_concurrency" in message
+
+
+def test_the_two_concurrency_knobs_are_independent() -> None:
+    config = SpeedLMConfig.from_dict(
+        {
+            "model": "org/model",
+            "tuning": {"extraction_concurrency": 4, "benchmark_concurrency": 8},
+        }
+    )
+
+    assert config.tuning.extraction_concurrency == 4
+    assert config.tuning.benchmark_concurrency == 8
+    dumped = config.to_dict()["tuning"]
+    assert dumped["extraction_concurrency"] == 4
+    assert dumped["benchmark_concurrency"] == 8
+    # Round-tripping a dump must not resurrect the ambiguous key.
+    assert "concurrency" not in dumped
+    assert SpeedLMConfig.from_dict(config.to_dict()).tuning.extraction_concurrency == 4
+
+
+@pytest.mark.parametrize("value", [0, -1, "x", True])
+def test_invalid_extraction_concurrency_is_rejected(value: object) -> None:
+    with pytest.raises(ConfigError, match="extraction_concurrency"):
+        IdleTuningConfig(extraction_concurrency=value)

@@ -67,7 +67,7 @@ def _config(tmp_path: Path, profile: ModelProfile) -> SpeedLMConfig:
             sequence_length=20_000,
             learning_rate=4e-6,
             epochs=2,
-            concurrency=3,
+            extraction_concurrency=3,
             training_port=9_123,
             scratch_quota_bytes=100_000,
             verifier_revision="6cee5e81ee83917806bbde320786a8fb61efebee",
@@ -414,6 +414,21 @@ def test_create_production_tuner_assembles_profile_bound_collaborators(
     assert (
         captured["gate"]["replay_concurrency"]
         == config.tuning.benchmark_concurrency
+    )
+    # ``extraction_concurrency`` drives the training-side extraction engine and
+    # must NOT be what the gate replays at.  While it was named ``concurrency``
+    # job 369006 set it to 4, recorded that in its config, and the gate replayed
+    # at 8; the fixture keeps the two values distinct so a rewiring shows up
+    # here rather than in a post-hoc analysis.
+    assert config.tuning.extraction_concurrency != config.tuning.benchmark_concurrency
+    assert (
+        captured["gate"]["replay_concurrency"]
+        != config.tuning.extraction_concurrency
+    )
+    assert captured["pipeline"]["concurrency"] == config.tuning.extraction_concurrency
+    assert (
+        captured["gate"]["benchmark_max_tokens"]
+        == config.tuning.benchmark_max_tokens
     )
     assert captured["gate"]["suite_dir"]() == split.suite_dir
     assert captured["gate"]["training_context_hashes"]() == frozenset({"train-hash"})

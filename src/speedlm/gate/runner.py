@@ -62,8 +62,11 @@ _T = TypeVar("_T")
 #: offline hidden-state extraction engine, which is not on the gate's serving
 #: path.)
 #:
-#: Eight matches :attr:`speedlm.config.IdleTuningConfig.concurrency`, the
-#: degree the codebase already uses when driving this same engine family.
+#: Eight matches
+#: :attr:`speedlm.config.IdleTuningConfig.extraction_concurrency`, the degree
+#: the codebase already uses when driving this same engine family.  It is a
+#: coincidence of value, not a dependency: that field configures the training
+#: side's offline extraction engine and is never read here.
 #:
 #: The gating statistic -- see
 #: :data:`speedlm.gate.decide.GATING_THROUGHPUT_STATISTIC` -- divides completion
@@ -91,6 +94,11 @@ CORRECTNESS_REPLAY_CONCURRENCY: Final = 1
 #: :attr:`speedlm.config.IdleTuningConfig.correctness_max_tokens`, which
 #: carries the justification.
 DEFAULT_CORRECTNESS_MAX_TOKENS: Final = 128
+
+#: Output cap for the throughput/acceptance pass when the caller supplies none.
+#: Mirrors :attr:`speedlm.config.IdleTuningConfig.benchmark_max_tokens`, which
+#: carries the justification and the acceptance-bias disclosure.
+DEFAULT_BENCHMARK_MAX_TOKENS: Final = 512
 
 #: Suite passes the correctness check makes per arm.
 #:
@@ -286,6 +294,7 @@ class BenchmarkGateRunner:
         repeats: int = 3,
         warmup_repeats: int = 1,
         correctness_max_tokens: int = DEFAULT_CORRECTNESS_MAX_TOKENS,
+        benchmark_max_tokens: int = DEFAULT_BENCHMARK_MAX_TOKENS,
         held_out_fraction: float = 0.2,
         training_context_hashes: TrainingHashes | None = None,
         clock: Clock = time.monotonic,
@@ -304,6 +313,12 @@ class BenchmarkGateRunner:
             or correctness_max_tokens < 1
         ):
             raise ValueError("correctness_max_tokens must be an integer >= 1")
+        if (
+            isinstance(benchmark_max_tokens, bool)
+            or not isinstance(benchmark_max_tokens, int)
+            or benchmark_max_tokens < 1
+        ):
+            raise ValueError("benchmark_max_tokens must be an integer >= 1")
         if (
             isinstance(held_out_fraction, bool)
             or not isinstance(held_out_fraction, (int, float))
@@ -335,6 +350,7 @@ class BenchmarkGateRunner:
         self._repeats = repeats
         self._warmup_repeats = warmup_repeats
         self._correctness_max_tokens = correctness_max_tokens
+        self._benchmark_max_tokens = benchmark_max_tokens
         self._held_out_fraction = float(held_out_fraction)
         self._training_context_hashes = training_context_hashes
         self._clock = clock
@@ -489,6 +505,10 @@ class BenchmarkGateRunner:
                 # Both arms replay at this degree.  Absolute tok/s figures are
                 # only comparable across runs that shared it.
                 "replay_concurrency": self._replay_concurrency,
+                # Both arms replay under this cap.  It bounds the acceptance
+                # window as well as the wall clock, so a reader comparing
+                # acceptance deltas across runs needs to know it matched.
+                "benchmark_max_tokens": self._benchmark_max_tokens,
                 # The correctness pass is a different measurement at a
                 # different degree; recording both stops a reader assuming the
                 # single number above described every request the gate sent.
@@ -543,6 +563,8 @@ class BenchmarkGateRunner:
             warmup_repeats=self._warmup_repeats,
             concurrency=self._replay_concurrency,
             correctness_repeats=CORRECTNESS_REPEATS,
+            benchmark_max_tokens=self._benchmark_max_tokens,
+            correctness_max_tokens=self._correctness_max_tokens,
         )
 
     def _measure_arm(
@@ -662,6 +684,16 @@ class BenchmarkGateRunner:
         *,
         repeats: int | None = None,
     ) -> ReplayResult:
+        """One throughput/acceptance pass, capped and batched.
+
+        The cap is sent explicitly rather than left to the server.  Omitting it
+        did not produce an unbounded pass; it produced one bounded by
+        ``max_model_len`` minus the prompt, which is a different length for
+        every served model and truncated 25.6% of gpt-oss requests against 3.5%
+        of Qwen's.  See
+        :attr:`speedlm.config.IdleTuningConfig.benchmark_max_tokens` for the
+        measurements and for what capping does and does not bias.
+        """
         return self._replay_executor.replay(
             suite,
             self._endpoint.url,
@@ -669,6 +701,7 @@ class BenchmarkGateRunner:
             repeats=self._repeats if repeats is None else repeats,
             timeout_seconds=timeout_seconds,
             should_abort=should_abort,
+            max_tokens=self._benchmark_max_tokens,
         )
 
     def _correctness_replay(

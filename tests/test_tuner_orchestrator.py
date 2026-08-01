@@ -30,6 +30,8 @@ from speedlm.tuner.idle import IdleDetector
 from speedlm.tuner.orchestrator import (
     BENCHMARK_MAX_SECONDS,
     BENCHMARK_MIN_SECONDS,
+    BENCHMARK_SAFETY_FACTOR,
+    BENCHMARK_SECONDS_PER_TOKEN,
     DECISION_FILE_NAME,
     METRICS_DIR_NAME,
     BenchmarkGate,
@@ -858,24 +860,79 @@ def test_derived_timeout_shrinks_with_concurrency() -> None:
     assert parallel < serial
 
 
-def test_derived_timeout_would_have_survived_job_368959() -> None:
-    """The regression this derivation exists for.
+def test_derived_timeout_covers_the_measured_production_shape() -> None:
+    """The shape the gate actually runs, sized against what it actually cost.
 
     103 held-out contexts, five scored repeats plus one warmup, two arms, at
-    the observed >16.7s per serialized generation.  The fixed 1800s deadline
-    expired inside the stock arm's warmup pass alone.
+    concurrency 8 under a 512-token throughput cap and a 1x128-token
+    correctness pass.  Job 369040 measured the whole benchmark at ~1740s for
+    gpt-oss and ~1140s for Qwen, and the fixed 1800s deadline this derivation
+    replaced expired inside the stock arm's warmup pass.
     """
-    warmup_pass_seconds = 103 * 16.7
-
     budget = derive_benchmark_timeout(
         num_contexts=103,
         repeats=5,
         warmup_repeats=1,
         concurrency=8,
+        correctness_repeats=1,
+        benchmark_max_tokens=512,
+        correctness_max_tokens=128,
     )
 
+    assert budget == pytest.approx(2_709.45, abs=1.0)
     assert budget > 1_800.0
-    assert budget > 2 * warmup_pass_seconds
+    # Headroom over both measured profiles, without the 3.5x slack the flat
+    # per-generation constant produced (9612s for a benchmark that used 2713s).
+    assert budget > 1_740.0
+    assert budget < 2 * 1_740.0
+
+
+def test_derived_timeout_scales_with_the_throughput_cap() -> None:
+    """The deadline must move when the cap it is sized against moves."""
+    shape: dict[str, int] = {
+        "num_contexts": 103,
+        "repeats": 5,
+        "warmup_repeats": 1,
+        "concurrency": 8,
+        "correctness_repeats": 1,
+    }
+    tight = derive_benchmark_timeout(**shape, benchmark_max_tokens=256)  # type: ignore[arg-type]
+    loose = derive_benchmark_timeout(**shape, benchmark_max_tokens=1_024)  # type: ignore[arg-type]
+
+    assert loose > tight
+    # The generation term is linear in the cap and nothing else in the formula
+    # depends on it, so the difference is exactly the extra tokens' cost.
+    extra_tokens = 2 * (1 + 5) * 103 * (1_024 - 256)
+    assert loose - tight == pytest.approx(
+        extra_tokens * BENCHMARK_SECONDS_PER_TOKEN / 8 * BENCHMARK_SAFETY_FACTOR
+    )
+
+
+def test_the_correctness_pass_is_not_charged_at_the_throughput_rate() -> None:
+    """Job 369040's real bug: a 128-token pass billed like a 512-token one.
+
+    The formula charged the correctness pass ``2 x 1 x 103 x 20.0 = 4120s``
+    against a measured 396s -- 10.4x over, and the majority of a 9612s
+    deadline.  Costing tokens makes the correctness term exactly its own cap's
+    share, so it can never again dominate a budget it does not spend.
+    """
+    shape: dict[str, int] = {
+        "num_contexts": 103,
+        "repeats": 5,
+        "warmup_repeats": 1,
+        "concurrency": 8,
+        "benchmark_max_tokens": 512,
+        "correctness_max_tokens": 128,
+    }
+    without = derive_benchmark_timeout(**shape, correctness_repeats=0)  # type: ignore[arg-type]
+    with_pass = derive_benchmark_timeout(**shape, correctness_repeats=1)  # type: ignore[arg-type]
+
+    correctness_share = with_pass - without
+    # 2 arms x 1 repeat x 103 contexts x 128 tokens x 0.016 s x 1.25 safety.
+    assert correctness_share == pytest.approx(527.36, abs=1.0)
+    # The old formula charged it 4120s before the safety factor; the point is
+    # that it is now a small fraction of the deadline, not the bulk of it.
+    assert correctness_share < 0.25 * with_pass
 
 
 def test_derived_timeout_is_clamped_at_both_ends() -> None:
@@ -901,7 +958,9 @@ def test_derived_timeout_is_clamped_at_both_ends() -> None:
         {"arms": 0},
         {"concurrency": 0},
         {"warmup_repeats": -1},
-        {"seconds_per_generation": 0.0},
+        {"seconds_per_token": 0.0},
+        {"benchmark_max_tokens": 0},
+        {"correctness_max_tokens": 0},
         {"safety_factor": -1.0},
         {"fixed_overhead_seconds": 0},
     ],

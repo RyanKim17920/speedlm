@@ -236,13 +236,28 @@ class RuntimeController(Protocol):
     def wake(self, *, timeout_seconds: float) -> None: ...
 
 
-#: Wall-clock one held-out generation is assumed to cost, serialized.
+#: Wall-clock one generated token is assumed to cost on one stream.
 #:
-#: Measured, not guessed: on job 368959 a single warmup pass of 103 contexts
-#: ran for more than 1720s with one request in flight, i.e. >16.7s per
-#: generation for this gpt-oss profile.  Rounded up to 20.0 so the derived
-#: deadline is not sized off the exact observation that produced it.
-BENCHMARK_SECONDS_PER_GENERATION: Final = 20.0
+#: Replaces a flat ``BENCHMARK_SECONDS_PER_GENERATION = 20.0``, which was wrong
+#: in two ways that a per-token rate fixes structurally rather than by
+#: re-tuning a constant.
+#:
+#: First, a per-*generation* constant cannot span models, because a generation
+#: is not a fixed amount of work.  Single-stream-equivalent cost measured 28.7
+#: s/gen for gpt-oss and 13.2 s/gen for Qwen on the same suite -- 20.0 is 1.44x
+#: too small for one and 1.5x too large for the other -- and essentially all of
+#: that spread is output length, not per-token speed.
+#:
+#: Second, it charged the bounded correctness pass at the same rate as the
+#: throughput pass.  On job 369040 the correctness pass took 396s while the
+#: formula charged it ``2 x 1 x 103 x 20.0 = 4120s``, 10.4x over, which made it
+#: the majority of a 9612s deadline for a benchmark that used 2713s.  A
+#: per-token rate charges each pass its own cap, so the two cannot diverge.
+#:
+#: 0.016 is measured: 0.01347 s/token for gpt-oss and 0.00820 for Qwen, so this
+#: carries ~19% margin over the slower of the two rather than being sized off
+#: the exact observation that produced it.
+BENCHMARK_SECONDS_PER_TOKEN: Final = 0.016
 
 #: Fixed, per-benchmark cost that is not generation: two engine activations
 #: (~90s each on job 368959), four Prometheus scrapes, suite load and the
@@ -279,18 +294,26 @@ def derive_benchmark_timeout(
     arms: int = 2,
     concurrency: int = 1,
     correctness_repeats: int = 0,
-    seconds_per_generation: float = BENCHMARK_SECONDS_PER_GENERATION,
+    benchmark_max_tokens: int = 512,
+    correctness_max_tokens: int = 128,
+    seconds_per_token: float = BENCHMARK_SECONDS_PER_TOKEN,
     fixed_overhead_seconds: float = BENCHMARK_FIXED_OVERHEAD_SECONDS,
     safety_factor: float = BENCHMARK_SAFETY_FACTOR,
 ) -> float:
     """Size a benchmark deadline from the work the benchmark will do.
 
     The work is ``arms x (warmup_repeats + repeats) x num_contexts``
-    generations, spread over ``concurrency`` in-flight requests, plus
-    ``arms x correctness_repeats x num_contexts`` single-stream generations for
-    the output-correctness pass, plus a fixed overhead that does not scale with
-    the suite.  The result is clamped into
-    ``[BENCHMARK_MIN_SECONDS, BENCHMARK_MAX_SECONDS]``.
+    generations of at most ``benchmark_max_tokens`` each, spread over
+    ``concurrency`` in-flight requests, plus
+    ``arms x correctness_repeats x num_contexts`` single-stream generations of
+    at most ``correctness_max_tokens`` each for the output-correctness pass,
+    plus a fixed overhead that does not scale with the suite.  The result is
+    clamped into ``[BENCHMARK_MIN_SECONDS, BENCHMARK_MAX_SECONDS]``.
+
+    Costing tokens rather than generations is what lets the two passes be
+    charged differently: the correctness pass is bounded an order of magnitude
+    tighter than the throughput pass, and a per-generation rate had no way to
+    express that -- see :data:`BENCHMARK_SECONDS_PER_TOKEN`.
 
     This exists because a fixed 1800s deadline is not a statement about
     anything: on job 368959 it was smaller than one arm's warmup pass, so the
@@ -307,6 +330,8 @@ def derive_benchmark_timeout(
         ("repeats", repeats),
         ("arms", arms),
         ("concurrency", concurrency),
+        ("benchmark_max_tokens", benchmark_max_tokens),
+        ("correctness_max_tokens", correctness_max_tokens),
     ):
         if isinstance(count, bool) or not isinstance(count, int) or count < 1:
             raise ValueError(f"{name} must be an integer >= 1")
@@ -317,7 +342,7 @@ def derive_benchmark_timeout(
         if isinstance(count, bool) or not isinstance(count, int) or count < 0:
             raise ValueError(f"{name} must be an integer >= 0")
     for name, factor in (
-        ("seconds_per_generation", seconds_per_generation),
+        ("seconds_per_token", seconds_per_token),
         ("fixed_overhead_seconds", fixed_overhead_seconds),
         ("safety_factor", safety_factor),
     ):
@@ -325,13 +350,20 @@ def derive_benchmark_timeout(
             raise ValueError(f"{name} must be a positive number")
 
     generations = arms * (warmup_repeats + repeats) * num_contexts
-    generation_seconds = generations * float(seconds_per_generation) / concurrency
+    generation_seconds = (
+        generations * benchmark_max_tokens * float(seconds_per_token) / concurrency
+    )
     # The correctness pass gives up all batching, so it does not get to divide
-    # by ``concurrency``.  It is also output-bounded, so charging it a full
-    # ``seconds_per_generation`` per context over-estimates it -- deliberately:
-    # this term is a deadline, and the cheap direction to be wrong in is long.
+    # by ``concurrency`` -- but it *is* bounded an order of magnitude tighter
+    # than the throughput pass, and charging it that tighter cap is the whole
+    # point of costing tokens.  Job 369040 measured this pass at 396s while the
+    # per-generation formula charged it 4120s.
     correctness_seconds = (
-        arms * correctness_repeats * num_contexts * float(seconds_per_generation)
+        arms
+        * correctness_repeats
+        * num_contexts
+        * correctness_max_tokens
+        * float(seconds_per_token)
     )
     budget = (
         (generation_seconds + correctness_seconds) * float(safety_factor)

@@ -185,10 +185,17 @@ async def _send_request(
 
     Args:
         max_tokens: Hard cap on generated tokens, or ``None`` to let the
-            generation run to the served model's length limit.  The gate's
-            correctness pass always sets it; the throughput pass never does,
-            because bounding output would change the statistic the throughput
-            threshold is calibrated against.
+            generation run to the served model's length limit.  Both of the
+            gate's passes set it, at different values: the correctness pass at
+            ``correctness_max_tokens`` and the throughput/acceptance pass at
+            ``benchmark_max_tokens``.  An earlier revision of this docstring
+            said the throughput pass never sets it, on the theory that bounding
+            output would change the statistic the throughput threshold is
+            calibrated against.  That was wrong twice over -- ``None`` is not
+            "unbounded" but "bounded by ``max_model_len`` minus the prompt",
+            which is model-dependent, and the throughput statistic is an
+            arm-to-arm ratio under a shared cap, so a common cap cancels.  See
+            :attr:`speedlm.config.IdleTuningConfig.benchmark_max_tokens`.
         capture_tokens: Ask for per-token logprobs so the response carries the
             model's own tokenisation of its output.
     """

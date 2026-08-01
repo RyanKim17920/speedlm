@@ -423,10 +423,10 @@ class IdleTuningConfig:
     #: Output cap, in tokens, for the gate's separate output-correctness pass.
     #:
     #: The gate runs two different replays for two different jobs.  The
-    #: throughput/acceptance pass runs at ``benchmark_concurrency`` with no
-    #: output cap, because that is what steady-state serving looks like and the
-    #: throughput threshold is calibrated against its dispersion.  The
-    #: correctness pass runs at concurrency 1 with this cap, because bitwise
+    #: throughput/acceptance pass runs at ``benchmark_concurrency`` under
+    #: ``benchmark_max_tokens``, because that is what steady-state serving looks
+    #: like and the throughput threshold is calibrated against its dispersion.
+    #: The correctness pass runs at concurrency 1 with this cap, because bitwise
     #: agreement is a property of a *single-stream, bounded* generation: job
     #: 369005 replayed unbounded (averaging ~1602 tokens against the 4096
     #: model-len cap) at concurrency 8, which is precisely the regime where
@@ -438,6 +438,34 @@ class IdleTuningConfig:
     #: short enough that the correctness pass costs ~1/12th of an unbounded
     #: pass per context even though it gives up all batching.
     correctness_max_tokens: int = 128
+    #: Output cap, in tokens, for the gate's throughput/acceptance pass.
+    #:
+    #: This pass used to send no ``max_tokens`` at all, which was never actually
+    #: "uncapped": it was bounded at ``max_model_len`` minus the prompt, i.e. by
+    #: an accident of the served model.  Job 369005 measured gpt-oss-20b
+    #: averaging 2091 completion tokens per request with 25.6% of requests
+    #: stopping at ``finish_reason=length``, against Qwen3-8B's 1602 tokens and
+    #: 3.5%.  A model-dependent implicit truncation is a worse statistic than an
+    #: explicit uniform one, so this replaces it rather than introducing it.
+    #:
+    #: 512 is the cap the live harness puts on production traffic
+    #: (``tests/e2e/test_live_idle_tuning.py``), and 93.6% of seed responses hit
+    #: it, so the gate had been replaying roughly 4.4x longer than the system it
+    #: gates ever serves.  Measured effect of the cap on the benchmark phase:
+    #: gpt-oss 4764s -> 1385s, Qwen 2318s -> 924s.
+    #:
+    #: Honesty about the bias this introduces.  *Acceptance* is biased, mildly:
+    #: late-sequence tokens are modestly harder to draft, measured at the repeat
+    #: tails as -3.6 pp for the stock arm and -5.6 pp for the candidate, so
+    #: truncating the tail removes a penalty that differs by arm and shifts the
+    #: reported acceptance delta by roughly +0.1 pp -- about 10% of
+    #: ``PromotionConfig.min_acceptance_delta_pp``.  The gate is therefore very
+    #: slightly more permissive on acceptance than an unbounded pass would be.
+    #: *Throughput* is not biased: shortening decode raises the prefill share of
+    #: every request, but it raises it identically in both arms (the suite,
+    #: prompts and cap are shared), and the gating statistic is an arm-to-arm
+    #: ratio, so a common-mode inflation cancels out of the threshold.
+    benchmark_max_tokens: int = 512
     #: How many of the newest trace records one cycle may train on.
     #:
     #: Trace selection is a sliding window, not a full rescan: without a bound
@@ -465,7 +493,19 @@ class IdleTuningConfig:
     sequence_length: int = 16_384
     learning_rate: float = 1e-5
     epochs: int = 1
-    concurrency: int = 8
+    #: Requests kept in flight by the Speculators *offline hidden-state
+    #: extraction* step (``data_generation_offline.py --concurrency``).
+    #:
+    #: Named ``concurrency`` until it was found to be a trap: run configs set
+    #: ``tuning.concurrency`` believing it controlled the gate's replay degree,
+    #: while the gate reads ``benchmark_concurrency`` and never consults this
+    #: field at all.  Job 369006's config recorded ``concurrency: 4`` and the
+    #: gate replayed at 8, so the archived config described traffic that never
+    #: happened.  The two knobs drive different processes -- this one the
+    #: training-side extraction engine, ``benchmark_concurrency`` the served
+    #: engine under gate replay -- so the fix is the name, not a rewiring; see
+    #: ``from_dict`` for the migration error the old key now raises.
+    extraction_concurrency: int = 8
     training_port: int = 8_131
     scratch_quota_bytes: int = 5 * 1024 * 1024 * 1024
     shutdown_timeout_seconds: float = 30.0
@@ -501,6 +541,11 @@ class IdleTuningConfig:
             "tuning.correctness_max_tokens",
             1,
         )
+        _validate_int_gte(
+            self.benchmark_max_tokens,
+            "tuning.benchmark_max_tokens",
+            1,
+        )
         if self.training_window_records is not None:
             _validate_int_gte(
                 self.training_window_records,
@@ -533,7 +578,11 @@ class IdleTuningConfig:
         ):
             raise ConfigError("tuning.learning_rate must be in (0, 1e-5]")
         _validate_int_gte(self.epochs, "tuning.epochs", 1)
-        _validate_int_gte(self.concurrency, "tuning.concurrency", 1)
+        _validate_int_gte(
+            self.extraction_concurrency,
+            "tuning.extraction_concurrency",
+            1,
+        )
         _validate_port(self.training_port, "tuning")
         from speedlm.tuner.eagle3 import MAX_SCRATCH_BYTES  # noqa: PLC0415
 
@@ -671,6 +720,7 @@ class SpeedLMConfig:
             "benchmark_repeats": self.tuning.benchmark_repeats,
             "benchmark_concurrency": self.tuning.benchmark_concurrency,
             "correctness_max_tokens": self.tuning.correctness_max_tokens,
+            "benchmark_max_tokens": self.tuning.benchmark_max_tokens,
             "training_window_records": self.tuning.training_window_records,
             "verifier_revision": self.tuning.verifier_revision,
             "speculators_repo": self.tuning.speculators_repo,
@@ -680,7 +730,7 @@ class SpeedLMConfig:
             "sequence_length": self.tuning.sequence_length,
             "learning_rate": self.tuning.learning_rate,
             "epochs": self.tuning.epochs,
-            "concurrency": self.tuning.concurrency,
+            "extraction_concurrency": self.tuning.extraction_concurrency,
             "training_port": self.tuning.training_port,
             "scratch_quota_bytes": self.tuning.scratch_quota_bytes,
             "shutdown_timeout_seconds": self.tuning.shutdown_timeout_seconds,
@@ -746,6 +796,22 @@ class SpeedLMConfig:
                 "min_divergence_token_index",
             },
         )
+        # ``tuning.concurrency`` used to exist and never reached the gate: it is
+        # the Speculators extraction knob, while gate replay is driven by
+        # ``benchmark_concurrency``.  Job 369006 set it to 4 and the gate ran at
+        # 8, so the archived config asserted a degree of parallelism that never
+        # ran.  Falling through to the generic "unknown keys in tuning" error
+        # would be loud but not informative -- an operator reading it would most
+        # likely re-add the key under some other spelling -- so the ambiguity is
+        # named explicitly here and the caller is forced to choose a side.
+        _legacy_tuning = data.get("tuning")
+        if isinstance(_legacy_tuning, Mapping) and "concurrency" in _legacy_tuning:
+            raise ConfigError(
+                "tuning.concurrency was renamed because it never reached the "
+                "benchmark gate: use tuning.extraction_concurrency for the "
+                "Speculators hidden-state extraction degree, or "
+                "tuning.benchmark_concurrency for the gate's replay degree"
+            )
         tuning_data = _nested(
             data,
             "tuning",
@@ -757,6 +823,7 @@ class SpeedLMConfig:
                 "benchmark_repeats",
                 "benchmark_concurrency",
                 "correctness_max_tokens",
+                "benchmark_max_tokens",
                 "training_window_records",
                 "verifier_revision",
                 "speculators_repo",
@@ -766,7 +833,7 @@ class SpeedLMConfig:
                 "sequence_length",
                 "learning_rate",
                 "epochs",
-                "concurrency",
+                "extraction_concurrency",
                 "training_port",
                 "scratch_quota_bytes",
                 "shutdown_timeout_seconds",

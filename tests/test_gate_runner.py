@@ -14,6 +14,7 @@ from speedlm.gate.replay import ReplayResult, RequestResult, RunResults
 from speedlm.gate.runner import (
     CORRECTNESS_REPEATS,
     CORRECTNESS_REPLAY_CONCURRENCY,
+    DEFAULT_BENCHMARK_MAX_TOKENS,
     DEFAULT_CORRECTNESS_MAX_TOKENS,
     DEFAULT_REPLAY_CONCURRENCY,
     BenchmarkGateRunner,
@@ -868,6 +869,8 @@ def test_estimated_benchmark_seconds_scales_with_the_suite(tmp_path: Path) -> No
         warmup_repeats=1,
         concurrency=DEFAULT_REPLAY_CONCURRENCY,
         correctness_repeats=CORRECTNESS_REPEATS,
+        benchmark_max_tokens=DEFAULT_BENCHMARK_MAX_TOKENS,
+        correctness_max_tokens=DEFAULT_CORRECTNESS_MAX_TOKENS,
     )
 
 
@@ -925,8 +928,11 @@ def test_correctness_pass_runs_single_stream_whatever_the_benchmark_degree(
         (CORRECTNESS_REPLAY_CONCURRENCY, DEFAULT_CORRECTNESS_MAX_TOKENS, True)
     ] * 2
     assert CORRECTNESS_REPLAY_CONCURRENCY == 1
-    # Every other pass left the degree to the executor and set no output cap.
-    assert [o for o in replay_executor.seen_options if not o[2]] == [(None, None, False)] * 8
+    # Every other pass left the degree to the executor and carried the
+    # throughput cap, which is a different number from the correctness cap.
+    assert [o for o in replay_executor.seen_options if not o[2]] == [
+        (None, DEFAULT_BENCHMARK_MAX_TOKENS, False)
+    ] * 8
     assert result.metrics["correctness"] == {
         "concurrency": 1,
         "max_tokens": DEFAULT_CORRECTNESS_MAX_TOKENS,
@@ -973,6 +979,117 @@ def test_invalid_correctness_max_tokens_is_rejected(
             metrics_source=FakeMetricsSource([]),
             replay_executor=FakeReplayExecutor(),
             correctness_max_tokens=value,
+            training_context_hashes=frozenset(),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Throughput/acceptance output cap
+# ---------------------------------------------------------------------------
+
+
+def test_the_throughput_pass_carries_an_explicit_output_cap(tmp_path: Path) -> None:
+    """Job 369005's throughput pass sent no cap and ran to the model-len bound.
+
+    That is not "uncapped", it is capped by the served model: gpt-oss averaged
+    2091 completion tokens with 25.6% truncated at length, Qwen 1602 with 3.5%.
+    An explicit uniform cap replaces a model-dependent implicit one.
+    """
+    replay_executor = FakeReplayExecutor()
+    runner, _, _, _ = _runner(
+        tmp_path,
+        scrapes=_normal_scrapes(),
+        replay=replay_executor,
+    )
+
+    runner.benchmark(
+        tmp_path / "candidate",
+        timeout_seconds=30,
+        should_abort=lambda: False,
+    )
+
+    throughput_caps = {o[1] for o in replay_executor.seen_options if not o[2]}
+    assert throughput_caps == {DEFAULT_BENCHMARK_MAX_TOKENS}
+    assert None not in throughput_caps
+
+
+def test_benchmark_max_tokens_is_configurable_and_reported(tmp_path: Path) -> None:
+    replay_executor = FakeReplayExecutor()
+    runner = BenchmarkGateRunner(
+        config=SpeedLMConfig(model="model"),
+        trace_source=FakeTraceSource((_trace(),)),
+        suite_dir=tmp_path / "suite",
+        stock_draft="stock",
+        endpoint=FakeEndpoint(),
+        metrics_source=FakeMetricsSource(_normal_scrapes()),
+        replay_executor=replay_executor,
+        benchmark_max_tokens=256,
+        training_context_hashes=frozenset(),
+        clock=FakeClock(),
+    )
+
+    result = runner.benchmark(
+        tmp_path / "candidate",
+        timeout_seconds=30,
+        should_abort=lambda: False,
+    )
+
+    assert {o[1] for o in replay_executor.seen_options if not o[2]} == {256}
+    assert result.metrics["benchmark_max_tokens"] == 256
+
+
+def test_the_two_passes_do_not_share_one_cap(tmp_path: Path) -> None:
+    """The correctness cap must not leak into the throughput pass, or back."""
+    replay_executor = FakeReplayExecutor()
+    runner = BenchmarkGateRunner(
+        config=SpeedLMConfig(model="model"),
+        trace_source=FakeTraceSource((_trace(),)),
+        suite_dir=tmp_path / "suite",
+        stock_draft="stock",
+        endpoint=FakeEndpoint(),
+        metrics_source=FakeMetricsSource(_normal_scrapes()),
+        replay_executor=replay_executor,
+        benchmark_max_tokens=256,
+        correctness_max_tokens=64,
+        training_context_hashes=frozenset(),
+        clock=FakeClock(),
+    )
+
+    runner.benchmark(
+        tmp_path / "candidate",
+        timeout_seconds=30,
+        should_abort=lambda: False,
+    )
+
+    assert {o[1] for o in replay_executor.seen_options if not o[2]} == {256}
+    assert {o[1] for o in replay_executor.seen_options if o[2]} == {64}
+
+
+def test_the_gate_config_cap_is_what_the_composed_runner_sends() -> None:
+    """The knob operators set is the number that reaches the payload."""
+    config = SpeedLMConfig.from_dict(
+        {"model": "org/model", "tuning": {"benchmark_max_tokens": 300}}
+    )
+
+    assert config.tuning.benchmark_max_tokens == 300
+    assert config.to_dict()["tuning"]["benchmark_max_tokens"] == 300
+
+
+@pytest.mark.parametrize("value", [0, -1, True])
+def test_invalid_benchmark_max_tokens_is_rejected(
+    tmp_path: Path,
+    value: object,
+) -> None:
+    with pytest.raises(ValueError, match="benchmark_max_tokens"):
+        BenchmarkGateRunner(
+            config=SpeedLMConfig(model="model"),
+            trace_source=FakeTraceSource((_trace(),)),
+            suite_dir=tmp_path / "suite",
+            stock_draft="stock",
+            endpoint=FakeEndpoint(),
+            metrics_source=FakeMetricsSource([]),
+            replay_executor=FakeReplayExecutor(),
+            benchmark_max_tokens=value,
             training_context_hashes=frozenset(),
         )
 
