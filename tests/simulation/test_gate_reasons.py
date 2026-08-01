@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
@@ -318,6 +318,34 @@ class TestMeasuredRejections:
             # blame the head for the engine.
             assert decision.reason is Reason.HIGH_INVALID_RATE
             assert max(r.invalid_rate for r in decision.per_repeat) > 0.1
+
+    def test_a_reasoning_model_truncated_at_the_cap_is_not_a_flaky_engine(
+        self, tmp_path: Path
+    ) -> None:
+        """SLURM 369147: ``high_invalid_rate 0.7379`` on a healthy engine.
+
+        Both arms are thinking models whose generations run past
+        ``benchmark_max_tokens``, so every held-out response comes back with
+        ``content: null`` and ``finish_reason: "length"``.  Under the old
+        predicate that was a 100% invalid rate and an automatic rejection.  The
+        engine generated the full 512 tokens for each one and its acceptance
+        counters moved exactly as dialled, so the gate must measure and judge on
+        the merits -- here, promote.
+        """
+        stock, candidate = _profiles()
+        stock = replace(stock, completion_tokens=4096, reasoning_model=True)
+        candidate = replace(candidate, completion_tokens=4096, reasoning_model=True)
+        with _fixture(tmp_path, stock, candidate) as fixture:
+            result = fixture.gate().benchmark(
+                fixture.candidate, timeout_seconds=600.0, should_abort=lambda: False
+            )
+
+            decision = result.decision
+            assert decision is not None
+            assert all(r.invalid_rate == 0.0 for r in decision.per_repeat)
+            assert decision.reason is not Reason.HIGH_INVALID_RATE
+            assert decision.verdict is Verdict.PROMOTE
+            assert decision.acceptance_delta_pp == pytest.approx(15.0, abs=1e-4)
 
 
 class TestGateFailuresThatNeverMeasured:

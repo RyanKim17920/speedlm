@@ -272,3 +272,210 @@ def test_invalid_max_tokens_is_rejected(
 ) -> None:
     with pytest.raises(ReplayError, match="max_tokens"):
         _replay(_suite(2), max_tokens=max_tokens)
+
+
+# ---------------------------------------------------------------------------
+# What "valid" means: reasoning models truncated at the cap
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _ScriptedClient:
+    """Async client that returns one caller-supplied choice/usage per request.
+
+    Unlike :class:`_RecordingClient` it does not synthesise a reply, so a test
+    can hand it the exact body a served engine produced -- including the shapes
+    a reasoning model emits when its ``<think>`` block runs into the cap.
+    """
+
+    choice: dict[str, Any]
+    usage: dict[str, Any]
+    #: Requests answered with ``choice``/``usage``; the rest get a plain reply.
+    scripted: int = 0
+    seen: int = 0
+    limits: Any = None
+
+    async def __aenter__(self) -> _ScriptedClient:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        return None
+
+    async def post(self, url: str, *, json: dict[str, Any]) -> _FakeResponse:
+        index = self.seen
+        self.seen += 1
+        await asyncio.sleep(0)
+        if index < self.scripted:
+            return _FakeResponse({"choices": [dict(self.choice)], "usage": self.usage})
+        return _FakeResponse(
+            {
+                "choices": [
+                    {"message": {"content": "answer"}, "finish_reason": "stop"}
+                ],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 7},
+            }
+        )
+
+
+def _scripted(
+    monkeypatch: pytest.MonkeyPatch,
+    choice: dict[str, Any],
+    usage: dict[str, Any],
+    *,
+    scripted: int,
+) -> _ScriptedClient:
+    recorder = _ScriptedClient(choice=choice, usage=usage, scripted=scripted)
+
+    def factory(**kwargs: Any) -> _ScriptedClient:
+        recorder.limits = kwargs.get("limits")
+        return recorder
+
+    monkeypatch.setattr(httpx, "AsyncClient", factory)
+    return recorder
+
+
+#: The shape SLURM 369147 produced on 76 of its 103 held-out contexts: Qwen3-8B
+#: spent the whole ``benchmark_max_tokens`` budget inside ``<think>``, so vLLM
+#: returned the generated text under ``message.reasoning`` and left ``content``
+#: null, with ``finish_reason`` "length" and ``completion_tokens`` at the cap.
+_TRUNCATED_REASONING_CHOICE: dict[str, Any] = {
+    "message": {"content": None, "reasoning": "Okay, let's think about this. " * 40},
+    "finish_reason": "length",
+}
+_TRUNCATED_REASONING_USAGE: dict[str, Any] = {
+    "prompt_tokens": 209,
+    "completion_tokens": 512,
+}
+
+
+def test_truncated_reasoning_is_a_valid_throughput_sample(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for SLURM 369147's ``high_invalid_rate`` rejection.
+
+    76 of 103 contexts hit ``benchmark_max_tokens`` mid-``<think>``, which made
+    ``content`` empty and the old predicate marked every one of them invalid --
+    ``invalid_rate: 0.7379`` against a 0.1 threshold, on a run whose correctness
+    pass reported zero divergences.  The engine generated 512 tokens for each of
+    them; that is a good throughput and acceptance sample.
+    """
+    _scripted(
+        monkeypatch,
+        _TRUNCATED_REASONING_CHOICE,
+        _TRUNCATED_REASONING_USAGE,
+        scripted=76,
+    )
+
+    run = _replay(_suite(103), concurrency=8, max_tokens=512).run_results[0]
+
+    assert run.invalid_rate == 0.0
+    assert run.invalid_count == 0
+    assert run.total_completion_tokens == 76 * 512 + 27 * 7
+
+
+def test_truncated_reasoning_keeps_the_generated_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The tokens are evidence; dropping them makes the sample unfalsifiable."""
+    _scripted(
+        monkeypatch,
+        _TRUNCATED_REASONING_CHOICE,
+        _TRUNCATED_REASONING_USAGE,
+        scripted=1,
+    )
+
+    request = _replay(_suite(1), max_tokens=512).run_results[0].results[0]
+
+    assert request.valid
+    assert request.finish_reason == "length"
+    assert request.reasoning_text.startswith("Okay, let's think about this.")
+    assert request.response_text == ""
+    assert request.generated_text == request.reasoning_text
+
+
+def test_reasoning_content_alias_is_recognised(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Some OpenAI-compatible servers name the field ``reasoning_content``."""
+    _scripted(
+        monkeypatch,
+        {
+            "message": {"content": "", "reasoning_content": "thinking hard"},
+            "finish_reason": "length",
+        },
+        {"prompt_tokens": 4, "completion_tokens": 512},
+        scripted=1,
+    )
+
+    request = _replay(_suite(1), max_tokens=512).run_results[0].results[0]
+
+    assert request.valid
+    assert request.reasoning_text == "thinking hard"
+
+
+def test_a_cap_hit_that_surfaced_nothing_is_still_a_throughput_sample(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Tokens were generated and counted; where the server filed them is its business."""
+    _scripted(
+        monkeypatch,
+        {"message": {"content": None}, "finish_reason": "length"},
+        {"prompt_tokens": 4, "completion_tokens": 512},
+        scripted=1,
+    )
+
+    request = _replay(_suite(1), max_tokens=512).run_results[0].results[0]
+
+    assert request.valid
+    assert request.error == ""
+
+
+def test_an_engine_that_generates_nothing_is_still_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The protection ``high_invalid_rate`` exists for must survive the fix."""
+    _scripted(
+        monkeypatch,
+        {"message": {"content": ""}, "finish_reason": "stop"},
+        {"prompt_tokens": 4, "completion_tokens": 0},
+        scripted=103,
+    )
+
+    run = _replay(_suite(103), concurrency=8, max_tokens=512).run_results[0]
+
+    assert run.invalid_rate == 1.0
+    assert run.results[0].error == "No generated tokens"
+
+
+def test_an_empty_response_that_stopped_on_its_own_is_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``finish_reason`` "stop" with nothing to show is a broken engine, not a cap."""
+    _scripted(
+        monkeypatch,
+        {"message": {"content": ""}, "finish_reason": "stop"},
+        {"prompt_tokens": 4, "completion_tokens": 9},
+        scripted=1,
+    )
+
+    request = _replay(_suite(1), max_tokens=512).run_results[0].results[0]
+
+    assert not request.valid
+    assert request.error == "Empty response text"
+
+
+def test_missing_usage_falls_back_to_the_surfaced_text(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A server that omits ``usage`` still produced a usable sample."""
+    _scripted(
+        monkeypatch,
+        {"message": {"content": "a real answer"}, "finish_reason": "stop"},
+        {},
+        scripted=1,
+    )
+
+    request = _replay(_suite(1)).run_results[0].results[0]
+
+    assert request.valid
+    assert request.completion_tokens == 0

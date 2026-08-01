@@ -377,6 +377,14 @@ def first_divergence(
     side did not capture it.  The basis is returned rather than assumed,
     because a character offset is not comparable to a token offset.
 
+    The character fallback aligns on ``generated_text``, not ``response_text``.
+    A reasoning model bounded at ``correctness_max_tokens`` routinely never
+    closes its ``<think>`` block, which leaves ``response_text`` empty on
+    *both* arms; comparing those two empty strings returns ``None`` --
+    "identical" -- having compared nothing at all.  Folding the reasoning
+    channel in means the fallback compares the text that was actually
+    generated.
+
     Returns:
         ``(index, basis, stock_length, candidate_length)`` where *index* is the
         first differing position, or ``None`` when one sequence is a prefix of
@@ -390,8 +398,8 @@ def first_divergence(
         right: Sequence[str] = candidate.output_tokens
     else:
         basis = DivergenceBasis.CHARACTER
-        left = stock.response_text
-        right = candidate.response_text
+        left = stock.generated_text
+        right = candidate.generated_text
 
     for index, (a, b) in enumerate(zip(left, right, strict=False)):
         if a != b:

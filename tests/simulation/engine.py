@@ -60,6 +60,13 @@ class DraftProfile:
             this profile reproduces the baseline output exactly.
         invalid_every: When set, every Nth request returns HTTP 500, which the
             replay records as an invalid result.
+        reasoning_model: Emit like a thinking model whose ``<think>`` block is
+            still open when the generation ends.  A generation that stopped on
+            ``max_tokens`` files its text under ``message.reasoning`` and
+            leaves ``content`` null, exactly as vLLM 0.25.1 did for Qwen3-8B
+            and gpt-oss-20b under ``benchmark_max_tokens``.  A generation that
+            reached its own stop token closed the block, so it reports
+            normally.
     """
 
     name: str
@@ -70,6 +77,7 @@ class DraftProfile:
     drafted_tokens_per_request: int = 40
     divergence_at_token: int | None = None
     invalid_every: int | None = None
+    reasoning_model: bool = False
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.acceptance_rate <= 1.0:
@@ -450,6 +458,17 @@ class SimulatedEngine:
             marker=profile.name,
         )
         text = "".join(tokens)
+        truncated = emitted < profile.completion_tokens
+        # A thinking model that ran out of budget never closed ``<think>``, so
+        # the server has nothing to put in ``content``.  The tokens are all
+        # still there, and ``usage`` still counts them.
+        thinking = profile.reasoning_model and truncated
+        message: dict[str, Any] = {
+            "role": "assistant",
+            "content": None if thinking else text,
+        }
+        if thinking:
+            message["reasoning"] = text
         body: dict[str, Any] = {
             "id": "chatcmpl-sim",
             "object": "chat.completion",
@@ -458,9 +477,8 @@ class SimulatedEngine:
             "choices": [
                 {
                     "index": 0,
-                    "message": {"role": "assistant", "content": text},
-                    "finish_reason": "length" if emitted < profile.completion_tokens
-                    else "stop",
+                    "message": message,
+                    "finish_reason": "length" if truncated else "stop",
                 }
             ],
             "usage": {

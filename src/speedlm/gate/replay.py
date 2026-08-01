@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Final
 
 from speedlm.config import SamplingConfig
 from speedlm.gate.suite import BenchmarkSuite, FrozenContext
@@ -46,10 +46,31 @@ class RequestResult:
     #: Recorded so a divergence at the very end of a bounded generation can be
     #: told apart from one that ended naturally.
     finish_reason: str = ""
+    #: The reasoning channel a thinking model fills instead of ``content``.
+    #:
+    #: Reasoning models spend most of a bounded budget inside ``<think>``, and
+    #: an OpenAI-compatible server that parses that block files it under
+    #: ``message.reasoning`` (vLLM 0.25.x) or ``message.reasoning_content``,
+    #: leaving ``content`` null until the block closes.  Captured because it is
+    #: the *only* direct evidence that a response whose ``content`` is empty was
+    #: nonetheless a complete, healthy generation.
+    reasoning_text: str = ""
 
     @property
     def invalid(self) -> bool:
         return not self.valid
+
+    @property
+    def generated_text(self) -> str:
+        """Everything the model emitted, reasoning channel included.
+
+        ``response_text`` alone is not the generation for a thinking model: at
+        the caps this gate replays under, it is routinely empty while hundreds
+        of tokens sit in ``reasoning_text``.  A character-basis comparison over
+        ``response_text`` would therefore compare ``""`` against ``""`` and
+        report agreement it never checked.
+        """
+        return self.reasoning_text + self.response_text
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -63,6 +84,7 @@ class RequestResult:
             "error": self.error,
             "output_tokens": list(self.output_tokens),
             "finish_reason": self.finish_reason,
+            "reasoning_text": self.reasoning_text,
         }
 
 
@@ -137,6 +159,90 @@ class ReplayResult:
 # ---------------------------------------------------------------------------
 # Replay
 # ---------------------------------------------------------------------------
+
+#: ``finish_reason`` an OpenAI-compatible server reports when a generation
+#: stopped because it exhausted the request's ``max_tokens``, as opposed to
+#: because the model emitted its own stop token.  This is the one signal that
+#: separates a deliberate truncation from a broken generation.
+FINISH_REASON_LENGTH: Final = "length"
+
+#: Field names a server may file a thinking model's ``<think>`` block under,
+#: in the order they are consulted.  vLLM 0.25.x uses ``reasoning``; the
+#: ``reasoning_content`` spelling is what several other OpenAI-compatible
+#: servers (and older vLLM reasoning parsers) emit.
+_REASONING_FIELDS: Final = ("reasoning", "reasoning_content")
+
+#: Recorded on a response the engine answered without generating anything at
+#: all.  This is the failure ``high_invalid_rate`` exists to catch: zero
+#: generated tokens means the throughput and acceptance numbers measured over
+#: that sample are meaningless.
+_ERROR_NO_TOKENS: Final = "No generated tokens"
+
+#: Recorded on a response that generated tokens and then surfaced none of them
+#: while claiming to have stopped of its own accord.  Also a broken engine --
+#: a healthy one that stops on its own has something to show for it.
+_ERROR_EMPTY_TEXT: Final = "Empty response text"
+
+
+def _extract_reasoning(message: dict[str, Any]) -> str:
+    """Recover the reasoning channel, whichever name the server used for it."""
+    for field in _REASONING_FIELDS:
+        value = message.get(field)
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _validity_error(
+    *,
+    completion_tokens: int,
+    text: str,
+    reasoning: str,
+    output_tokens: tuple[str, ...],
+    finish_reason: str,
+) -> str:
+    """Classify one 200-OK response: ``""`` when usable, else why it is not.
+
+    "Valid" used to mean "``choices[0].message.content`` is a non-empty
+    string", which asks a question neither replay pass needs answered.  The
+    throughput/acceptance pass never reads the text -- it needs tokens/second
+    and it needs the engine's Prometheus acceptance counters to move.  The
+    correctness pass compares token streams recovered from logprobs, which do
+    not care what the text renders as.  Only the predicate cared, and on a
+    reasoning model it was wrong most of the time: SLURM 369147 replayed
+    Qwen3-8B at ``benchmark_max_tokens=512``, 76 of 103 held-out contexts spent
+    the whole budget inside ``<think>``, and every one came back with
+    ``content: null``, ``finish_reason: "length"`` and
+    ``completion_tokens: 512``.  The gate rejected on ``invalid_rate 0.7379``
+    while its own correctness pass reported zero divergences.  gpt-oss-20b
+    (SLURM 369148) produces the identical shape, so this is a property of
+    reasoning models, not of one tokenizer.
+
+    What replaces it is "the engine did real work", which is what the threshold
+    is actually protecting.  Ordered so the genuinely broken cases still fail:
+
+    1. Nothing generated and nothing surfaced -> invalid.  ``usage`` is the
+       cleanest signal available and it was non-zero for every one of the 512
+       captured responses in that run, so a zero here is a real anomaly.
+       Surfaced output is accepted as a substitute because a server may omit
+       ``usage`` entirely.
+    2. Anything surfaced -- content, reasoning, or captured tokens -> valid.
+    3. Nothing surfaced but the cap was hit -> valid.  The tokens exist and
+       were counted; which channel the server filed them under does not change
+       what a throughput sample measures.
+    4. Nothing surfaced and the model claims it stopped on its own -> invalid.
+       That is an engine returning empty responses, which is exactly the
+       measurement-is-worthless case the threshold guards.
+    """
+    surfaced = bool(text) or bool(reasoning) or bool(output_tokens)
+    if completion_tokens <= 0 and not surfaced:
+        return _ERROR_NO_TOKENS
+    if surfaced:
+        return ""
+    if finish_reason == FINISH_REASON_LENGTH:
+        return ""
+    return _ERROR_EMPTY_TEXT
+
 
 def _extract_output_tokens(choice: dict[str, Any]) -> tuple[str, ...]:
     """Recover the generated token sequence from an OpenAI-shaped choice.
@@ -247,25 +353,22 @@ async def _send_request(
 
         choice = choices[0]
         message = choice.get("message", {})
-        text = message.get("content", "")
+        raw_text = message.get("content")
+        text = raw_text if isinstance(raw_text, str) else ""
+        reasoning = _extract_reasoning(message)
         output_tokens = _extract_output_tokens(choice)
         finish_reason = choice.get("finish_reason") or ""
         usage = body.get("usage", {})
         pt = usage.get("prompt_tokens", 0)
         ct = usage.get("completion_tokens", 0)
 
-        if not text:
-            return RequestResult(
-                context_hash=ctx.context_hash,
-                latency_s=latency,
-                prompt_tokens=pt,
-                completion_tokens=ct,
-                total_tokens=pt + ct,
-                response_text="",
-                valid=False,
-                error="Empty response text",
-                finish_reason=finish_reason,
-            )
+        error = _validity_error(
+            completion_tokens=ct,
+            text=text,
+            reasoning=reasoning,
+            output_tokens=output_tokens,
+            finish_reason=finish_reason,
+        )
 
         return RequestResult(
             context_hash=ctx.context_hash,
@@ -274,9 +377,11 @@ async def _send_request(
             completion_tokens=ct,
             total_tokens=pt + ct,
             response_text=text,
-            valid=True,
+            valid=not error,
+            error=error,
             output_tokens=output_tokens,
             finish_reason=finish_reason,
+            reasoning_text=reasoning,
         )
 
     except httpx.HTTPError as exc:

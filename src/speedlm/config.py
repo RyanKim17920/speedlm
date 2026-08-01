@@ -515,6 +515,31 @@ class IdleTuningConfig:
     #: every request, but it raises it identically in both arms (the suite,
     #: prompts and cap are shared), and the gating statistic is an arm-to-arm
     #: ratio, so a common-mode inflation cancels out of the threshold.
+    #:
+    #: The +0.1 pp figure above understates it, and the first capped run says so.
+    #: Reading the gate-metrics counters directly: SLURM 369147 (capped) drew
+    #: 504.2 completion tokens per request against qwen-cross-20260801T014500Z's
+    #: 1588.9 uncapped, and its stock arm accepted 0.3752 against the uncapped
+    #: run's 0.3995 -- 2.4 pp *lower*, not higher, so late tokens in a reasoning
+    #: model's ``<think>`` block are easier to draft than the answer that
+    #: follows, and truncation removes the easy part.  On the gated *delta* the
+    #: two runs read -0.238 pp (capped) against -0.554 pp (uncapped): the cap
+    #: shifts the delta by about +0.32 pp, roughly a third of
+    #: ``PromotionConfig.min_acceptance_delta_pp``, in the permissive direction.
+    #: That is a cross-run comparison of two different candidates, so it bounds
+    #: the effect rather than measuring it, but it is three times the earlier
+    #: estimate and should be treated as the working number.
+    #:
+    #: 512 is nevertheless kept, for a reason stronger than "unbiased": it is
+    #: the cap live traffic runs under, so a capped gate measures the regime the
+    #: system actually serves, and raising the gate's cap above the serving cap
+    #: would measure a regime that never occurs in production.  It is a property
+    #: of the harness, not of the model, so it needs no per-model override --
+    #: which matters, because Qwen3-8B and gpt-oss-20b differ in almost every
+    #: other respect here.  Reverting to an uncapped pass costs the benchmark
+    #: phase 969.5s -> 2713s per cycle on Qwen (2.8x); if the acceptance bias
+    #: above ever needs eliminating rather than bounding, raise the *serving*
+    #: cap first and let this follow it.
     benchmark_max_tokens: int = 512
     #: Whether the gate measures the candidate arm before the stock arm.
     #:
