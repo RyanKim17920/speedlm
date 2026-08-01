@@ -1,7 +1,32 @@
 """Stage 0 kill-condition prototype: serving-time activation capture.
 
-This test verifies that the aux hidden states captured from a live EAGLE-3
-vLLM serving engine match the offline extraction path, elementwise per layer.
+Two comparisons run here, and they answer different questions.  Conflating them
+is the mistake this docstring exists to prevent.
+
+**Leg 1 — captured vs. vLLM's offline extraction (a TRANSPORT check).**  These
+two are *not* independent derivations.  Both take the tensor that
+``EagleModelMixin._maybe_add_hidden_state`` appends at vLLM
+``model_executor/models/interfaces.py:1337``; the serving hook lifts that list
+object straight out of ``_model_forward`` while the offline path reads the same
+variable one branch later at ``v1/worker/gpu_model_runner.py:5035`` and merely
+copies it (stack, same-dtype buffer assignment, integer-indexed KV scatter, the
+inverse gather, a pinned same-dtype D2H copy, ``save_file``) — no
+floating-point arithmetic and no dtype cast anywhere, and the offline "draft
+model" has no weights (``models/extract_hidden_states.py:392-394``) and a
+``pass`` forward (``:229-231``).  Bit-identical is therefore the *expected*
+outcome, and a ``mean_rel_error`` of exactly 0.0 says the round trip is
+lossless — it says nothing about whether the tensor is the right quantity.
+What this leg does catch, and what nothing else here catches: slot-mapping
+errors, layer misordering, truncation, row misalignment, prefix-cache row loss.
+
+**Leg 2 — captured vs. HuggingFace transformers in float32 (an IDENTITY
+check).**  The same prompt token ids are re-run through an implementation that
+shares no kernel, no dtype and no code path with vLLM, and each captured aux
+layer must both land within a derived bf16-vs-fp32 tolerance *and* be the
+strict nearest match among its neighbouring residual-stream depths.  See
+:mod:`speedlm.activation_capture.hf_reference` for the layer-index mapping
+proof and the tolerance derivation.  This is the leg that can distinguish
+"pre-norm layer 21" from "post-norm layer 21" or "layer 20".
 
 Required environment:
 * ``SPEEDLM_E2E_ACTIVATION_CAPTURE=1`` — opt-in GPU gate
@@ -17,6 +42,13 @@ Optional environment:
   needed to override the layers derived from the models under test.
 * ``SPEEDLM_E2E_PROMPT`` — override the fixed prompt (default: a short
   English sentence)
+* ``SPEEDLM_E2E_HF_REFERENCE`` — set to ``0`` to skip the independent
+  HuggingFace fp32 reference leg.  Default is on; skipping is recorded in
+  ``result.json`` as ``hf_reference: null`` so a skipped run cannot be mistaken
+  for a passing one.
+* ``SPEEDLM_E2E_HF_REFERENCE_DEVICE`` — force ``cuda`` or ``cpu`` for the
+  reference forward.  Default: ``cuda`` when the freed device can hold the
+  fp32 copy, else ``cpu``.
 """
 
 from __future__ import annotations
@@ -38,6 +70,12 @@ from speedlm.activation_capture.compare import (
     PrefixCacheResult,
     align_prompt_rows,
     build_result,
+)
+from speedlm.activation_capture.hf_reference import (
+    HFReferenceResult,
+    compare_to_hf_reference,
+    reference_residual_stream,
+    select_reference_device,
 )
 from speedlm.activation_capture.offline_extract import (
     extract as _run_offline_extract,
@@ -693,6 +731,202 @@ def _wait_for_gpu_memory_release(
 
 
 # ---------------------------------------------------------------------------
+# Independent HuggingFace fp32 reference (Leg 2)
+# ---------------------------------------------------------------------------
+
+
+def _prompt_token_ids(
+    verifier: str, prompt: str, *, expected_count: int
+) -> list[int]:
+    """Render *prompt* through the verifier's chat template and tokenize it.
+
+    The reference forward is only independent evidence if it runs **the same
+    tokens** the engine prefilled.  That is asserted, not assumed: the rendered
+    length must equal the engine's own ``usage.prompt_tokens``.  A mismatch
+    means the template this test renders and the one vLLM applied are not the
+    same, and every downstream number would be comparing different sequences.
+    """
+    from transformers import AutoTokenizer
+
+    model_dir = _resolve_model_dir(verifier)
+    tokenizer = AutoTokenizer.from_pretrained(str(model_dir))
+    token_ids = tokenizer.apply_chat_template(
+        [{"role": "user", "content": prompt}],
+        add_generation_prompt=True,
+        tokenize=True,
+    )
+    ids = [int(t) for t in token_ids]
+    assert len(ids) == expected_count, (
+        f"locally rendered prompt is {len(ids)} tokens but the engine reported "
+        f"usage.prompt_tokens={expected_count}; the HF reference would be "
+        f"running a different token sequence than the capture, which makes the "
+        f"comparison meaningless.  Rendered: {tokenizer.decode(ids)!r}"
+    )
+    return ids
+
+
+def _free_device_bytes() -> int | None:
+    """Return free VRAM on the current device, or ``None`` if there is none."""
+    if torch is None or not torch.cuda.is_available():
+        return None
+    free, _total = torch.cuda.mem_get_info()
+    return int(free)
+
+
+def _run_hf_reference(
+    verifier: str,
+    prompt: str,
+    captured: dict[int, torch.Tensor],
+    *,
+    prompt_token_count: int,
+    final_layer_idx: int | None,
+) -> HFReferenceResult:
+    """Re-derive the captured activations with HuggingFace transformers, fp32.
+
+    Runs **after** both vLLM engines are gone, reusing
+    :func:`_wait_for_gpu_memory_release` — the same nvidia-smi-polling
+    machinery the offline phase already uses — so the fp32 copy gets the whole
+    card rather than competing with an engine for it.  See
+    ``hf_reference.select_reference_device`` for why GPU-after-teardown was
+    chosen over CPU-fp32 or a smaller model, and why CPU remains the automatic
+    fallback.
+    """
+    token_ids = _prompt_token_ids(
+        verifier, prompt, expected_count=prompt_token_count
+    )
+
+    _wait_for_gpu_memory_release(gpu_memory_fraction=0.5)
+
+    model_dir = _resolve_model_dir(verifier)
+    config = _read_model_config(model_dir)
+    num_hidden_layers = _verifier_num_hidden_layers(config)
+    assert num_hidden_layers is not None, (
+        f"cannot read num_hidden_layers from {model_dir}/config.json; the "
+        f"reference forward cannot validate its own layer-index mapping"
+    )
+    #: Parameter count is not in config.json.  Estimating it from the config
+    #: would be another unverified assumption, so the safetensors index is read
+    #: instead: total_size is the on-disk byte count of a bf16 checkpoint, so
+    #: params ~= total_size / 2.  Falls back to CPU if the index is absent.
+    num_parameters = _checkpoint_parameter_count(model_dir)
+
+    forced = os.environ.get("SPEEDLM_E2E_HF_REFERENCE_DEVICE")
+    if forced in ("cuda", "cpu"):
+        device = forced
+    elif num_parameters is None:
+        device = "cpu"
+    else:
+        device = select_reference_device(
+            num_parameters=num_parameters,
+            free_device_bytes=_free_device_bytes(),
+        )
+    logger.info(
+        "HF fp32 reference: %d params, device=%s, %d prompt tokens, %d layers",
+        num_parameters or -1, device, len(token_ids), num_hidden_layers,
+    )
+
+    stream, post_norm_final, dtype_name = reference_residual_stream(
+        str(model_dir), token_ids, device=device
+    )
+    return compare_to_hf_reference(
+        captured,
+        stream,
+        post_norm_final,
+        prompt_token_count=prompt_token_count,
+        final_layer_idx=final_layer_idx,
+        device=device,
+        dtype=dtype_name,
+    )
+
+
+def _checkpoint_parameter_count(model_dir: Path) -> int | None:
+    """Estimate the parameter count from the safetensors index, or ``None``.
+
+    ``metadata.total_size`` is the checkpoint's byte count; these verifiers ship
+    in bf16, so two bytes per parameter.  Returning ``None`` on any doubt keeps
+    the device choice conservative (CPU) rather than guessing high and OOMing.
+    """
+    index = model_dir / "model.safetensors.index.json"
+    if not index.is_file():
+        return None
+    try:
+        raw = json.loads(index.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    total = raw.get("metadata", {}).get("total_size")
+    if not isinstance(total, int) or total <= 0:
+        return None
+    return total // 2
+
+
+# ---------------------------------------------------------------------------
+# Prefix-cache measurement helpers
+# ---------------------------------------------------------------------------
+
+
+def _prefix_cache_counters(url: str) -> tuple[float, float]:
+    """Read ``(hits, queries)`` from the engine's Prometheus ``/metrics``.
+
+    The counters are ``vllm:prefix_cache_hits`` and
+    ``vllm:prefix_cache_queries`` (registered at vLLM
+    ``v1/metrics/loggers.py:547-564``, exported with Prometheus' ``_total``
+    suffix, in units of blocks).  This is the engine's own accounting of
+    whether a request was served from cache — the only way to *measure*
+    ``cache_hit`` rather than infer it from "we sent the same prompt twice".
+
+    Returns:
+        ``(hits, queries)``.  Both are ``0.0`` when the counters are absent,
+        which the caller must treat as "no hit observed", never as success.
+    """
+    with httpx.Client(timeout=10.0, trust_env=False) as client:
+        resp = client.get(f"{url}/metrics")
+        resp.raise_for_status()
+        body = resp.text
+
+    def _sum(metric: str) -> float:
+        total = 0.0
+        for line in body.splitlines():
+            if line.startswith("#") or not line.startswith(metric):
+                continue
+            head, _, value = line.rpartition(" ")
+            #: Guard against a prefix collision (e.g. ``..._hits_total`` vs a
+            #: hypothetical ``..._hits_total_bucket``): the metric name must be
+            #: followed by a label brace or whitespace, nothing else.
+            name = head.split("{", 1)[0].strip()
+            if name != metric:
+                continue
+            try:
+                total += float(value)
+            except ValueError:
+                continue
+        return total
+
+    return _sum("vllm:prefix_cache_hits_total"), _sum(
+        "vllm:prefix_cache_queries_total"
+    )
+
+
+def _rows_per_layer(captured: dict[int, torch.Tensor]) -> int:
+    """Return the row count shared by every captured layer.
+
+    Summing rows across layers (the old ``captured_row_count``) yields
+    ``rows x layers``, which is not comparable to a prompt token count.  Every
+    layer is collected at the same positions in the same forward, so they must
+    agree; a disagreement is itself a capture bug and is raised rather than
+    averaged away.
+    """
+    assert captured, "no captured layers"
+    counts = {idx: int(t.shape[0]) for idx, t in captured.items()}
+    distinct = set(counts.values())
+    assert len(distinct) == 1, (
+        f"captured layers disagree on row count: {counts}; every aux layer is "
+        f"collected at the same token positions in the same forward, so this "
+        f"is a capture bug, not a measurement to be summarized"
+    )
+    return distinct.pop()
+
+
+# ---------------------------------------------------------------------------
 # Tests
 # ---------------------------------------------------------------------------
 
@@ -707,8 +941,14 @@ def test_stage0_activation_capture() -> None:
     4. Tears down the capture engine.
     5. Waits for GPU memory to be released.
     6. Runs the offline extraction on the same prompt.
-    7. Compares the two tensor stacks elementwise per layer.
-    8. Writes a JSON result with PASS/FAIL verdict.
+    7. Compares the two tensor stacks elementwise per layer (Leg 1 —
+       transport; bit-identical is the expected result, see module docstring).
+    8. Re-derives the same activations with HuggingFace transformers in fp32
+       and checks tolerance *and* neighbour discrimination (Leg 2 — identity).
+    9. Writes a JSON result with PASS/FAIL verdict.
+
+    Only step 8 can distinguish a correct capture from a well-transported
+    wrong quantity.  Step 7 returning 0.0 is not evidence of correctness.
     """
     verifier, drafter, artifact_root = _require_environment()
     prompt = os.environ.get("SPEEDLM_E2E_PROMPT", DEFAULT_PROMPT)
@@ -899,12 +1139,50 @@ def test_stage0_activation_capture() -> None:
             )
         except ValueError as exc:
             raise AssertionError(f"cannot align final layer: {exc}") from exc
-    # Phase 5: Build verdict
+    # Phase 5: independent HuggingFace fp32 re-derivation (Leg 2).
+    #
+    # Leg 1 above is a transport check between two views of ONE tensor (see
+    # the module docstring).  This is the only part of the test that runs a
+    # second, independent forward, and therefore the only part that can tell
+    # a correct capture from a well-transported wrong quantity.
+    hf_reference: HFReferenceResult | None = None
+    reference_enabled = os.environ.get("SPEEDLM_E2E_HF_REFERENCE", "1") != "0"
+    if reference_enabled:
+        hf_reference = _run_hf_reference(
+            verifier,
+            prompt,
+            captured_tensors,
+            prompt_token_count=prompt_token_count,
+            final_layer_idx=final_layer_idx,
+        )
+        logger.info(
+            "HF fp32 reference verdict=%s device=%s layers=%s",
+            hf_reference.verdict,
+            hf_reference.device,
+            [
+                (layer.aux_layer_idx, layer.mean_rel_error, layer.tolerance)
+                for layer in hf_reference.layers
+            ],
+        )
+
+    # Phase 6: Build verdict.
+    #
+    # This engine ran with --no-enable-prefix-caching, so cache_hit is False by
+    # construction rather than by measurement -- and it is verified as such:
+    # every prompt row must have produced an activation row.  The measured
+    # cache-hit case lives in test_prefix_cache_coverage.
+    captured_rows = _rows_per_layer(aligned_captured)
+    assert captured_rows == prompt_token_count, (
+        f"prefix caching is disabled on this engine, so all "
+        f"{prompt_token_count} prompt positions must have been forwarded, but "
+        f"only {captured_rows} rows were captured per layer"
+    )
     prefix_cache = PrefixCacheResult(
         prompt_token_count=prompt_token_count,
-        captured_row_count=sum(t.shape[0] for t in aligned_captured.values()),
+        captured_rows_per_layer=captured_rows,
+        captured_layer_count=len(aligned_captured),
         cache_hit=False,
-        rows_missing=0,
+        rows_missing=prompt_token_count - captured_rows,
     )
 
     result = build_result(
@@ -913,6 +1191,7 @@ def test_stage0_activation_capture() -> None:
         captured_final_pre_norm=captured_final,
         offline_final_pre_norm=offline_final,
         prefix_cache=prefix_cache,
+        hf_reference=hf_reference,
     )
 
     result_path = artifact_dir / "result.json"
@@ -923,9 +1202,19 @@ def test_stage0_activation_capture() -> None:
     # Set SPEEDLM_E2E_STRICT_VERDICT=0 to skip this assertion for exploratory runs.
     strict = os.environ.get("SPEEDLM_E2E_STRICT_VERDICT", "1") != "0"
     if strict:
+        # A skipped reference leg must never read as a pass.  ``build_result``
+        # deliberately does not fail on ``hf_reference is None`` (that would
+        # flip the verdict for every pre-existing caller), so the harness that
+        # asked for the leg is the one that insists it ran.
+        assert not reference_enabled or hf_reference is not None, (
+            "SPEEDLM_E2E_HF_REFERENCE is enabled but no reference result was "
+            "produced; the run proves only that one tensor round-trips two "
+            "ways, not that it is the right tensor"
+        )
         assert result.verdict == "PASS", (
             f"Activation capture comparison failed: verdict={result.verdict}, "
-            f"rel_error_trend={result.rel_error_trend}. "
+            f"rel_error_trend={result.rel_error_trend}, "
+            f"hf_reference={(hf_reference.verdict if hf_reference else 'not run')}. "
             f"Full result at {result_path}"
         )
 
@@ -936,11 +1225,36 @@ def test_stage0_activation_capture() -> None:
 
 
 def test_prefix_cache_coverage() -> None:
-    """Measure whether prefix-cache hits produce no activation row.
+    """Prove that a prefix-cache hit leaves activation rows missing.
 
-    This test sends the same prompt twice with prefix caching enabled,
-    then checks whether the second request captures fewer activation rows
-    than the first.
+    This is the empirical check for hazard 6.1 in
+    ``docs/serving-time-activation-capture.md``: on a cache hit the matched
+    tokens are never forwarded, so no aux hidden state is produced for them and
+    a naive capture silently under-covers the prompt.
+
+    **What changed and why.**  The first version of this test contained no
+    ``assert`` at all.  It wrote ``cache_hit: true`` and ``rows_missing: 0``
+    into its result file as *hardcoded literals* and reported them as findings —
+    a test that recorded an assumption and could not fail, including in the case
+    where prefix caching silently did not engage.  Every field is now measured:
+
+    * ``cache_hit`` comes from the engine's own
+      ``vllm:prefix_cache_hits_total`` counter (vLLM
+      ``v1/metrics/loggers.py:558-564``), sampled before and after the second
+      request.  Sending the same prompt twice is what *should* cause a hit; it
+      is not evidence that one occurred.
+    * ``captured_rows_per_layer`` is the per-layer row count, not the old
+      ``rows x layers`` sum, so it is comparable to ``prompt_token_count``.
+    * ``rows_missing`` is the difference between them.
+
+    **On the apparent conflict with the main test.**  ``result.json`` from
+    ``test_stage0_activation_capture`` reports ``cache_hit: false`` while this
+    test reports true.  Both are correct and they are not in conflict: the main
+    test launches its engine with ``--no-enable-prefix-caching``, so a hit is
+    impossible there and the absence of one is asserted; this test leaves prefix
+    caching at its default (on) precisely so a hit can occur.  The old
+    ``cache_hit: true`` here happened to name the right answer for the wrong
+    reason — it was never read off the engine.
     """
     verifier, drafter, artifact_root = _require_environment()
     prompt = os.environ.get("SPEEDLM_E2E_PROMPT", DEFAULT_PROMPT)
@@ -992,39 +1306,92 @@ def test_prefix_cache_coverage() -> None:
 
         served_model_id = _get_served_model_id(url)
 
-        # Activate capture
-        _collective_rpc(vllm_proc, port, "activate_capture", str(capture_dir))
+        # -- Request 1: cold.  Flushed to its own directory so its rows are
+        # not conflated with request 2's; flush_capture drains the buffer, so
+        # the second flush contains only the second request's rows.
+        first_dir = capture_dir / "first"
+        first_dir.mkdir(exist_ok=True)
+        _collective_rpc(vllm_proc, port, "activate_capture", str(first_dir))
+        _, first_prompt_tokens = _send_prompt(
+            url, prompt, served_model_id=served_model_id
+        )
+        time.sleep(0.5)
+        _collective_rpc(vllm_proc, port, "flush_capture")
+        first_captured = _load_captured_safetensors(first_dir)
+        first_rows = _rows_per_layer(first_captured)
 
-        # Send same prompt twice; second should hit prefix cache
-        _send_prompt(url, prompt, served_model_id=served_model_id)
+        # -- Request 2: identical prompt, expected to hit the prefix cache.
+        second_dir = capture_dir / "second"
+        second_dir.mkdir(exist_ok=True)
+        _collective_rpc(vllm_proc, port, "activate_capture", str(second_dir))
+        hits_before, queries_before = _prefix_cache_counters(url)
         _, prompt_token_count = _send_prompt(
             url, prompt, served_model_id=served_model_id
         )
-
         time.sleep(0.5)
+        hits_after, queries_after = _prefix_cache_counters(url)
         _collective_rpc(vllm_proc, port, "flush_capture")
+        second_captured = _load_captured_safetensors(second_dir)
+        second_rows = _rows_per_layer(second_captured)
 
-        # Load captured results to measure row counts
-        captured = _load_captured_safetensors(capture_dir)
-        total_rows = sum(t.shape[0] for t in captured.values())
-
+        cache_hit = hits_after > hits_before
         result = PrefixCacheResult(
             prompt_token_count=prompt_token_count,
-            captured_row_count=total_rows,
-            cache_hit=True,
-            rows_missing=0,
+            captured_rows_per_layer=second_rows,
+            captured_layer_count=len(second_captured),
+            cache_hit=cache_hit,
+            rows_missing=prompt_token_count - second_rows,
         )
         result_path = artifact_dir / "prefix_cache_result.json"
+        # Write before asserting: a failing check must not discard the
+        # measurement that produced it.
         result_path.write_text(
             json.dumps({
                 "prompt_token_count": result.prompt_token_count,
-                "captured_row_count": result.captured_row_count,
+                "captured_rows_per_layer": result.captured_rows_per_layer,
+                "captured_layer_count": result.captured_layer_count,
                 "cache_hit": result.cache_hit,
                 "rows_missing": result.rows_missing,
+                "first_request_prompt_tokens": first_prompt_tokens,
+                "first_request_rows_per_layer": first_rows,
+                "prefix_cache_hits_before": hits_before,
+                "prefix_cache_hits_after": hits_after,
+                "prefix_cache_queries_before": queries_before,
+                "prefix_cache_queries_after": queries_after,
             }, indent=2) + "\n",
             encoding="utf-8",
         )
         logger.info("Prefix cache result: %s", result_path)
+
+        assert queries_after > queries_before, (
+            f"the engine recorded no prefix-cache queries across the second "
+            f"request ({queries_before} -> {queries_after}); prefix caching is "
+            f"not engaged at all, so this test measured nothing.  Result at "
+            f"{result_path}"
+        )
+        assert cache_hit, (
+            f"the second identical request did not hit the prefix cache "
+            f"(vllm:prefix_cache_hits_total {hits_before} -> {hits_after}); "
+            f"hazard 6.1 cannot be demonstrated without a hit.  Result at "
+            f"{result_path}"
+        )
+        assert first_prompt_tokens == prompt_token_count, (
+            f"the two requests were not the same length "
+            f"({first_prompt_tokens} vs {prompt_token_count} prompt tokens); "
+            f"their row counts are not comparable"
+        )
+        assert second_rows < first_rows, (
+            f"a prefix-cache hit did not reduce the captured row count "
+            f"({first_rows} rows cold vs {second_rows} rows warm).  Either the "
+            f"hazard in doc section 6.1 does not hold on this build, or the "
+            f"capture is picking up rows the forward did not produce.  Result "
+            f"at {result_path}"
+        )
+        assert result.rows_missing > 0, (
+            f"captured {second_rows} rows for a {prompt_token_count}-token "
+            f"prompt on a cache hit, i.e. nothing is missing -- which "
+            f"contradicts the measured cache hit.  Result at {result_path}"
+        )
 
     finally:
         vllm_proc.terminate()

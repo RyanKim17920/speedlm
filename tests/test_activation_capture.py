@@ -661,7 +661,8 @@ class TestBuildResult:
         t = torch.ones(4, 8)
         pc = PrefixCacheResult(
             prompt_token_count=10,
-            captured_row_count=10,
+            captured_rows_per_layer=10,
+            captured_layer_count=1,
             cache_hit=False,
             rows_missing=0,
         )
@@ -750,7 +751,13 @@ class TestSerialization:
 
     def test_write_json_with_prefix_cache(self, tmp_path: Path) -> None:
         t = torch.ones(2, 4)
-        pc = PrefixCacheResult(8, 6, True, 2)
+        pc = PrefixCacheResult(
+            prompt_token_count=8,
+            captured_rows_per_layer=6,
+            captured_layer_count=3,
+            cache_hit=True,
+            rows_missing=2,
+        )
         result = build_result(
             {0: t},
             {0: t},

@@ -223,10 +223,42 @@ def _stream_chat(
         for delta_value in [delta.get(field)]
         if isinstance(delta_value, str)
     )
+    #: The last non-null finish_reason across the stream.  vLLM emits it on the
+    #: penultimate chunk (the usage-only chunk that follows carries a null
+    #: choice list), so it must be scanned for rather than read off the last
+    #: event.
+    finish_reason = next(
+        (
+            reason
+            for event in reversed(events)
+            for choice in event.get("choices", [])
+            if isinstance(choice, dict)
+            for reason in [choice.get("finish_reason")]
+            if isinstance(reason, str)
+        ),
+        None,
+    )
     usage_events = [event["usage"] for event in events if isinstance(event.get("usage"), dict)]
     assert content or reasoning_content, (
         "stream contained neither assistant content nor reasoning"
     )
+    # Mirror of the non-streaming guard: a reasoning model that spends its
+    # whole budget inside the thinking block emits reasoning and no content,
+    # and finishes with "length".  Without this the streaming path accepted
+    # exactly that -- the stream that motivated this guard exhausted all 512
+    # tokens, returned finish_reason="length", and PASSED, because the
+    # `content or reasoning_content` assertion above is satisfied by reasoning
+    # alone.  An answer that was truncated away is not a delivered answer.
+    if not content.strip():
+        completion_tokens = (
+            usage_events[-1].get("completion_tokens") if usage_events else None
+        )
+        assert finish_reason != "length", (
+            "streamed generation exhausted max_tokens inside its reasoning "
+            f"block and never emitted content (finish_reason={finish_reason!r}, "
+            f"completion_tokens={completion_tokens}); "
+            f"raise STREAM_MAX_TOKENS (currently {STREAM_MAX_TOKENS})"
+        )
     assert usage_events, "stream_options.include_usage did not produce usage"
     usage = usage_events[-1]
     assert usage["prompt_tokens"] > 0
@@ -236,6 +268,7 @@ def _stream_chat(
         "model": next(event["model"] for event in events if isinstance(event.get("model"), str)),
         "content": content,
         "reasoning_content": reasoning_content or None,
+        "finish_reason": finish_reason,
         "usage": usage,
         "raw_chunk_count": len(raw_chunks),
         "event_count": len(events),

@@ -14,6 +14,16 @@ Two ordering rules apply to everything after the measured phases:
   failing check can never discard an H100 benchmark's data.
 * Capture completeness is exact. Every accepted gateway response must have
   exactly one corresponding trace, including under peak concurrency.
+
+**What is asserted vs. what is only recorded.**  Asserted: the exact capture
+bijection, the concurrency throughput ratios, and — since 2026-08-01 — median
+latency overhead against the bounds in ``MAX_TTFT_ABSOLUTE_OVERHEAD_SECONDS``,
+``MAX_E2E_PERCENTAGE_OVERHEAD`` and ``MAX_INTER_TOKEN_PERCENTAGE_OVERHEAD``.
+Recorded only: every p95 figure, the absolute direct/gateway latencies, and the
+sequential-throughput comparison.  Those are diagnostics on a shared GPU and no
+bound on them would be both meaningful and stable, so **a p95 number in
+``proxy_overhead.json`` is an observation, not a guarantee** — do not cite one
+as if the suite enforces it.
 """
 
 from __future__ import annotations
@@ -59,6 +69,38 @@ VLLM = VLLM_VENV / "bin" / "vllm"
 
 MODEL_DEFAULT = "Qwen/Qwen3.5-2B"
 MAX_TOKENS = 64
+
+# ---------------------------------------------------------------------------
+# Latency regression bounds
+# ---------------------------------------------------------------------------
+#
+# Until 2026-08-01 this benchmark recorded latency and asserted nothing about
+# it: only the 231/231 capture bijection and the concurrency ratios could fail
+# the test.  A regression that pushed gateway TTFT to +500 ms would have been
+# written to proxy_overhead.json, printed to the log, and passed.  These bounds
+# close that hole.
+#
+# They are derived from the measured run, not chosen for roundness.  Observed
+# medians on that run: TTFT +24.7 ms (+48.27%), non-stream E2E +0.43%, stream
+# E2E +7.91%, inter-token +3.41%.
+#
+# TTFT is bounded in ABSOLUTE milliseconds, not as a percentage.  The +48.27%
+# figure is dominated by how small the direct TTFT baseline is, so a *faster*
+# child engine would inflate the percentage without the proxy getting any
+# worse -- a percentage bound on TTFT would flake for the wrong reason and then
+# get widened until it meant nothing.  The proxy's real cost is a fixed
+# per-request hop, which is what an absolute bound measures.  150 ms is ~6x the
+# observed 24.7 ms: enough headroom to absorb a noisy scheduler on a shared
+# H100, tight enough that the +500 ms regression above fails loudly.
+MAX_TTFT_ABSOLUTE_OVERHEAD_SECONDS = 0.150
+
+# The end-to-end and inter-token figures are ratios of quantities dominated by
+# generation time, so they are stable and a percentage bound is the right shape.
+# Each is ~3-50x the observed value.  These are regression detectors, not
+# service-level objectives: they are deliberately loose enough that ordinary
+# run-to-run variance on a shared GPU cannot trip them.
+MAX_E2E_PERCENTAGE_OVERHEAD = 25.0
+MAX_INTER_TOKEN_PERCENTAGE_OVERHEAD = 25.0
 
 # Delta fields that carry a generated token.  A reasoning model served with a
 # reasoning parser (Qwen3-8B + --reasoning-parser qwen3, gpt-oss-20b + harmony)
@@ -826,6 +868,31 @@ def test_proxy_overhead_benchmark() -> None:
             f"capture is not an exact bijection: {captured_trace_count}/"
             f"{expected_captures} traces, missing {missing_captures}"
         )
+
+        # Latency regression bounds.  Medians only: p95 on a shared H100 is
+        # dominated by scheduler noise the proxy does not control, so bounding
+        # it would produce flakes rather than findings.  See the constants for
+        # why TTFT is absolute and the rest are percentages.
+        ttft_absolute = results["ttft"]["absolute_overhead"]["median"]
+        assert ttft_absolute <= MAX_TTFT_ABSOLUTE_OVERHEAD_SECONDS, (
+            f"gateway TTFT overhead regressed: median +"
+            f"{ttft_absolute * 1000:.2f} ms exceeds the "
+            f"{MAX_TTFT_ABSOLUTE_OVERHEAD_SECONDS * 1000:.0f} ms bound "
+            f"(direct {results['ttft']['direct']['median'] * 1000:.2f} ms, "
+            f"gateway {results['ttft']['gateway']['median'] * 1000:.2f} ms)"
+        )
+        for metric, bound in (
+            ("nonstream_e2e", MAX_E2E_PERCENTAGE_OVERHEAD),
+            ("stream_e2e", MAX_E2E_PERCENTAGE_OVERHEAD),
+            ("inter_token_latency", MAX_INTER_TOKEN_PERCENTAGE_OVERHEAD),
+        ):
+            percentage = results[metric]["percentage_overhead"]["median"]
+            assert percentage <= bound, (
+                f"gateway {metric} overhead regressed: median "
+                f"{percentage:.2f}% exceeds the {bound:.2f}% bound "
+                f"(direct {results[metric]['direct']['median']:.4f} s, "
+                f"gateway {results[metric]['gateway']['median']:.4f} s)"
+            )
 
         # Performance must fail only on the requested serialization signal.
         for concurrency in CONCURRENCY_LEVELS:

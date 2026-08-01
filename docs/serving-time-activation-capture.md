@@ -1,7 +1,19 @@
 # Serving-time activation capture
 
-**Status:** design proposal. Nothing here is implemented. No code change accompanies
-this document.
+**Status:** design proposal, with Stage 0 (Section 9) prototyped. Sections 1-8
+remain a proposal: no cache, no retention, no training integration exists. What
+does exist is the Stage 0 de-risking prototype —
+`src/speedlm/activation_capture/` and
+`tests/e2e/test_serving_activation_capture.py`.
+
+**Read Section 6.2 before citing Stage 0 results.** Stage 0's original
+comparison (serving capture vs. vLLM's offline extraction) returned a perfect
+`0.0` on every layer, and that number was initially read as settling the
+correctness question. It does not. The two paths transport a single tensor
+object rather than deriving it twice, so bit-identity is the expected outcome
+and says nothing about *which* quantity was captured. The independent evidence
+comes from a separate float32 HuggingFace re-derivation, added afterwards. The
+table in Section 9 says which question each leg answers.
 
 **Audience:** engineers on SpeedLM who have not followed the investigation that
 produced it. It is written to stand alone.
@@ -269,10 +281,16 @@ offline hidden-states connector path reads the identical variable at `:5035`
 guarded by a raise at `:5031` if it is absent) — it keeps the list rather than
 concatenating.
 
-That last point matters: **the offline extraction machinery vLLM ships already
-reads exactly the variable we want to capture, from exactly the serving-engine
-code path.** The gap is purely one of plumbing and activation conditions
-(Section 5), not of the data existing.
+That last point matters twice over. First: **the offline extraction machinery
+vLLM ships already reads exactly the variable we want to capture, from exactly
+the serving-engine code path.** The gap is purely one of plumbing and activation
+conditions (Section 5), not of the data existing.
+
+Second, and less comfortably: it means a capture-vs-offline comparison is a
+comparison of **one tensor against itself**, since neither side recomputes
+anything from `:5035` onward. That is why Stage 0's `0.0` result is not the
+correctness proof it looks like, and why an independent re-derivation was
+needed. See Section 6.2.
 
 **4.8 Attribution data is live at the same point.** Row → request mapping does
 not need to be reconstructed. `req_indices = np.repeat(self.arange_np[:num_reqs],
@@ -515,17 +533,104 @@ index to the aux collection list — the pre-norm value exists only inside the
 decoder loop and is not stored or returned elsewhere; after the loop, the final
 RMSNorm is applied and only the post-norm tensor survives.
 
-**Detector:** a numerical equivalence test. Run the same short prompt through the
-offline extraction path and the serving capture path and assert the produced
-tensors match to a stated tolerance, elementwise, per layer. This test is the
-single most valuable artifact of the whole project — it is what converts
-"we believe capture is equivalent" into "we check it every CI run." It must exist
-before any training consumes captured data.
+**Detector — and a correction to what it detects.** The original detector was
+"run the same short prompt through the offline extraction path and the serving
+capture path and assert the produced tensors match." That test exists
+(`tests/e2e/test_serving_activation_capture.py`) and job 369229 passed it with
+`mean_rel_error` of exactly `0.0` and `max_abs_diff` of `0.0` on all three
+layers at shape `[18, 4096]`.
 
-The verdict is driven by the *aggregate* relative error
+**That result does not mean what the first draft of this document claimed it
+meant.** The two paths are not two derivations of the aux hidden states; they
+are two transports of one tensor object. Traced and confirmed against the
+pinned checkout:
+
+- Both originate at `V/model_executor/models/interfaces.py:1337`,
+  `value = hidden_states + residual`, appended by
+  `EagleModelMixin._maybe_add_hidden_state` (`:1329`) and unpacked by the runner
+  at `V/v1/worker/gpu_model_runner.py:4364`.
+- The serving capture wraps `_model_forward` and takes `result[1]` — the same
+  list object — then `.detach().cpu()` (`hook.py:530`) and `save_file`
+  (`hook.py:222`).
+- The offline path reads the *identical variable* one branch later at
+  `V/v1/worker/gpu_model_runner.py:5035` and copies it: `torch.stack`
+  (`V/v1/spec_decode/extract_hidden_states.py:132`) → assignment into a
+  same-dtype buffer (`:136`, allocated at `:78-82` from `model_config.dtype`)
+  → integer-indexed KV scatter (`V/model_executor/models/extract_hidden_states
+  .py:81-90`, preceded by dtype-equality **asserts** at `:220,223` that raise
+  rather than cast) → the inverse gather
+  (`V/distributed/kv_transfer/kv_connector/v1/example_hidden_states_connector
+  .py:35-42`) → `torch.empty_like(..., device="cpu", pin_memory=True)` plus a
+  same-dtype `copy_` (`:393-396`) → `save_file` (`:320-338`). **No
+  floating-point arithmetic and no dtype cast at any step.**
+- The offline "draft model" computes nothing: `load_weights` returns `set()`
+  (`V/model_executor/models/extract_hidden_states.py:392-394`) and
+  `CacheOnlyAttentionImpl.forward` (`:229-231`) is a bare `pass`. It has no
+  `nn.Parameter` at all.
+
+So `0.0` is the **expected** outcome, not a surprise, and the 10 % relative
+tolerance in `compare.py` was sized for a two-forward comparison this test does
+not perform. What the test genuinely detects — and nothing else here does — is
+transport failure: slot-mapping errors, layer misordering, truncation, row
+misalignment, prefix-cache row loss. Those are real hazards (6.1, 6.3, 6.5) and
+this detector is the right one for them. It is simply not evidence about
+*which quantity* was captured.
+
+**The identity detector.** The missing independent leg is
+`src/speedlm/activation_capture/hf_reference.py`, exercised as Leg 2 of the same
+E2E test: the same prompt token ids re-run through **HuggingFace transformers in
+float32** — a different implementation, a different dtype, no shared code path.
+Each captured aux layer must satisfy two checks:
+
+1. **Tolerance.** `mean_rel_error` within a *derived* bf16-vs-fp32 bound
+   `u * (k + 4)` where `u = 2^-8 = 3.906e-3` is bfloat16's unit roundoff (7
+   stored significand bits + 1 implicit) and `k` is the aux layer id, i.e. the
+   number of times the residual stream has been materialized in bf16. The
+   worst-case linear accumulation is used rather than the `sqrt(k)*u`
+   random-walk bound because vLLM's reduction order is not statistically
+   independent of HuggingFace's. For Qwen3-8B this is 2.3 %, 6.3 % and 9.8 % at
+   layers 2/12/21 and 15.6 % at the appended final layer — tighter than the flat
+   10 % at shallow depth, and one to two orders of magnitude below the O(1)
+   error a wrong quantity produces.
+2. **Identification.** The claimed reference index must beat both neighbouring
+   depths by at least 3x. This is the check a lossless round-trip cannot fake:
+   an off-by-one layer or a post-norm substitution moves the argmin, and it does
+   not depend on the tolerance in (1) being correctly derived.
+
+The layer-index mapping is proved, not assumed. vLLM calls
+`_maybe_add_hidden_state([], 0, ...)` with `residual is None` before the decoder
+loop and `(..., idx + 1, ...)` after each layer
+(`V/model_executor/models/qwen2.py:415-421`; `Qwen3Model` subclasses
+`Qwen2Model` at `qwen3.py:260`), so **aux id `k` is the residual stream entering
+decoder layer `k`**, and `self.norm` is applied only to the main return value
+afterwards (`qwen2.py:429`). HuggingFace 5.10.4 builds `output_hidden_states` by
+prepending the first layer's input and appending each layer's output
+(`transformers/utils/output_capturing.py:99-118`), then — because
+`tie_last_hidden_states` defaults to `True` — **overwrites the last entry with
+the post-norm `last_hidden_state`** (`:264-266`). Therefore `hf.hidden_states[k]`
+equals vLLM aux id `k` exactly for `0 <= k <= L-1`, while aux id `L` (the final
+decoder layer this design appends) has *no* counterpart in the HF tuple and is
+taken instead from a forward hook on `model.layers[L-1]`. Both halves are
+asserted at runtime rather than trusted: the tuple length must be `L+1`, the
+hook must fire, and the post-norm tensor must be measurably *further* from the
+capture than the hooked pre-norm one — which is what makes
+`final_layer_prenorm_confirmed` a real answer to 6.2 rather than a restatement
+of the question.
+
+Both legs must exist before any training consumes captured data. Leg 1 alone
+cannot tell a correct capture from a well-transported wrong one.
+
+The Leg 1 verdict is driven by the *aggregate* relative error
 (`mean_rel_error = mean|cap-off| / mean|off|`, tolerance 0.10) together with the
 shape check and the pre-norm check; cosine similarity is the corroborating
-signal. The elementwise metrics `max_rel_error` and `p99_rel_error` are
+signal. The 0.10 bound is retained deliberately even though 0.0 is what the
+transport actually achieves: it is the correct bound if the two transports ever
+stop being bit-identical (an upstream cast, a fused-MoE reduction-order change),
+and tightening it to 0.0 would turn any benign vLLM change into a red test
+without adding information. Note also that `check_pre_norm` on this leg is a
+tolerance check on one extra layer, not a structural one — **both** sides
+collect at `interfaces.py:1337`, so it can never distinguish pre-norm from
+post-norm. Only Leg 2's `final_layer_prenorm_confirmed` can. The elementwise metrics `max_rel_error` and `p99_rel_error` are
 diagnostics and do **not** gate PASS/FAIL. They divide by
 `max(|off_i|, 1e-3 * RMS(off))`, not by `|off_i| + eps`: a residual stream is
 full of near-zero elements, and a bare additive epsilon turns ordinary bf16
@@ -821,9 +926,24 @@ kills or reshapes the plan; it does not get waived.**
 Attach a capture mechanism to a running EAGLE-3 serving engine, serve one fixed
 short prompt, and write the aux hidden states to a file. Separately, run the
 existing offline extraction path over the same prompt. **Compare the two tensors
-elementwise.**
+elementwise.** Then re-derive the same activations independently, with
+HuggingFace transformers in float32, and compare against that.
 
 Nothing else. No cache, no retention, no training, no integration.
+
+**What Stage 0 proves, and what it does not.** This split is load-bearing and
+the first version of this document got it wrong, so it is stated explicitly.
+
+| Question | Settled by | Status |
+| --- | --- | --- |
+| Can a mechanism reach `aux_hidden_states` in a serving engine? | The capture running at all | **Yes** — `worker_extension_cls` + `_model_forward` monkeypatch (5.2) |
+| Does the capture survive transport to disk intact — right rows, right layers, right order, no truncation? | Leg 1 (capture vs. offline) | **Yes** — job 369229, `max_abs_diff = 0.0` on all three layers |
+| Are the captured values the **same quantity** the trainer expects (pre-norm, layer `k`, not `k±1`)? | Leg 2 (capture vs. HF fp32) | **Not settled by Leg 1.** Leg 1 is a transport check between two views of one tensor (see 6.2); a `0.0` there is expected and carries no information about identity. Leg 2 exists to answer this and its verdict gates the test. |
+| Does a prefix-cache hit genuinely drop rows (6.1)? | `test_prefix_cache_coverage` | **Now measured.** Until 2026-08-01 that test contained no `assert` and wrote `cache_hit: true` / `rows_missing: 0` as hardcoded literals — it recorded an assumption. It now reads `vllm:prefix_cache_hits_total` off the engine and asserts a hit occurred, that the warm request captured strictly fewer rows per layer than the cold one, and that rows are actually missing. |
+| What is the real serving latency cost of capture? | p50/p99 with capture on vs. off | **Still open.** Not measured. |
+
+Do not cite "Stage 0 passed" as settling the correctness question. Cite which
+leg, and what that leg can see.
 
 This single experiment settles the questions that determine whether the rest of
 the plan is worth writing:
@@ -839,10 +959,20 @@ the plan is worth writing:
 **Exit criteria:**
 - Captured and offline tensors match to a stated, written-down tolerance, or the
   discrepancy is fully explained (and the explanation is not "it's probably
-  fine").
+  fine"). **Met — but see the table above for what it establishes.** Because
+  the two paths share the tensor, "match" here is bit-identity and the exit
+  criterion is weaker than it reads.
+- Captured tensors match an **independent** float32 re-derivation to a derived
+  bf16 tolerance, *and* are the strict nearest match among neighbouring
+  residual-stream depths. This criterion was absent from the original plan;
+  without it the previous criterion is satisfiable by any wrong quantity that
+  is transported correctly.
 - A cache-hit prompt demonstrably yields fewer captured rows than tokens,
-  confirming 6.1 empirically.
+  confirming 6.1 empirically. **Now actually asserted**, from the engine's own
+  prefix-cache counters rather than from the fact that the same prompt was sent
+  twice.
 - Measured p50 and p99 serving latency with capture on versus off, published.
+  **Still outstanding.**
 
 **Kill condition:** if the tensors cannot be made to match, or if matching
 requires a model-runner patch that cannot be isolated from the drafter's forward
@@ -902,11 +1032,20 @@ changes.
 
 1. **What is the real serving latency cost of capture?** Design intent says near
    zero. Nobody has measured it. Stage 0.
-2. **Do captured and offline activations actually match?** The single most
-   important unknown. Stage 0.
+2. **Do captured and offline activations actually match?** **Answered, and the
+   question was the wrong one.** They match bit-for-bit (job 369229), because
+   they are the same tensor transported two ways with no arithmetic on either
+   path (6.2). The question that actually matters — *is the captured tensor the
+   quantity the trainer expects* — is answered by the independent HuggingFace
+   fp32 leg, not by this comparison. Do not let a `0.0` in `result.json` retire
+   this line item.
 3. **Does the prefix-cache absence inference hold?** Section 6.1 is inference from
    what crosses an API boundary, not from an explicit statement in code.
-   Empirical check required.
+   Empirical check required — and now performed: `test_prefix_cache_coverage`
+   reads `vllm:prefix_cache_hits_total` and asserts the warm request captured
+   strictly fewer rows. Before 2026-08-01 that test asserted nothing and wrote
+   its "findings" as literals, so any earlier citation of it as confirmation of
+   6.1 was citing an assumption.
 4. **What did the 16 aborted cycles actually fail on?** The claim that capture
    would have prevented them is currently unsupported. Read the failure records.
 5. **What is the throughput cost of `VLLM_BATCH_INVARIANT=1` on this stack?**
@@ -920,8 +1059,11 @@ changes.
    (`llama_eagle3.py:176-187`, `:139`), independent of how many aux layers the
    serving engine collects. The binding constraint is a localized model-runner
    patch that slices the 4th entry before feeding the drafter. This correction is
-   derived from code reading, not measurement; Stage 0's elementwise comparison
-   remains the empirical check.
+   derived from code reading, not measurement. The empirical check is that the
+   engine serves at all with the 4th layer collected (the drafter's `fc` would
+   raise a shape error otherwise) plus Leg 2's `final_layer_prenorm_confirmed`;
+   Leg 1's elementwise comparison cannot check it, since both sides collect the
+   4th layer at the same place.
 8. **What is the actual size of the reference verifier's weights, and what is the
    host's PCIe link generation and width?** Both are quoted in Section 7 and
    Section 8 from memory rather than from the machine.

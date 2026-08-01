@@ -5,6 +5,30 @@ activation capture prototype. It compares two stacks of per-layer tensors
 (captured at serving time vs. extracted offline) and produces a machine-readable
 verdict.
 
+**WHAT THIS COMPARISON DOES AND DOES NOT ESTABLISH.**  The captured and offline
+stacks are *not* two independent derivations of the aux hidden states.  Both
+originate from the single tensor that vLLM's
+``EagleModelMixin._maybe_add_hidden_state`` appends at
+``model_executor/models/interfaces.py:1337``; the serving hook takes that list
+object directly out of ``_model_forward``, while the offline path reads the same
+variable one branch later at ``v1/worker/gpu_model_runner.py:5035`` and merely
+transports it (stack, same-dtype buffer assignment, integer-indexed KV scatter,
+the inverse gather, a pinned same-dtype D2H copy, ``save_file``) with no
+floating-point arithmetic and no dtype cast at any step.  The offline "draft
+model" has no weights (``models/extract_hidden_states.py:392-394`` returns
+``set()``) and computes nothing (``CacheOnlyAttentionImpl.forward`` at
+``:229-231`` is ``pass``).
+
+So this comparison is a **transport check**: it catches slot-mapping errors,
+layer misordering, truncation, row misalignment and prefix-cache row loss.  A
+result of exactly ``0.0`` is the *expected* outcome, not a surprise, and it does
+not establish that the captured tensor is the quantity the trainer wants.  The
+independent evidence for that lives in
+:mod:`speedlm.activation_capture.hf_reference`, which re-derives the same
+quantity with HuggingFace transformers in float32 — a different implementation,
+a different dtype, no shared code path.  Read the two together; neither alone
+settles Stage 0.
+
 Tolerance rationale:
 Both paths run the same model weights through the same vLLM kernel selection
 on the same GPU. The dominant sources of numerical difference are:
@@ -20,12 +44,25 @@ on the same GPU. The dominant sources of numerical difference are:
 3. **dtype**: both paths use bf16, so no cross-dtype conversion is expected.
 
 **Relative tolerance (primary)**
-bf16 has ~7-8 bits of mantissa, giving a per-op relative error near 1e-2.
-Across 20+ decoder layers with residual accumulation, error can compound to a
-few percent. A relative tolerance of **0.10 (10 %)** is chosen as a generous
-but defensible bound: it is well above the bf16 noise floor for a single
-operation yet tight enough to catch a genuinely different quantity (e.g.,
-post-norm vs. pre-norm, or a shifted residual).  The relative metric
+The 0.10 bound below was sized for a *two-forward* comparison — two engines
+each recomputing the activations, where kernel-order and batch-composition
+differences are real.  This test does not perform two forwards (see the note
+above), so on the paths it actually exercises the achievable value is 0.0 and
+the bound is slack by construction.  It is retained deliberately: it is the
+right bound if the transports ever stop being bit-identical (e.g. an upstream
+change introduces a cast or a fused-MoE reduction-order difference), and
+tightening it to 0.0 would turn any future benign vLLM change into a red test
+without adding information.  **Do not read a pass at this tolerance as
+evidence about numerical agreement between derivations** — for that, see
+``hf_reference.bf16_relative_tolerance``, which derives a real, depth-dependent
+bf16-vs-fp32 bound.
+
+The original rationale, which still describes the sources of difference in the
+two-forward case: bf16 has ~7-8 bits of mantissa, giving a per-op relative
+error near 1e-2; across 20+ decoder layers with residual accumulation, error
+can compound to a few percent; 10% sits well above the bf16 noise floor for a
+single operation yet below the O(1) error of a genuinely different quantity
+(e.g. post-norm vs. pre-norm, or a shifted residual).  The relative metric
 ``mean_rel_error`` (mean|a-b| / mean|b|) drives the verdict; the absolute
 tolerance is retained for reference but no longer gates PASS/FAIL.
 
@@ -53,6 +90,8 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from speedlm.activation_capture.hf_reference import HFReferenceResult
 
 if TYPE_CHECKING:
     # Only executed by static type checkers. mypy has per-module overrides for
@@ -148,11 +187,35 @@ class LayerComparison:
 
 @dataclass(frozen=True)
 class PrefixCacheResult:
-    """Result of the prefix-cache coverage measurement."""
+    """Result of the prefix-cache coverage measurement.
 
+    Every field here must be **measured**.  The first version of this type was
+    populated with hardcoded literals (``cache_hit=True``, ``rows_missing=0``)
+    by a test with no assertions, which recorded an assumption and reported it
+    as a finding.  If a caller cannot measure a field, it must not construct
+    this type.
+
+    The row count is **per layer**, not summed over layers.  The old
+    ``captured_row_count`` summed ``rows x layers``, which is not comparable to
+    ``prompt_token_count`` and made ``rows_missing`` meaningless; the field was
+    renamed rather than redefined so no stale caller keeps the old meaning.
+    """
+
+    #: The engine's own ``usage.prompt_tokens`` for the request under test.
     prompt_token_count: int
-    captured_row_count: int
+    #: Rows captured **for a single layer**.  Directly comparable to
+    #: ``prompt_token_count``: one row per forwarded token position.
+    captured_rows_per_layer: int
+    #: Number of layers captured.  ``captured_rows_per_layer *
+    #: captured_layer_count`` is the total tensor row count.
+    captured_layer_count: int
+    #: Whether the engine actually served this request from its prefix cache,
+    #: read from ``vllm:prefix_cache_hits_total`` on ``/metrics`` — never
+    #: inferred from the fact that the same prompt was sent twice.
     cache_hit: bool
+    #: ``prompt_token_count - captured_rows_per_layer``: the prompt positions
+    #: that produced no activation row.  Section 6.1's hazard is real exactly
+    #: when this is positive on a cache hit.
     rows_missing: int
 
 
@@ -168,6 +231,12 @@ class ComparisonResult:
     layers: list[LayerComparison]
     pre_norm_match: bool | None  # None if final-layer data absent
     prefix_cache_test: PrefixCacheResult | None = None
+    #: Verdict of the independent HuggingFace fp32 re-derivation.  ``None``
+    #: means the reference was NOT run, which is not a pass -- the caller is
+    #: responsible for asserting that it ran.  It is not gated here because a
+    #: default-None field must not change the verdict of every existing
+    #: caller; see ``derive_verdict``.
+    hf_reference: HFReferenceResult | None = None
     tolerance: float = DEFAULT_TOLERANCE
     relative_tolerance: float = DEFAULT_RELATIVE_TOLERANCE
     verdict: str = ""  # Set by derive_verdict
@@ -214,6 +283,11 @@ class ComparisonResult:
             "prefix_cache_test": (
                 asdict(self.prefix_cache_test)
                 if self.prefix_cache_test is not None
+                else None
+            ),
+            "hf_reference": (
+                self.hf_reference.to_dict()
+                if self.hf_reference is not None
                 else None
             ),
             "tolerance": self.tolerance,
@@ -548,6 +622,11 @@ def derive_verdict(result: ComparisonResult) -> str:
       The ``rel_error_trend`` field indicates whether the divergence looks
       like proportional noise ("constant") or a systematic drift ("growing").
     - **FAIL_pre_norm**: pre-norm comparison failed or could not be confirmed.
+    - **FAIL_hf_reference**: the independent HuggingFace fp32 re-derivation was
+      run and did not pass.  A ``hf_reference`` of ``None`` means it was not
+      run and is deliberately NOT a failure here: gating on absence would flip
+      the verdict of every caller that predates the reference.  The e2e harness
+      asserts separately that the reference actually ran.
     """
     if not result.layers:
         return "FAIL_empty"
@@ -559,6 +638,8 @@ def derive_verdict(result: ComparisonResult) -> str:
         return "FAIL_pre_norm"
     if not result.pre_norm_match:
         return "FAIL_pre_norm"
+    if result.hf_reference is not None and not result.hf_reference.passed:
+        return "FAIL_hf_reference"
     return "PASS"
 
 
@@ -569,6 +650,7 @@ def build_result(
     captured_final_pre_norm: Tensor | None = None,
     offline_final_pre_norm: Tensor | None = None,
     prefix_cache: PrefixCacheResult | None = None,
+    hf_reference: HFReferenceResult | None = None,
     tolerance: float = DEFAULT_TOLERANCE,
     relative_tolerance: float = DEFAULT_RELATIVE_TOLERANCE,
 ) -> ComparisonResult:
@@ -587,6 +669,7 @@ def build_result(
         layers=layers,
         pre_norm_match=pre_norm,
         prefix_cache_test=prefix_cache,
+        hf_reference=hf_reference,
         tolerance=tolerance,
         relative_tolerance=relative_tolerance,
         verdict="",
@@ -596,6 +679,7 @@ def build_result(
         layers=result.layers,
         pre_norm_match=result.pre_norm_match,
         prefix_cache_test=result.prefix_cache_test,
+        hf_reference=result.hf_reference,
         tolerance=result.tolerance,
         relative_tolerance=result.relative_tolerance,
         verdict=derive_verdict(result),
