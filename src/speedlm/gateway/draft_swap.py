@@ -315,7 +315,12 @@ class DraftSwapExtension:
         drafter nor the verifier was left stranded on the meta device.
 
         Returns:
-            ``{"swapped": True, "parameters_loaded": int}``.
+            ``{"swapped": True, "parameters_loaded": int,
+            "target_owned_submodules": [...], "dropped_tensors": [...]}``.
+            The last two report the *live* drafter/verifier sharing topology
+            that governed the payload, because how many tensors legitimately
+            load depends on it (see :meth:`_target_owned_submodules`) and a
+            bare count cannot be interpreted without it.
 
         Raises:
             RuntimeError: no drafter is loaded, or the swap left tensors on
@@ -333,10 +338,17 @@ class DraftSwapExtension:
         #: Validate compatibility BEFORE touching anything.
         self._validate_compatibility(drafter, new_weights, directory)
 
-        count = self._apply_weights(drafter, new_weights)
+        owned = self._target_owned_submodules(drafter)
+        dropped = self._target_owned_tensor_names(new_weights, owned)
+        count = self._apply_weights(drafter, new_weights, owned=owned)
 
         logger.info("Hot-swapped %d drafter parameters from %s", count, weights_path)
-        return {"swapped": True, "parameters_loaded": count}
+        return {
+            "swapped": True,
+            "parameters_loaded": count,
+            "target_owned_submodules": sorted(owned),
+            "dropped_tensors": dropped,
+        }
 
     def draft_info(self) -> dict[str, Any]:
         """Return metadata about the currently loaded drafter.
@@ -360,6 +372,13 @@ class DraftSwapExtension:
             "parameter_dtypes": param_dtypes,
             "quantization": self._get_quantization(),
             "draft_config": asdict(summarize_hf_config(self._draft_hf_config())),
+            #: The live sharing topology.  vLLM decides per checkpoint whether
+            #: the drafter's embedding/head are the verifier's objects or the
+            #: drafter's own copies (see :meth:`_target_owned_submodules`), and
+            #: that decision changes how many candidate tensors a swap may
+            #: legitimately load.  Exposing it lets a caller *derive* the
+            #: expected payload size instead of assuming one topology.
+            "target_owned_submodules": sorted(self._target_owned_submodules(drafter)),
         }
 
     # -- model lookup --
@@ -548,9 +567,9 @@ class DraftSwapExtension:
         This deliberately does NOT set-diff checkpoint tensor names against
         ``drafter.named_parameters()``.  vLLM fuses ``q/k/v_proj`` into
         ``qkv_proj`` and ``gate/up_proj`` into ``gate_up_proj`` while HF
-        checkpoints store them separately, and the EAGLE proposer *deletes*
-        the drafter's ``embed_tokens``/``lm_head`` and rebinds the verifier's
-        (``llm_base_proposer.py:1492-1494`` and ``:1545-1547``).  A name
+        checkpoints store them separately, and the EAGLE proposer *may* delete
+        the drafter's ``embed_tokens``/``lm_head`` and rebind the verifier's
+        (conditionally -- see :meth:`_target_owned_submodules`).  A name
         set-diff therefore reports both "missing" and "extra" parameters for a
         byte-identical drafter.  ``drafter.load_weights()`` already resolves
         fusion correctly, so what is validated here is what the loader cannot
@@ -602,14 +621,37 @@ class DraftSwapExtension:
     def _target_owned_submodules(self, drafter: Any) -> dict[str, Any]:
         """Map drafter submodule paths that are *the verifier's* modules.
 
-        The EAGLE proposer shares the verifier's ``embed_tokens`` and
-        ``lm_head`` with the drafter by object identity
-        (``llm_base_proposer.py:1492-1494``, ``:1545-1547``).  They are
-        reachable from ``drafter.modules()`` but they are NOT the drafter's to
-        reload: ``initialize_layerwise_reload`` walks every module and calls
-        ``restore_layer_on_meta`` on each (``reload/layerwise.py:100-117``),
-        which would move the *running verifier's* embedding onto the meta
-        device and never restore it.
+        The EAGLE proposer *may* share the verifier's ``embed_tokens`` and
+        ``lm_head`` with the drafter by object identity.  When it does, they
+        are reachable from ``drafter.modules()`` but they are NOT the
+        drafter's to reload: ``initialize_layerwise_reload`` walks every module
+        and calls ``restore_layer_on_meta`` on each
+        (``reload/layerwise.py:100-117``), which would move the *running
+        verifier's* embedding onto the meta device and never restore it.
+
+        **Sharing is conditional, not structural.**  Both runner generations
+        gate it on the same two questions -- does the checkpoint carry its own
+        copy, and if so is that copy weight-identical to the verifier's:
+
+        * V1 ``EagleProposer``: ``llm_base_proposer.py:1432-1461``
+          (``has_own_embed_tokens`` + ``torch.equal``) and ``:1508-1547``
+          (``has_own_lm_head`` + ``torch.equal``).
+        * V2 ``EagleSpeculator``: ``v1/worker/gpu/spec_decode/eagle/utils.py``
+          ``_should_share`` (``:12-25``), applied to ``embed_tokens`` at
+          ``:60-65`` and ``lm_head`` at ``:69-74``.  It rebinds under the *same*
+          attribute paths V1 uses -- ``drafter.model.embed_tokens`` and
+          ``drafter.lm_head`` -- so nothing about the V2 topology needs special
+          casing here.
+
+        The flags themselves are set from the checkpoint's tensor names during
+        loading (``model_executor/models/utils.py:915-934``).  So a drafter
+        published with a *distinct* embedding or a reduced-vocabulary head --
+        e.g. an EAGLE-3 checkpoint with ``draft_vocab_size`` smaller than the
+        verifier's ``vocab_size``, which makes the head shapes differ and
+        ``torch.equal`` therefore ``False`` -- genuinely owns those weights,
+        and this correctly returns ``{}`` for it.  That is why the answer is
+        read from live object identity rather than from a fixed name list: the
+        same drafter architecture yields a different answer per checkpoint.
 
         Only top-most matches are returned; detaching a parent detaches its
         children with it.
@@ -626,11 +668,40 @@ class DraftSwapExtension:
             if name and id(module) in target_ids:
                 owned[name] = module
 
-        return {
+        topmost = {
             name: module
             for name, module in owned.items()
             if not any(name.startswith(f"{other}.") for other in owned if other != name)
         }
+        #: Logged unconditionally, including the empty case.  vLLM logs its
+        #: sharing decision on V1 but not on V2 (``eagle/utils.py`` is silent),
+        #: so without this line an absent "dropping ..." warning is ambiguous
+        #: between "nothing is shared" and "the lookup failed" -- an ambiguity
+        #: that already cost one GPU run.
+        logger.info(
+            "Drafter shares %d submodule(s) with the verifier by identity: %s",
+            len(topmost),
+            sorted(topmost),
+        )
+        return topmost
+
+    @staticmethod
+    def _target_owned_tensor_names(
+        new_weights: Mapping[str, Any], owned: Mapping[str, Any]
+    ) -> list[str]:
+        """Candidate tensor names that would land in a verifier-owned module.
+
+        The single definition of the drop rule, shared by
+        :meth:`_drop_target_owned_weights` (which applies it) and
+        :meth:`hot_swap_draft` (which reports it), so the reported set cannot
+        drift from the applied one.
+        """
+        if not owned:
+            return []
+        leaves = {path.rpartition(".")[2] for path in owned}
+        return sorted(
+            name for name in new_weights if any(leaf in name for leaf in leaves)
+        )
 
     @contextmanager
     def _detached_submodules(
@@ -655,9 +726,9 @@ class DraftSwapExtension:
             for holder, attr, module in reversed(detached):
                 setattr(holder, attr, module)
 
-    @staticmethod
+    @classmethod
     def _drop_target_owned_weights(
-        new_weights: Mapping[str, Any], owned: Mapping[str, Any]
+        cls, new_weights: Mapping[str, Any], owned: Mapping[str, Any]
     ) -> dict[str, Any]:
         """Drop candidate tensors destined for verifier-owned modules.
 
@@ -665,27 +736,24 @@ class DraftSwapExtension:
         *running verifier*.  vLLM applies the same substring exclusion via
         ``AutoWeightsLoader(skip_substrs=...)`` in
         ``llama_eagle3.py:419-432``.
+
+        When nothing is shared (``owned`` empty) the drafter owns its own
+        embedding/head and the candidate's copies are exactly what must be
+        loaded, so the payload passes through untouched.
         """
-        if not owned:
+        dropped = set(cls._target_owned_tensor_names(new_weights, owned))
+        if not dropped:
             return dict(new_weights)
 
-        leaves = {path.rpartition(".")[2] for path in owned}
-        kept: dict[str, Any] = {}
-        dropped: list[str] = []
-        for name, tensor in new_weights.items():
-            if any(leaf in name for leaf in leaves):
-                dropped.append(name)
-                continue
-            kept[name] = tensor
-
-        if dropped:
-            logger.warning(
-                "Dropping %d candidate tensors bound to verifier-shared modules %s: %s",
-                len(dropped),
-                sorted(leaves),
-                sorted(dropped)[:5],
-            )
-        return kept
+        logger.warning(
+            "Dropping %d candidate tensors bound to verifier-shared modules %s: %s",
+            len(dropped),
+            sorted(path.rpartition(".")[2] for path in owned),
+            sorted(dropped)[:5],
+        )
+        return {
+            name: tensor for name, tensor in new_weights.items() if name not in dropped
+        }
 
     def _stranded_on_meta(self, drafter: Any) -> dict[str, list[str]]:
         """Return ``{"draft": [...], "target": [...]}`` of meta-device tensors.
@@ -751,14 +819,27 @@ class DraftSwapExtension:
                 f"(model is unusable): {sorted(stranded)[:5]}"
             )
 
-    def _apply_weights(self, drafter: Any, new_weights: Mapping[str, Any]) -> int:
-        """Apply *new_weights* into *drafter* in-place, preserving CUDA graphs."""
+    def _apply_weights(
+        self,
+        drafter: Any,
+        new_weights: Mapping[str, Any],
+        *,
+        owned: Mapping[str, Any] | None = None,
+    ) -> int:
+        """Apply *new_weights* into *drafter* in-place, preserving CUDA graphs.
+
+        *owned* is the verifier-shared submodule map from
+        :meth:`_target_owned_submodules`; it is accepted as an argument so
+        :meth:`hot_swap_draft` can report the same topology it acted on rather
+        than recomputing (and possibly re-deriving a different) one.
+        """
         from vllm.model_executor.model_loader.reload.layerwise import (
             finalize_layerwise_reload,
             initialize_layerwise_reload,
         )
 
-        owned = self._target_owned_submodules(drafter)
+        if owned is None:
+            owned = self._target_owned_submodules(drafter)
         payload = self._drop_target_owned_weights(new_weights, owned)
         model_config = self._draft_model_config()
 

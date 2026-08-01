@@ -21,6 +21,18 @@ for once:
    ``swapped=True`` with a parameter count that matches the candidate payload,
    nothing is on the meta device afterwards -- drafter *or* target -- and a
    greedy canary completion afterwards is token-identical to before.
+
+   The expected parameter count is *derived* from the topology the engine
+   reports (``draft_info``'s ``target_owned_submodules``), not assumed: vLLM
+   shares the verifier's embedding/head with the drafter only when the
+   checkpoint's own copies are weight-identical, so how many candidate tensors
+   legitimately load differs per checkpoint.
+
+Every meta-device reading is written into ``result.json`` under
+``materialization`` *before* it is asserted on, alongside the topology and the
+swap's own report.  A bare assertion stores nothing, so a run that fails at any
+phase used to leave no record of whether the verifier's embedding was
+stranded -- the exact question the previous failure could not answer.
 4. Speculative-decode counters advance after the swap.
 5. INCOMPATIBLE swap (doctored ``hidden_size``) is rejected with the running
    drafter untouched, and a canary still succeeds.
@@ -66,6 +78,7 @@ import socket
 import struct
 import subprocess
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -94,11 +107,17 @@ WORKER_EXTENSION_CLS = "speedlm.gateway.draft_swap.CombinedWorkerExtension"
 REQUIRED_SWAP_CALL = "hot_swap_draft"
 REQUIRED_CAPTURE_CALL = "activate_capture"
 
-#: Substrings of the drafter submodules that the EAGLE proposer shares with the
-#: verifier by object identity.  ``_drop_target_owned_weights`` filters
-#: candidate tensors by exactly this rule, so the expected
-#: ``parameters_loaded`` is the candidate tensor count minus these.
-TARGET_OWNED_LEAVES = ("embed_tokens", "lm_head")
+#: RPC returning the drafter/verifier sharing topology, whose keys this test
+#: uses instead of a hard-coded module list.  vLLM decides *per checkpoint*
+#: whether the drafter's ``embed_tokens``/``lm_head`` are the verifier's
+#: objects or the drafter's own copies -- gated on a weight-equality check
+#: (``v1/worker/gpu/spec_decode/eagle/utils.py:12-25`` on V2,
+#: ``llm_base_proposer.py:1432-1461``/``:1508-1547`` on V1).  An EAGLE-3 head
+#: with ``draft_vocab_size < vocab_size`` therefore keeps its own head, and a
+#: head-distinct checkpoint keeps its own embedding, so a fixed
+#: ``("embed_tokens", "lm_head")`` list is wrong for exactly the checkpoints
+#: this project publishes.
+TOPOLOGY_KEY = "target_owned_submodules"
 
 DEFAULT_PROMPT = "Explain in one sentence why the sky appears blue."
 
@@ -441,20 +460,32 @@ def _candidate_tensor_names(directory: Path) -> list[str]:
     return names
 
 
-def _expected_parameters_loaded(directory: Path) -> int:
+def _expected_parameters_loaded(
+    directory: Path, target_owned_submodules: Sequence[str]
+) -> int:
     """Payload size ``_apply_weights`` should report for *directory*.
 
     Deliberately NOT the drafter's ``named_parameters()`` count: vLLM fuses
     ``q/k/v_proj`` into ``qkv_proj`` and ``gate/up_proj`` into
     ``gate_up_proj``, so a byte-identical checkpoint always has more tensors
     than the live model has parameters.  What the swap reports is the number of
-    candidate tensors handed to the loader after the verifier-owned
-    embedding/head tensors are dropped, and that is what is asserted.
+    candidate tensors handed to the loader after the verifier-*owned* ones are
+    dropped.
+
+    Which tensors those are is **derived from the live engine**, not assumed:
+    *target_owned_submodules* is the set of drafter submodule paths that are
+    the verifier's objects, as reported by ``draft_info``.  When the drafter
+    owns its own embedding and head -- the normal case for an EAGLE-3
+    checkpoint whose head has a reduced draft vocabulary -- that set is empty
+    and every candidate tensor is expected to load.  Hard-coding
+    ``("embed_tokens", "lm_head")`` here asserts one topology against the
+    other and fails a *correct* swap.
     """
     names = _candidate_tensor_names(directory)
-    return sum(
-        1 for name in names if not any(leaf in name for leaf in TARGET_OWNED_LEAVES)
-    )
+    leaves = {path.rpartition(".")[2] for path in target_owned_submodules}
+    if not leaves:
+        return len(names)
+    return sum(1 for name in names if not any(leaf in name for leaf in leaves))
 
 
 # ---------------------------------------------------------------------------
@@ -686,6 +717,14 @@ def test_draft_hot_swap_on_live_engine() -> None:
         # runner to walk.
         info_before = _collective_rpc_one(port, "draft_info")
         shapes_before = info_before["parameter_shapes"]
+        #: Recorded BEFORE the assertions below so a failing run still leaves
+        #: the topology in result.json -- the previous run's post-mortem could
+        #: not answer "was anything shared?" because nothing was persisted.
+        owned_before = list(info_before.get(TOPOLOGY_KEY, []))
+        report["draft_topology"] = {
+            TOPOLOGY_KEY: owned_before,
+            "num_parameters": info_before["num_parameters"],
+        }
         assert info_before["num_parameters"] > 0, (
             f"draft_info reports zero parameters: {info_before!r}"
         )
@@ -698,12 +737,21 @@ def test_draft_hot_swap_on_live_engine() -> None:
             "num_parameters": info_before["num_parameters"],
             "draft_config": info_before.get("draft_config"),
             "quantization": info_before.get("quantization"),
+            TOPOLOGY_KEY: owned_before,
         }
 
         # -- Phase 2b: nothing is on meta before any swap --------------------
         # Baseline meta-device walk: proves the probe reports "clean" on a
         # healthy engine, so a clean post-swap reading is not just a broken probe.
+        # Every reading is recorded under report["materialization"] BEFORE it is
+        # asserted on, so that a run failing at any later phase still says
+        # whether the verifier's embedding was stranded.  A bare assert stores
+        # nothing, which is why the previous failure was undiagnosable.
+        materialization: dict[str, Any] = {}
+        report["materialization"] = materialization
+
         meta_before = _collective_rpc_one(port, "draft_materialization_report")
+        materialization["before_swap"] = meta_before
         assert meta_before["stranded_total"] == 0, (
             f"tensors were already on the meta device BEFORE any swap: "
             f"{meta_before['stranded']}"
@@ -720,21 +768,44 @@ def test_draft_hot_swap_on_live_engine() -> None:
         # Failure mode: the reload machinery itself is broken.  Swapping in the
         # weights that are already loaded means any behavioural difference is
         # attributable to the machinery and nothing else.
-        expected_loaded = _expected_parameters_loaded(drafter_dir)
+        candidate_names = _candidate_tensor_names(drafter_dir)
+        expected_loaded = _expected_parameters_loaded(drafter_dir, owned_before)
+        #: Recorded before the RPC so a swap that *raises* still leaves the
+        #: expectation and the topology it was derived from in result.json.
+        report["null_swap_expectation"] = {
+            "candidate_tensors": len(candidate_names),
+            "expected_parameters_loaded": expected_loaded,
+            "derived_from": owned_before,
+        }
         swap = _collective_rpc_one(port, "hot_swap_draft", str(drafter_dir))
+        report["null_swap"] = swap
         assert swap.get("swapped") is True, f"null swap did not report success: {swap!r}"
         assert swap.get("parameters_loaded") == expected_loaded, (
             f"null swap loaded {swap.get('parameters_loaded')} parameters but the "
-            f"candidate payload under {drafter_dir} has {expected_loaded} tensors "
-            f"after dropping verifier-owned {list(TARGET_OWNED_LEAVES)}"
+            f"candidate payload under {drafter_dir} has {expected_loaded} of its "
+            f"{len(candidate_names)} tensors left after dropping the ones bound to "
+            f"the verifier-owned submodules the engine reported ({owned_before})"
         )
-        report["null_swap"] = swap
+        #: The swap must have acted on the topology ``draft_info`` reported and
+        #: dropped exactly the tensors that implies -- otherwise the count
+        #: above could match for the wrong reason.
+        assert sorted(swap.get(TOPOLOGY_KEY, [])) == sorted(owned_before), (
+            f"hot_swap_draft acted on topology {swap.get(TOPOLOGY_KEY)!r} but "
+            f"draft_info reported {owned_before!r}"
+        )
+        assert len(candidate_names) - len(swap.get("dropped_tensors", [])) == (
+            expected_loaded
+        ), (
+            f"dropped tensors {swap.get('dropped_tensors')!r} do not reconcile "
+            f"{len(candidate_names)} candidate tensors with {expected_loaded} loaded"
+        )
 
         # -- Phase 3c: nothing stranded on meta after the swap ---------------
         # Failure mode: the layerwise reload walked the drafter's *shared*
         # submodules and left the running verifier's embedding on the meta
         # device — the model then answers, wrongly, until it crashes.
         meta_after = _collective_rpc_one(port, "draft_materialization_report")
+        materialization["after_swap"] = meta_after
         assert meta_after["stranded_total"] == 0, (
             f"draft hot-swap stranded tensors on the meta device: "
             f"{meta_after['stranded']}"
@@ -802,6 +873,7 @@ def test_draft_hot_swap_on_live_engine() -> None:
             "shapes; validation did not happen before mutation"
         )
         meta_rejected = _collective_rpc_one(port, "draft_materialization_report")
+        materialization["after_rejection"] = meta_rejected
         assert meta_rejected["stranded_total"] == 0, (
             f"the rejected candidate left tensors on the meta device: "
             f"{meta_rejected['stranded']}"
@@ -827,6 +899,20 @@ def test_draft_hot_swap_on_live_engine() -> None:
         report["capture_meta"] = capture_meta
 
     finally:
+        #: Last-gasp meta-device reading before the engine is torn down.  When
+        #: an earlier phase fails, the post-swap probe never runs and the
+        #: post-mortem cannot say whether the verifier's embedding was
+        #: stranded -- exactly what blocked diagnosis of the previous failure.
+        #: Best-effort by construction: the engine may already be dead, and a
+        #: diagnostic must never replace the real failure.
+        final_meta = report.setdefault("materialization", {})
+        try:
+            final_meta["at_teardown"] = _collective_rpc_one(
+                port, "draft_materialization_report"
+            )
+        except Exception as exc:  # noqa: BLE001 -- diagnostics must not mask
+            final_meta["at_teardown_error"] = repr(exc)
+
         vllm_proc.terminate()
         try:
             vllm_proc.wait(timeout=60)

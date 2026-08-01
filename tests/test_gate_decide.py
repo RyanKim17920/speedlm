@@ -1,5 +1,7 @@
 """Tests for gate/decide.py — no GPU, no network."""
 
+import math
+
 import pytest
 
 from speedlm.config import PromotionConfig
@@ -7,6 +9,7 @@ from speedlm.gate.decide import (
     GATING_ACCEPTANCE_STATISTIC,
     GATING_THROUGHPUT_STATISTIC,
     Decision,
+    DispersionBasis,
     DivergenceBasis,
     Reason,
     Verdict,
@@ -1120,3 +1123,195 @@ def test_a_repeat_window_without_acceptance_falls_back_to_the_pooled_rate() -> N
 
     # The idle window reports the arm's pooled rate rather than a measured 0%.
     assert [r.stock_acceptance_rate for r in dec.per_repeat] == [0.62, 0.60, 0.58]
+
+
+# ---------------------------------------------------------------------------
+# Dispersion basis: a zero standard error is not a good measurement
+# ---------------------------------------------------------------------------
+
+def _replay_with_tps_series(series: list[float]) -> ReplayResult:
+    """A replay whose per-repeat throughput follows *series* exactly."""
+    return _make_replay([_valid_run(tps=t) for t in series])
+
+
+def test_degenerate_acceptance_is_labelled_not_reported_as_a_tight_measurement() -> None:
+    """Five bit-identical repeats must not read as an infinitely good measurement.
+
+    This is job 369162 (gpt-oss-20b) in miniature: both arms returned the same
+    acceptance rate on every repeat, so ``*_acceptance_stdev`` is 0.0.  A
+    consumer computing ``min_acceptance_delta_pp / standard_error`` on that
+    would get infinity.  The record has to say the standard error does not
+    exist instead.
+    """
+    stock_windows = [_make_delta(acceptance_rate=0.3558) for _ in range(5)]
+    cand_windows = [_make_delta(acceptance_rate=0.3501) for _ in range(5)]
+
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.3558),
+        _make_delta(acceptance_rate=0.3501),
+        _valid_runs_with_tps(100.0, count=5),
+        _valid_runs_with_tps(110.0, count=5),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+        stock_repeat_metrics=stock_windows,
+        candidate_repeat_metrics=cand_windows,
+    )
+
+    assert dec.stock_acceptance_stdev == 0.0
+    assert dec.candidate_acceptance_stdev == 0.0
+    assert dec.acceptance_dispersion is DispersionBasis.DEGENERATE
+    assert dec.acceptance_delta_standard_error_pp is None
+
+    record = dec.to_dict()
+    assert record["acceptance_dispersion"] == "degenerate"
+    assert record["acceptance_delta_standard_error_pp"] is None
+
+
+def test_varying_acceptance_is_labelled_measured_and_carries_a_standard_error() -> None:
+    """Job 369161's shape: the column actually varies, so the SE means something."""
+    stock_windows = [_make_delta(acceptance_rate=r) for r in (0.60, 0.62, 0.58)]
+    cand_windows = [_make_delta(acceptance_rate=r) for r in (0.70, 0.66, 0.68)]
+
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.60),
+        _make_delta(acceptance_rate=0.68),
+        _valid_runs_with_tps(100.0),
+        _valid_runs_with_tps(110.0),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+        stock_repeat_metrics=stock_windows,
+        candidate_repeat_metrics=cand_windows,
+    )
+
+    assert dec.acceptance_dispersion is DispersionBasis.MEASURED
+    se = dec.acceptance_delta_standard_error_pp
+    assert se is not None
+    # sqrt(sd_s^2/n + sd_c^2/n) with sd = 0.02 on both arms, n = 3, in pp.
+    assert se == pytest.approx(math.sqrt(2 * 0.02**2 / 3) * 100.0)
+    assert dec.to_dict()["acceptance_dispersion"] == "measured"
+
+
+def test_one_arm_varying_is_still_a_measurement() -> None:
+    """A degenerate label needs *both* arms flat; one varying arm gives a real SE."""
+    stock_windows = [_make_delta(acceptance_rate=r) for r in (0.60, 0.62, 0.58)]
+    cand_windows = [_make_delta(acceptance_rate=0.70) for _ in range(3)]
+
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.60),
+        _make_delta(acceptance_rate=0.70),
+        _valid_runs_with_tps(100.0),
+        _valid_runs_with_tps(110.0),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+        stock_repeat_metrics=stock_windows,
+        candidate_repeat_metrics=cand_windows,
+    )
+
+    assert dec.candidate_acceptance_stdev == 0.0
+    assert dec.acceptance_dispersion is DispersionBasis.MEASURED
+    assert dec.acceptance_delta_standard_error_pp is not None
+
+
+def test_throughput_standard_error_is_published_in_percent_of_stock() -> None:
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.60),
+        _make_delta(acceptance_rate=0.70),
+        _replay_with_tps_series([100.0, 102.0, 98.0]),
+        _replay_with_tps_series([110.0, 108.0, 112.0]),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+
+    assert dec.throughput_dispersion is DispersionBasis.MEASURED
+    se = dec.throughput_delta_standard_error_pct
+    assert se is not None
+    # sd = 2.0 on both arms, n = 3, expressed against the 100 tok/s stock mean.
+    assert se == pytest.approx(math.sqrt(2 * 2.0**2 / 3))
+    assert dec.to_dict()["throughput_delta_standard_error_pct"] == pytest.approx(se)
+
+
+def test_a_stubbed_constant_throughput_replay_is_degenerate_not_perfect() -> None:
+    """Constant clock readings mean the clock was not read, not that it is noiseless."""
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.60),
+        _make_delta(acceptance_rate=0.70),
+        _valid_runs_with_tps(100.0),
+        _valid_runs_with_tps(110.0),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+
+    assert dec.throughput_dispersion is DispersionBasis.DEGENERATE
+    assert dec.throughput_delta_standard_error_pct is None
+    assert dec.to_dict()["throughput_dispersion"] == "degenerate"
+
+
+# ---------------------------------------------------------------------------
+# Warm-up drift: why the repeat count cannot simply be cut
+# ---------------------------------------------------------------------------
+
+def test_a_warming_candidate_arm_publishes_a_positive_trend() -> None:
+    """The number that says ``sd/sqrt(n)`` is resting on non-exchangeable repeats.
+
+    Modelled on jobs 369161/369162, where the candidate arm (which runs first)
+    rose monotonically across all five scored repeats while stock did not.
+    """
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.60),
+        _make_delta(acceptance_rate=0.70),
+        _replay_with_tps_series([100.0, 100.0, 100.0, 100.0, 100.0]),
+        _replay_with_tps_series([96.0, 98.0, 100.0, 102.0, 104.0]),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+
+    assert dec.stock_throughput_trend_pct_per_repeat == pytest.approx(0.0)
+    # +2 tok/s per repeat on a 100 tok/s mean.
+    assert dec.candidate_throughput_trend_pct_per_repeat == pytest.approx(2.0)
+    record = dec.to_dict()
+    assert record["candidate_throughput_trend_pct_per_repeat"] == pytest.approx(2.0)
+    assert record["stock_throughput_trend_pct_per_repeat"] == pytest.approx(0.0)
+
+
+def test_truncating_a_warming_arm_moves_the_gated_delta_toward_the_reject_bar() -> None:
+    """Why ``benchmark_repeats`` was kept at five rather than cut to three.
+
+    The same recorded candidate series, scored over its first three repeats
+    instead of all five, reads materially worse -- not because it is noisier
+    but because the truncated window is the cold part of a warming arm.  This
+    pins the bias as a property of the gate's own arithmetic, so a future
+    reduction of ``benchmark_repeats`` cannot be made without this test failing.
+    """
+    stock_series = [100.0, 100.0, 100.0, 100.0, 100.0]
+    candidate_series = [96.0, 98.0, 100.0, 102.0, 104.0]
+
+    full = decide_promotion(
+        _make_delta(acceptance_rate=0.60),
+        _make_delta(acceptance_rate=0.70),
+        _replay_with_tps_series(stock_series),
+        _replay_with_tps_series(candidate_series),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+    truncated = decide_promotion(
+        _make_delta(acceptance_rate=0.60),
+        _make_delta(acceptance_rate=0.70),
+        _replay_with_tps_series(stock_series[:3]),
+        _replay_with_tps_series(candidate_series[:3]),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+
+    assert full.throughput_delta_pct == pytest.approx(0.0)
+    assert truncated.throughput_delta_pct == pytest.approx(-2.0)
+    assert truncated.throughput_delta_pct is not None
+    assert full.throughput_delta_pct is not None
+    assert truncated.throughput_delta_pct < full.throughput_delta_pct
+
+
+def test_trend_needs_two_repeats_before_it_means_anything() -> None:
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.60),
+        _make_delta(acceptance_rate=0.70),
+        _make_replay([_valid_run(tps=100.0)]),
+        _make_replay([_valid_run(tps=110.0)]),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+
+    assert dec.reason is Reason.TOO_FEW_REPEATS
+    assert dec.candidate_throughput_trend_pct_per_repeat is None
+    assert dec.throughput_dispersion is DispersionBasis.UNSAMPLED
+    assert dec.throughput_delta_standard_error_pct is None
+    assert dec.acceptance_dispersion is DispersionBasis.UNSAMPLED

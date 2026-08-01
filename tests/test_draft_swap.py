@@ -482,6 +482,32 @@ class _FakeHFConfig:
 RUNNER_TOPOLOGIES: tuple[str, ...] = ("drafter", "speculator")
 
 
+#: The drafter/verifier *weight-sharing* topologies vLLM can produce, keyed by
+#: which drafter submodule paths end up bound to the verifier's own object.
+#:
+#: Sharing is decided per checkpoint, not per architecture.  Both runner
+#: generations gate it on "does the checkpoint ship its own copy, and is that
+#: copy weight-identical to the verifier's" -- V2 in
+#: ``v1/worker/gpu/spec_decode/eagle/utils.py:12-25`` (``_should_share``,
+#: applied at ``:60-65`` and ``:69-74``), V1 in
+#: ``llm_base_proposer.py:1432-1461`` and ``:1508-1547``.  Both rebind under
+#: the same paths, so the runner generation does not change this axis.
+#:
+#: ``neither`` is the shipped case: ``RedHatAI/Qwen3-8B-speculator.eagle3``
+#: carries an ``embed_tokens`` that differs from Qwen3-8B's and a
+#: ``(32000, 4096)`` head against the verifier's ``(151936, 4096)``, so vLLM
+#: declines both and the drafter owns all 16 of its checkpoint tensors.
+#: Fakes must model each of these separately -- a fake that only ever shares
+#: makes a name-based lookup look correct, which is how the hard-coded
+#: expectation shipped.
+SHARING_TOPOLOGIES: dict[str, tuple[str, ...]] = {
+    "both": ("lm_head", "model.embed_tokens"),
+    "embed_only": ("model.embed_tokens",),
+    "head_only": ("lm_head",),
+    "neither": (),
+}
+
+
 class _FakeRunner:
     """A model runner exposing the proposer under exactly one attribute name.
 
@@ -932,8 +958,19 @@ class TestCompatibilityValidation:
 
 
 class TestScopedReload:
-    def _rig(self, monkeypatch: pytest.MonkeyPatch):
-        """A drafter sharing the verifier's embed_tokens and lm_head."""
+    def _rig(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        shared: Sequence[str] = SHARING_TOPOLOGIES["both"],
+    ):
+        """A drafter/verifier pair wired to the sharing topology *shared*.
+
+        See :data:`SHARING_TOPOLOGIES`.  Paths named in *shared* are bound to
+        the verifier's module object by identity; the rest get the drafter's
+        own, distinct module, exactly as vLLM leaves them when the
+        weight-equality gate declines to share.
+        """
         target = _FakeModule()
         target_inner = _FakeModule()
         target_embed = _FakeModule(weight=_FakeTensor((151936, 4096)))
@@ -945,34 +982,100 @@ class TestScopedReload:
         drafter = _FakeDrafter()
         draft_inner = _FakeModule()
         draft_inner.layers = _FakeModule(weight=_FakeTensor((4096, 4096)))
-        #: The EAGLE proposer rebinds the verifier's modules onto the drafter
-        #: by identity (llm_base_proposer.py:1492-1494, :1545-1547).
-        draft_inner.embed_tokens = target_embed
+        draft_inner.embed_tokens = (
+            target_embed
+            if "model.embed_tokens" in shared
+            #: Distinct object, SAME attribute name -- an identity check
+            #: separates these two, a name check cannot.
+            else _FakeModule(weight=_FakeTensor((151936, 4096)))
+        )
         drafter.model = draft_inner
-        drafter.lm_head = target_head
+        drafter.lm_head = (
+            target_head
+            if "lm_head" in shared
+            #: Reduced draft vocabulary: the shape alone makes vLLM's
+            #: ``torch.equal`` gate False, so the drafter keeps its own head.
+            else _FakeModule(weight=_FakeTensor((32000, 4096)))
+        )
 
         calls = _install_fake_vllm_reload(monkeypatch)
         ext = _make_extension(monkeypatch, drafter=drafter, target=target)
         return ext, drafter, target, target_embed, target_head, calls
 
-    def test_target_owned_modules_detected(
+    @pytest.mark.parametrize("shared", SHARING_TOPOLOGIES.values(), ids=list(SHARING_TOPOLOGIES))
+    def test_target_owned_modules_track_the_live_topology(
+        self, monkeypatch: pytest.MonkeyPatch, shared: tuple[str, ...]
+    ) -> None:
+        """Only the modules actually bound to the verifier count as owned.
+
+        The regression this pins: a name-based lookup that always claims
+        ``embed_tokens``/``lm_head`` is tautologically right against a fake
+        that only ever shares them, and wrong on every checkpoint vLLM
+        declines to share -- which is what the shipped drafter is.
+        """
+        ext, drafter, _target, _embed, _head, _calls = self._rig(
+            monkeypatch, shared=shared
+        )
+        assert sorted(ext._target_owned_submodules(drafter)) == sorted(shared)
+
+    def test_unshared_topology_loads_the_candidate_embed_and_head(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        ext, drafter, _target, _embed, _head, _calls = self._rig(monkeypatch)
-        owned = ext._target_owned_submodules(drafter)
-        assert sorted(owned) == ["lm_head", "model.embed_tokens"]
+        """A drafter owning its weights must receive them, not have them dropped.
 
-    def test_verifier_not_left_on_meta(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        """The regression: an unscoped walk strands the verifier's embedding."""
-        ext, drafter, target, _embed, _head, _calls = self._rig(monkeypatch)
-        weights = {"midlayer.weight": _FakeTensor((4096, 4096))}
+        Dropping here would leave the drafter's own embedding and head at
+        their pre-swap values while every other tensor advanced -- a silently
+        half-swapped model that still answers.
+        """
+        ext, drafter, _target, _embed, _head, _calls = self._rig(
+            monkeypatch, shared=SHARING_TOPOLOGIES["neither"]
+        )
+        weights = {
+            "midlayer.weight": _FakeTensor((4096, 4096)),
+            "embed_tokens.weight": _FakeTensor((151936, 4096)),
+            "lm_head.weight": _FakeTensor((32000, 4096)),
+        }
 
-        ext._apply_weights(drafter, weights)
+        count = ext._apply_weights(drafter, weights)
 
-        stranded = [
-            name for name, t in target.named_parameters() if t.device.type == "meta"
-        ]
-        assert stranded == []
+        assert drafter.load_calls == [list(weights)]
+        assert count == 3
+
+    def test_partially_shared_topology_drops_only_the_shared_leaf(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The shipped EAGLE-3 shape: embedding shared, reduced-vocab head not."""
+        ext, drafter, _target, _embed, _head, _calls = self._rig(
+            monkeypatch, shared=SHARING_TOPOLOGIES["embed_only"]
+        )
+        weights = {
+            "midlayer.weight": _FakeTensor((4096, 4096)),
+            "embed_tokens.weight": _FakeTensor((151936, 4096)),
+            "lm_head.weight": _FakeTensor((32000, 4096)),
+        }
+
+        count = ext._apply_weights(drafter, weights)
+
+        assert drafter.load_calls == [["midlayer.weight", "lm_head.weight"]]
+        assert count == 2
+
+    @pytest.mark.parametrize("shared", SHARING_TOPOLOGIES.values(), ids=list(SHARING_TOPOLOGIES))
+    def test_verifier_never_left_on_meta_under_any_topology(
+        self, monkeypatch: pytest.MonkeyPatch, shared: tuple[str, ...]
+    ) -> None:
+        """The topology-independent post-condition, checked on every topology."""
+        ext, drafter, target, _embed, _head, _calls = self._rig(
+            monkeypatch, shared=shared
+        )
+        ext._apply_weights(
+            drafter,
+            {
+                "midlayer.weight": _FakeTensor((4096, 4096)),
+                "embed_tokens.weight": _FakeTensor((151936, 4096)),
+                "lm_head.weight": _FakeTensor((32000, 4096)),
+            },
+        )
+        assert [n for n, t in target.named_parameters() if t.device.type == "meta"] == []
 
     def test_shared_modules_reattached_after_swap(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1099,7 +1202,14 @@ class TestHotSwapDraftRPC:
 
         result = ext.hot_swap_draft(str(directory))
 
-        assert result == {"swapped": True, "parameters_loaded": 5}
+        assert result == {
+            "swapped": True,
+            "parameters_loaded": 5,
+            #: This rig has no verifier wired in at all, so nothing can be
+            #: shared and nothing may be dropped.
+            "target_owned_submodules": [],
+            "dropped_tensors": [],
+        }
         assert drafter.load_calls == [
             [
                 "midlayer.self_attn.q_proj.weight",
@@ -1118,6 +1228,8 @@ class TestHotSwapDraftRPC:
         assert json.loads(json.dumps(ext.hot_swap_draft(str(directory)))) == {
             "swapped": True,
             "parameters_loaded": 5,
+            "target_owned_submodules": [],
+            "dropped_tensors": [],
         }
 
     def test_incompatible_vocab_rejected_before_mutation(
@@ -1165,6 +1277,8 @@ class TestHotSwapDraftRPC:
         assert ext.hot_swap_draft(str(directory)) == {
             "swapped": True,
             "parameters_loaded": 5,
+            "target_owned_submodules": [],
+            "dropped_tensors": [],
         }
         assert drafter.load_calls != []
 
@@ -1196,6 +1310,140 @@ class TestHotSwapDraftRPC:
             ext, "model_runner", _FakeRunner(proposer=_FakeProposer(_Wrapper(drafter)))
         )
         assert ext._get_drafter_model() is drafter
+
+
+# ---------------------------------------------------------------------------
+# Reported sharing topology -- what the E2E derives its expectation from
+# ---------------------------------------------------------------------------
+
+
+#: Tensor names of a candidate shaped like the shipped EAGLE-3 checkpoint:
+#: fused-source projections, the vocab mapping pair, plus an embedding and a
+#: head whose fate depends entirely on the sharing topology.
+CANDIDATE_TENSORS: tuple[str, ...] = (
+    "midlayer.self_attn.q_proj.weight",
+    "embed_tokens.weight",
+    "lm_head.weight",
+    "d2t",
+    "t2d",
+)
+
+
+class TestReportedTopology:
+    """The swap must publish the topology it acted on, and act on what it published.
+
+    The E2E cannot hard-code how many tensors a swap should load -- that
+    number is a function of the live sharing topology.  It derives the
+    expectation from ``draft_info``'s ``target_owned_submodules`` instead, so
+    that report has to be (a) accurate and (b) the same one ``hot_swap_draft``
+    applied.  These tests pin both halves without a GPU.
+    """
+
+    def _rig(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        shared: Sequence[str],
+    ):
+        directory = _write_draft_dir(tmp_path, config=DRAFT_CONFIG)
+        _install_fake_safetensors(
+            monkeypatch,
+            {
+                "model.safetensors": {
+                    name: _FakeTensor((4096, 4096)) for name in CANDIDATE_TENSORS
+                }
+            },
+        )
+        _install_fake_vllm_reload(monkeypatch)
+
+        target = _FakeModule()
+        target_inner = _FakeModule()
+        target_embed = _FakeModule(weight=_FakeTensor((151936, 4096)))
+        target_head = _FakeModule(weight=_FakeTensor((151936, 4096)))
+        target_inner.embed_tokens = target_embed
+        target.model = target_inner
+        target.lm_head = target_head
+
+        drafter = _FakeDrafter()
+        draft_inner = _FakeModule()
+        draft_inner.layers = _FakeModule(weight=_FakeTensor((4096, 4096)))
+        draft_inner.embed_tokens = (
+            target_embed
+            if "model.embed_tokens" in shared
+            else _FakeModule(weight=_FakeTensor((151936, 4096)))
+        )
+        drafter.model = draft_inner
+        drafter.lm_head = (
+            target_head
+            if "lm_head" in shared
+            else _FakeModule(weight=_FakeTensor((32000, 4096)))
+        )
+        drafter.add_buffer("draft_id_to_target_id", _FakeTensor((32000,)))
+
+        ext = _make_extension(monkeypatch, drafter=drafter, target=target)
+        return ext, drafter, directory
+
+    @pytest.mark.parametrize(
+        "shared", SHARING_TOPOLOGIES.values(), ids=list(SHARING_TOPOLOGIES)
+    )
+    def test_draft_info_reports_the_live_topology(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shared: tuple[str, ...]
+    ) -> None:
+        ext, _drafter, _directory = self._rig(tmp_path, monkeypatch, shared=shared)
+        info = ext.draft_info()
+        assert info["target_owned_submodules"] == sorted(shared)
+        #: Still JSON-serializable -- it crosses collective_rpc.
+        assert json.loads(json.dumps(info))["target_owned_submodules"] == sorted(shared)
+
+    @pytest.mark.parametrize(
+        "shared", SHARING_TOPOLOGIES.values(), ids=list(SHARING_TOPOLOGIES)
+    )
+    def test_swap_report_reconciles_the_candidate_count(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shared: tuple[str, ...]
+    ) -> None:
+        """``candidates - dropped == parameters_loaded``, on every topology.
+
+        This is precisely the arithmetic the E2E performs, so a topology the
+        production code mishandles fails here first, without a GPU.
+        """
+        ext, _drafter, directory = self._rig(tmp_path, monkeypatch, shared=shared)
+        info = ext.draft_info()
+
+        swap = ext.hot_swap_draft(str(directory))
+
+        leaves = {path.rpartition(".")[2] for path in info["target_owned_submodules"]}
+        expected = [
+            name
+            for name in CANDIDATE_TENSORS
+            if not any(leaf in name for leaf in leaves)
+        ]
+        assert swap["target_owned_submodules"] == info["target_owned_submodules"]
+        assert sorted(swap["dropped_tensors"]) == sorted(
+            set(CANDIDATE_TENSORS) - set(expected)
+        )
+        assert swap["parameters_loaded"] == len(expected)
+        assert len(CANDIDATE_TENSORS) - len(swap["dropped_tensors"]) == (
+            swap["parameters_loaded"]
+        )
+
+    def test_unshared_topology_loads_every_candidate_tensor(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The shipped case, stated as an absolute rather than a relation.
+
+        ``RedHatAI/Qwen3-8B-speculator.eagle3`` shares nothing with Qwen3-8B,
+        so all of its tensors -- embedding and head included -- are the
+        drafter's own and must load.  Asserting a count of
+        ``len(candidates) - 2`` here is the bug this test exists to catch.
+        """
+        ext, drafter, directory = self._rig(
+            tmp_path, monkeypatch, shared=SHARING_TOPOLOGIES["neither"]
+        )
+        swap = ext.hot_swap_draft(str(directory))
+        assert swap["parameters_loaded"] == len(CANDIDATE_TENSORS)
+        assert swap["dropped_tensors"] == []
+        assert drafter.load_calls == [list(CANDIDATE_TENSORS)]
 
 
 # ---------------------------------------------------------------------------

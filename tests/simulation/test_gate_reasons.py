@@ -36,7 +36,7 @@ from simulation.harness import (
     simulation_config,
 )
 from speedlm.config import PromotionConfig
-from speedlm.gate.decide import Reason, Verdict
+from speedlm.gate.decide import DispersionBasis, Reason, Verdict
 from speedlm.gate.runner import BenchmarkGateRunner
 from speedlm.gate.suite import SuiteError
 from speedlm.tuner.orchestrator import GateFailure
@@ -162,6 +162,45 @@ class TestPromotion:
             assert len(decision.per_repeat) == 3
             assert decision.acceptance_statistic == "per_repeat_mean"
             assert decision.throughput_statistic == "replay_per_repeat_mean"
+
+    def test_a_deterministic_acceptance_replay_is_labelled_degenerate(
+        self, tmp_path: Path
+    ) -> None:
+        """Repeats do not sample acceptance, and the record has to admit it.
+
+        The simulated engine advances its ``spec_decode`` counters by the same
+        amount on every suite pass, which is exactly what the real engine does
+        under greedy replay of a frozen suite -- jobs 369161/369162 produced
+        bit-identical counter deltas across five repeats.  The published
+        standard deviation is therefore 0.0, and the danger is that a consumer
+        reads ``min_acceptance_delta_pp / standard_error`` as infinite headroom.
+        The decision must label the reading ``degenerate`` and publish a null
+        standard error rather than a zero one.
+        """
+        stock, candidate = _profiles()
+        with _fixture(tmp_path, stock, candidate) as fixture:
+            result = fixture.gate().benchmark(
+                fixture.candidate, timeout_seconds=600.0, should_abort=lambda: False
+            )
+
+            decision = result.decision
+            assert decision is not None
+            assert decision.num_repeats >= 2
+            assert len({r.stock_acceptance_rate for r in decision.per_repeat}) == 1
+            assert decision.stock_acceptance_stdev == 0.0
+            assert decision.candidate_acceptance_stdev == 0.0
+            assert decision.acceptance_dispersion is DispersionBasis.DEGENERATE
+            assert decision.acceptance_delta_standard_error_pp is None
+
+            record = decision.to_dict()
+            assert record["acceptance_dispersion"] == "degenerate"
+            assert record["acceptance_delta_standard_error_pp"] is None
+            # Throughput is the quantity the repeats are actually there for, so
+            # it must not be labelled the same way: real wall-clock timing over
+            # more than one repeat always disperses.
+            assert decision.throughput_dispersion is DispersionBasis.MEASURED
+            assert decision.throughput_delta_standard_error_pct is not None
+            assert decision.candidate_throughput_trend_pct_per_repeat is not None
 
     def test_every_scrape_is_kept_verbatim_as_evidence(self, tmp_path: Path) -> None:
         stock, candidate = _profiles()

@@ -262,6 +262,16 @@ class PromotionConfig:
     job 368648, at **-17.5% replay** (-19.2% on the Prometheus decode rate) --
     is still ~16 standard errors past it.
 
+    That 1.10% figure is now superseded, in the *reassuring* direction.  It was
+    extrapolated from job 368670, which predates ``benchmark_max_tokens`` and
+    ``benchmark_concurrency``; measured directly on the two capped, concurrent
+    runs, the standard error on the arm-to-arm replay delta over five repeats is
+    0.607% (job 369161, Qwen3-8B) and 0.640% (job 369162, gpt-oss-20b).  ``-2.0``
+    therefore sits 3.3 and 3.1 standard errors below zero, not 1.8.  Do not read
+    that as slack to spend: the same two runs show most of the surviving
+    dispersion is *drift*, not noise (see ``IdleTuningConfig.benchmark_repeats``),
+    and ``sd/sqrt(n)`` overstates how much a shorter measurement would keep.
+
     A caveat on ``min_acceptance_delta_pp``'s derivation: the "no measured
     noise" claim above rests on job 368670's two arms reporting byte-identical
     counters, and on every archived run reporting acceptance as a *single*
@@ -283,6 +293,33 @@ class PromotionConfig:
     deviation up to ~0.52 pp, and stops being one (< 1.6 standard errors) above
     ~1.0 pp.  Recalibrate from the first run whose ``per_repeat`` acceptance
     column actually varies, not from this comment.
+
+    Those runs have now happened, and they close the question rather than
+    answering it.  Job 369161 (Qwen3-8B) is the first record whose acceptance
+    column varies at all: per-repeat deltas of -0.199, -0.151, -0.171, -0.199,
+    -0.226 pp, sample sd 0.0287 pp, standard error on the delta of means
+    0.0174 pp -- so 1.0 pp sits at ~57 standard errors, far inside the
+    "<= 0.52 pp sd" band the paragraph above predicted, and the ">= 3 SE" claim
+    held with two orders of magnitude to spare.  Job 369162 (gpt-oss-20b) does
+    not vary at all: all five repeats read -0.5674 pp, both
+    ``*_acceptance_stdev`` fields are exactly 0.0, and the standard error is
+    undefined.
+
+    The right conclusion is *not* that the acceptance measurement is superb.
+    Reading the raw ``spec_decode`` counter deltas out of
+    ``gate-metrics/*-after-repeat-*.prom.gz`` shows why: on job 369162 every
+    repeat of the candidate arm drafted 86830 tokens and accepted 30400, and
+    every repeat of the stock arm drafted 86325 and accepted 30713 -- the same
+    integers five times.  Job 369161's candidate alternates between exactly two
+    states (73530/27362 and 73680/27398), a 150-token wobble in 73.6k that comes
+    from batch composition at ``benchmark_concurrency``, not from the head.
+    Greedy replay of a frozen suite against a frozen draft is deterministic by
+    construction, so repeats do not *sample* acceptance; a zero standard
+    deviation here is evidence of no measurement, not of a tight one.  The gate
+    now says so in the record -- see
+    :class:`speedlm.gate.decide.DispersionBasis` -- and
+    ``IdleTuningConfig.benchmark_repeats`` is justified from throughput
+    dispersion alone, because throughput is the only thing repeats measure.
 
     Both values remain fully configurable via ``promotion`` in ``config.json``;
     these are defaults, not policy.  Note that setting them to ``0.0``/``0.0``
@@ -460,6 +497,61 @@ class IdleTuningConfig:
     #: ``benchmark_concurrency`` is what makes it affordable, and
     #: :func:`speedlm.tuner.orchestrator.derive_benchmark_timeout` is what
     #: keeps the deadline sized to it.
+    #:
+    #: **Five was re-examined against measured per-repeat data and kept.**  The
+    #: case for cutting it is strong on cost -- benchmarking is the dominant
+    #: remaining downtime (job 369161: 1043.4s of a 1546.3s cycle; job 369162:
+    #: 1808.5s of 2386.6s), each repeat is one of the six suite passes an arm
+    #: runs, and 5 -> 3 would return roughly a third of that -- about 300s/cycle
+    #: on Qwen3-8B and 500s+ on gpt-oss-20b.  It is nonetheless the wrong trade,
+    #: for two reasons, in increasing order of importance.
+    #:
+    #: First, repeats buy nothing for *acceptance* and never did.  Greedy replay
+    #: of a frozen suite is deterministic by construction: job 369162's five
+    #: repeats produced bit-identical ``spec_decode`` counter deltas in both
+    #: arms, and job 369161's candidate alternated between exactly two states.
+    #: See ``PromotionConfig``'s docstring for the counters.  So the repeat count
+    #: has to be justified from throughput dispersion alone -- there is no second
+    #: quantity it is also serving.
+    #:
+    #: Second, and decisively: truncating the repeat vector is not merely
+    #: noisier, it is *biased*.  The candidate arm runs first
+    #: (``benchmark_candidate_arm_first``) and is still warming when its
+    #: measurement window opens.  Its per-repeat throughput trends +0.63%/repeat
+    #: on job 369161 and +0.80%/repeat on job 369162 -- 83% and 94% of that arm's
+    #: per-repeat variance is that monotone drift, not noise -- while the stock
+    #: arm shows no such structure (-0.42%/repeat and +0.13%/repeat).  Replaying
+    #: the recorded arrays over a shortened window moves the *gated* delta
+    #: toward the reject bar every time: on job 369161 from +0.160% (n=5) to
+    #: -1.068% (n=3), on job 369162 from -1.243% to -1.715%, and at n=2 job
+    #: 369162 reads -2.485%, past ``min_throughput_delta_pct`` entirely.  Losing
+    #: 1.2 points of a 2.0-point guard to a truncation artefact is a far larger
+    #: error than the ~0.2 points of extra standard error it would have saved,
+    #: and it errs toward rejecting good heads -- which, with no post-promotion
+    #: rollback, is the direction the gate is allowed to fail in but not the
+    #: direction that makes idle tuning worth running.
+    #:
+    #: The measured standard errors are the same story quantitatively: 0.607%
+    #: (369161) and 0.640% (369162) over five repeats, putting the -2.0% guard
+    #: 3.3 and 3.1 standard errors clear of zero.  Scaling by ``sqrt(5/3)`` puts
+    #: n=3 at 2.5 and 2.4 -- and that scaling is itself optimistic, because it
+    #: treats the drift above as exchangeable noise.
+    #:
+    #: Adaptive stopping ("halt once the standard error is tight enough") was
+    #: considered and rejected on the same evidence.  A monotonically warming
+    #: arm produces its *smallest* consecutive-repeat spread while it is still
+    #: cold, so an SE-triggered stop fires early and preferentially, locking in
+    #: exactly the bias described above.  It would add a control loop that makes
+    #: the measurement worse.
+    #:
+    #: Where the saving actually is: not here.  These arms are under-warmed at
+    #: ``warmup_repeats=1``, so the honest direction for this knob is *up*, not
+    #: down.  Retuning warmup needs a run that scores enough repeats to see
+    #: where the candidate trend flattens -- the two runs above only show that
+    #: it has not flattened by repeat five -- so it is deliberately not being
+    #: changed from a rearrangement of the same two arrays that motivated it.
+    #: ``Decision.candidate_throughput_trend_pct_per_repeat`` is now published on
+    #: every decision so that measurement accumulates by itself.
     benchmark_repeats: int = 5
     #: Held-out requests kept in flight per arm during a gate replay.
     #:

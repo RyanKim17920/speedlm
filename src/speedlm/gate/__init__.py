@@ -3,7 +3,7 @@
 Provides benchmarking, metrics parsing, and promotion-decision logic
 for candidate speculative draft heads.
 """
-from speedlm.gate.decide import Decision, decide_promotion
+from speedlm.gate.decide import Decision, DispersionBasis, decide_promotion
 from speedlm.gate.metrics import (
     CounterResetError,
     MetricsSnapshot,
@@ -27,6 +27,7 @@ __all__ = [
     "BenchmarkSuite",
     "CounterResetError",
     "Decision",
+    "DispersionBasis",
     "DraftEndpoint",
     "GateRunner",
     "HttpReplayExecutor",

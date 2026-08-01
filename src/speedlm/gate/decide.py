@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import statistics
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -96,6 +97,43 @@ GATING_ACCEPTANCE_STATISTIC: Final[str] = "per_repeat_mean"
 #: repeat: one Prometheus window spanning every repeat of an arm, stamped into
 #: each per-repeat row.  A loader must label those records as what they were.
 LEGACY_ACCEPTANCE_STATISTIC: Final[str] = "prometheus_pooled_window"
+
+
+class DispersionBasis(Enum):
+    """Whether a published standard deviation is a *measurement* or an artefact.
+
+    A standard deviation of zero and a standard deviation of 0.03 look alike to
+    a consumer -- both are "small" -- but they mean opposite things, and the
+    difference is not recoverable from the number itself.  Job 369162
+    (gpt-oss-20b) published ``candidate_acceptance_stdev = 0.0`` and
+    ``stock_acceptance_stdev = 0.0`` across five repeats.  Anything scoring the
+    measurement as ``min_acceptance_delta_pp / standard_error`` reads that as
+    *infinitely many* standard errors of headroom and concludes the gate is
+    superbly resolved.  It is the reverse: five repeats produced five
+    bit-identical readings, so there is no variance estimate at all, and the
+    threshold's margin is unknown rather than large.
+
+    Naming the three states keeps that distinction in the record:
+
+    * ``MEASURED`` -- two or more repeats, and they disagreed.  The published
+      standard error means what it says.
+    * ``DEGENERATE`` -- two or more repeats, and every one returned the same
+      value in both arms.  The standard error is exactly zero because nothing
+      varied, which is evidence of *no measurement*, not of a tight one.  The
+      accompanying standard-error field is ``None`` rather than ``0.0``, so a
+      consumer dividing by it fails loudly instead of computing infinity.
+    * ``UNSAMPLED`` -- fewer than two repeats.  There was never anything to
+      disperse.
+
+    This is a reporting distinction only.  ``DEGENERATE`` is not a rejection
+    reason: for acceptance it is the *expected* state (see
+    :data:`GATING_ACCEPTANCE_STATISTIC`), and turning the expected state into a
+    reject would stop the gate promoting anything at all.
+    """
+
+    MEASURED = "measured"
+    DEGENERATE = "degenerate"
+    UNSAMPLED = "unsampled"
 
 
 class DivergenceBasis(Enum):
@@ -260,6 +298,89 @@ class Decision:
     #: original head.
     stock_draft: str | None = None
 
+    # -- dispersion of the gated statistics ---------------------------------
+    # Derived from ``per_repeat`` rather than stored, so an archived decision
+    # rebuilt by ``speedlm.report.parse_decision`` reports the same basis the
+    # gate did -- the per-repeat array is the evidence, and it has always been
+    # persisted.  Nothing here gates; see :class:`DispersionBasis`.
+
+    @property
+    def acceptance_dispersion(self) -> DispersionBasis:
+        """Whether the acceptance repeats actually disagreed."""
+        return _dispersion_basis(
+            [r.stock_acceptance_rate for r in self.per_repeat],
+            [r.candidate_acceptance_rate for r in self.per_repeat],
+        )
+
+    @property
+    def acceptance_delta_standard_error_pp(self) -> float | None:
+        """Standard error of ``acceptance_delta_pp``, or ``None`` if unmeasured.
+
+        ``None`` for both :attr:`DispersionBasis.DEGENERATE` and
+        :attr:`DispersionBasis.UNSAMPLED`, because in neither case does a
+        standard error exist.  Returning ``0.0`` there would be read as a
+        perfect measurement by anything that divides a threshold by it.
+        """
+        return _delta_standard_error(
+            [r.stock_acceptance_rate for r in self.per_repeat],
+            [r.candidate_acceptance_rate for r in self.per_repeat],
+            scale=100.0,
+        )
+
+    @property
+    def throughput_dispersion(self) -> DispersionBasis:
+        """Whether the throughput repeats actually disagreed.
+
+        Unlike acceptance this is expected to be ``MEASURED`` on live hardware;
+        ``DEGENERATE`` here means the replay was stubbed or the clock was not
+        read, not that the machine is noiseless.
+        """
+        return _dispersion_basis(
+            [r.stock_tok_per_sec for r in self.per_repeat],
+            [r.candidate_tok_per_sec for r in self.per_repeat],
+        )
+
+    @property
+    def throughput_delta_standard_error_pct(self) -> float | None:
+        """Standard error of ``throughput_delta_pct``, in percent of stock.
+
+        Read this together with the two ``*_throughput_trend_pct_per_repeat``
+        properties.  It is a ``sd/sqrt(n)`` figure, which assumes the repeats
+        are exchangeable; when an arm is still warming they are not, and the
+        trend is what says so.
+        """
+        stock = [r.stock_tok_per_sec for r in self.per_repeat]
+        mean_stock = _mean(stock)
+        if mean_stock <= 0:
+            return None
+        return _delta_standard_error(
+            stock,
+            [r.candidate_tok_per_sec for r in self.per_repeat],
+            scale=100.0 / mean_stock,
+        )
+
+    @property
+    def stock_throughput_trend_pct_per_repeat(self) -> float | None:
+        """Least-squares slope of the stock throughput column, %/repeat.
+
+        Published because a warming arm breaks the assumption underneath every
+        ``sd/sqrt(n)`` figure in this record, and the breakage is invisible in
+        the standard deviation alone -- drift inflates it exactly as noise
+        does.  On jobs 369161/369162 the *candidate* arm (which runs first, see
+        ``IdleTuningConfig.benchmark_candidate_arm_first``) trended
+        +0.63%/repeat and +0.80%/repeat, accounting for 83% and 94% of that
+        arm's per-repeat variance, while stock trended -0.42%/repeat and
+        +0.13%/repeat with no such structure.  A large positive candidate trend
+        means the measurement window opened before the arm reached steady
+        state, and that the reported delta understates the candidate.
+        """
+        return _trend_pct_per_repeat([r.stock_tok_per_sec for r in self.per_repeat])
+
+    @property
+    def candidate_throughput_trend_pct_per_repeat(self) -> float | None:
+        """Least-squares slope of the candidate throughput column, %/repeat."""
+        return _trend_pct_per_repeat([r.candidate_tok_per_sec for r in self.per_repeat])
+
     @property
     def output_early_divergences(self) -> int:
         """Divergences early enough to count against ``max_output_mismatches``."""
@@ -315,12 +436,32 @@ class Decision:
             "candidate_avg_acceptance": self.candidate_avg_acceptance,
             "stock_acceptance_stdev": self.stock_acceptance_stdev,
             "candidate_acceptance_stdev": self.candidate_acceptance_stdev,
+            # Why the two stdevs above are worth what they are.  A zero stdev
+            # is published as ``degenerate`` with a ``null`` standard error,
+            # never as a very good measurement; see :class:`DispersionBasis`.
+            "acceptance_dispersion": self.acceptance_dispersion.value,
+            "acceptance_delta_standard_error_pp": (
+                self.acceptance_delta_standard_error_pp
+            ),
             "min_divergence_token_index": self.min_divergence_token_index,
             "output_early_divergences": self.output_early_divergences,
             "output_total_divergences": self.output_total_divergences,
             "output_divergences": [d.to_dict() for d in self.output_divergences],
             "stock_avg_tok_per_sec": self.stock_avg_tok_per_sec,
             "candidate_avg_tok_per_sec": self.candidate_avg_tok_per_sec,
+            "throughput_dispersion": self.throughput_dispersion.value,
+            "throughput_delta_standard_error_pct": (
+                self.throughput_delta_standard_error_pct
+            ),
+            # Drift, not noise: the number that says whether the standard error
+            # above rests on exchangeable repeats.  See
+            # ``stock_throughput_trend_pct_per_repeat``.
+            "stock_throughput_trend_pct_per_repeat": (
+                self.stock_throughput_trend_pct_per_repeat
+            ),
+            "candidate_throughput_trend_pct_per_repeat": (
+                self.candidate_throughput_trend_pct_per_repeat
+            ),
             "stock_prometheus_decode_tok_per_sec": (
                 self.stock_prometheus_decode_tok_per_sec
             ),
@@ -359,6 +500,62 @@ def _stdev(values: list[float]) -> float:
     if len(values) < 2:
         return 0.0
     return statistics.stdev(values)
+
+
+def _delta_standard_error_raw(stock: list[float], candidate: list[float]) -> float | None:
+    """SE of the arm-to-arm delta of means, in the inputs' own units.
+
+    ``None`` when there are fewer than two paired repeats.  The two arms are
+    timed and scraped independently, so their variances add rather than
+    cancel; this is the unpaired form, matching how ``*_avg_*`` and the gated
+    deltas are computed.
+    """
+    n = min(len(stock), len(candidate))
+    if n < 2:
+        return None
+    var = _stdev(stock[:n]) ** 2 / n + _stdev(candidate[:n]) ** 2 / n
+    return math.sqrt(var)
+
+
+def _dispersion_basis(stock: list[float], candidate: list[float]) -> DispersionBasis:
+    """Classify what a published standard error is worth.  See :class:`DispersionBasis`."""
+    se = _delta_standard_error_raw(stock, candidate)
+    if se is None:
+        return DispersionBasis.UNSAMPLED
+    if se == 0.0:
+        return DispersionBasis.DEGENERATE
+    return DispersionBasis.MEASURED
+
+
+def _delta_standard_error(
+    stock: list[float],
+    candidate: list[float],
+    *,
+    scale: float,
+) -> float | None:
+    """:func:`_delta_standard_error_raw` in reporting units, ``None`` unless measured."""
+    se = _delta_standard_error_raw(stock, candidate)
+    if se is None or se == 0.0:
+        return None
+    return se * scale
+
+
+def _trend_pct_per_repeat(values: list[float]) -> float | None:
+    """OLS slope of a per-repeat column, as a percentage of its own mean.
+
+    ``None`` below two repeats, or when the mean is non-positive and a
+    percentage would be meaningless.
+    """
+    n = len(values)
+    if n < 2:
+        return None
+    mean = _mean(values)
+    if mean <= 0:
+        return None
+    mean_x = (n - 1) / 2.0
+    denominator = sum((i - mean_x) ** 2 for i in range(n))
+    numerator = sum((i - mean_x) * (v - mean) for i, v in enumerate(values))
+    return numerator / denominator / mean * 100.0
 
 
 def first_divergence(
