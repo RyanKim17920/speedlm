@@ -46,7 +46,9 @@ def _record(
 
 
 def _tokens(record: TraceRecord) -> int:
-    if record.total_tokens is not None:
+    #: Mirrors ``store._accounting_tokens``: a reported zero is not a
+    #: measurement, so it falls back to the estimate like a missing count.
+    if record.total_tokens:
         return record.total_tokens
     prompt, completion = estimate_message_tokens(list(record.messages))
     return prompt + completion

@@ -571,7 +571,17 @@ def load_profiles(home: Path | None = None) -> dict[str, ModelProfile]:
         raise ProfileError(f"profile path is not a directory: {profiles_dir}")
 
     user_profile_names: set[str] = set()
+    resolved_dir = profiles_dir.resolve()
     for path in sorted(profiles_dir.glob("*.json")):
+        #: The profiles directory is user-writable, so a *.json entry may be a
+        #: symlink aimed anywhere on the filesystem. Loading one would let an
+        #: attacker with write access to the directory (but not to the profile
+        #: contents) redirect the verifier/draft models a run trains against.
+        if path.is_symlink() and not path.resolve().is_relative_to(resolved_dir):
+            raise ProfileError(
+                f"{path}: refusing to load profile symlink pointing outside"
+                f" {profiles_dir}"
+            )
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except json.JSONDecodeError as exc:

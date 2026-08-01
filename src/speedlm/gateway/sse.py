@@ -222,6 +222,12 @@ class SSEAssembler:
         except (json.JSONDecodeError, UnicodeDecodeError):
             self._valid = False
             return
+        except RecursionError:
+            #: json's C scanner raises RecursionError, not JSONDecodeError, on
+            #: deeply nested input. An upstream (or a proxied client replaying
+            #: one) must not be able to unwind the capture task with it.
+            self._valid = False
+            return
         if not isinstance(payload, dict):
             self._valid = False
             return
@@ -348,7 +354,9 @@ def parse_json_responses(
         return ()
     try:
         payload = json.loads(body)
-    except (json.JSONDecodeError, UnicodeDecodeError):
+    except (json.JSONDecodeError, UnicodeDecodeError, RecursionError):
+        #: RecursionError covers deeply nested bodies, which the C scanner
+        #: reports separately from a decode error.
         return ()
     if not isinstance(payload, dict):
         return ()

@@ -4,6 +4,7 @@ import contextlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 from collections.abc import Iterator
@@ -11,6 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Final
 
 try:
     import fcntl as _fcntl
@@ -68,6 +70,37 @@ def resolve_layout(home: Path | None = None) -> Layout:
     )
 
 
+#: Every speedlm directory holds captured user traffic or the metadata that
+#: points at it, so the whole tree is owner-only. ``mkdir(mode=...)`` is masked
+#: by the process umask, and pre-existing directories keep their old mode, so
+#: an explicit ``chmod`` follows each ``mkdir``.
+DIR_MODE: Final[int] = 0o700
+
+#: Files under the layout are captured prompts, responses and their sidecars.
+#: ``os.open`` applies the umask to its mode argument too, so callers that need
+#: an exact mode must ``fchmod`` after creating the descriptor.
+FILE_MODE: Final[int] = 0o600
+
+
+def _harden_dir(path: Path) -> None:
+    """Create *path* (with parents) and force owner-only permissions."""
+    path.mkdir(parents=True, exist_ok=True, mode=DIR_MODE)
+    with contextlib.suppress(OSError):
+        path.chmod(DIR_MODE)
+
+
+def _open_owner_only(path: Path, flags: int) -> int:
+    """Open *path* with *flags*, forcing mode 0600 past the process umask."""
+    fd = os.open(str(path), flags, FILE_MODE)
+    try:
+        os.fchmod(fd, FILE_MODE)
+    except OSError:
+        # Best effort: a filesystem that refuses chmod (e.g. some network
+        # mounts) must not turn a successful capture into a dropped write.
+        logger.debug("cannot force owner-only mode on %s", path)
+    return fd
+
+
 def ensure_layout(home: Path | None = None) -> Layout:
     """Like :func:`resolve_layout` but creates the storage directories."""
     layout = resolve_layout(home)
@@ -76,11 +109,9 @@ def ensure_layout(home: Path | None = None) -> Layout:
         layout.traces_dir,
         layout.profiles_dir,
         layout.runs_dir,
+        layout.exchanges_dir,
     ):
-        dir_path.mkdir(parents=True, exist_ok=True)
-    layout.exchanges_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
-    with contextlib.suppress(OSError):
-        layout.exchanges_dir.chmod(0o700)
+        _harden_dir(dir_path)
     return layout
 
 
@@ -101,11 +132,17 @@ def new_run_dir(
     If that name already exists a numeric suffix (``-1``, ``-2``, ...) is
     appended until a free name is found.  The directory is created and
     returned.
+
+    *prefix* reaches this function from CLI flags and config files, so it is
+    sanitized rather than interpolated: separators and traversal segments are
+    replaced so the result can only ever name a direct child of
+    ``layout.runs_dir``.  A prefix that sanitizes to nothing falls back to
+    ``"run"``.
     """
     if now is None:
         now = datetime.now()
     ts = now.strftime("%Y%m%d-%H%M%S")
-    base = f"{prefix}-{ts}"
+    base = f"{_safe_run_prefix(prefix)}-{ts}"
     candidate = layout.runs_dir / base
     if not candidate.exists():
         candidate.mkdir(parents=True, exist_ok=True)
@@ -119,6 +156,24 @@ def new_run_dir(
         counter += 1
 
 
+#: Anything outside this class is a path separator, a traversal segment, a
+#: shell metacharacter or a non-portable filename byte; all collapse to "_".
+_UNSAFE_PREFIX_RE: Final[re.Pattern[str]] = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _safe_run_prefix(prefix: str) -> str:
+    """Reduce *prefix* to a single containable path component."""
+    if not isinstance(prefix, str):
+        raise StorageError("run prefix must be a string")
+    cleaned = _UNSAFE_PREFIX_RE.sub("_", prefix)
+    #: "..", "..." and leading dots would either escape or hide the directory.
+    cleaned = cleaned.strip(".")
+    cleaned = cleaned.strip("_-")
+    if not cleaned:
+        return "run"
+    return cleaned
+
+
 # ---------------------------------------------------------------------------
 # Atomic writes
 # ---------------------------------------------------------------------------
@@ -128,7 +183,7 @@ def atomic_write_text(path: Path, text: str) -> None:
     """Atomically write *text* to *path* via same-dir tmp + rename."""
     tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
     try:
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        fd = _open_owner_only(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
             f.flush()
@@ -145,7 +200,7 @@ def atomic_write_bytes(path: Path, payload: bytes) -> None:
     """Atomically write *payload* to *path* via same-dir tmp + rename."""
     tmp = path.with_suffix(path.suffix + f".tmp{os.getpid()}")
     try:
-        fd = os.open(str(tmp), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        fd = _open_owner_only(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC)
         with os.fdopen(fd, "wb") as f:
             f.write(payload)
             f.flush()
@@ -194,7 +249,7 @@ def _exclusive_file_lock(
     """
     timeout = max(0.0, timeout)
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
+        _harden_dir(path.parent)
     except OSError as exc:
         logger.warning("dropping write after lock setup failed for %s: %s", path, exc)
         yield False
@@ -215,7 +270,7 @@ def _exclusive_file_lock(
 
     lock_path = _file_lock_path(path)
     try:
-        lock_fd = os.open(str(lock_path), os.O_RDWR | os.O_CREAT, 0o644)
+        lock_fd = _open_owner_only(lock_path, os.O_RDWR | os.O_CREAT)
     except OSError as exc:
         logger.warning("dropping write after lock open failed for %s: %s", path, exc)
         yield False
@@ -257,7 +312,7 @@ def _append_jsonl(path: Path, obj: object) -> bool:
         if not acquired:
             return False
         try:
-            fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+            fd = _open_owner_only(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND)
             with os.fdopen(fd, "a", encoding="utf-8") as f:
                 f.write(line)
                 f.flush()

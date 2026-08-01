@@ -72,9 +72,22 @@ def test_monotonic_counters_have_non_negative_deltas(
 @pytest.mark.xfail(
     strict=True,
     reason=(
-        "src/speedlm/gate/metrics.py encodes absent draft counters as numeric 0.0 "
-        "even though AcceptanceStatus.UNAVAILABLE exists; the availability flag "
-        "carries the distinction instead"
+        "src/speedlm/gate/metrics.py:161 MetricsSnapshot.acceptance_rate and "
+        "compute_delta both return 0.0 when no draft counters were scraped, so "
+        "AcceptanceStatus.UNAVAILABLE is declared but never returned; the "
+        "distinction is carried by has_draft_counters / acceptance_available "
+        "instead. NOT FIXED DELIBERATELY: this is a type-design question, not a "
+        "security one, and it sits on the promotion gate, which has no "
+        "post-promotion rollback. Returning the enum widens the type to "
+        "'float | AcceptanceStatus' at src/speedlm/gate/decide.py:382 and 481-482, "
+        "where the value flows into GateRepeat.stock_acceptance_rate / "
+        "candidate_acceptance_rate (declared float), into the serialized gate "
+        "record at decide.py:274-275 and runner.py:826, and into arithmetic at "
+        "report.py:1284-1285. A fix must either keep acceptance_rate a float and "
+        "add a separate acceptance_status property, or widen the type and update "
+        "every consumer plus the on-disk record schema, and must replay "
+        "tests/test_gate_decide.py jobs 368670/368689 to prove no promote/reject "
+        "decision changes."
     ),
 )
 def test_absent_draft_counters_are_unavailable_not_zero() -> None:

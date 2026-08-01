@@ -161,12 +161,22 @@ def _messages(
             if result_name is not None:
                 if not isinstance(result_name, str):
                     raise ValueError(f"{location}.name must be a string")
-                for suffix in _HARMONY_TOOL_SUFFIXES:
-                    if result_name.endswith(suffix):
-                        result_name = result_name[: -len(suffix)]
-                        message["name"] = result_name
-                        break
-                if result_name != known_calls[call_id]:
+                #: Mirror the guarded call-name strip below: only adopt the
+                #: stripped name when it resolves to the referenced call. A tool
+                #: genuinely named ``search<|channel|>analysis`` is left alone
+                #: instead of being rewritten into a mismatch, while a result
+                #: naming a different tool is still rejected.
+                expected = known_calls[call_id]
+                if result_name != expected:
+                    for suffix in _HARMONY_TOOL_SUFFIXES:
+                        if (
+                            result_name.endswith(suffix)
+                            and result_name[: -len(suffix)] == expected
+                        ):
+                            result_name = expected
+                            message["name"] = result_name
+                            break
+                if result_name != expected:
                     raise ValueError(
                         f"{location}.name does not match its referenced tool call"
                     )
@@ -208,7 +218,10 @@ def _validate_calls(
         if not isinstance(function, dict):
             raise ValueError(f"{call_location}.function must be an object")
         name = function.get("name")
-        if isinstance(name, str):
+        #: A literal tool name always wins over its stripped form, so a tool
+        #: genuinely named with a Harmony suffix is never rewritten into a
+        #: different captured tool.
+        if isinstance(name, str) and name not in tool_names:
             for suffix in _HARMONY_TOOL_SUFFIXES:
                 if name.endswith(suffix) and name[: -len(suffix)] in tool_names:
                     name = name[: -len(suffix)]
@@ -350,7 +363,12 @@ def _offset_sequence(value: object, row_id: str) -> tuple[tuple[int, int], ...]:
         if (
             not isinstance(offset, Sequence)
             or len(offset) != 2
-            or not all(isinstance(point, int) for point in offset)
+            #: Guard bools like ``_integer_sequence`` does: ``[True, False]``
+            #: would otherwise become the inverted span ``(1, 0)``.
+            or not all(
+                isinstance(point, int) and not isinstance(point, bool)
+                for point in offset
+            )
         ):
             raise ValueError(
                 f"training row {row_id!r} tokenizer returned invalid offset_mapping"
@@ -392,7 +410,9 @@ def harmony_render_messages(row: TrainingRow) -> list[dict[str, Any]]:
     for message in messages:
         if message.get("role") == "assistant" and message.get("content") is None:
             message["content"] = ""
-        for call in message.get("tool_calls", []):
+        #: ``or []`` rather than a default: several OpenAI-compatible servers
+        #: emit an explicit ``"tool_calls": null``, which survives validation.
+        for call in message.get("tool_calls") or []:
             arguments = call["function"]["arguments"]
             call["function"]["arguments"] = json.loads(arguments)
     return messages

@@ -229,14 +229,6 @@ def test_malformed_timestamp_strings_are_rejected(timestamp: str) -> None:
         )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "src/speedlm/traces/normalize.py:80 calls math.isfinite on an arbitrarily "
-        "large JSON integer, leaking OverflowError instead of NormalizeError; "
-        "minimal class: timestamp=10**309"
-    ),
-)
 def test_huge_epoch_is_a_declared_rejection() -> None:
     with pytest.raises(NormalizeError):
         normalize_record(

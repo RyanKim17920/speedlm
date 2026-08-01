@@ -105,7 +105,9 @@ class TestRecordRoundTrip:
         store.append(rec)
         stats = store.stats()
         assert stats.measured_tokens == 0
-        assert stats.estimated_tokens == 0
+        # A legacy 0/0 pair is not a measurement, so prune accounting charges
+        # the record its estimate rather than letting it sit in the buffer free.
+        assert stats.estimated_tokens > 0
 
     def test_message_provenance_round_trip_and_legacy_default(self) -> None:
         tagged = _rec().to_dict()
@@ -328,14 +330,22 @@ class TestPruneAge:
 class TestPruneTokens:
     def test_prune_by_tokens_oldest_first(self, tmp_path: Path) -> None:
         now = time.time()
+        # Seeded through a permissive store: append now enforces the token
+        # ceiling itself, so a store configured at 180 would never let the
+        # over-budget file that prune() is under test for exist.
+        seed = TraceStore(
+            tmp_path / "t.jsonl",
+            max_tokens=10_000,
+            max_age_days=365.0,
+        )
         store = TraceStore(
             tmp_path / "t.jsonl",
             max_tokens=180,
             max_age_days=365.0,
         )
-        store.append(_rec(ts=now - 30, prompt_tokens=100, completion_tokens=0))
-        store.append(_rec(ts=now - 20, prompt_tokens=100, completion_tokens=0))
-        store.append(_rec(ts=now - 10, prompt_tokens=100, completion_tokens=0))
+        seed.append(_rec(ts=now - 30, prompt_tokens=100, completion_tokens=0))
+        seed.append(_rec(ts=now - 20, prompt_tokens=100, completion_tokens=0))
+        seed.append(_rec(ts=now - 10, prompt_tokens=100, completion_tokens=0))
 
         dropped = store.prune(now=now)
         # 300 > 180, drop oldest (100) -> 200 > 180, drop next (100) -> 100 <= 180
@@ -351,14 +361,20 @@ class TestPruneTokens:
 class TestPruneBoth:
     def test_age_then_tokens(self, tmp_path: Path) -> None:
         now = time.time()
+        # Seeded through a permissive store; see TestPruneTokens.
+        seed = TraceStore(
+            tmp_path / "t.jsonl",
+            max_tokens=10_000,
+            max_age_days=365.0,
+        )
         store = TraceStore(
             tmp_path / "t.jsonl",
             max_tokens=150,
             max_age_days=1.0,
         )
-        store.append(_rec(ts=now - 86400 * 3, prompt_tokens=200, completion_tokens=0))
-        store.append(_rec(ts=now - 3600, prompt_tokens=100, completion_tokens=0))
-        store.append(_rec(ts=now - 1800, prompt_tokens=100, completion_tokens=0))
+        seed.append(_rec(ts=now - 86400 * 3, prompt_tokens=200, completion_tokens=0))
+        seed.append(_rec(ts=now - 3600, prompt_tokens=100, completion_tokens=0))
+        seed.append(_rec(ts=now - 1800, prompt_tokens=100, completion_tokens=0))
 
         dropped = store.prune(now=now)
         # age drops 1 (3d ago), left: 100+100=200 > 150 -> drop oldest young -> 100 <= 150
@@ -432,7 +448,10 @@ class TestStoreConcurrency:
 
         records = list(store.iter_records())
         assert all(result is not None for result in append_results)
-        assert dropped == 1
+        # Either the explicit prune or an append that crossed the token ceiling
+        # may be the caller that evicts "expired"; which one wins the lock is a
+        # race. The invariant under test is the end state asserted below.
+        assert dropped in (0, 1)
         assert {record.id for record in records} == {
             f"new-{idx}" for idx in range(append_count)
         }
@@ -444,6 +463,12 @@ class TestStoreConcurrency:
     ) -> None:
         now = time.time()
         path = tmp_path / "t.jsonl"
+        seed_store = TraceStore(
+            path,
+            max_tokens=10_000,
+            max_age_days=365.0,
+            redaction_enabled=False,
+        )
         loose_store = TraceStore(
             path,
             max_tokens=250,
@@ -457,7 +482,7 @@ class TestStoreConcurrency:
             redaction_enabled=False,
         )
         for idx in range(3):
-            loose_store.append(
+            seed_store.append(
                 _rec(
                     rid=f"r{idx}",
                     ts=now - (30 - idx),

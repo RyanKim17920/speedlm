@@ -77,6 +77,16 @@ def _parse_timestamp_to_epoch(value: Any, *, index: int) -> float:
             f"'timestamp' must be a number or ISO-8601 string (got bool)"
         )
     if isinstance(value, (int, float)):
+        #: Python ints are unbounded, so ``math.isfinite`` on a JSON integer
+        #: wider than a double raises OverflowError rather than returning
+        #: False. Convert first so an out-of-range epoch is a declared
+        #: rejection instead of an escaping OverflowError.
+        try:
+            value = float(value)
+        except OverflowError:
+            raise NormalizeError(
+                f"record[{index}]: 'timestamp' is too large to represent"
+            ) from None
         if not math.isfinite(value):
             raise NormalizeError(
                 f"record[{index}]: 'timestamp' must be a finite number"

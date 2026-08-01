@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Mapping
 from typing import Any
 
 from speedlm.gateway.sse import AssembledResponse
+
+logger = logging.getLogger(__name__)
 
 _TERMINAL_EVENTS = {
     "response.completed",
@@ -25,19 +28,34 @@ def parse_responses_response(body: bytes | bytearray) -> AssembledResponse | Non
 def parse_responses_sse(body: bytes | bytearray) -> AssembledResponse | None:
     """Recover the terminal response object from a Responses API SSE stream."""
     terminal: Mapping[str, Any] | None = None
+    unusable = 0
     for raw_event in _sse_data_events(body):
         if raw_event.strip() == b"[DONE]":
             continue
         try:
             payload = json.loads(raw_event)
         except (json.JSONDecodeError, UnicodeDecodeError):
-            return None
+            #: A terminal event carries the complete response snapshot, so an
+            #: undecodable neighbour (a connection truncated inside a trailing
+            #: frame, a stray non-JSON line) cannot make it partial. Skip the
+            #: frame rather than discarding an exchange that already arrived.
+            unusable += 1
+            continue
         if not isinstance(payload, Mapping):
-            return None
+            unusable += 1
+            continue
         event_type = payload.get("type")
         response = payload.get("response")
         if event_type in _TERMINAL_EVENTS and isinstance(response, Mapping):
             terminal = response
+    if unusable:
+        #: Never silent: a malformed stream that still yields a terminal event
+        #: is captured, but the operator has to be able to see it happened.
+        logger.warning(
+            "skipped %d unusable /v1/responses SSE event(s); terminal response %s",
+            unusable,
+            "recovered" if terminal is not None else "not recovered",
+        )
     return _parse_response_payload(terminal)
 
 
@@ -46,31 +64,42 @@ def response_status_and_id(
     content_type: str,
 ) -> tuple[str | None, str | None]:
     """Return response id/status even when a background response has no output."""
-    payload: Any = None
     if content_type.lower().startswith("text/event-stream"):
-        for raw_event in _sse_data_events(body):
-            if raw_event.strip() == b"[DONE]":
-                continue
-            try:
-                candidate = json.loads(raw_event)
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                return None, None
-            if isinstance(candidate, Mapping):
-                nested = candidate.get("response")
-                payload = nested if isinstance(nested, Mapping) else candidate
-    else:
-        try:
-            payload = json.loads(body)
-        except (json.JSONDecodeError, UnicodeDecodeError):
-            return None, None
+        return _sse_status_and_id(body)
+    try:
+        payload = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return None, None
     if not isinstance(payload, Mapping):
         return None, None
-    response_id = payload.get("id")
-    status = payload.get("status")
-    return (
-        response_id if isinstance(response_id, str) and response_id else None,
-        status if isinstance(status, str) and status else None,
-    )
+    return _non_empty_str(payload.get("id")), _non_empty_str(payload.get("status"))
+
+
+def _sse_status_and_id(body: bytes | bytearray) -> tuple[str | None, str | None]:
+    response_id: str | None = None
+    status: str | None = None
+    for raw_event in _sse_data_events(body):
+        if raw_event.strip() == b"[DONE]":
+            continue
+        try:
+            candidate = json.loads(raw_event)
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return None, None
+        if not isinstance(candidate, Mapping):
+            continue
+        nested = candidate.get("response")
+        selected = nested if isinstance(nested, Mapping) else candidate
+        #: Keep the last event that actually carries identity. A trailing
+        #: delta event has no ``response`` object, and must not erase the id
+        #: and status already announced by ``response.created`` — capture.py
+        #: registers background responses from exactly this pair.
+        response_id = _non_empty_str(selected.get("id")) or response_id
+        status = _non_empty_str(selected.get("status")) or status
+    return response_id, status
+
+
+def _non_empty_str(value: Any) -> str | None:
+    return value if isinstance(value, str) and value else None
 
 
 def responses_request_messages(
@@ -183,16 +212,35 @@ def _parse_response_payload(payload: Any) -> AssembledResponse | None:
         elif item_type in {"function_call", "custom_tool_call"}:
             name = item.get("name")
             arguments = item.get("arguments")
-            if isinstance(name, str) and isinstance(arguments, str):
-                call: dict[str, Any] = {
-                    "type": "function",
-                    "function": {"name": name, "arguments": arguments},
-                }
-                call_id = item.get("call_id") or item.get("id")
-                if isinstance(call_id, str) and call_id:
-                    call["id"] = call_id
-                tool_calls.append(call)
-                saw_output = True
+            if not isinstance(name, str) or not isinstance(arguments, str):
+                #: OpenAI transports tool arguments as a JSON *string*. A server
+                #: that pre-decodes them leaves nothing that can be restored to
+                #: the bytes the model actually emitted, so re-serializing would
+                #: fabricate training text. Drop the item — but loudly, because
+                #: a sole malformed call collapses the whole response to None
+                #: and capture.py can then only report "not reconstructed".
+                logger.warning(
+                    "dropping unusable /v1/responses %s output item: "
+                    "name=%r, arguments type=%s",
+                    item_type,
+                    name,
+                    type(arguments).__name__,
+                )
+                continue
+            call: dict[str, Any] = {
+                "type": "function",
+                "function": {"name": name, "arguments": arguments},
+            }
+            #: ``call_id or id`` short-circuits on any truthy value, so a
+            #: non-string call_id would win the fallback and then fail the type
+            #: check, leaving the call with no id at all.
+            call_id = item.get("call_id")
+            if not _non_empty_str(call_id):
+                call_id = item.get("id")
+            if isinstance(call_id, str) and call_id:
+                call["id"] = call_id
+            tool_calls.append(call)
+            saw_output = True
         elif item_type == "reasoning":
             summary = item.get("summary")
             if isinstance(summary, list):

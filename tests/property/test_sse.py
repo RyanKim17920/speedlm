@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from typing import Any
 
-import pytest
 from hypothesis import given, settings
 from hypothesis import strategies as st
 
@@ -187,13 +186,6 @@ def test_any_proper_stream_prefix_never_claims_completion(
     assert content.startswith(response.content or "")
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "src/speedlm/gateway/sse.py:147 does not catch RecursionError from "
-        "deeply nested malformed JSON"
-    ),
-)
 def test_deeply_nested_json_never_escapes_feed() -> None:
     depth = 10_000
     malformed = b"data: " + b"[" * depth + b"0" + b"]" * depth + b"\n\n"

@@ -1019,36 +1019,57 @@ def test_a_suffixed_tool_result_name_is_stripped_before_comparison() -> None:
     assert row.conversation[1]["name"] == "search"
 
 
-def test_unconditional_result_name_stripping_rejects_a_literally_suffixed_tool() -> None:
-    """BUG (rows.py:164-172): the tool-result strip is unconditional.
+def test_a_literally_suffixed_tool_round_trips_through_its_result() -> None:
+    """Regression: the tool-result strip is conditional, like the call strip.
 
-    Unlike the call-name strip at rows.py:212-216, which only adopts the stripped
-    name when it resolves to a captured tool, the tool-result branch strips any
-    trailing Harmony suffix before comparing. A tool genuinely named
-    ``search<|channel|>analysis`` therefore records ``known_calls['call-1'] ==
-    'search<|channel|>analysis'`` but its result name is rewritten to ``'search'``,
-    so a perfectly consistent conversation is rejected. This test pins CURRENT
-    behaviour; it should become an accepted round trip once the strip is made
-    conditional on the stripped name matching the referenced call.
+    The strip used to be unconditional, so a tool genuinely named
+    ``search<|channel|>analysis`` recorded ``known_calls['call-1'] ==
+    'search<|channel|>analysis'`` while its result name was rewritten to
+    ``'search'`` — a self-consistent conversation rejected outright.
     """
+    row = training_row_from_trace(
+        _trace(
+            tools=[_tool("search<|channel|>analysis")],
+            messages=[
+                {"role": "user", "content": "find"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_call(name="search<|channel|>analysis")],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-1",
+                    "name": "search<|channel|>analysis",
+                    "content": "ok",
+                },
+            ],
+        )
+    )
+
+    assert row.conversation[2]["name"] == "search<|channel|>analysis"
+
+
+def test_a_result_name_naming_a_different_tool_is_still_rejected() -> None:
+    """The conditional strip must not weaken the consistency check."""
     with pytest.raises(
         ValueError,
         match=re.escape("messages[2].name does not match its referenced tool call"),
     ):
         training_row_from_trace(
             _trace(
-                tools=[_tool("search<|channel|>analysis")],
+                tools=[_tool("search"), _tool("write")],
                 messages=[
                     {"role": "user", "content": "find"},
                     {
                         "role": "assistant",
                         "content": None,
-                        "tool_calls": [_call(name="search<|channel|>analysis")],
+                        "tool_calls": [_call(name="search")],
                     },
                     {
                         "role": "tool",
                         "tool_call_id": "call-1",
-                        "name": "search<|channel|>analysis",
+                        "name": "write<|channel|>analysis",
                         "content": "ok",
                     },
                 ],
@@ -1351,14 +1372,19 @@ def test_offset_sequence_rejects_non_int_points(point: object) -> None:
         _offset_sequence([[0, point]], "r")
 
 
-def test_offset_sequence_admits_bool_points() -> None:
-    """Documented gap: unlike _integer_sequence, offsets do not reject bools.
+@pytest.mark.parametrize("offset", [[True, False], [0, True], [False, 2]])
+def test_offset_sequence_rejects_bool_points(offset: object) -> None:
+    """Regression: bools are rejected, matching ``_integer_sequence``.
 
-    ``isinstance(True, int)`` is True and there is no bool guard at rows.py:353,
-    so ``[True, False]`` becomes the offset ``(1, 0)`` -- an inverted span that
-    would silently contribute nothing to a loss mask.
+    ``isinstance(True, int)`` is True, so without a guard ``[True, False]``
+    became the offset ``(1, 0)`` -- an inverted span that silently contributes
+    nothing to a loss mask.
     """
-    assert _offset_sequence([[True, False]], "r") == ((1, 0),)
+    with pytest.raises(
+        ValueError,
+        match=re.escape("training row 'r' tokenizer returned invalid offset_mapping"),
+    ):
+        _offset_sequence([offset], "r")
 
 
 # --------------------------------------------------------------------------
@@ -1446,23 +1472,22 @@ def test_harmony_render_leaves_a_message_without_tool_calls_alone() -> None:
     ]
 
 
-def test_harmony_render_crashes_on_an_explicit_null_tool_calls_key() -> None:
-    """BUG (rows.py:395): ``message.get("tool_calls", [])`` returns None, not [].
+def test_harmony_render_tolerates_an_explicit_null_tool_calls_key() -> None:
+    """Regression: ``message.get("tool_calls", [])`` returned None, not [].
 
     ``_validate_calls`` returns early for ``tool_calls: None`` and ``_json_copy``
-    preserves the key, so an assistant message that carries an explicit null
-    ``tool_calls`` -- which several OpenAI-compatible servers emit -- survives
-    validation and then raises ``TypeError: 'NoneType' object is not iterable``
-    here. ``message.get("tool_calls") or []`` would fix it. Pinning current
-    behaviour.
+    preserves the key, so an assistant message carrying an explicit null
+    ``tool_calls`` -- which several OpenAI-compatible servers emit -- survived
+    validation and then raised ``TypeError: 'NoneType' object is not iterable``.
     """
     row = training_row_from_trace(
         _trace(messages=[{"role": "assistant", "content": "x", "tool_calls": None}])
     )
     assert row.conversation[0]["tool_calls"] is None
 
-    with pytest.raises(TypeError, match="'NoneType' object is not iterable"):
-        harmony_render_messages(row)
+    assert harmony_render_messages(row) == [
+        {"role": "assistant", "content": "x", "tool_calls": None}
+    ]
 
 
 # --------------------------------------------------------------------------

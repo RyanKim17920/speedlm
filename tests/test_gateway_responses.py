@@ -8,6 +8,7 @@ explicitly wherever the production code chooses silence.
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
 
 import pytest
@@ -218,11 +219,14 @@ def test_tool_call_with_falsy_call_id_falls_back_to_id(call_id: Any) -> None:
     assert parsed.tool_calls[0]["id"] == "fc_fallback"
 
 
-def test_tool_call_with_a_truthy_non_string_call_id_loses_its_id_entirely() -> None:
-    # BUG (responses.py:191-193): ``call_id or id`` short-circuits on any truthy
-    # value, so a numeric call_id both wins the fallback and then fails the str
-    # check — the surviving tool call has no id at all, silently breaking
-    # correlation with the matching function_call_output.
+def test_a_truthy_non_string_call_id_still_falls_back_to_id() -> None:
+    """Regression: ``call_id`` must be a *usable* string before it wins.
+
+    ``call_id or id`` short-circuited on any truthy value, so a numeric call_id
+    both won the fallback and then failed the str check, leaving the tool call
+    with no id at all and silently breaking correlation with its matching
+    ``function_call_output``.
+    """
     body = _json(
         _response(
             output=[
@@ -240,7 +244,7 @@ def test_tool_call_with_a_truthy_non_string_call_id_loses_its_id_entirely() -> N
     parsed = parse_responses_response(body)
 
     assert parsed is not None
-    assert "id" not in parsed.tool_calls[0]
+    assert parsed.tool_calls[0]["id"] == "fc_fallback"
 
 
 def test_incomplete_details_reason_becomes_stop_reason() -> None:
@@ -526,10 +530,18 @@ def test_unknown_content_part_types_are_ignored() -> None:
     assert parse_responses_response(body) is None
 
 
-def test_function_call_with_non_string_arguments_is_silently_dropped() -> None:
-    # BUG (responses.py:186): ``arguments`` must be a str, so a provider that
-    # emits a pre-parsed object drops the whole tool call; when it is the only
-    # output item the entire exchange is discarded with no diagnostic.
+def test_function_call_with_non_string_arguments_is_dropped_with_a_diagnostic(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Regression: the drop stays, the silence does not.
+
+    ``arguments`` must be an OpenAI JSON *string*; a server that pre-decodes it
+    leaves nothing that can be restored to the bytes the model emitted, so
+    re-serializing would fabricate training text. The item is still dropped —
+    and when it is the only output the exchange is still discarded — but the
+    reason is now logged instead of surfacing downstream as an unexplained
+    "capture response could not be reconstructed".
+    """
     body = _json(
         _response(
             output=[
@@ -543,7 +555,11 @@ def test_function_call_with_non_string_arguments_is_silently_dropped() -> None:
         )
     )
 
-    assert parse_responses_response(body) is None
+    with caplog.at_level(logging.WARNING, logger="speedlm.gateway.responses"):
+        assert parse_responses_response(body) is None
+
+    assert "dropping unusable /v1/responses function_call output item" in caplog.text
+    assert "arguments type=dict" in caplog.text
 
 
 def test_function_call_with_non_string_name_is_dropped_but_siblings_survive() -> None:
@@ -792,24 +808,55 @@ def test_truncated_terminal_event_returns_none() -> None:
     assert parse_responses_sse(body) is None
 
 
-def test_malformed_event_after_a_valid_terminal_discards_the_terminal() -> None:
-    # BUG (responses.py:33-34): a decode failure anywhere in the stream returns
-    # None, throwing away a terminal response that was already recovered. A
-    # connection truncated one byte into the trailing [DONE] frame loses the
-    # entire exchange even though the completed snapshot arrived intact.
+def test_malformed_event_after_a_valid_terminal_keeps_the_terminal(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Regression: a truncated trailing frame no longer voids the exchange.
+
+    A terminal event carries the complete response snapshot, so an undecodable
+    neighbour cannot make it partial. Recovering it is strictly better than
+    losing a whole exchange to a connection dropped one byte into the trailing
+    frame — and the skipped frame is logged so the damage is not silent.
+    """
     good = _event("response.completed", _response())
     body = _sse(good) + b'data: {"type": "response.out\n\n'
 
-    assert parse_responses_sse(body) is None
-    # The same stream without the trailing garbage parses fine.
-    assert parse_responses_sse(_sse(good)) is not None
+    with caplog.at_level(logging.WARNING, logger="speedlm.gateway.responses"):
+        parsed = parse_responses_sse(body)
+
+    assert parsed is not None
+    assert parsed.content == "hello"
+    assert "skipped 1 unusable" in caplog.text
+    assert "recovered" in caplog.text
+    # The same stream without the trailing garbage parses identically.
+    assert parse_responses_sse(_sse(good)) == parsed
 
 
-@pytest.mark.parametrize("event", ["[]", '"text"', "7", "null", "true"])
-def test_non_mapping_event_payloads_return_none(event: str) -> None:
+def test_undecodable_events_without_a_terminal_still_return_none(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    body = _sse(_event("response.output_text.delta", None)) + b'data: {"type": "response.out\n\n'
+
+    with caplog.at_level(logging.WARNING, logger="speedlm.gateway.responses"):
+        assert parse_responses_sse(body) is None
+
+    assert "not recovered" in caplog.text
+
+
+@pytest.mark.parametrize("event", ["[]", "[1,2]", '"text"', "7", "null", "true"])
+def test_non_mapping_event_payloads_are_skipped_not_fatal(event: str) -> None:
+    """Regression: a stray ``data: [1,2]`` after a good terminal is not fatal."""
     body = _sse(_event("response.completed", _response()), event)
 
-    assert parse_responses_sse(body) is None
+    parsed = parse_responses_sse(body)
+
+    assert parsed is not None
+    assert parsed.content == "hello"
+
+
+@pytest.mark.parametrize("event", ["[1,2]", '"text"', "7"])
+def test_non_mapping_event_payloads_alone_still_return_none(event: str) -> None:
+    assert parse_responses_sse(_sse(event)) is None
 
 
 def test_sse_invalid_utf8_returns_none() -> None:
@@ -859,16 +906,20 @@ def test_sse_body_falls_back_to_the_top_level_payload() -> None:
     assert response_status_and_id(body, "text/event-stream") == ("resp_bg", "queued")
 
 
-def test_sse_last_event_without_a_response_object_loses_the_id() -> None:
-    # BUG (responses.py:58-60): the loop keeps the LAST event unconditionally
-    # instead of the last one carrying a response object, so a background stream
-    # that ends on a delta reports (None, None) despite having announced its id.
+def test_sse_last_event_without_a_response_object_keeps_the_announced_id() -> None:
+    """Regression: a trailing delta must not erase the announced identity.
+
+    The loop kept the LAST event unconditionally instead of the last one
+    carrying identity, so a background stream truncated after a delta reported
+    ``(None, None)`` — which is exactly the pair capture.py uses to register
+    ``_pending_responses``, silently dropping background correlation.
+    """
     body = _sse(
         _event("response.created", {"id": "resp_bg", "status": "queued"}),
         json.dumps({"type": "response.output_text.delta", "delta": "hi"}),
     )
 
-    assert response_status_and_id(body, "text/event-stream") == (None, None)
+    assert response_status_and_id(body, "text/event-stream") == ("resp_bg", "queued")
 
 
 @pytest.mark.parametrize(

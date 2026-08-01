@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Protocol
 
+from speedlm.traces.redact import Redactor
 from speedlm.training.base import BackendInfo
 from speedlm.training.masking import FinalAssistantMaskError, MaskPolicy
 
@@ -71,8 +72,18 @@ class TrainingError(Eagle3Error):
     """Speculators training failed, retaining stderr for diagnosis."""
 
     def __init__(self, message: str, *, stderr: str) -> None:
+        #: ``stderr`` stays verbatim for callers that persist it to the
+        #: owner-only training-log sidecar. The exception *message* travels
+        #: much further -- tracebacks, CLI output, structured logs -- so the
+        #: copy interpolated there is redacted first. A subprocess that echoes
+        #: an API key or a token in a diagnostic line must not turn a training
+        #: failure into a credential leak.
         self.stderr = stderr
-        detail = f"{message}; stderr: {stderr}" if stderr else message
+        if stderr:
+            redacted, _ = Redactor().redact_text(stderr)
+            detail = f"{message}; stderr: {redacted}"
+        else:
+            detail = message
         super().__init__(detail)
 
 

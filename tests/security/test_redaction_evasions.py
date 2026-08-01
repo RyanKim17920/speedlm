@@ -79,7 +79,22 @@ def test_zero_width_obfuscated_secret_must_not_reach_disk(tmp_path: Path) -> Non
 
 @pytest.mark.xfail(
     strict=True,
-    reason="redaction state does not join secrets split across message boundaries",
+    reason=(
+        "src/speedlm/traces/redact.py:266 Redactor._walk scans each string leaf "
+        "independently, so a secret split across two messages matches no pattern "
+        "and both halves reach disk verbatim. NOT FIXED DELIBERATELY: a real fix "
+        "cannot just concatenate adjacent same-role contents -- the split can be "
+        "across roles, across tool_call arguments, into three or more pieces, or "
+        "interleaved with unrelated leaves, so containment requires matching over "
+        "every ordering of the record's string leaves and then mapping each hit "
+        "back to per-leaf spans. It would also have to redact leaves that are "
+        "individually innocuous (here the tail 'mnopqrstuvwxyz1234567890'), which "
+        "makes false positives on ordinary prose unavoidable. A defensible fix "
+        "needs a stated concatenation contract (which leaves join, in what order) "
+        "plus a false-positive budget measured on real captured traffic; a "
+        "pairwise-adjacent join would pass this test while leaving the general "
+        "evasion open."
+    ),
 )
 def test_secret_split_across_messages_must_not_reach_disk(tmp_path: Path) -> None:
     secret = "sk-abcdefghijklmnopqrstuvwxyz1234567890"

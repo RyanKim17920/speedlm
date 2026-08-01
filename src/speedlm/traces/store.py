@@ -428,6 +428,13 @@ class TraceStore:
         self._redactor: TraceRedactor | None = (
             redactor or Redactor() if redaction_enabled else None
         )
+        #: Running token total for the buffer, so ``append`` can decide whether
+        #: pruning is due without re-reading the file on every request. ``None``
+        #: means "not yet known"; it is seeded from disk on the first append and
+        #: recomputed after each prune. Another process appending concurrently
+        #: only makes this an under-estimate, and that process runs the same
+        #: check, so the ceiling still holds.
+        self._buffered_tokens: int | None = None
 
     @classmethod
     def from_config(
@@ -539,7 +546,37 @@ class TraceStore:
         if not _append_jsonl(self._path, trace_record):
             self.record_drop("lock_timeout")
             return None
+        self._enforce_budget_after_append(record)
         return report
+
+    def _enforce_budget_after_append(self, record: TraceRecord) -> None:
+        """Prune when the newly appended record pushed the buffer over budget.
+
+        Pruning rewrites the whole file, so it must not run on every append:
+        this is the live capture path. The running total makes the common case
+        a single addition and defers the full read to the crossings.
+        """
+        if self._buffered_tokens is None:
+            self._buffered_tokens = self._measure_buffered_tokens()
+        self._buffered_tokens += _accounting_tokens(record)
+        if self._buffered_tokens <= self._max_tokens:
+            return
+        try:
+            self._prune(now=None, enforce_age=False)
+        except Exception as exc:  # pragma: no cover - defensive on the hot path
+            logger.warning("trace prune after append failed: %s", exc)
+            return
+        self._buffered_tokens = self._measure_buffered_tokens()
+
+    def _measure_buffered_tokens(self) -> int:
+        """Sum the on-disk token cost, treating unreadable tails as zero."""
+        total = 0
+        try:
+            for rec in self.iter_records():
+                total += _accounting_tokens(rec)
+        except (StorageError, TraceError) as exc:
+            logger.warning("trace token accounting truncated: %s", exc)
+        return total
 
     def count_records(self) -> int:
         """Return how many records the buffer holds, without deserializing any.
@@ -629,6 +666,17 @@ class TraceStore:
         4. A missing file returns 0.
         5. Records exactly at the age boundary are KEPT (strict > comparison).
         """
+        return self._prune(now=now, enforce_age=True)
+
+    def _prune(self, *, now: float | None, enforce_age: bool) -> int:
+        """Prune the buffer, optionally skipping the age filter.
+
+        ``append`` enforces only the token ceiling: age is measured against a
+        caller-supplied clock, and silently applying wall-clock retention as a
+        side effect of a capture would delete records the caller never asked
+        about. Unbounded disk growth is the append-path risk; retention stays
+        with the callers that schedule it.
+        """
         if now is None:
             now = time.time()
 
@@ -659,7 +707,8 @@ class TraceStore:
             age_seconds = self._max_age_days * 86400.0
 
             # Step 1: age filter (strict > — boundary records kept)
-            records = [r for r in records if (now - r.timestamp) <= age_seconds]
+            if enforce_age:
+                records = [r for r in records if (now - r.timestamp) <= age_seconds]
 
             # Step 2: token budget — drop oldest-first
             total = sum(_accounting_tokens(record) for record in records)
@@ -685,8 +734,16 @@ class TraceStore:
 
 
 def _accounting_tokens(record: TraceRecord) -> int:
+    """Return the token cost the prune budget charges *record*.
+
+    A reported total of zero is never trusted as a measurement: an upstream
+    that answers ``usage: {"prompt_tokens": 0, "completion_tokens": 0}``
+    alongside megabytes of message text would otherwise sit in the buffer at
+    zero cost and defeat the token ceiling entirely. Zero and missing counts
+    both fall back to the estimate.
+    """
     total = record.total_tokens
-    if total is not None:
+    if total is not None and total > 0:
         return total
     prompt_tokens, completion_tokens = estimate_message_tokens(list(record.messages))
     return prompt_tokens + completion_tokens
