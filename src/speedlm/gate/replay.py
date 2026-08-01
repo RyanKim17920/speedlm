@@ -34,6 +34,18 @@ class RequestResult:
     response_text: str
     valid: bool
     error: str = ""
+    #: The generated sequence as the endpoint tokenised it, in order.
+    #:
+    #: Populated only when the request asked for logprobs -- see
+    #: :func:`_send_request`.  Empty means "not captured", which is different
+    #: from "the model emitted nothing"; a caller comparing two generations
+    #: must fall back to characters rather than treat an empty tuple as a
+    #: zero-length match.
+    output_tokens: tuple[str, ...] = ()
+    #: vLLM's ``finish_reason`` verbatim (``"stop"``, ``"length"``, ...).
+    #: Recorded so a divergence at the very end of a bounded generation can be
+    #: told apart from one that ended naturally.
+    finish_reason: str = ""
 
     @property
     def invalid(self) -> bool:
@@ -49,6 +61,8 @@ class RequestResult:
             "response_text": self.response_text,
             "valid": self.valid,
             "error": self.error,
+            "output_tokens": list(self.output_tokens),
+            "finish_reason": self.finish_reason,
         }
 
 
@@ -124,13 +138,60 @@ class ReplayResult:
 # Replay
 # ---------------------------------------------------------------------------
 
+def _extract_output_tokens(choice: dict[str, Any]) -> tuple[str, ...]:
+    """Recover the generated token sequence from an OpenAI-shaped choice.
+
+    The OpenAI-compatible surface vLLM serves has no way to return raw token
+    *ids* per request: ``--return-tokens-as-token-ids`` is a server-launch flag,
+    and the gate replays against an engine it did not launch with that flag.
+    What the endpoint does expose per request is ``logprobs.content``, one entry
+    per generated token carrying that token's decoded piece.  That is a genuine
+    token-level alignment -- the segmentation is the model's own, not a
+    re-tokenisation of the response string -- which is what a first-divergence
+    index needs.  (If the server *was* started with
+    ``--return-tokens-as-token-ids`` these pieces are literally ``token_id:N``
+    strings, and the comparison becomes an exact id comparison for free.)
+
+    Returns an empty tuple when logprobs were not requested or not returned, so
+    the caller can tell "not captured" from "captured, and empty".
+    """
+    logprobs = choice.get("logprobs")
+    if not isinstance(logprobs, dict):
+        return ()
+    content = logprobs.get("content")
+    if not isinstance(content, list):
+        return ()
+    tokens: list[str] = []
+    for entry in content:
+        if not isinstance(entry, dict):
+            return ()
+        token = entry.get("token")
+        if not isinstance(token, str):
+            return ()
+        tokens.append(token)
+    return tuple(tokens)
+
+
 async def _send_request(
     client: Any,
     ctx: FrozenContext,
     sampling: SamplingConfig,
     model: str,
+    *,
+    max_tokens: int | None = None,
+    capture_tokens: bool = False,
 ) -> RequestResult:
-    """Send a single context to the OpenAI-compatible endpoint."""
+    """Send a single context to the OpenAI-compatible endpoint.
+
+    Args:
+        max_tokens: Hard cap on generated tokens, or ``None`` to let the
+            generation run to the served model's length limit.  The gate's
+            correctness pass always sets it; the throughput pass never does,
+            because bounding output would change the statistic the throughput
+            threshold is calibrated against.
+        capture_tokens: Ask for per-token logprobs so the response carries the
+            model's own tokenisation of its output.
+    """
     import httpx
     payload: dict[str, Any] = {
         "model": model,
@@ -139,6 +200,13 @@ async def _send_request(
         "top_p": sampling.top_p,
         "seed": sampling.seed,
     }
+    if max_tokens is not None:
+        payload["max_tokens"] = max_tokens
+    if capture_tokens:
+        # ``top_logprobs`` is deliberately omitted: the gate needs the chosen
+        # token per position, not the distribution around it, and asking for
+        # alternatives multiplies the response size by the requested width.
+        payload["logprobs"] = True
     start = time.monotonic()
     try:
         resp = await client.post("v1/chat/completions", json=payload)
@@ -170,8 +238,11 @@ async def _send_request(
                 error="Empty choices array",
             )
 
-        message = choices[0].get("message", {})
+        choice = choices[0]
+        message = choice.get("message", {})
         text = message.get("content", "")
+        output_tokens = _extract_output_tokens(choice)
+        finish_reason = choice.get("finish_reason") or ""
         usage = body.get("usage", {})
         pt = usage.get("prompt_tokens", 0)
         ct = usage.get("completion_tokens", 0)
@@ -186,6 +257,7 @@ async def _send_request(
                 response_text="",
                 valid=False,
                 error="Empty response text",
+                finish_reason=finish_reason,
             )
 
         return RequestResult(
@@ -196,6 +268,8 @@ async def _send_request(
             total_tokens=pt + ct,
             response_text=text,
             valid=True,
+            output_tokens=output_tokens,
+            finish_reason=finish_reason,
         )
 
     except httpx.HTTPError as exc:
@@ -230,6 +304,8 @@ async def _run_single(
     sampling: SamplingConfig,
     model: str,
     concurrency: int,
+    max_tokens: int | None = None,
+    capture_tokens: bool = False,
 ) -> RunResults:
     """Execute one full pass over the suite, up to *concurrency* in flight.
 
@@ -248,7 +324,14 @@ async def _run_single(
 
     async def bounded(ctx: FrozenContext) -> RequestResult:
         async with semaphore:
-            return await _send_request(client, ctx, sampling, model)
+            return await _send_request(
+                client,
+                ctx,
+                sampling,
+                model,
+                max_tokens=max_tokens,
+                capture_tokens=capture_tokens,
+            )
 
     results: list[RequestResult] = list(
         await asyncio.gather(*(bounded(ctx) for ctx in suite.contexts))
@@ -280,6 +363,8 @@ async def replay_suite(
     timeout: float = 120.0,
     model: str = "auto",
     concurrency: int = 1,
+    max_tokens: int | None = None,
+    capture_tokens: bool = False,
 ) -> ReplayResult:
     """Replay suite against an OpenAI-compatible endpoint N times.
 
@@ -294,12 +379,19 @@ async def replay_suite(
             strictly sequential -- a repeat is the unit the gate's per-repeat
             statistic is computed over, so overlapping two of them would fold
             two samples into one measurement.
+        max_tokens: Per-request output cap, or ``None`` for the served model's
+            own limit.  Bounding output changes what throughput means, so the
+            gate sets this only on its correctness pass.
+        capture_tokens: Request per-token logprobs so each result carries the
+            model's own tokenisation, which is what
+            :func:`speedlm.gate.decide.first_divergence` aligns on.
 
     Returns:
         Aggregated :class:`ReplayResult` with per-run data.
 
     Raises:
-        ReplayError: If repeats < 1, concurrency < 1, or suite is empty.
+        ReplayError: If repeats < 1, concurrency < 1, max_tokens < 1, or the
+            suite is empty.
     """
     import httpx
 
@@ -307,6 +399,10 @@ async def replay_suite(
         raise ReplayError(f"repeats must be >= 1, got {repeats}")
     if isinstance(concurrency, bool) or not isinstance(concurrency, int) or concurrency < 1:
         raise ReplayError(f"concurrency must be an integer >= 1, got {concurrency!r}")
+    if max_tokens is not None and (
+        isinstance(max_tokens, bool) or not isinstance(max_tokens, int) or max_tokens < 1
+    ):
+        raise ReplayError(f"max_tokens must be None or an integer >= 1, got {max_tokens!r}")
     if not suite.contexts:
         raise ReplayError("Cannot replay empty suite")
 
@@ -324,7 +420,15 @@ async def replay_suite(
         ),
     ) as client:
         for _ in range(repeats):
-            run = await _run_single(client, suite, sampling, model, concurrency)
+            run = await _run_single(
+                client,
+                suite,
+                sampling,
+                model,
+                concurrency,
+                max_tokens=max_tokens,
+                capture_tokens=capture_tokens,
+            )
             runs.append(run)
 
     return ReplayResult(

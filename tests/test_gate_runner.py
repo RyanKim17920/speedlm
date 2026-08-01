@@ -12,6 +12,9 @@ from speedlm.config import SamplingConfig, SpeedLMConfig
 from speedlm.gate.decide import Reason, Verdict
 from speedlm.gate.replay import ReplayResult, RequestResult, RunResults
 from speedlm.gate.runner import (
+    CORRECTNESS_REPEATS,
+    CORRECTNESS_REPLAY_CONCURRENCY,
+    DEFAULT_CORRECTNESS_MAX_TOKENS,
     DEFAULT_REPLAY_CONCURRENCY,
     BenchmarkGateRunner,
     HttpReplayExecutor,
@@ -75,6 +78,13 @@ class FakeReplayExecutor:
     calls: int = 0
     seen_repeats: list[int] = field(default_factory=list)
     seen_suite_ids: list[int] = field(default_factory=list)
+    #: ``(concurrency, max_tokens, capture_tokens)`` per call, in call order.
+    seen_options: list[tuple[int | None, int | None, bool]] = field(default_factory=list)
+    #: Text each request should return, keyed by whether the call is the
+    #: correctness pass.  Lets a test make the arms disagree on the correctness
+    #: pass while agreeing on the throughput pass, which is the real shape.
+    response_text: str = "same deterministic output"
+    correctness_tokens: tuple[str, ...] | None = None
 
     def replay(
         self,
@@ -85,6 +95,9 @@ class FakeReplayExecutor:
         repeats: int,
         timeout_seconds: float,
         should_abort: Callable[[], bool],
+        concurrency: int | None = None,
+        max_tokens: int | None = None,
+        capture_tokens: bool = False,
     ) -> ReplayResult:
         assert endpoint_url == "http://not-used.test/"
         assert timeout_seconds > 0
@@ -95,8 +108,11 @@ class FakeReplayExecutor:
         self.calls += 1
         self.seen_repeats.append(repeats)
         self.seen_suite_ids.append(id(suite))
+        self.seen_options.append((concurrency, max_tokens, capture_tokens))
         if self.events is not None:
-            self.events.append(f"replay:{repeats}")
+            self.events.append(
+                f"correctness:{concurrency}" if capture_tokens else f"replay:{repeats}"
+            )
 
         runs: list[RunResults] = []
         for _ in range(repeats):
@@ -109,8 +125,13 @@ class FakeReplayExecutor:
                 prompt_tokens=4,
                 completion_tokens=10,
                 total_tokens=14,
-                response_text="same deterministic output",
+                response_text=self.response_text,
                 valid=True,
+                output_tokens=(
+                    self.correctness_tokens
+                    if capture_tokens and self.correctness_tokens is not None
+                    else ()
+                ),
             )
             runs.append(
                 RunResults(
@@ -181,37 +202,74 @@ def _snapshot(
     )
 
 
+def _arm_ladder(
+    *,
+    start: tuple[float, float, float, float],
+    totals: tuple[float, float, float, float],
+    repeats: int,
+    fractions: tuple[float, ...] | None = None,
+    accepted_fractions: tuple[float, ...] | None = None,
+) -> list[str]:
+    """One scrape before the arm's first repeat and one after each repeat.
+
+    The gate samples ``/metrics`` between repeats so acceptance is measured per
+    repeat rather than once per arm, so a fake metrics source has to supply a
+    ladder rather than two endpoints.  ``fractions`` says how much of *totals*
+    has accrued by each rung, which is how a test injects real per-repeat
+    acceptance variance; the default spreads the totals evenly, reproducing the
+    old two-endpoint behaviour exactly at the pooled level.
+    """
+    if fractions is None:
+        fractions = tuple((i + 1) / repeats for i in range(repeats))
+    assert len(fractions) == repeats
+    assert fractions[-1] == 1.0
+    if accepted_fractions is None:
+        accepted_fractions = fractions
+    assert len(accepted_fractions) == repeats
+    assert accepted_fractions[-1] == 1.0
+    rungs = list(zip([0.0, *fractions], [0.0, *accepted_fractions], strict=True))
+    return [
+        _snapshot(
+            generated=start[0] + totals[0] * f,
+            elapsed_ns=start[1] + totals[1] * f,
+            # Accrues on its own schedule so a test can give the arm real
+            # per-repeat acceptance variance without touching its totals.
+            accepted=start[2] + totals[2] * a,
+            rejected=start[3] + totals[3] * f,
+        )
+        for f, a in rungs
+    ]
+
+
 def _normal_scrapes(
     *,
     candidate_generated: float = 120,
     candidate_elapsed_ns: float = 800_000_000,
     candidate_accepted: float = 80,
     candidate_rejected: float = 20,
+    repeats: int = 3,
+    stock_fractions: tuple[float, ...] | None = None,
+    stock_accepted_fractions: tuple[float, ...] | None = None,
+    candidate_fractions: tuple[float, ...] | None = None,
 ) -> list[str]:
     return [
-        _snapshot(
-            generated=100,
-            elapsed_ns=1_000_000_000,
-            accepted=10,
-            rejected=10,
+        *_arm_ladder(
+            start=(100, 1_000_000_000, 10, 10),
+            totals=(100, 1_000_000_000, 60, 40),
+            repeats=repeats,
+            fractions=stock_fractions,
+            accepted_fractions=stock_accepted_fractions,
         ),
-        _snapshot(
-            generated=200,
-            elapsed_ns=2_000_000_000,
-            accepted=70,
-            rejected=50,
-        ),
-        _snapshot(
-            generated=1_000,
-            elapsed_ns=10_000_000_000,
-            accepted=100,
-            rejected=100,
-        ),
-        _snapshot(
-            generated=1_000 + candidate_generated,
-            elapsed_ns=10_000_000_000 + candidate_elapsed_ns,
-            accepted=100 + candidate_accepted,
-            rejected=100 + candidate_rejected,
+        *_arm_ladder(
+            start=(1_000, 10_000_000_000, 100, 100),
+            totals=(
+                candidate_generated,
+                candidate_elapsed_ns,
+                candidate_accepted,
+                candidate_rejected,
+            ),
+            repeats=repeats,
+            fractions=candidate_fractions,
         ),
     ]
 
@@ -264,8 +322,10 @@ def test_passing_candidate_promotes_with_real_decision(tmp_path: Path) -> None:
     assert result.decision.verdict is Verdict.PROMOTE
     assert result.decision.reason is Reason.BOTH_THRESHOLDS_MET
     assert endpoint.activations == ["stock", tmp_path / "candidate"]
-    assert replay.calls == 4
-    assert replay.seen_repeats == [1, 3, 1, 3]
+    # Per arm: one warmup pass, three scored passes issued one at a time so
+    # a scrape can sit between them, and one correctness pass.
+    assert replay.calls == 10
+    assert replay.seen_repeats == [1] * 10
     assert len(set(replay.seen_suite_ids)) == 1
 
 
@@ -477,7 +537,7 @@ def test_gate_resolves_callable_training_hashes_for_each_benchmark(
     assert first.decision is not None
     assert provider_calls == 2
     assert endpoint.activations == ["stock", tmp_path / "candidate-a"]
-    assert replay.calls == 4
+    assert replay.calls == 10
 
 
 def test_warmup_pass_runs_before_the_measurement_window(tmp_path: Path) -> None:
@@ -496,24 +556,26 @@ def test_warmup_pass_runs_before_the_measurement_window(tmp_path: Path) -> None:
 
     assert result.decision is not None
     # Each arm warms up first, and only then does the metrics window open.
-    assert events == [
+    per_arm = [
+        "replay:1",  # warmup, outside the window
+        "scrape",  # window opens
         "replay:1",
         "scrape",
-        "replay:3",
-        "scrape",
         "replay:1",
         "scrape",
-        "replay:3",
-        "scrape",
+        "replay:1",
+        "scrape",  # window closes
+        "correctness:1",  # bounded, single-stream, outside the window
     ]
-    assert replay.seen_repeats == [1, 3, 1, 3]
+    assert events == per_arm * 2
+    assert replay.seen_repeats == [1] * 10
 
 
 def test_warmup_pass_is_excluded_from_the_scored_repeats(tmp_path: Path) -> None:
     # One slow cold pass per arm (JIT compilation), then steady state.  If the
     # warmup were scored, the 2.5 tok/s pass would show up in ``per_repeat``.
     replay = FakeReplayExecutor(
-        run_latencies=[4.0, 1.0, 1.0, 1.0, 4.0, 1.0, 1.0, 1.0],
+        run_latencies=[4.0, 1.0, 1.0, 1.0, 1.0, 4.0, 1.0, 1.0, 1.0, 1.0],
     )
     runner, _, replay, _ = _runner(
         tmp_path,
@@ -537,7 +599,7 @@ def test_warmup_pass_is_excluded_from_the_scored_repeats(tmp_path: Path) -> None
 
 def test_warmup_measurement_stays_visible_in_the_report(tmp_path: Path) -> None:
     replay = FakeReplayExecutor(
-        run_latencies=[4.0, 1.0, 1.0, 1.0, 4.0, 1.0, 1.0, 1.0],
+        run_latencies=[4.0, 1.0, 1.0, 1.0, 1.0, 4.0, 1.0, 1.0, 1.0, 1.0],
     )
     runner, _, _, _ = _runner(
         tmp_path,
@@ -581,7 +643,7 @@ def test_warmup_can_be_disabled(tmp_path: Path) -> None:
     )
 
     assert result.decision is not None
-    assert replay_executor.seen_repeats == [3, 3]
+    assert replay_executor.seen_repeats == [1] * 8
     warmup = result.metrics["warmup"]
     assert isinstance(warmup, dict)
     assert warmup == {"requested_repeats": 0, "stock": None, "candidate": None}
@@ -628,11 +690,18 @@ def test_every_scrape_body_is_returned_verbatim(tmp_path: Path) -> None:
         should_abort=lambda: False,
     )
 
+    # One scrape opens each arm's window and one closes it after every
+    # repeat, so the archive keeps every window the acceptance vector was
+    # derived from -- not just the two endpoints of the pooled one.
     assert dict(result.metrics_bodies) == {
         "stock-before": expected[0],
-        "stock-after": expected[1],
-        "candidate-before": expected[2],
-        "candidate-after": expected[3],
+        "stock-after-repeat-0": expected[1],
+        "stock-after-repeat-1": expected[2],
+        "stock-after": expected[3],
+        "candidate-before": expected[4],
+        "candidate-after-repeat-0": expected[5],
+        "candidate-after-repeat-1": expected[6],
+        "candidate-after": expected[7],
     }
 
 
@@ -798,6 +867,7 @@ def test_estimated_benchmark_seconds_scales_with_the_suite(tmp_path: Path) -> No
         repeats=3,
         warmup_repeats=1,
         concurrency=DEFAULT_REPLAY_CONCURRENCY,
+        correctness_repeats=CORRECTNESS_REPEATS,
     )
 
 
@@ -811,3 +881,192 @@ def test_estimated_benchmark_seconds_is_none_when_no_suite_can_be_built(
     )
 
     assert runner.estimated_benchmark_seconds() is None
+
+
+# ---------------------------------------------------------------------------
+# Output-correctness pass
+# ---------------------------------------------------------------------------
+
+
+def test_correctness_pass_runs_single_stream_whatever_the_benchmark_degree(
+    tmp_path: Path,
+) -> None:
+    """Concurrency is a throughput knob and must not reach the equality check.
+
+    Job 369005 ran the equality check inside the concurrency-8 throughput pass,
+    where the per-token divergence hazard is ~12x what it is single-stream, and
+    rejected a candidate on 82-87 "mismatches" that were the scheduler's doing.
+    """
+    replay_executor = FakeReplayExecutor()
+    runner = BenchmarkGateRunner(
+        config=SpeedLMConfig(model="model"),
+        trace_source=FakeTraceSource((_trace(),)),
+        suite_dir=tmp_path / "suite",
+        stock_draft="stock",
+        endpoint=FakeEndpoint(),
+        metrics_source=FakeMetricsSource(_normal_scrapes()),
+        replay_executor=replay_executor,
+        replay_concurrency=32,
+        training_context_hashes=frozenset(),
+        clock=FakeClock(),
+    )
+
+    result = runner.benchmark(
+        tmp_path / "candidate",
+        timeout_seconds=30,
+        should_abort=lambda: False,
+    )
+
+    assert result.decision is not None
+    correctness_calls = [
+        options for options in replay_executor.seen_options if options[2]
+    ]
+    assert correctness_calls == [
+        (CORRECTNESS_REPLAY_CONCURRENCY, DEFAULT_CORRECTNESS_MAX_TOKENS, True)
+    ] * 2
+    assert CORRECTNESS_REPLAY_CONCURRENCY == 1
+    # Every other pass left the degree to the executor and set no output cap.
+    assert [o for o in replay_executor.seen_options if not o[2]] == [(None, None, False)] * 8
+    assert result.metrics["correctness"] == {
+        "concurrency": 1,
+        "max_tokens": DEFAULT_CORRECTNESS_MAX_TOKENS,
+        "repeats": CORRECTNESS_REPEATS,
+    }
+
+
+def test_correctness_max_tokens_is_configurable(tmp_path: Path) -> None:
+    replay_executor = FakeReplayExecutor()
+    runner = BenchmarkGateRunner(
+        config=SpeedLMConfig(model="model"),
+        trace_source=FakeTraceSource((_trace(),)),
+        suite_dir=tmp_path / "suite",
+        stock_draft="stock",
+        endpoint=FakeEndpoint(),
+        metrics_source=FakeMetricsSource(_normal_scrapes()),
+        replay_executor=replay_executor,
+        correctness_max_tokens=64,
+        training_context_hashes=frozenset(),
+        clock=FakeClock(),
+    )
+
+    runner.benchmark(
+        tmp_path / "candidate",
+        timeout_seconds=30,
+        should_abort=lambda: False,
+    )
+
+    assert {o[1] for o in replay_executor.seen_options if o[2]} == {64}
+
+
+@pytest.mark.parametrize("value", [0, -1, True])
+def test_invalid_correctness_max_tokens_is_rejected(
+    tmp_path: Path,
+    value: object,
+) -> None:
+    with pytest.raises(ValueError, match="correctness_max_tokens"):
+        BenchmarkGateRunner(
+            config=SpeedLMConfig(model="model"),
+            trace_source=FakeTraceSource((_trace(),)),
+            suite_dir=tmp_path / "suite",
+            stock_draft="stock",
+            endpoint=FakeEndpoint(),
+            metrics_source=FakeMetricsSource([]),
+            replay_executor=FakeReplayExecutor(),
+            correctness_max_tokens=value,
+            training_context_hashes=frozenset(),
+        )
+
+
+def test_an_early_divergence_on_the_correctness_pass_rejects(tmp_path: Path) -> None:
+    replay = FakeReplayExecutor(correctness_tokens=("A", "B", "C"))
+    runner, _, _, _ = _runner(tmp_path, scrapes=_normal_scrapes(), replay=replay)
+
+    # The candidate arm answers differently from the third token onwards.
+    original = FakeReplayExecutor.replay
+
+    def alternating(self: FakeReplayExecutor, *args: object, **kwargs: object) -> ReplayResult:
+        if self.calls >= 5:  # every pass after the stock arm finished
+            self.correctness_tokens = ("A", "B", "Z")
+        return original(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    replay.replay = alternating.__get__(replay)  # type: ignore[method-assign]
+
+    result = runner.benchmark(
+        tmp_path / "candidate",
+        timeout_seconds=30,
+        should_abort=lambda: False,
+    )
+
+    assert result.passed is False
+    assert result.decision is not None
+    assert result.decision.reason is Reason.OUTPUT_MISMATCH
+    assert result.decision.output_early_divergences == 1
+    assert [
+        d.first_divergence_index for d in result.decision.output_divergences
+    ] == [2]
+    assert result.decision.to_dict()["output_divergences"][0]["basis"] == "token"
+
+
+# ---------------------------------------------------------------------------
+# Acceptance is sampled per repeat
+# ---------------------------------------------------------------------------
+
+
+def test_acceptance_is_measured_once_per_repeat_not_once_per_arm(
+    tmp_path: Path,
+) -> None:
+    """The per-repeat rows must carry three measurements, not one repeated.
+
+    Job 369005 reported ``0.40302518489174166`` bit-identically in all five
+    rows because the whole repeat loop sat inside a single ``replay`` call with
+    the two scrapes outside it.
+    """
+    # Front-load the stock arm's accepted tokens so the three repeat windows
+    # genuinely differ, and keep the pooled totals unchanged.
+    scrapes = _normal_scrapes(stock_accepted_fractions=(0.5, 0.75, 1.0))
+    runner, _, _, _ = _runner(tmp_path, scrapes=scrapes)
+
+    result = runner.benchmark(
+        tmp_path / "candidate",
+        timeout_seconds=30,
+        should_abort=lambda: False,
+    )
+
+    assert result.decision is not None
+    rates = [r.stock_acceptance_rate for r in result.decision.per_repeat]
+    assert len(rates) == 3
+    assert len(set(rates)) == 3
+    # ... and the published mean really is the mean of that column.
+    assert result.decision.stock_avg_acceptance == pytest.approx(
+        sum(rates) / len(rates)
+    )
+    assert result.decision.stock_acceptance_stdev > 0.0
+    # The raw per-repeat windows land in the metrics beside the pooled one.
+    per_repeat_windows = result.metrics["stock_per_repeat"]
+    assert isinstance(per_repeat_windows, list)
+    assert len(per_repeat_windows) == 3
+
+
+def test_a_reset_inside_one_repeat_window_invalidates_the_arm(
+    tmp_path: Path,
+) -> None:
+    """Sampling more finely must not make the gate blinder to a restart."""
+    scrapes = _normal_scrapes()
+    # Counters go backwards inside repeat 1 and recover by the last scrape, so
+    # the pooled window on its own looks perfectly monotone.
+    scrapes[1] = _snapshot(
+        generated=5,
+        elapsed_ns=1_100_000_000,
+        accepted=1,
+        rejected=1,
+    )
+    runner, _, _, _ = _runner(tmp_path, scrapes=scrapes)
+
+    result = runner.benchmark(
+        tmp_path / "candidate",
+        timeout_seconds=30,
+        should_abort=lambda: False,
+    )
+
+    assert result.decision is not None
+    assert result.decision.reason is Reason.COUNTER_RESET

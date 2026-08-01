@@ -30,7 +30,9 @@ from typing import Any, Final
 from speedlm.config import ConfigError, SpeedLMConfig, load_config
 from speedlm.doctor import PRIMARY_VERIFIER
 from speedlm.gate.decide import (
+    LEGACY_ACCEPTANCE_STATISTIC,
     LEGACY_THROUGHPUT_STATISTIC,
+    ContextDivergence,
     Decision,
     Reason,
     RepeatSummary,
@@ -921,6 +923,13 @@ def _require_float(record: Mapping[str, Any], key: str, source: Path) -> float:
     return value
 
 
+def _require_str(record: Mapping[str, Any], key: str, source: Path) -> str:
+    value = record.get(key)
+    if not isinstance(value, str):
+        raise ReportError(f"{source}: '{key}' must be a string")
+    return value
+
+
 def _require_int(record: Mapping[str, Any], key: str, source: Path) -> int:
     value = _optional_int(record.get(key))
     if value is None:
@@ -1002,8 +1011,53 @@ def parse_decision(record: Mapping[str, Any], *, source: Path) -> Decision:
         candidate_avg_acceptance=_require_float(record, "candidate_avg_acceptance", source),
         stock_avg_tok_per_sec=_require_float(record, "stock_avg_tok_per_sec", source),
         candidate_avg_tok_per_sec=_require_float(record, "candidate_avg_tok_per_sec", source),
+        # All optional: decisions written before acceptance was measured per
+        # repeat carry none of these.  Zero is the truth for those runs -- a
+        # single pooled sample really does have no dispersion to report -- and
+        # an empty divergence array really is all the divergence detail they
+        # kept.
+        stock_acceptance_stdev=_optional_float(record.get("stock_acceptance_stdev")) or 0.0,
+        candidate_acceptance_stdev=(
+            _optional_float(record.get("candidate_acceptance_stdev")) or 0.0
+        ),
+        min_divergence_token_index=(
+            _require_int(record, "min_divergence_token_index", source)
+            if "min_divergence_token_index" in record
+            else 0
+        ),
+        output_divergences=_parse_divergences(record, source),
+        acceptance_statistic=(
+            _require_str(record, "acceptance_statistic", source)
+            if "acceptance_statistic" in record
+            else LEGACY_ACCEPTANCE_STATISTIC
+        ),
         **_parse_throughput_statistic(record, source, measured=measured),
     )
+
+
+def _parse_divergences(
+    record: Mapping[str, Any],
+    source: Path,
+) -> tuple[ContextDivergence, ...]:
+    raw = record.get("output_divergences", [])
+    if not isinstance(raw, list):
+        raise ReportError(f"{source}: 'output_divergences' must be a list")
+    parsed: list[ContextDivergence] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            raise ReportError(f"{source}: each 'output_divergences' entry must be an object")
+        parsed.append(
+            ContextDivergence(
+                context_hash=_require_str(item, "context_hash", source),
+                repeat_index=_require_int(item, "repeat_index", source),
+                first_divergence_index=_require_int(item, "first_divergence_index", source),
+                basis=_require_str(item, "basis", source),
+                stock_length=_require_int(item, "stock_length", source),
+                candidate_length=_require_int(item, "candidate_length", source),
+                early=bool(item.get("early", False)),
+            )
+        )
+    return tuple(parsed)
 
 
 def _parse_throughput_statistic(
@@ -1232,6 +1286,17 @@ class GainReport:
                     f"invalid {r.invalid_rate * 100:.2f}%, "
                     f"mismatches {r.output_mismatches}"
                 )
+        if decision.output_divergences:
+            offsets = sorted(
+                d.first_divergence_index for d in decision.output_divergences
+            )
+            lines.append(
+                f"divergences       : {len(offsets)} contexts parted "
+                f"({decision.output_early_divergences} before token "
+                f"{decision.min_divergence_token_index}); "
+                f"first-divergence offsets min {offsets[0]}, "
+                f"median {offsets[len(offsets) // 2]}, max {offsets[-1]}"
+            )
         lines.append(self.detail)
         return "\n".join(lines)
 

@@ -20,7 +20,8 @@ attr)`` for the rest before doing ``worker_class.__bases__ += (extension,)``.
 The two mixins use disjoint names (``activate_``/``flush_``/``deactivate_``/
 ``_install_``/``_deactivate_``/``_buffer_``/``_extend_``/``capture_`` vs.
 ``hot_swap_``/``draft_``/``_apply_``/``_load_``/``_validate_``/``_target_``/
-``_get_drafter``/``_get_quantization``), except for the deliberately shared
+``_stranded_``/``_get_drafter``/``_get_quantization``), except for the
+deliberately shared
 lazy-init helpers (``_ensure_init``/``_get_lock``/``_get_pending``) which are
 inherited from a single definition in ``ActivationCaptureExtension`` and so
 appear exactly once in ``dir()``.
@@ -617,16 +618,15 @@ class DraftSwapExtension:
             )
         return kept
 
-    def _assert_materialized(self, drafter: Any) -> None:
-        """Raise if the swap left drafter or verifier tensors on meta.
+    def _stranded_on_meta(self, drafter: Any) -> dict[str, list[str]]:
+        """Return ``{"draft": [...], "target": [...]}`` of meta-device tensors.
 
-        ``restore_layer_on_meta`` strips a layer's parameters and re-registers
-        meta-device placeholders; only a successful load materializes them
-        again.  Anything still on meta afterwards is a silently broken model,
-        so this is the post-condition that turns a partial swap into a loud
-        failure the caller can fall back from.
+        Walks parameters *and* buffers of both the drafter and the verifier.
+        The verifier is included because the two share modules by object
+        identity, so a mis-scoped layerwise reload strands the *target's*
+        embedding rather than anything the drafter owns.
         """
-        stranded: list[str] = []
+        stranded: dict[str, list[str]] = {"draft": [], "target": []}
         for label, model in (("draft", drafter), ("target", self._get_target_model())):
             if model is None:
                 continue
@@ -637,7 +637,46 @@ class DraftSwapExtension:
                 for name, tensor in enumerate_tensors():
                     device = getattr(tensor, "device", None)
                     if getattr(device, "type", None) == "meta":
-                        stranded.append(f"{label}.{name}")
+                        stranded[label].append(name)
+        return stranded
+
+    def draft_materialization_report(self) -> dict[str, Any]:
+        """Read-only report of tensors left on the meta device.
+
+        Purely observational test-support accessor: it mutates nothing and is
+        safe to call at any time.  ``_assert_materialized`` runs the same walk
+        as a post-condition inside ``hot_swap_draft``, but its only observable
+        effect is raising, so an E2E caller cannot distinguish "swap kept every
+        tensor materialized" from "the post-condition never ran".  This exposes
+        the walk as data so the caller can assert on it directly, and take a
+        pre-swap baseline to compare against.
+
+        Returns:
+            ``{"stranded": {"draft": [...], "target": [...]},
+            "stranded_total": int}`` -- all JSON-serializable.
+        """
+        drafter = self._get_drafter_model()
+        if drafter is None:
+            raise RuntimeError("no drafter model found")
+        stranded = self._stranded_on_meta(drafter)
+        return {
+            "stranded": stranded,
+            "stranded_total": sum(len(names) for names in stranded.values()),
+        }
+
+    def _assert_materialized(self, drafter: Any) -> None:
+        """Raise if the swap left drafter or verifier tensors on meta.
+
+        ``restore_layer_on_meta`` strips a layer's parameters and re-registers
+        meta-device placeholders; only a successful load materializes them
+        again.  Anything still on meta afterwards is a silently broken model,
+        so this is the post-condition that turns a partial swap into a loud
+        failure the caller can fall back from.
+        """
+        by_label = self._stranded_on_meta(drafter)
+        stranded = [
+            f"{label}.{name}" for label, names in by_label.items() for name in names
+        ]
 
         if stranded:
             raise RuntimeError(

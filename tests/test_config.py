@@ -402,3 +402,37 @@ def test_idle_tuning_config_window_must_be_at_least_corpus() -> None:
 def test_idle_tuning_config_corpus_too_small() -> None:
     with pytest.raises(ConfigError, match="min_corpus_records"):
         IdleTuningConfig(min_corpus_records=1)
+
+
+def test_divergence_threshold_round_trips_through_config() -> None:
+    config = SpeedLMConfig.from_dict(
+        {
+            "model": "m",
+            "promotion": {"min_divergence_token_index": 32},
+            "tuning": {"correctness_max_tokens": 64},
+        }
+    )
+
+    assert config.promotion.min_divergence_token_index == 32
+    assert config.tuning.correctness_max_tokens == 64
+    assert config.to_dict()["promotion"]["min_divergence_token_index"] == 32
+    assert config.to_dict()["tuning"]["correctness_max_tokens"] == 64
+
+
+def test_divergence_threshold_defaults_are_the_documented_ones() -> None:
+    config = SpeedLMConfig(model="m")
+
+    assert config.promotion.min_divergence_token_index == 16
+    assert config.tuning.correctness_max_tokens == 128
+
+
+@pytest.mark.parametrize("value", [-1, "x", 1.5])
+def test_invalid_divergence_threshold_is_rejected(value: object) -> None:
+    with pytest.raises(ConfigError, match="min_divergence_token_index"):
+        PromotionConfig(min_divergence_token_index=value)
+
+
+@pytest.mark.parametrize("value", [0, -1, "x"])
+def test_invalid_correctness_max_tokens_is_rejected(value: object) -> None:
+    with pytest.raises(ConfigError, match="correctness_max_tokens"):
+        IdleTuningConfig(correctness_max_tokens=value)

@@ -386,6 +386,7 @@ def create_production_tuner(
         metrics_source=_MetricsSource(http),
         repeats=tuning.benchmark_repeats,
         replay_concurrency=tuning.benchmark_concurrency,
+        correctness_max_tokens=tuning.correctness_max_tokens,
         held_out_fraction=tuning.held_out_fraction,
         training_context_hashes=lambda: split.training_context_hashes,
     )

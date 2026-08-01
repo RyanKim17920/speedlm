@@ -58,6 +58,10 @@ class _RecordingClient:
     #: Extra loop turns each request waits, keyed by prompt suffix, so a
     #: deliberately slow request can be made to finish out of arrival order.
     delays: dict[str, int] = field(default_factory=dict)
+    #: Every request body sent, in arrival order.
+    payloads: list[dict[str, Any]] = field(default_factory=list)
+    #: Per-token logprob entries to return, or ``None`` to return none at all.
+    logprob_tokens: list[str] | None = None
 
     async def __aenter__(self) -> _RecordingClient:
         return self
@@ -68,14 +72,23 @@ class _RecordingClient:
     async def post(self, url: str, *, json: dict[str, Any]) -> _FakeResponse:
         prompt = json["messages"][0]["content"]
         self.arrivals.append(prompt)
+        self.payloads.append(json)
         self.in_flight += 1
         self.peak_in_flight = max(self.peak_in_flight, self.in_flight)
         for _ in range(1 + self.delays.get(prompt, 0)):
             await asyncio.sleep(0)
         self.in_flight -= 1
+        choice: dict[str, Any] = {
+            "message": {"content": f"reply to {prompt}"},
+            "finish_reason": "stop",
+        }
+        if self.logprob_tokens is not None:
+            choice["logprobs"] = {
+                "content": [{"token": t, "logprob": 0.0} for t in self.logprob_tokens]
+            }
         return _FakeResponse(
             {
-                "choices": [{"message": {"content": f"reply to {prompt}"}}],
+                "choices": [choice],
                 "usage": {"prompt_tokens": 3, "completion_tokens": 7},
             }
         )
@@ -199,3 +212,63 @@ def test_invalid_concurrency_is_rejected(
 ) -> None:
     with pytest.raises(ReplayError, match="concurrency"):
         _replay(_suite(2), concurrency=concurrency)
+
+
+# ---------------------------------------------------------------------------
+# Bounded output and token capture, for the correctness pass
+# ---------------------------------------------------------------------------
+
+
+def test_throughput_replay_sends_no_output_cap_and_asks_for_no_logprobs(
+    client: _RecordingClient,
+) -> None:
+    """The default shape is unchanged: capping output would change tok/s."""
+    _replay(_suite(2))
+
+    assert all("max_tokens" not in body for body in client.payloads)
+    assert all("logprobs" not in body for body in client.payloads)
+
+
+def test_max_tokens_bounds_every_request(client: _RecordingClient) -> None:
+    _replay(_suite(3), max_tokens=128)
+
+    assert [body["max_tokens"] for body in client.payloads] == [128, 128, 128]
+
+
+def test_capture_tokens_asks_for_logprobs_but_not_alternatives(
+    client: _RecordingClient,
+) -> None:
+    _replay(_suite(2), capture_tokens=True)
+
+    assert all(body["logprobs"] is True for body in client.payloads)
+    assert all("top_logprobs" not in body for body in client.payloads)
+
+
+def test_captured_tokens_reach_the_result(client: _RecordingClient) -> None:
+    client.logprob_tokens = ["Hel", "lo", " world"]
+
+    result = _replay(_suite(1), capture_tokens=True)
+
+    request = result.run_results[0].results[0]
+    assert request.output_tokens == ("Hel", "lo", " world")
+    assert request.finish_reason == "stop"
+    assert request.to_dict()["output_tokens"] == ["Hel", "lo", " world"]
+
+
+def test_missing_logprobs_leave_the_token_sequence_uncaptured(
+    client: _RecordingClient,
+) -> None:
+    """Empty means "not captured", never "the model emitted nothing"."""
+    result = _replay(_suite(1), capture_tokens=True)
+
+    assert result.run_results[0].results[0].output_tokens == ()
+    assert result.run_results[0].results[0].response_text != ""
+
+
+@pytest.mark.parametrize("max_tokens", [0, -1, True, 1.5])
+def test_invalid_max_tokens_is_rejected(
+    client: _RecordingClient,
+    max_tokens: object,
+) -> None:
+    with pytest.raises(ReplayError, match="max_tokens"):
+        _replay(_suite(2), max_tokens=max_tokens)

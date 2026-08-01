@@ -11,6 +11,7 @@ import asyncio
 import time
 from collections.abc import Callable, Iterator
 from contextlib import suppress
+from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Protocol, TypeVar
 
@@ -23,7 +24,7 @@ from speedlm.gate.metrics import (
     compute_delta,
     parse_metrics,
 )
-from speedlm.gate.replay import ReplayResult, replay_suite
+from speedlm.gate.replay import ReplayResult, RunResults, replay_suite
 from speedlm.gate.suite import (
     BenchmarkSuite,
     SuiteError,
@@ -72,6 +73,32 @@ _T = TypeVar("_T")
 #: is that absolute tok/s figures are only comparable across runs that used the
 #: same concurrency, which is why the value is recorded in the gate's metrics.
 DEFAULT_REPLAY_CONCURRENCY: Final = 8
+
+#: In-flight requests during the gate's output-correctness pass.
+#:
+#: Pinned to one, and deliberately *not* derived from
+#: ``tuning.benchmark_concurrency``.  Bitwise agreement between two greedy
+#: generations is a property of the batch composition they were generated
+#: under: vLLM's target forward pass is not bitwise reproducible across
+#: differing batch shapes, and commit cbaff80 measured the per-token divergence
+#: hazard rising roughly 12x when replay concurrency went from 1 to 8.  A
+#: correctness check run at the throughput pass's concurrency is therefore
+#: measuring the scheduler, not the drafter.  The throughput pass keeps its
+#: concurrency; the two jobs are simply no longer done by the same pass.
+CORRECTNESS_REPLAY_CONCURRENCY: Final = 1
+
+#: Output cap for the correctness pass when the caller supplies none.  Mirrors
+#: :attr:`speedlm.config.IdleTuningConfig.correctness_max_tokens`, which
+#: carries the justification.
+DEFAULT_CORRECTNESS_MAX_TOKENS: Final = 128
+
+#: Suite passes the correctness check makes per arm.
+#:
+#: One.  The check is a predicate about the head, not a statistic about the
+#: machine, so repeating it buys resolution on a quantity that has none -- and
+#: every extra pass is a fresh draw against the benign-divergence hazard, i.e.
+#: it strictly *increases* the false-reject rate without improving detection.
+CORRECTNESS_REPEATS: Final = 1
 
 
 def _validated_concurrency(value: int, name: str) -> int:
@@ -124,6 +151,9 @@ class ReplayExecutor(Protocol):
         repeats: int,
         timeout_seconds: float,
         should_abort: AbortCheck,
+        concurrency: int | None = None,
+        max_tokens: int | None = None,
+        capture_tokens: bool = False,
     ) -> ReplayResult: ...
 
 
@@ -165,7 +195,22 @@ class HttpReplayExecutor:
         repeats: int,
         timeout_seconds: float,
         should_abort: AbortCheck,
+        concurrency: int | None = None,
+        max_tokens: int | None = None,
+        capture_tokens: bool = False,
     ) -> ReplayResult:
+        """Replay *suite*, optionally overriding this executor's own degree.
+
+        ``concurrency`` overrides :attr:`concurrency` for this call only, which
+        is how the gate runs its correctness pass single-stream without giving
+        up the throughput pass's batching.
+        """
+        degree = (
+            self._concurrency
+            if concurrency is None
+            else _validated_concurrency(concurrency, "replay concurrency")
+        )
+
         async def run_with_preemption() -> ReplayResult:
             loop = asyncio.get_running_loop()
             deadline = loop.time() + timeout_seconds
@@ -177,7 +222,9 @@ class HttpReplayExecutor:
                     repeats=repeats,
                     timeout=timeout_seconds,
                     model=self._model,
-                    concurrency=self._concurrency,
+                    concurrency=degree,
+                    max_tokens=max_tokens,
+                    capture_tokens=capture_tokens,
                 )
             )
             try:
@@ -205,6 +252,23 @@ class HttpReplayExecutor:
         return asyncio.run(run_with_preemption())
 
 
+@dataclass(frozen=True, slots=True)
+class _ArmMeasurement:
+    """Everything one arm contributes to the decision."""
+
+    #: The scored suite passes, concatenated into one result so downstream code
+    #: still sees "N repeats of this arm" regardless of how they were issued.
+    replay: ReplayResult
+    #: One metric window per scored repeat, in repeat order.
+    repeat_deltas: tuple[MetricsDelta, ...]
+    #: The window spanning every scored repeat, i.e. first scrape to last.
+    #: This is the same quantity the gate used to report as *the* delta, so the
+    #: diagnostic Prometheus throughput keeps its meaning across the change.
+    pooled_delta: MetricsDelta
+    #: The bounded, single-stream output-correctness pass.
+    correctness: ReplayResult
+
+
 class BenchmarkGateRunner:
     """Build/load a suite, measure both draft arms, and decide promotion."""
 
@@ -221,6 +285,7 @@ class BenchmarkGateRunner:
         replay_concurrency: int = DEFAULT_REPLAY_CONCURRENCY,
         repeats: int = 3,
         warmup_repeats: int = 1,
+        correctness_max_tokens: int = DEFAULT_CORRECTNESS_MAX_TOKENS,
         held_out_fraction: float = 0.2,
         training_context_hashes: TrainingHashes | None = None,
         clock: Clock = time.monotonic,
@@ -233,6 +298,12 @@ class BenchmarkGateRunner:
             or warmup_repeats < 0
         ):
             raise ValueError("warmup_repeats must be an integer >= 0")
+        if (
+            isinstance(correctness_max_tokens, bool)
+            or not isinstance(correctness_max_tokens, int)
+            or correctness_max_tokens < 1
+        ):
+            raise ValueError("correctness_max_tokens must be an integer >= 1")
         if (
             isinstance(held_out_fraction, bool)
             or not isinstance(held_out_fraction, (int, float))
@@ -263,6 +334,7 @@ class BenchmarkGateRunner:
         )
         self._repeats = repeats
         self._warmup_repeats = warmup_repeats
+        self._correctness_max_tokens = correctness_max_tokens
         self._held_out_fraction = float(held_out_fraction)
         self._training_context_hashes = training_context_hashes
         self._clock = clock
@@ -348,22 +420,7 @@ class BenchmarkGateRunner:
                 "stock warmup",
                 lambda available: self._warmup(suite, available, should_abort),
             )
-            stock_before = scrape(
-                "stock metrics pre-scrape",
-                "stock-before",
-            )
-            stock_replay = stage(
-                "stock replay",
-                lambda available: self._replay(suite, available, should_abort),
-            )
-            stock_after = scrape(
-                "stock metrics post-scrape",
-                "stock-after",
-            )
-            stock_delta = stage(
-                "stock metric delta",
-                lambda _timeout: _safe_delta(stock_before, stock_after),
-            )
+            stock_arm = self._measure_arm("stock", suite, stage, scrape, should_abort)
 
             stage(
                 "candidate activation",
@@ -377,32 +434,23 @@ class BenchmarkGateRunner:
                 "candidate warmup",
                 lambda available: self._warmup(suite, available, should_abort),
             )
-            candidate_before = scrape(
-                "candidate metrics pre-scrape",
-                "candidate-before",
-            )
-            candidate_replay = stage(
-                "candidate replay",
-                lambda available: self._replay(suite, available, should_abort),
-            )
-            candidate_after = scrape(
-                "candidate metrics post-scrape",
-                "candidate-after",
-            )
-            candidate_delta = stage(
-                "candidate metric delta",
-                lambda _timeout: _safe_delta(candidate_before, candidate_after),
+            candidate_arm = self._measure_arm(
+                "candidate", suite, stage, scrape, should_abort
             )
 
             decision = stage(
                 "promotion decision",
                 lambda _timeout: decide_promotion(
-                    stock_delta,
-                    candidate_delta,
-                    stock_replay,
-                    candidate_replay,
+                    stock_arm.pooled_delta,
+                    candidate_arm.pooled_delta,
+                    stock_arm.replay,
+                    candidate_arm.replay,
                     self._config.promotion,
                     warmup_repeats=_warmup_runs(stock_warmup, candidate_warmup),
+                    stock_repeat_metrics=stock_arm.repeat_deltas,
+                    candidate_repeat_metrics=candidate_arm.repeat_deltas,
+                    stock_correctness=stock_arm.correctness,
+                    candidate_correctness=candidate_arm.correctness,
                 ),
             )
         except BenchmarkAborted as exc:
@@ -434,13 +482,23 @@ class BenchmarkGateRunner:
                 "num_contexts": len(suite.contexts),
                 # Observed, not configured: a report that says three repeats
                 # ran must mean three repeats ran.
-                "num_repeats": min(stock_replay.num_runs, candidate_replay.num_runs),
+                "num_repeats": min(
+                    stock_arm.replay.num_runs, candidate_arm.replay.num_runs
+                ),
                 "requested_repeats": self._repeats,
                 # Both arms replay at this degree.  Absolute tok/s figures are
                 # only comparable across runs that shared it.
                 "replay_concurrency": self._replay_concurrency,
-                "stock_runs": stock_replay.num_runs,
-                "candidate_runs": candidate_replay.num_runs,
+                # The correctness pass is a different measurement at a
+                # different degree; recording both stops a reader assuming the
+                # single number above described every request the gate sent.
+                "correctness": {
+                    "concurrency": CORRECTNESS_REPLAY_CONCURRENCY,
+                    "max_tokens": self._correctness_max_tokens,
+                    "repeats": CORRECTNESS_REPEATS,
+                },
+                "stock_runs": stock_arm.replay.num_runs,
+                "candidate_runs": candidate_arm.replay.num_runs,
                 # Unscored, but not invisible: the warmup pass is reported so a
                 # reader can see what was excluded and how slow it was.
                 "warmup": {
@@ -448,8 +506,15 @@ class BenchmarkGateRunner:
                     "stock": _warmup_dict(stock_warmup),
                     "candidate": _warmup_dict(candidate_warmup),
                 },
-                "stock": _delta_dict(stock_delta),
-                "candidate": _delta_dict(candidate_delta),
+                "stock": _delta_dict(stock_arm.pooled_delta),
+                "candidate": _delta_dict(candidate_arm.pooled_delta),
+                # Per-repeat windows, published beside the pooled one so the
+                # acceptance vector in ``decision.json`` is reconcilable
+                # against the counters that produced it.
+                "stock_per_repeat": [_delta_dict(d) for d in stock_arm.repeat_deltas],
+                "candidate_per_repeat": [
+                    _delta_dict(d) for d in candidate_arm.repeat_deltas
+                ],
             },
             metrics_bodies=bodies,
             decision=decision,
@@ -477,6 +542,76 @@ class BenchmarkGateRunner:
             repeats=self._repeats,
             warmup_repeats=self._warmup_repeats,
             concurrency=self._replay_concurrency,
+            correctness_repeats=CORRECTNESS_REPEATS,
+        )
+
+    def _measure_arm(
+        self,
+        arm: str,
+        suite: BenchmarkSuite,
+        stage: Callable[[str, Callable[[float], object]], object],
+        scrape: Callable[[str, str], MetricsSnapshot],
+        should_abort: AbortCheck,
+    ) -> _ArmMeasurement:
+        """Run one arm's scored repeats and its correctness pass.
+
+        The scrape schedule is one before the first repeat and one after each
+        repeat -- ``repeats + 1`` scrapes rather than 2, which costs no extra
+        suite passes and no extra generations.  Consecutive pairs give a real
+        per-repeat acceptance sample; the first and last give the pooled window
+        the gate used to report.  Before this, the repeat loop lived inside a
+        single ``replay(repeats=N)`` call with the scrapes outside it, so there
+        was exactly one acceptance measurement per arm no matter how many
+        repeats ran, and it was stamped into all N per-repeat rows.
+
+        The correctness pass runs *after* the last scrape, deliberately: it is
+        bounded and single-stream, so folding it into the measurement window
+        would contaminate both the acceptance counters and the decode-time
+        throughput with traffic that is not the workload being measured.
+        """
+        snapshots = [scrape(f"{arm} metrics pre-scrape", f"{arm}-before")]
+        runs: list[RunResults] = []
+        for index in range(self._repeats):
+            replay = stage(
+                f"{arm} replay repeat {index}",
+                lambda available: self._replay(suite, available, should_abort, repeats=1),
+            )
+            assert isinstance(replay, ReplayResult)
+            runs.extend(replay.run_results)
+            label = (
+                f"{arm}-after"
+                if index == self._repeats - 1
+                else f"{arm}-after-repeat-{index}"
+            )
+            snapshots.append(scrape(f"{arm} metrics scrape after repeat {index}", label))
+
+        correctness = stage(
+            f"{arm} correctness pass",
+            lambda available: self._correctness_replay(suite, available, should_abort),
+        )
+        assert isinstance(correctness, ReplayResult)
+
+        repeat_deltas = tuple(
+            _safe_delta(before, after)
+            for before, after in zip(snapshots[:-1], snapshots[1:], strict=True)
+        )
+        # A reset inside any repeat window invalidates the arm, even when the
+        # endpoints of the pooled window happen to look monotone across it.
+        # Sampling more finely must not make the gate blinder.
+        pooled = (
+            _reset_delta(snapshots[0], snapshots[-1])
+            if any(d.reset_detected for d in repeat_deltas)
+            else _safe_delta(snapshots[0], snapshots[-1])
+        )
+        return _ArmMeasurement(
+            replay=ReplayResult(
+                run_results=tuple(runs),
+                num_runs=len(runs),
+                suite_hash=suite.suite_hash,
+            ),
+            repeat_deltas=repeat_deltas,
+            pooled_delta=pooled,
+            correctness=correctness,
         )
 
     def _load_or_build_suite(self) -> BenchmarkSuite:
@@ -536,6 +671,31 @@ class BenchmarkGateRunner:
             should_abort=should_abort,
         )
 
+    def _correctness_replay(
+        self,
+        suite: BenchmarkSuite,
+        timeout_seconds: float,
+        should_abort: AbortCheck,
+    ) -> ReplayResult:
+        """One bounded, single-stream pass whose only job is output agreement.
+
+        The concurrency is pinned here rather than passed through from config
+        on purpose: ``benchmark_concurrency`` is a throughput knob, and letting
+        it reach this pass is exactly the conflation that made job 369005's
+        equality check unsound.
+        """
+        return self._replay_executor.replay(
+            suite,
+            self._endpoint.url,
+            self._config.sampling,
+            repeats=CORRECTNESS_REPEATS,
+            timeout_seconds=timeout_seconds,
+            should_abort=should_abort,
+            concurrency=CORRECTNESS_REPLAY_CONCURRENCY,
+            max_tokens=self._correctness_max_tokens,
+            capture_tokens=True,
+        )
+
     def _warmup(
         self,
         suite: BenchmarkSuite,
@@ -555,20 +715,30 @@ class BenchmarkGateRunner:
 GateRunner = BenchmarkGateRunner
 
 
+def _reset_delta(before: MetricsSnapshot, after: MetricsSnapshot) -> MetricsDelta:
+    """The shape a window takes once a counter reset has invalidated it.
+
+    Every derived quantity is zeroed rather than guessed: a window spanning a
+    restart has no defensible throughput or acceptance, and reporting one would
+    make an unmeasurable run look measured.
+    """
+    return MetricsDelta(
+        reset_detected=True,
+        acceptance_available=before.has_draft_counters and after.has_draft_counters,
+        drafted_tokens=0.0,
+        accepted_tokens=0.0,
+        acceptance_rate=0.0,
+        mean_accepted_length=0.0,
+        tpot_ms=0.0,
+        output_tok_per_sec=0.0,
+    )
+
+
 def _safe_delta(before: MetricsSnapshot, after: MetricsSnapshot) -> MetricsDelta:
     try:
         return compute_delta(before, after)
     except CounterResetError:
-        return MetricsDelta(
-            reset_detected=True,
-            acceptance_available=before.has_draft_counters and after.has_draft_counters,
-            drafted_tokens=0.0,
-            accepted_tokens=0.0,
-            acceptance_rate=0.0,
-            mean_accepted_length=0.0,
-            tpot_ms=0.0,
-            output_tok_per_sec=0.0,
-        )
+        return _reset_delta(before, after)
 
 
 def _warmup_runs(

@@ -278,6 +278,7 @@ def derive_benchmark_timeout(
     warmup_repeats: int = 1,
     arms: int = 2,
     concurrency: int = 1,
+    correctness_repeats: int = 0,
     seconds_per_generation: float = BENCHMARK_SECONDS_PER_GENERATION,
     fixed_overhead_seconds: float = BENCHMARK_FIXED_OVERHEAD_SECONDS,
     safety_factor: float = BENCHMARK_SAFETY_FACTOR,
@@ -285,8 +286,10 @@ def derive_benchmark_timeout(
     """Size a benchmark deadline from the work the benchmark will do.
 
     The work is ``arms x (warmup_repeats + repeats) x num_contexts``
-    generations, spread over ``concurrency`` in-flight requests, plus a fixed
-    overhead that does not scale with the suite.  The result is clamped into
+    generations, spread over ``concurrency`` in-flight requests, plus
+    ``arms x correctness_repeats x num_contexts`` single-stream generations for
+    the output-correctness pass, plus a fixed overhead that does not scale with
+    the suite.  The result is clamped into
     ``[BENCHMARK_MIN_SECONDS, BENCHMARK_MAX_SECONDS]``.
 
     This exists because a fixed 1800s deadline is not a statement about
@@ -307,12 +310,12 @@ def derive_benchmark_timeout(
     ):
         if isinstance(count, bool) or not isinstance(count, int) or count < 1:
             raise ValueError(f"{name} must be an integer >= 1")
-    if (
-        isinstance(warmup_repeats, bool)
-        or not isinstance(warmup_repeats, int)
-        or warmup_repeats < 0
+    for name, count in (
+        ("warmup_repeats", warmup_repeats),
+        ("correctness_repeats", correctness_repeats),
     ):
-        raise ValueError("warmup_repeats must be an integer >= 0")
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ValueError(f"{name} must be an integer >= 0")
     for name, factor in (
         ("seconds_per_generation", seconds_per_generation),
         ("fixed_overhead_seconds", fixed_overhead_seconds),
@@ -323,7 +326,17 @@ def derive_benchmark_timeout(
 
     generations = arms * (warmup_repeats + repeats) * num_contexts
     generation_seconds = generations * float(seconds_per_generation) / concurrency
-    budget = generation_seconds * float(safety_factor) + float(fixed_overhead_seconds)
+    # The correctness pass gives up all batching, so it does not get to divide
+    # by ``concurrency``.  It is also output-bounded, so charging it a full
+    # ``seconds_per_generation`` per context over-estimates it -- deliberately:
+    # this term is a deadline, and the cheap direction to be wrong in is long.
+    correctness_seconds = (
+        arms * correctness_repeats * num_contexts * float(seconds_per_generation)
+    )
+    budget = (
+        (generation_seconds + correctness_seconds) * float(safety_factor)
+        + float(fixed_overhead_seconds)
+    )
     return min(max(budget, BENCHMARK_MIN_SECONDS), BENCHMARK_MAX_SECONDS)
 
 

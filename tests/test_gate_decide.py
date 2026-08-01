@@ -4,11 +4,14 @@ import pytest
 
 from speedlm.config import PromotionConfig
 from speedlm.gate.decide import (
+    GATING_ACCEPTANCE_STATISTIC,
     GATING_THROUGHPUT_STATISTIC,
     Decision,
+    DivergenceBasis,
     Reason,
     Verdict,
     decide_promotion,
+    first_divergence,
 )
 from speedlm.gate.metrics import MetricsDelta
 from speedlm.gate.replay import (
@@ -29,9 +32,11 @@ def _make_request_result(
     latency_s: float = 0.1,
     prompt_tokens: int = 10,
     completion_tokens: int = 5,
+    output_tokens: tuple[str, ...] = (),
+    context_hash: str = "abcd1234",
 ) -> RequestResult:
     return RequestResult(
-        context_hash="abcd1234",
+        context_hash=context_hash,
         latency_s=latency_s,
         prompt_tokens=prompt_tokens,
         completion_tokens=completion_tokens,
@@ -39,6 +44,7 @@ def _make_request_result(
         response_text=response_text,
         valid=valid,
         error=error,
+        output_tokens=output_tokens,
     )
 
 
@@ -831,3 +837,286 @@ def test_job_368670_agreed_and_still_rejects_on_acceptance() -> None:
 
     assert dec.verdict is Verdict.REJECT
     assert dec.reason is Reason.ACCEPTANCE_BELOW_THRESHOLD
+
+
+# ---------------------------------------------------------------------------
+# Output correctness: divergence position, not string equality
+# ---------------------------------------------------------------------------
+
+
+def _tokens(prefix: int, tail: str, length: int) -> tuple[str, ...]:
+    """A generation that agrees for *prefix* tokens then says *tail* forever."""
+    return tuple(f"t{i}" for i in range(prefix)) + (tail,) * (length - prefix)
+
+
+def _correctness_pair(
+    *,
+    diverge_at: int | None,
+    length: int = 1600,
+    contexts: int = 1,
+) -> tuple[ReplayResult, ReplayResult]:
+    """Two single-repeat correctness passes that part at *diverge_at*."""
+    stock: list[RequestResult] = []
+    candidate: list[RequestResult] = []
+    for index in range(contexts):
+        shared = _tokens(length, "x", length)
+        stock.append(
+            _make_request_result(
+                "answer",
+                output_tokens=shared,
+                context_hash=f"ctx-{index}",
+            )
+        )
+        candidate.append(
+            _make_request_result(
+                "answer",
+                output_tokens=(
+                    shared if diverge_at is None else _tokens(diverge_at, "OTHER", length)
+                ),
+                context_hash=f"ctx-{index}",
+            )
+        )
+    return (
+        _make_replay([_make_run(stock)]),
+        _make_replay([_make_run(candidate)]),
+    )
+
+
+def _decide_with_correctness(
+    *,
+    diverge_at: int | None,
+    min_divergence_token_index: int = 16,
+    contexts: int = 1,
+) -> Decision:
+    stock_correctness, cand_correctness = _correctness_pair(
+        diverge_at=diverge_at, contexts=contexts
+    )
+    return decide_promotion(
+        _make_delta(acceptance_rate=0.60),
+        _make_delta(acceptance_rate=0.65),
+        _valid_runs_with_tps(100.0),
+        _valid_runs_with_tps(110.0),
+        PromotionConfig(
+            min_acceptance_delta_pp=1.0,
+            min_throughput_delta_pct=2.0,
+            min_divergence_token_index=min_divergence_token_index,
+        ),
+        stock_correctness=stock_correctness,
+        candidate_correctness=cand_correctness,
+    )
+
+
+def test_first_divergence_reports_a_token_offset_not_a_boolean() -> None:
+    stock = _make_request_result("a", output_tokens=("A", "B", "C", "D"))
+    candidate = _make_request_result("a", output_tokens=("A", "B", "Z", "D"))
+
+    index, basis, s_len, c_len = first_divergence(stock, candidate)
+
+    assert index == 2
+    assert basis is DivergenceBasis.TOKEN
+    assert (s_len, c_len) == (4, 4)
+
+
+def test_first_divergence_falls_back_to_characters_without_token_capture() -> None:
+    index, basis, _, _ = first_divergence(
+        _make_request_result("hello world"),
+        _make_request_result("hello WORLD"),
+    )
+
+    assert index == 6
+    assert basis is DivergenceBasis.CHARACTER
+
+
+def test_first_divergence_is_none_only_for_identical_generations() -> None:
+    same = ("A", "B", "C")
+    assert first_divergence(
+        _make_request_result("x", output_tokens=same),
+        _make_request_result("x", output_tokens=same),
+    )[0] is None
+    # A prefix is not a match: stopping early is itself a difference.
+    assert first_divergence(
+        _make_request_result("x", output_tokens=same),
+        _make_request_result("x", output_tokens=same[:2]),
+    )[0] == 2
+
+
+def test_candidate_diverging_at_token_3_is_rejected() -> None:
+    """Parting almost immediately is what a broken drafter looks like."""
+    dec = _decide_with_correctness(diverge_at=3)
+
+    assert dec.verdict is Verdict.REJECT
+    assert dec.reason is Reason.OUTPUT_MISMATCH
+    assert dec.output_early_divergences == 1
+
+
+def test_candidate_diverging_at_token_900_of_1600_is_not_rejected_for_it() -> None:
+    """Float non-determinism deep in a long answer is not a defect."""
+    dec = _decide_with_correctness(diverge_at=900)
+
+    assert dec.verdict is Verdict.PROMOTE
+    assert dec.reason is Reason.BOTH_THRESHOLDS_MET
+    # The divergence is still recorded -- it is simply not disqualifying.
+    assert dec.output_total_divergences == 1
+    assert dec.output_early_divergences == 0
+
+
+def test_first_divergence_offsets_are_persisted_for_every_diverging_context() -> None:
+    dec = _decide_with_correctness(diverge_at=900, contexts=3)
+
+    record = dec.to_dict()
+    assert record["output_total_divergences"] == 3
+    assert record["output_early_divergences"] == 0
+    assert record["min_divergence_token_index"] == 16
+    assert [d["first_divergence_index"] for d in record["output_divergences"]] == [
+        900,
+        900,
+        900,
+    ]
+    assert {d["context_hash"] for d in record["output_divergences"]} == {
+        "ctx-0",
+        "ctx-1",
+        "ctx-2",
+    }
+    assert {d["basis"] for d in record["output_divergences"]} == {"token"}
+    assert {d["early"] for d in record["output_divergences"]} == {False}
+
+
+def test_identical_generations_record_no_divergences_at_all() -> None:
+    dec = _decide_with_correctness(diverge_at=None, contexts=3)
+
+    assert dec.verdict is Verdict.PROMOTE
+    assert dec.output_divergences == ()
+
+
+def test_divergence_threshold_is_configurable() -> None:
+    """The same measurement flips verdict when the bar moves past it."""
+    assert _decide_with_correctness(
+        diverge_at=20, min_divergence_token_index=16
+    ).verdict is Verdict.PROMOTE
+    assert _decide_with_correctness(
+        diverge_at=20, min_divergence_token_index=64
+    ).reason is Reason.OUTPUT_MISMATCH
+
+
+def test_correctness_pass_is_compared_instead_of_the_throughput_pass() -> None:
+    """The batched throughput pass must not be able to veto on its own text."""
+    stock_correctness, cand_correctness = _correctness_pair(diverge_at=None)
+    # Throughput replays whose *text* differs everywhere -- which is exactly
+    # what job 369005 saw at concurrency 8 -- and which used to reject.
+    stock_throughput = _make_replay([_make_run([_make_request_result("aaa")])] * 3)
+    cand_throughput = _make_replay([_make_run([_make_request_result("bbb")])] * 3)
+
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.60),
+        _make_delta(acceptance_rate=0.65),
+        stock_throughput,
+        cand_throughput,
+        _pcfg(acc_pp=1.0, throughput_pct=-100.0),
+        stock_correctness=stock_correctness,
+        candidate_correctness=cand_correctness,
+    )
+
+    assert dec.verdict is Verdict.PROMOTE
+    assert dec.output_divergences == ()
+
+
+# ---------------------------------------------------------------------------
+# Acceptance is an n-repeat measurement
+# ---------------------------------------------------------------------------
+
+
+def test_per_repeat_acceptance_vector_carries_real_variance() -> None:
+    """Each repeat's own metric window reaches its own per-repeat row."""
+    stock_windows = [_make_delta(acceptance_rate=r) for r in (0.60, 0.62, 0.58)]
+    cand_windows = [_make_delta(acceptance_rate=r) for r in (0.70, 0.66, 0.68)]
+
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.60),
+        _make_delta(acceptance_rate=0.68),
+        _valid_runs_with_tps(100.0),
+        _valid_runs_with_tps(110.0),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+        stock_repeat_metrics=stock_windows,
+        candidate_repeat_metrics=cand_windows,
+    )
+
+    assert [r.stock_acceptance_rate for r in dec.per_repeat] == [0.60, 0.62, 0.58]
+    assert [r.candidate_acceptance_rate for r in dec.per_repeat] == [0.70, 0.66, 0.68]
+    # Not one scalar stamped N times: the rows actually differ.
+    assert len({r.stock_acceptance_rate for r in dec.per_repeat}) == 3
+
+
+def test_avg_acceptance_is_the_mean_of_the_column_beside_it() -> None:
+    stock_windows = [_make_delta(acceptance_rate=r) for r in (0.60, 0.62, 0.58)]
+    cand_windows = [_make_delta(acceptance_rate=r) for r in (0.70, 0.66, 0.68)]
+
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.0),
+        _make_delta(acceptance_rate=0.0),
+        _valid_runs_with_tps(100.0),
+        _valid_runs_with_tps(110.0),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+        stock_repeat_metrics=stock_windows,
+        candidate_repeat_metrics=cand_windows,
+    )
+
+    assert dec.stock_avg_acceptance == pytest.approx(0.60)
+    assert dec.candidate_avg_acceptance == pytest.approx(0.68)
+    assert dec.acceptance_delta_pp == pytest.approx(8.0)
+    assert dec.acceptance_statistic == GATING_ACCEPTANCE_STATISTIC
+
+
+def test_acceptance_dispersion_is_published_so_the_bar_can_be_recalibrated() -> None:
+    stock_windows = [_make_delta(acceptance_rate=r) for r in (0.60, 0.62, 0.58)]
+    cand_windows = [_make_delta(acceptance_rate=r) for r in (0.70, 0.70, 0.70)]
+
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.60),
+        _make_delta(acceptance_rate=0.70),
+        _valid_runs_with_tps(100.0),
+        _valid_runs_with_tps(110.0),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+        stock_repeat_metrics=stock_windows,
+        candidate_repeat_metrics=cand_windows,
+    )
+
+    assert dec.stock_acceptance_stdev == pytest.approx(0.02)
+    assert dec.candidate_acceptance_stdev == 0.0
+    record = dec.to_dict()
+    assert record["stock_acceptance_stdev"] == pytest.approx(0.02)
+    assert record["candidate_acceptance_stdev"] == 0.0
+
+
+def test_without_per_repeat_windows_the_dispersion_is_honestly_zero() -> None:
+    """One pooled sample has no dispersion, and must not pretend otherwise."""
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.60),
+        _make_delta(acceptance_rate=0.65),
+        _valid_runs_with_tps(100.0),
+        _valid_runs_with_tps(110.0),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+
+    assert {r.stock_acceptance_rate for r in dec.per_repeat} == {0.60}
+    assert dec.stock_acceptance_stdev == 0.0
+    assert dec.stock_avg_acceptance == pytest.approx(0.60)
+
+
+def test_a_repeat_window_without_acceptance_falls_back_to_the_pooled_rate() -> None:
+    windows = [
+        _make_delta(acceptance_rate=0.62),
+        _make_delta(acceptance_rate=0.0, acceptance_available=False),
+        _make_delta(acceptance_rate=0.58),
+    ]
+
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.60),
+        _make_delta(acceptance_rate=0.70),
+        _valid_runs_with_tps(100.0),
+        _valid_runs_with_tps(110.0),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+        stock_repeat_metrics=windows,
+    )
+
+    # The idle window reports the arm's pooled rate rather than a measured 0%.
+    assert [r.stock_acceptance_rate for r in dec.per_repeat] == [0.62, 0.60, 0.58]

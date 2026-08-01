@@ -262,6 +262,28 @@ class PromotionConfig:
     job 368648, at **-17.5% replay** (-19.2% on the Prometheus decode rate) --
     is still ~16 standard errors past it.
 
+    A caveat on ``min_acceptance_delta_pp``'s derivation: the "no measured
+    noise" claim above rests on job 368670's two arms reporting byte-identical
+    counters, and on every archived run reporting acceptance as a *single*
+    pooled window per arm.  That was n=1 per arm, so it could not have shown
+    dispersion even if dispersion existed -- job 369005's five per-repeat rows
+    all carry ``0.40302518489174166``, which is
+    ``(539777-88070)/(1343865-223074)`` stamped five times, not five
+    measurements.  The gate now samples acceptance once per repeat and
+    publishes the vector's standard deviation
+    (``Decision.stock_acceptance_stdev``), so the threshold becomes checkable
+    for the first time.  It is deliberately *not* being retuned here, because
+    no artifact in the archive contains the number that would justify a change.
+    What the archive does bound is the floor: job 369005 drafted ~224k tokens
+    per repeat, so pure counting noise on a 0.403 rate is 0.104 pp per repeat,
+    putting the standard error on the arm-to-arm delta at 0.066 pp over five
+    repeats and 1.0 pp at ~15 standard errors.  Drafted tokens are correlated
+    within a request, so the real dispersion will exceed that floor; 1.0 pp
+    remains a meaningful bar (>= 3 standard errors) for any per-repeat standard
+    deviation up to ~0.52 pp, and stops being one (< 1.6 standard errors) above
+    ~1.0 pp.  Recalibrate from the first run whose ``per_repeat`` acceptance
+    column actually varies, not from this comment.
+
     Both values remain fully configurable via ``promotion`` in ``config.json``;
     these are defaults, not policy.  Note that setting them to ``0.0``/``0.0``
     reduces the gate to "not measurably worse", which promotes on noise
@@ -272,12 +294,51 @@ class PromotionConfig:
     min_acceptance_delta_pp: float = 1.0
     #: Negative by design: a floor on regression, not a required speedup.
     min_throughput_delta_pct: float = -2.0
+    #: How far into a generation the candidate must stay token-identical to
+    #: stock before a divergence is treated as behaviourally harmless.
+    #:
+    #: The gate used to compare whole response strings for exact equality with
+    #: zero tolerance.  That check is unsound on realistic generations, and job
+    #: 369005 is the proof: 82-87 of 103 held-out contexts "mismatched" on a
+    #: candidate whose acceptance was within 0.65 pp of stock, at an average of
+    #: ~1602 generated tokens per request.  Rejection sampling at temperature 0
+    #: is *mathematically* lossless, not *bitwise* lossless -- vLLM's target
+    #: forward pass is not bitwise reproducible when batch composition varies,
+    #: so a per-token divergence hazard ``p`` turns into a whole-string failure
+    #: probability of ``1 - (1 - p) ** L``.  At L~1602 the observed 80%
+    #: mismatch rate implies ``p ~ 1.0e-3`` at replay concurrency 8; the same
+    #: measurement at concurrency 1 (commit cbaff80) put ``p`` roughly 12x
+    #: lower, ~8.5e-5.  Truncation and prefix-cache asymmetry were both ruled
+    #: out on that run: 18-19 length-finishes against 82-87 mismatches, and a
+    #: 71.1% prefix hit rate on *both* arms.
+    #:
+    #: So the question a correctness check can actually answer is not "are the
+    #: two strings equal" but "how soon do they part".  A drafter that is
+    #: genuinely broken -- wrong vocabulary mapping, mis-loaded weights, a head
+    #: trained against a different verifier -- makes the verifier reject
+    #: immediately and the sequences part within a handful of tokens.  Float
+    #: non-determinism parts them, on average, around token ``1/p``.
+    #:
+    #: 16 is chosen against the concurrency-1 hazard the correctness pass
+    #: actually runs at.  A benign context parts within its first 16 tokens
+    #: with probability ``1 - (1 - 8.5e-5) ** 16 = 1.4e-3``, so across a
+    #: 103-context suite the expected number of benign early divergences is
+    #: 0.14 -- i.e. roughly one gate run in eight rejects a good candidate.
+    #: That is the price of the fail-closed posture, and it is the right price
+    #: here: a rejection costs one tuning cycle, while a false promotion is
+    #: permanent because there is no post-promotion rollback.  Raising this to
+    #: 32 doubles the false-reject rate to ~25%; lowering it to 8 halves it to
+    #: ~7% but starts to admit heads that only survive the formulaic opening of
+    #: an answer.  Set to 0 to disable the position criterion entirely and
+    #: accept any divergence, which is *not* recommended.
+    min_divergence_token_index: int = 16
 
     def __post_init__(self) -> None:
         _validate_float_gte(self.min_acceptance_delta_pp, "min_acceptance_delta_pp", 0)
         # No lower bound of zero here: a negative value is the intended
         # regression-guard form ("reject anything more than N% slower").
         _validate_float(self.min_throughput_delta_pct, "min_throughput_delta_pct")
+        _validate_int_gte(self.min_divergence_token_index, "min_divergence_token_index", 0)
 
 
 @dataclass(frozen=True, slots=True)
@@ -359,6 +420,24 @@ class IdleTuningConfig:
     #: runs vLLM's default scheduler width and can absorb it.  Set to 1 to
     #: restore single-stream measurement.
     benchmark_concurrency: int = 8
+    #: Output cap, in tokens, for the gate's separate output-correctness pass.
+    #:
+    #: The gate runs two different replays for two different jobs.  The
+    #: throughput/acceptance pass runs at ``benchmark_concurrency`` with no
+    #: output cap, because that is what steady-state serving looks like and the
+    #: throughput threshold is calibrated against its dispersion.  The
+    #: correctness pass runs at concurrency 1 with this cap, because bitwise
+    #: agreement is a property of a *single-stream, bounded* generation: job
+    #: 369005 replayed unbounded (averaging ~1602 tokens against the 4096
+    #: model-len cap) at concurrency 8, which is precisely the regime where
+    #: float non-determinism accumulates fastest -- see
+    #: ``PromotionConfig.min_divergence_token_index``.
+    #:
+    #: 128 is eight times that divergence threshold: long enough that a head
+    #: cannot pass by reproducing only the formulaic opening of an answer, and
+    #: short enough that the correctness pass costs ~1/12th of an unbounded
+    #: pass per context even though it gives up all batching.
+    correctness_max_tokens: int = 128
     #: How many of the newest trace records one cycle may train on.
     #:
     #: Trace selection is a sliding window, not a full rescan: without a bound
@@ -415,6 +494,11 @@ class IdleTuningConfig:
         _validate_int_gte(
             self.benchmark_concurrency,
             "tuning.benchmark_concurrency",
+            1,
+        )
+        _validate_int_gte(
+            self.correctness_max_tokens,
+            "tuning.correctness_max_tokens",
             1,
         )
         if self.training_window_records is not None:
@@ -577,6 +661,7 @@ class SpeedLMConfig:
         result["promotion"] = {
             "min_acceptance_delta_pp": self.promotion.min_acceptance_delta_pp,
             "min_throughput_delta_pct": self.promotion.min_throughput_delta_pct,
+            "min_divergence_token_index": self.promotion.min_divergence_token_index,
         }
         result["tuning"] = {
             "min_trace_records": self.tuning.min_trace_records,
@@ -585,6 +670,7 @@ class SpeedLMConfig:
             "held_out_fraction": self.tuning.held_out_fraction,
             "benchmark_repeats": self.tuning.benchmark_repeats,
             "benchmark_concurrency": self.tuning.benchmark_concurrency,
+            "correctness_max_tokens": self.tuning.correctness_max_tokens,
             "training_window_records": self.tuning.training_window_records,
             "verifier_revision": self.tuning.verifier_revision,
             "speculators_repo": self.tuning.speculators_repo,
@@ -652,7 +738,13 @@ class SpeedLMConfig:
         buffer_data = _nested(data, "buffer", {"max_tokens", "max_age_days"})
         redaction_data = _nested(data, "redaction", {"enabled"})
         promotion_data = _nested(
-            data, "promotion", {"min_acceptance_delta_pp", "min_throughput_delta_pct"}
+            data,
+            "promotion",
+            {
+                "min_acceptance_delta_pp",
+                "min_throughput_delta_pct",
+                "min_divergence_token_index",
+            },
         )
         tuning_data = _nested(
             data,
@@ -664,6 +756,7 @@ class SpeedLMConfig:
                 "held_out_fraction",
                 "benchmark_repeats",
                 "benchmark_concurrency",
+                "correctness_max_tokens",
                 "training_window_records",
                 "verifier_revision",
                 "speculators_repo",

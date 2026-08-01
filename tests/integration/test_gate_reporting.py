@@ -177,11 +177,16 @@ class _Replay:
         repeats: int,
         timeout_seconds: float,
         should_abort: Callable[[], bool],
+        concurrency: int | None = None,
+        max_tokens: int | None = None,
+        capture_tokens: bool = False,
     ) -> ReplayResult:
         assert endpoint_url == "http://fake-endpoint"
         assert sampling == SamplingConfig()
-        # One unscored warmup pass per arm, then the scored repeats.
-        assert repeats in (1, 3)
+        # One unscored warmup pass per arm, then the scored repeats one at a
+        # time, then the bounded single-stream correctness pass.
+        assert repeats == 1
+        assert capture_tokens is (concurrency == 1 and max_tokens is not None)
         assert timeout_seconds > 0 and not should_abort()
         request = RequestResult(
             context_hash=suite.contexts[0].context_hash,
@@ -253,9 +258,15 @@ def test_gate_decision_persistence_is_reported_as_measured_gain(
     endpoint = _Endpoint()
     metrics = _Metrics(
         [
+            # Four scrapes per arm: one opening the window, one after each
+            # of the three scored repeats.
             _metrics_snapshot(100, 1_000_000_000, 10, 10),
+            _metrics_snapshot(133, 1_333_333_333, 30, 23),
+            _metrics_snapshot(166, 1_666_666_666, 50, 36),
             _metrics_snapshot(200, 2_000_000_000, 70, 50),
             _metrics_snapshot(1_000, 10_000_000_000, 100, 100),
+            _metrics_snapshot(1_040, 10_266_666_666, 126, 106),
+            _metrics_snapshot(1_080, 10_533_333_333, 153, 113),
             _metrics_snapshot(1_120, 10_800_000_000, 180, 120),
         ]
     )
@@ -303,8 +314,12 @@ def test_gate_decision_persistence_is_reported_as_measured_gain(
     # numbers stay auditable from artifacts alone.
     metrics_dir = result.decision_path.parent / "gate-metrics"
     assert sorted(path.name for path in metrics_dir.iterdir()) == [
+        "candidate-after-repeat-0.prom.gz",
+        "candidate-after-repeat-1.prom.gz",
         "candidate-after.prom.gz",
         "candidate-before.prom.gz",
+        "stock-after-repeat-0.prom.gz",
+        "stock-after-repeat-1.prom.gz",
         "stock-after.prom.gz",
         "stock-before.prom.gz",
     ]
