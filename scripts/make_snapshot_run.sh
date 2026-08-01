@@ -62,12 +62,19 @@ VLLM_ENV=/admin/home/ryan.kim/speedlm/.preflight/venvs/vllm
 PYLIBS_PYTEST=/data/ryan.kim/pylibs/pytest
 CORPUS=/data/ryan.kim/speedlm-corpora/ultrachat-prompts.jsonl
 
+# The gateway flavors default SPEEDLM_*_VLLM_ARGS to "[]", i.e. no bounds at
+# all, which on a shared GPU lets vLLM size its KV cache for the whole card.
+# These are the args tests/e2e/run_overhead_bench.sh:24 has always passed.
+DEFAULT_GATEWAY_VLLM_ARGS='[ "--max-model-len", "4096", "--gpu-memory-utilization", "0.85", "--enforce-eager" ]'
+
 usage() {
     cat <<'EOF'
 make_snapshot_run.sh -- pin a GPU run to an immutable snapshot of the repo.
 
 Required:
   --flavor F            idle-tuning | activation-capture | hot-swap
+                        | live-vllm | proxy-overhead | token-fidelity
+                        | model-matrix | capture-matrix | agent-harness
 
 Optional:
   --commit REF          commit/ref to snapshot            (default: HEAD)
@@ -83,7 +90,12 @@ Optional:
   --drafter-dir PATH    SPEEDLM_E2E_DRAFTER_DIR           (hot-swap, optional)
   --corpus PATH         SPEEDLM_E2E_PROMPT_CORPUS         (idle-tuning)
   --no-corpus           omit the corpus; test falls back to synthetic prompts
-  --vllm-args JSON      SPEEDLM_E2E_VLLM_ARGS, a JSON array of strings
+  --model ID            served model                      (default: per flavor)
+  --matrix-cell NAME    SPEEDLM_MATRIX_CELL               (model-matrix only, required)
+  --hf-home PATH        HF_HOME                           (default: /data/ryan.kim/hf-cache)
+  --vllm-args JSON      a JSON array of strings, exported as the flavor's own
+                        vLLM-args variable (SPEEDLM_E2E_VLLM_ARGS, or the
+                        CAPTURE/AGENT equivalent)
   --force               re-extract the snapshot even if it already exists
   -h | --help           this message
 
@@ -110,6 +122,10 @@ verifier=""
 drafter=""
 drafter_dir=""
 corpus="$CORPUS"
+model=""
+matrix_cell=""
+hf_home=/data/ryan.kim/hf-cache
+hf_home_set=0
 vllm_args=""
 force=0
 
@@ -128,6 +144,9 @@ while [[ $# -gt 0 ]]; do
         --drafter-dir)    drafter_dir="$2"; shift 2 ;;
         --corpus)         corpus="$2"; shift 2 ;;
         --no-corpus)      corpus=""; shift ;;
+        --model)          model="$2"; shift 2 ;;
+        --matrix-cell)    matrix_cell="$2"; shift 2 ;;
+        --hf-home)        hf_home="$2"; hf_home_set=1; shift 2 ;;
         --vllm-args)      vllm_args="$2"; shift 2 ;;
         --force)          force=1; shift ;;
         -h|--help)        usage; exit 0 ;;
@@ -150,7 +169,24 @@ done
 #   * test_serving_draft_hot_swap.py parses safetensors headers by hand and
 #     needs no torch in-process, but it is kept on the vLLM venv to match the
 #     existing hotswap-smoke-TEMPLATE convention and the engine it drives.
+#   * the six gateway flavors below (live-vllm, proxy-overhead, token-fidelity,
+#     model-matrix, capture-matrix, agent-harness) drive `speedlm vllm serve`
+#     over HTTP and import no torch in-process -- model-matrix imports only
+#     speedlm.training.rows and the chatml/harmony templates, which are
+#     torch-free -- so they run under the project venv.  They DO need the
+#     `speedlm` console script on PATH: it lives in an installed venv, never in
+#     the snapshot, and each test falls back to shutil.which() when
+#     REPO_ROOT/.venv is absent (which it always is under a snapshot).  Running
+#     the CLI from the live venv does not break provenance: the child inherits
+#     PYTHONPATH, so `import speedlm` still resolves to the snapshot.
+#
+# Every one of these six also uses its own artifact-dir variable, hence
+# `artifact_var` rather than a hardcoded SPEEDLM_E2E_ARTIFACT_DIR.
 # --------------------------------------------------------------------------
+artifact_var="SPEEDLM_E2E_ARTIFACT_DIR"
+vllm_args_var="SPEEDLM_E2E_VLLM_ARGS"
+extra_path=""
+
 case "$flavor" in
     idle-tuning)
         test_path="tests/e2e/test_live_idle_tuning.py"
@@ -187,8 +223,101 @@ case "$flavor" in
         : "${drafter:=RedHatAI/Qwen3-8B-speculator.eagle3}"
         corpus=""   # this flavor does not read SPEEDLM_E2E_PROMPT_CORPUS
         ;;
+    live-vllm)
+        test_path="tests/e2e/test_live_vllm.py"
+        gate_var="SPEEDLM_E2E"
+        interpreter="$REPO/.venv/bin/python"
+        extra_pythonpath=""
+        extra_path=":$REPO/.venv/bin"
+        job_suffix="livevllm"
+        # One model load plus three chat requests (non-stream, stream, tools),
+        # a trace drain and two CLI calls.  Load dominates.
+        default_time="01:30:00"
+        : "${model:=Qwen/Qwen3-8B}"
+        corpus=""
+        ;;
+    proxy-overhead)
+        test_path="tests/e2e/test_proxy_overhead.py"
+        gate_var="SPEEDLM_E2E"
+        interpreter="$REPO/.venv/bin/python"
+        extra_pythonpath=""
+        extra_path=":$REPO/.venv/bin"
+        job_suffix="overhead"
+        # ~470 requests at 64 output tokens each (warmup, 8 latency repeats
+        # streaming and non-streaming on both paths, then 4 repeats over
+        # concurrency 1/4/16/32 direct and via the gateway) on top of the load.
+        default_time="02:00:00"
+        : "${model:=Qwen/Qwen3-8B}"
+        corpus=""
+        ;;
+    token-fidelity)
+        test_path="tests/e2e/test_token_fidelity.py"
+        gate_var="SPEEDLM_E2E"
+        interpreter="$REPO/.venv/bin/python"
+        extra_pythonpath=""
+        extra_path=":$REPO/.venv/bin"
+        job_suffix="fidelity"
+        # Three chat requests plus six /tokenize round trips.  Load dominates.
+        default_time="01:30:00"
+        # test_token_fidelity.py:39 hardcodes MODEL = "Qwen/Qwen3.5-2B" with no
+        # env override, and that model is NOT in /data/ryan.kim/hf-cache -- the
+        # only local copy is under ob-cache.  Point HF_HOME there unless the
+        # caller said otherwise, or the offline load fails instantly.
+        [[ $hf_home_set -eq 1 ]] || hf_home=/data/ryan.kim/ob-cache
+        model=""
+        corpus=""
+        ;;
+    model-matrix)
+        test_path="tests/e2e/test_model_matrix.py"
+        gate_var="SPEEDLM_E2E"
+        interpreter="$REPO/.venv/bin/python"
+        extra_pythonpath=""
+        extra_path=":$REPO/.venv/bin"
+        artifact_var="SPEEDLM_MATRIX_ARTIFACT_DIR"
+        job_suffix="matrix"
+        # Two or three requests; the cell's startup timeout defaults to 900s
+        # and a 20B eagle3 cell is the slow case.
+        default_time="01:30:00"
+        [[ -n "$matrix_cell" ]] || {
+            echo "error: --matrix-cell is required for --flavor model-matrix" >&2
+            echo "       (test_model_matrix.py:166 hard-fails without SPEEDLM_MATRIX_CELL)" >&2
+            echo "       cells: gpt-oss-20b-eagle3 qwen3.5-9b-mtp qwen3.5-2b-none qwen3.5-2b-ngram" >&2
+            exit 2
+        }
+        # The cell pins its own model; --model is not consulted here.
+        model=""
+        corpus=""
+        ;;
+    capture-matrix)
+        test_path="tests/e2e/test_capture_harness_matrix.py"
+        gate_var="SPEEDLM_E2E"
+        interpreter="$REPO/.venv/bin/python"
+        extra_pythonpath=""
+        extra_path=":$REPO/.venv/bin"
+        artifact_var="SPEEDLM_CAPTURE_ARTIFACT_DIR"
+        job_suffix="capmatrix"
+        # Eight exchanges over raw httpx and a separate OpenAI SDK subprocess,
+        # then a manifest and trace drain.  Load dominates.
+        default_time="01:30:00"
+        : "${model:=Qwen/Qwen3-8B}"
+        corpus=""
+        ;;
+    agent-harness)
+        test_path="tests/e2e/test_agent_harness.py"
+        gate_var="SPEEDLM_E2E"
+        interpreter="$REPO/.venv/bin/python"
+        extra_pythonpath=""
+        extra_path=":$REPO/.venv/bin"
+        artifact_var="SPEEDLM_AGENT_ARTIFACT_DIR"
+        job_suffix="agent"
+        # A three-turn scripted tool-calling conversation, capped by
+        # SPEEDLM_AGENT_SUBPROCESS_TIMEOUT=420 on top of the load.
+        default_time="01:30:00"
+        : "${model:=openai/gpt-oss-20b}"
+        corpus=""
+        ;;
     *)
-        echo "error: unknown flavor '$flavor' (want idle-tuning|activation-capture|hot-swap)" >&2
+        echo "error: unknown flavor '$flavor' (want idle-tuning|activation-capture|hot-swap|live-vllm|proxy-overhead|token-fidelity|model-matrix|capture-matrix|agent-harness)" >&2
         exit 2
         ;;
 esac
@@ -290,8 +419,8 @@ interpreter=$interpreter
 
 cd "\$snapshot"
 
-export PATH="$VLLM_ENV/bin:\$PATH"
-export HF_HOME=/data/ryan.kim/hf-cache
+export PATH="$VLLM_ENV/bin$extra_path:\$PATH"
+export HF_HOME=$hf_home
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1
 export TOKENIZERS_PARALLELISM=false PYTHONUNBUFFERED=1
 
@@ -304,8 +433,8 @@ export PYTHONPATH="$pythonpath"
 export PYTHONDONTWRITEBYTECODE=1
 
 export $gate_var=1
-export SPEEDLM_E2E_ARTIFACT_DIR="\$run_dir/results"
-mkdir -p "\$SPEEDLM_E2E_ARTIFACT_DIR"
+export $artifact_var="\$run_dir/results"
+mkdir -p "\$$artifact_var"
 EOF
 
 case "$flavor" in
@@ -329,10 +458,51 @@ EOF
         [[ -n "$drafter_dir" ]] && echo "export SPEEDLM_E2E_DRAFTER_DIR=$drafter_dir"
         echo "export SPEEDLM_E2E_READY_TIMEOUT=1800"
         ;;
+    live-vllm)
+        echo "export SPEEDLM_E2E_MODEL=$model"
+        echo "export SPEEDLM_E2E_STAGE=${model//\//--}"
+        echo "export SPEEDLM_E2E_READY_TIMEOUT=1800"
+        : "${vllm_args:=$DEFAULT_GATEWAY_VLLM_ARGS}"
+        ;;
+    proxy-overhead)
+        echo "export SPEEDLM_E2E_MODEL=$model"
+        echo "export SPEEDLM_E2E_STAGE=proxy-overhead"
+        : "${vllm_args:=$DEFAULT_GATEWAY_VLLM_ARGS}"
+        ;;
+    token-fidelity)
+        echo "export SPEEDLM_FIDELITY_STAGE=token-fidelity"
+        : "${vllm_args:=$DEFAULT_GATEWAY_VLLM_ARGS}"
+        ;;
+    model-matrix)
+        echo "export SPEEDLM_MATRIX_CELL=$matrix_cell"
+        echo "export SPEEDLM_MATRIX_STARTUP_TIMEOUT=1800"
+        echo "export SPEEDLM_MATRIX_REQUEST_TIMEOUT=240"
+        # The cell carries its own vLLM args; do not override them.
+        ;;
+    capture-matrix)
+        echo "export SPEEDLM_CAPTURE_MODEL=$model"
+        echo "export SPEEDLM_CAPTURE_STAGE=${model//\//--}"
+        echo "export SPEEDLM_CAPTURE_READY_TIMEOUT=1800"
+        echo "export SPEEDLM_CAPTURE_VLLM_VENV=$VLLM_ENV"
+        # The OpenAI-SDK half of the matrix runs in its own interpreter; the
+        # project venv has no `openai`, the vLLM venv does.
+        echo "export SPEEDLM_CAPTURE_SDK_PYTHON=$VLLM_ENV/bin/python"
+        vllm_args_var="SPEEDLM_CAPTURE_VLLM_ARGS"
+        : "${vllm_args:=$DEFAULT_GATEWAY_VLLM_ARGS}"
+        ;;
+    agent-harness)
+        echo "export SPEEDLM_AGENT_MODEL=$model"
+        echo "export SPEEDLM_AGENT_STAGE=${model//\//--}"
+        echo "export SPEEDLM_AGENT_CLI=scripted"
+        echo "export SPEEDLM_AGENT_STARTUP_TIMEOUT=1800"
+        echo "export SPEEDLM_AGENT_SUBPROCESS_TIMEOUT=420"
+        # test_agent_harness.py:193 builds per-model defaults already.
+        vllm_args_var="SPEEDLM_AGENT_VLLM_ARGS"
+        ;;
 esac
 
 if [[ -n "$vllm_args" ]]; then
-    echo "export SPEEDLM_E2E_VLLM_ARGS='$vllm_args'"
+    echo "export $vllm_args_var='$vllm_args'"
 fi
 
 cat <<EOF

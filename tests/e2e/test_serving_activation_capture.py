@@ -13,7 +13,8 @@ Required environment:
 Optional environment:
 * ``SPEEDLM_E2E_READY_TIMEOUT`` — engine readiness cap in seconds (default: 360)
 * ``SPEEDLM_E2E_PORT`` — vLLM serve port (default: auto-assigned free port)
-* ``SPEEDLM_E2E_TARGET_LAYER_IDS`` — JSON array, e.g. ``[4, 12, 20]``
+* ``SPEEDLM_E2E_TARGET_LAYER_IDS`` — JSON array, e.g. ``[2, 18, 33]``.  Only
+  needed to override the layers derived from the models under test.
 * ``SPEEDLM_E2E_PROMPT`` — override the fixed prompt (default: a short
   English sentence)
 """
@@ -26,7 +27,9 @@ import os
 import socket
 import subprocess
 import time
+from collections.abc import Mapping
 from pathlib import Path
+from typing import Any, Final
 
 import httpx
 import pytest
@@ -41,6 +44,11 @@ from speedlm.activation_capture.offline_extract import (
 from speedlm.gateway.control import (
     GPUMemoryPrecondition,
     NvidiaSmiMemoryProbe,
+)
+from speedlm.profiles import (
+    ProfileError,
+    resolve_profile,
+    resolve_target_layer_ids,
 )
 
 # torch and safetensors live in the vLLM venv, not the project venv. These are
@@ -129,21 +137,185 @@ def _ready_timeout() -> float:
         raise AssertionError("SPEEDLM_E2E_READY_TIMEOUT must be a number") from exc
 
 
-def _target_layer_ids() -> list[int]:
-    """Return the target aux layer IDs for the offline extraction path.
+#: Keys a Speculators/EAGLE-3 drafter config may use to declare its aux layers.
+#: ``eagle_aux_hidden_state_layer_ids`` pins the indices outright;
+#: ``num_aux_hidden_states`` pins only the arity, which is what
+#: ``fc_input_size`` is built from.  Neither drafter this deployment uses
+#: states the indices: RedHatAI/Qwen3-8B-speculator.eagle3 omits the key
+#: entirely and RedHatAI/gpt-oss-20b-speculator.eagle3 carries it as null.
+_AUX_LAYER_IDS_KEY: Final = "eagle_aux_hidden_state_layer_ids"
+_AUX_COUNT_KEY: Final = "num_aux_hidden_states"
+#: Nested sections a drafter config may bury the declaration under.
+_AUX_CONFIG_SECTIONS: Final = ("speculators_config", "eagle_config")
 
-    The serving engine reads its aux layers from the drafter's own hf_config
-    on disk.  The offline extraction must use the same IDs or the comparison
-    is meaningless.  If SPEEDLM_E2E_TARGET_LAYER_IDS is set, the test will
-    later verify that the engine's actual aux layers match this expectation.
+
+def _resolve_model_dir(model: str, *, override: str | None = None) -> Path:
+    """Resolve a repo id (or path) to the cached snapshot directory on disk.
+
+    These runs set ``HF_HUB_OFFLINE=1``, so there is no download fallback: the
+    snapshot must already be in the cache under ``HF_HOME``.  This mirrors
+    ``_resolve_drafter_dir`` in the hot-swap E2E rather than inventing a
+    second resolution rule.
+    """
+    if override:
+        path = Path(override)
+        assert (path / "config.json").is_file(), (
+            f"model directory override has no config.json: {path}"
+        )
+        return path
+
+    direct = Path(model)
+    if (direct / "config.json").is_file():
+        return direct
+
+    hf_home = Path(os.environ.get("HF_HOME", Path.home() / ".cache" / "huggingface"))
+    slug = "models--" + model.replace("/", "--")
+    repository = hf_home / "hub" / slug
+    snapshots = sorted((repository / "snapshots").glob("*"))
+    usable = [path for path in snapshots if (path / "config.json").is_file()]
+    assert usable, (
+        f"cannot resolve {model!r} to a cached snapshot under {repository}; "
+        f"the run is offline, so the snapshot must already be in HF_HOME"
+    )
+    return usable[-1]
+
+
+def _read_model_config(model_dir: Path) -> Mapping[str, Any]:
+    """Read and parse ``config.json`` from a resolved snapshot directory."""
+    path = model_dir / "config.json"
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise AssertionError(f"cannot read model config {path}: {exc}") from exc
+    if not isinstance(raw, Mapping):
+        raise AssertionError(f"model config is not a JSON object: {path}")
+    return raw
+
+
+def _positive_int(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        return None
+    return value
+
+
+def _drafter_aux_declaration(
+    config: Mapping[str, Any],
+) -> tuple[tuple[int, ...] | None, int | None]:
+    """Return the drafter's ``(declared aux layer ids, declared aux count)``.
+
+    Both are ``None`` when the drafter declares neither, which is the normal
+    case for the published RedHatAI speculators.  A declared id list also
+    fixes the count, so the count is taken from its length in that case.
+    """
+    sections: list[Mapping[str, Any]] = [config]
+    sections.extend(
+        section
+        for name in _AUX_CONFIG_SECTIONS
+        if isinstance(section := config.get(name), Mapping)
+    )
+
+    declared_ids: tuple[int, ...] | None = None
+    for section in sections:
+        value = section.get(_AUX_LAYER_IDS_KEY)
+        if isinstance(value, list) and value:
+            if not all(
+                not isinstance(entry, bool) and isinstance(entry, int)
+                for entry in value
+            ):
+                raise AssertionError(
+                    f"{_AUX_LAYER_IDS_KEY} must be a list of integers, got {value!r}"
+                )
+            declared_ids = tuple(int(entry) for entry in value)
+            break
+
+    declared_count: int | None = None
+    for section in sections:
+        declared_count = _positive_int(section.get(_AUX_COUNT_KEY))
+        if declared_count is not None:
+            break
+
+    if declared_ids is not None and declared_count is None:
+        declared_count = len(declared_ids)
+    return declared_ids, declared_count
+
+
+def _verifier_num_hidden_layers(config: Mapping[str, Any]) -> int | None:
+    """Read the verifier's decoder depth, honouring a ``text_config`` nest."""
+    text_config = config.get("text_config")
+    for section in (config, text_config):
+        if isinstance(section, Mapping):
+            depth = _positive_int(section.get("num_hidden_layers"))
+            if depth is not None:
+                return depth
+    return None
+
+
+def _target_layer_ids(verifier: str, drafter: str) -> list[int]:
+    """Derive the target aux layer IDs for the offline extraction path.
+
+    The serving engine derives its aux layers from the drafter's declaration
+    and the verifier's depth; offline extraction must key on the same IDs or
+    the elementwise comparison is meaningless.  A constant default cannot do
+    that -- it is model-specific, and the previous one ([4, 12, 20]) matched
+    neither drafter this deployment runs (job 369214).
+
+    Resolution order, mirroring ``profiles.resolve_target_layer_ids``:
+
+    1. ``SPEEDLM_E2E_TARGET_LAYER_IDS`` -- the operator's explicit override.
+    2. The drafter's own ``eagle_aux_hidden_state_layer_ids``, when it pins a
+       real list.
+    3. ``profiles.resolve_target_layer_ids`` over the profile's pin, the
+       verifier's ``num_hidden_layers`` read off disk, and the drafter's
+       declared arity -- i.e. exactly the production resolution path.
+
+    This reads the *inputs* the engine reads (the two on-disk configs), never
+    the engine's own report.  The engine's captured ``original_aux_layers``
+    therefore remains an independent value, and the assertion comparing the
+    two still fails whenever vLLM's in-engine derivation and SpeedLM's
+    resolution disagree.
     """
     raw = os.environ.get("SPEEDLM_E2E_TARGET_LAYER_IDS")
     if raw:
         try:
-            return json.loads(raw)
+            override = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise AssertionError("SPEEDLM_E2E_TARGET_LAYER_IDS must be JSON") from exc
-    return [4, 12, 20]
+        if not isinstance(override, list) or not override:
+            raise AssertionError(
+                "SPEEDLM_E2E_TARGET_LAYER_IDS must be a non-empty JSON array"
+            )
+        return sorted(int(entry) for entry in override)
+
+    drafter_config = _read_model_config(
+        _resolve_model_dir(
+            drafter,
+            override=os.environ.get("SPEEDLM_E2E_DRAFTER_DIR"),
+        )
+    )
+    declared_ids, declared_count = _drafter_aux_declaration(drafter_config)
+    if declared_ids is not None:
+        return sorted(declared_ids)
+
+    num_hidden_layers = _verifier_num_hidden_layers(
+        _read_model_config(_resolve_model_dir(verifier))
+    )
+
+    profile = None
+    try:
+        profile = resolve_profile(served_model=verifier)
+    except ProfileError:
+        #: An unprofiled verifier is legitimate here -- the derivation only
+        #: needs the depth, which was read off disk above.
+        profile = None
+    if num_hidden_layers is None and profile is not None:
+        num_hidden_layers = profile.num_hidden_layers
+
+    resolved = resolve_target_layer_ids(
+        explicit=profile.target_layer_ids if profile is not None else None,
+        num_hidden_layers=num_hidden_layers,
+        drafter_aux_count=declared_count,
+    )
+    return sorted(resolved)
 
 
 def _create_artifact_dir(root: Path) -> Path:
@@ -531,7 +703,7 @@ def test_stage0_activation_capture() -> None:
     """
     verifier, drafter, artifact_root = _require_environment()
     prompt = os.environ.get("SPEEDLM_E2E_PROMPT", DEFAULT_PROMPT)
-    target_layers = _target_layer_ids()
+    target_layers = _target_layer_ids(verifier, drafter)
     artifact_dir = _create_artifact_dir(artifact_root)
     port = int(os.environ.get("SPEEDLM_E2E_PORT", _free_port()))
     timeout = _ready_timeout()
@@ -603,8 +775,10 @@ def test_stage0_activation_capture() -> None:
         assert sorted(original_aux) == target_layers, (
             f"Captured drafter-input layers {sorted(original_aux)} do not match "
             f"target_layers {target_layers} — offline extraction will use "
-            f"wrong keys.  Set SPEEDLM_E2E_TARGET_LAYER_IDS to match the "
-            f"drafter's config."
+            f"wrong keys.  target_layers were derived from the drafter/"
+            f"verifier configs on disk, so a mismatch means vLLM's in-engine "
+            f"derivation disagrees with speedlm.profiles.resolve_target_"
+            f"layer_ids.  Set SPEEDLM_E2E_TARGET_LAYER_IDS to override."
         )
 
         # The captured keys must be exactly original_aux + final_layer_idx.

@@ -23,6 +23,7 @@ import json
 import math
 import os
 import re
+import shutil
 import signal
 import socket
 import subprocess
@@ -36,7 +37,23 @@ import pytest
 pytestmark = pytest.mark.e2e
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-SPEEDLM = REPO_ROOT / ".venv" / "bin" / "speedlm"
+def _resolve_speedlm() -> Path:
+    """Locate the speedlm CLI.
+
+    The console script lives in an installed venv, never in the source tree.
+    Under a snapshot run (scripts/make_snapshot_run.sh) REPO_ROOT is a
+    read-only `git archive` extract with no .venv, so fall back to PATH.
+    Snapshot provenance is still enforced by PYTHONPATH, which the child
+    process inherits via os.environ.copy().
+    """
+    local = REPO_ROOT / ".venv" / "bin" / "speedlm"
+    if local.exists():
+        return local
+    found = shutil.which("speedlm")
+    return Path(found) if found is not None else local
+
+
+SPEEDLM = _resolve_speedlm()
 VLLM_VENV = Path("/admin/home/ryan.kim/speedlm/.preflight/venvs/vllm")
 VLLM = VLLM_VENV / "bin" / "vllm"
 

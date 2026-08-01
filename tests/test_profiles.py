@@ -614,3 +614,174 @@ def test_qwen3_8b_profile_resolution_regression() -> None:
             served_model="qwen3-8b-eagle3", profiles=BUILTIN_PROFILES
         ) is QWEN_3_8B_EAGLE3_PROFILE
     )
+
+
+# -- activation-capture E2E aux-layer derivation --------------------------
+#
+# The serving-activation-capture E2E used to default its target layers to a
+# hardcoded [4, 12, 20], which matched neither drafter this deployment runs
+# and aborted job 369214.  Its replacement derives them from the drafter and
+# verifier configs through ``resolve_target_layer_ids``, so it is covered
+# here alongside the resolution it delegates to rather than only behind the
+# GPU gate.
+from e2e.test_serving_activation_capture import (  # noqa: E402
+    _drafter_aux_declaration,
+    _resolve_model_dir,
+    _target_layer_ids,
+    _verifier_num_hidden_layers,
+)
+
+#: The published RedHatAI speculators as they actually sit in the HF cache:
+#: Qwen3-8B omits ``eagle_aux_hidden_state_layer_ids`` entirely, gpt-oss-20b
+#: carries it as null.  Neither states the layers, so both must come from the
+#: derivation path.
+_QWEN_DRAFTER_CONFIG: dict[str, object] = {
+    "architectures": ["Eagle3Speculator"],
+    "speculators_model_type": "eagle3",
+    "speculators_config": {
+        "algorithm": "eagle3",
+        "verifier": {"name_or_path": "Qwen/Qwen3-8B"},
+    },
+}
+_GPT_OSS_DRAFTER_CONFIG: dict[str, object] = {
+    "architectures": ["Eagle3DraftModel"],
+    "speculators_model_type": "eagle3",
+    "eagle_aux_hidden_state_layer_ids": None,
+    "speculators_config": {
+        "algorithm": "eagle3",
+        "verifier": {"name_or_path": "openai/gpt-oss-20b"},
+    },
+}
+
+
+def _write_cached_model(
+    hf_home: Path,
+    repository: str,
+    config: dict[str, object],
+) -> Path:
+    slug = "models--" + repository.replace("/", "--")
+    snapshot = hf_home / "hub" / slug / "snapshots" / "deadbeef"
+    snapshot.mkdir(parents=True, exist_ok=True)
+    (snapshot / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    return snapshot
+
+
+def _fake_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    hf_home = tmp_path / "hf-cache"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    monkeypatch.delenv("SPEEDLM_E2E_TARGET_LAYER_IDS", raising=False)
+    monkeypatch.delenv("SPEEDLM_E2E_DRAFTER_DIR", raising=False)
+    _write_cached_model(hf_home, "Qwen/Qwen3-8B", {"num_hidden_layers": 36})
+    _write_cached_model(
+        hf_home, "RedHatAI/Qwen3-8B-speculator.eagle3", _QWEN_DRAFTER_CONFIG
+    )
+    _write_cached_model(hf_home, "openai/gpt-oss-20b", {"num_hidden_layers": 24})
+    _write_cached_model(
+        hf_home, "RedHatAI/gpt-oss-20b-speculator.eagle3", _GPT_OSS_DRAFTER_CONFIG
+    )
+    return hf_home
+
+
+def test_e2e_target_layers_derived_for_both_cached_drafters(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Neither published drafter states its layers; both must be derived."""
+    _fake_cache(tmp_path, monkeypatch)
+
+    assert _target_layer_ids(
+        "Qwen/Qwen3-8B", "RedHatAI/Qwen3-8B-speculator.eagle3"
+    ) == [2, 18, 33]
+    assert _target_layer_ids(
+        "openai/gpt-oss-20b", "RedHatAI/gpt-oss-20b-speculator.eagle3"
+    ) == [2, 12, 21]
+
+
+def test_e2e_target_layers_track_verifier_depth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A different verifier depth moves the layers -- nothing is hardcoded."""
+    hf_home = _fake_cache(tmp_path, monkeypatch)
+    _write_cached_model(hf_home, "acme/deep-48", {"num_hidden_layers": 48})
+
+    assert _target_layer_ids(
+        "acme/deep-48", "RedHatAI/Qwen3-8B-speculator.eagle3"
+    ) == list(spread_aux_layers(3, 48))
+
+
+def test_e2e_target_layers_honour_drafter_declared_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A drafter that pins its own layer ids wins over the heuristic."""
+    hf_home = _fake_cache(tmp_path, monkeypatch)
+    _write_cached_model(
+        hf_home,
+        "acme/pinned.eagle3",
+        {"eagle_aux_hidden_state_layer_ids": [33, 2, 18]},
+    )
+
+    assert _target_layer_ids("Qwen/Qwen3-8B", "acme/pinned.eagle3") == [2, 18, 33]
+
+
+def test_e2e_target_layers_use_drafter_declared_arity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A declared aux count drives k, not the k == 3 fallback."""
+    hf_home = _fake_cache(tmp_path, monkeypatch)
+    _write_cached_model(hf_home, "acme/four.eagle3", {"num_aux_hidden_states": 4})
+
+    assert _target_layer_ids("Qwen/Qwen3-8B", "acme/four.eagle3") == list(
+        spread_aux_layers(4, 36)
+    )
+
+
+def test_e2e_target_layers_explicit_env_override_wins(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_cache(tmp_path, monkeypatch)
+    monkeypatch.setenv("SPEEDLM_E2E_TARGET_LAYER_IDS", "[11, 3, 7]")
+
+    assert _target_layer_ids(
+        "Qwen/Qwen3-8B", "RedHatAI/Qwen3-8B-speculator.eagle3"
+    ) == [3, 7, 11]
+
+
+def test_e2e_target_layers_reject_malformed_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _fake_cache(tmp_path, monkeypatch)
+    monkeypatch.setenv("SPEEDLM_E2E_TARGET_LAYER_IDS", "not json")
+    with pytest.raises(AssertionError, match="must be JSON"):
+        _target_layer_ids("Qwen/Qwen3-8B", "RedHatAI/Qwen3-8B-speculator.eagle3")
+
+    monkeypatch.setenv("SPEEDLM_E2E_TARGET_LAYER_IDS", "[]")
+    with pytest.raises(AssertionError, match="non-empty JSON array"):
+        _target_layer_ids("Qwen/Qwen3-8B", "RedHatAI/Qwen3-8B-speculator.eagle3")
+
+
+def test_e2e_uncached_model_reports_instead_of_downloading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Offline runs must name the missing snapshot, not hang on a fetch."""
+    _fake_cache(tmp_path, monkeypatch)
+    with pytest.raises(AssertionError, match="cannot resolve"):
+        _resolve_model_dir("acme/never-pulled")
+
+
+def test_e2e_aux_declaration_readers_handle_null_and_absent() -> None:
+    assert _drafter_aux_declaration(_QWEN_DRAFTER_CONFIG) == (None, None)
+    assert _drafter_aux_declaration(_GPT_OSS_DRAFTER_CONFIG) == (None, None)
+    assert _drafter_aux_declaration({"eagle_aux_hidden_state_layer_ids": [2, 5]}) == (
+        (2, 5),
+        2,
+    )
+    assert _drafter_aux_declaration(
+        {"eagle_config": {"eagle_aux_hidden_state_layer_ids": [1, 4, 9]}}
+    ) == ((1, 4, 9), 3)
+    assert _drafter_aux_declaration({"num_aux_hidden_states": 5}) == (None, 5)
+
+
+def test_e2e_verifier_depth_reader_handles_text_config() -> None:
+    assert _verifier_num_hidden_layers({"num_hidden_layers": 36}) == 36
+    assert _verifier_num_hidden_layers({"text_config": {"num_hidden_layers": 28}}) == 28
+    assert _verifier_num_hidden_layers({"num_hidden_layers": 0}) is None
+    assert _verifier_num_hidden_layers({}) is None
