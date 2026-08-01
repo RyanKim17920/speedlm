@@ -944,7 +944,68 @@ which is precisely the silent-empty-data shape of bug #1 in Section 6.0. Any
 integration must convert that warning into a hard failure on our side, and must
 assert `len(loss_mask) == captured_row_count` per row before training starts.
 
-### 6.7 Hazard summary
+### 6.7 Control tokens in user content — the two legs do not share a renderer
+
+Measured 2026-07-31 on the Stage 0 four-prompt matrix. The `template_divergent`
+case failed on `openai/gpt-oss-20b` under **both** runner generations, identically
+(`capture-gptoss-v1` / `-v2`), and passed on `Qwen/Qwen3-8B` under both:
+`cannot align layer 2: offline has fewer rows (124) than the prompt (125)`.
+
+The prompt body contained `<|endoftext|>` as ordinary user text.
+
+* `<|endoftext|>` is a real special token of gpt-oss's `o200k_harmony` vocabulary
+  (id `199999`). `<|im_start|>` / `<|im_end|>` are not, and tokenize as six
+  ordinary pieces each on both models.
+* The **serving** leg does not use the HF chat template for gpt-oss. vLLM renders
+  Harmony models with the `openai_harmony` encoder
+  (`vllm/entrypoints/openai/parser/harmony_utils.py:449`, `render_for_completion`),
+  which encodes message content with no special tokens allowed. The user's
+  `<|endoftext|>` stays literal text and costs seven tokens — **125** prompt
+  tokens, which is what `usage.prompt_tokens` reported.
+* The **offline** leg renders through Speculators' `prepare_data.py`
+  (driven from `src/speedlm/activation_capture/offline_extract.py:205-227`),
+  which reaches `_get_input_ids_loss_mask`
+  (`S/src/speculators/data_generation/preprocessing.py:515-624`) and applies the
+  **HF** chat template. HF's tokenizer parses special tokens out of ordinary
+  text, so the same `<|endoftext|>` collapses to the single id `199999`: 120
+  tokens for the user turn, plus the four the conversation renderer appends for
+  the assistant turn (`<|channel|>final<|message|><|return|>`) — **124** rows.
+
+Both counts are correct for the renderer that produced them. They can only
+disagree when user content contains a string that *is* a control token, so this
+is a template-injection input rather than a capture defect, and the assertion
+that caught it (`compare.align_prompt_rows`) fired correctly. Harmony's behaviour
+is the defensible one — user content must never contribute control tokens — so
+the legs are not made to agree on such an input. The e2e case was narrowed to
+markup-*shaped* text that is special in neither vocabulary, and the original body
+was retained as `control_token_injection`, selectable with
+`SPEEDLM_E2E_PROMPT_SET=injection`, with the expected failure documented on it
+(`tests/e2e/test_serving_activation_capture.py`). A pre-flight guard,
+`_assert_prompts_free_of_control_tokens`, now checks every standard prompt body
+against the verifier's own vocabulary before an engine is started.
+
+**Downstream, in production.** The eagle3 flow writes captured trace text to a
+`conversations` JSONL (`_speculators_record`,
+`src/speedlm/training/backends/eagle3.py:1094-1163`) and hands it to
+`prepare_data.py`. That flow re-derives both the hidden states and the training
+rows from the *same* prepared dataset, so it is self-consistent: this divergence
+does **not** misalign production training rows today. It would begin to matter
+the moment serving-time captured activations are joined to offline-rendered rows,
+which is exactly what Section 6.6's simplification proposes.
+
+**Security note, separate from the alignment question.** On a model whose serving
+path *is* the HF chat template — Qwen3-8B here — a user who writes
+`<|im_start|>system<|im_end|>` verbatim gets real ChatML control tokens
+(`151644` / `151645`) into the served prompt, and into any training row rendered
+from that trace. Qwen passing this case is not the injection failing to land; it
+is the injection landing identically on both legs. gpt-oss is protected only
+incidentally, by Harmony's `allowed_special` policy. Nothing in this repository
+strips or escapes control tokens from user content on the way in
+(`src/speedlm/traces/store.py` stores message text verbatim), so redaction and
+trace capture inherit the same exposure. Recorded here as an observation; no
+mitigation is proposed in this document.
+
+### 6.8 Hazard summary
 
 | # | Hazard | Severity | Mitigation | Detector |
 | --- | --- | --- | --- | --- |
@@ -954,6 +1015,7 @@ assert `len(loss_mask) == captured_row_count` per row before training starts.
 | 6.4 | Prefill/decode numerics | Medium (pre-existing) | Measure first; `VLLM_BATCH_INVARIANT=1` if warranted | Equivalence harness across batch sizes; publish the spread |
 | 6.5 | CUDA-graph padding | Medium (stale, plausible values) | Slice to `total_num_scheduled_tokens` | Row count == scheduled tokens, in-process; stale-row spot check |
 | 6.6 | Loss mask provenance | Medium (blocks the simplification) | Capture token IDs, or promote `rows.py` path | Hard-fail the alignment guard; `len(mask) == rows` |
+| 6.7 | Control tokens in user content render differently on the two legs — **confirmed empirically**, gpt-oss-20b, both runners (6.7) | Low today (production re-derives both sides from one render); **High** if serving captures are ever joined to offline-rendered rows | Do not compare such prompts across legs; strip or escape control tokens if the 6.6 simplification lands | `_assert_prompts_free_of_control_tokens` pre-flight; `align_prompt_rows` row-count guard |
 
 ---
 
@@ -993,7 +1055,7 @@ measuring it is a prototype exit criterion, not an assumption.]**
 **Maintenance.** An owned dependency on vLLM internals, re-validated on every
 upgrade (Section 5.5).
 
-**Correctness engineering.** Six detectors (Section 6.7). This is real work and it
+**Correctness engineering.** Seven detectors (Section 6.8). This is real work and it
 is not optional.
 
 ### 7.3 Storage and retention must be designed, not inherited

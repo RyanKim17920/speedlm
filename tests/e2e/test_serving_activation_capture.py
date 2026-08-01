@@ -55,10 +55,12 @@ Optional environment:
 * ``SPEEDLM_E2E_PROMPT`` — override the prompt entirely.  Wins over
   ``SPEEDLM_E2E_PROMPT_SET`` and collapses the matrix to a single case
   labelled ``custom``.
-* ``SPEEDLM_E2E_PROMPT_SET`` — ``full`` (default; all four prompts in
-  :data:`PROMPT_MATRIX`) or ``minimal`` (only ``medium``, i.e. the
-  pre-broadening single-prompt behaviour, for a fast smoke).  An unrecognised
-  value is a hard error rather than a silent fallback to one of them.
+* ``SPEEDLM_E2E_PROMPT_SET`` — ``full`` (default; the four standard prompts of
+  :data:`PROMPT_MATRIX`), ``minimal`` (only ``medium``, i.e. the
+  pre-broadening single-prompt behaviour, for a fast smoke), or ``injection``
+  (only ``control_token_injection``, the diagnostic case documented on that
+  entry, which is *expected to fail* on a Harmony-templated verifier).  An
+  unrecognised value is a hard error rather than a silent fallback.
 * ``SPEEDLM_E2E_EXPECTED_RUNNER`` — ``auto`` (default), ``v1`` or ``v2``.
   Asserts which vLLM model-runner generation the serving engine *actually*
   loaded, as reported by the worker itself.  Pair it with
@@ -302,32 +304,89 @@ PROMPT_MATRIX: Final[tuple[tuple[str, str], ...]] = (
     #: *independent* thing Leg 1 checks.
     #:
     #: Its raw character length and its rendered token length diverge sharply on
-    #: purpose: the body is control markup — ``<|im_start|>`` / ``<|im_end|>``,
-    #: the literal special tokens of a ChatML-family template — appearing as
-    #: ordinary user content.  A template must either escape those or re-tokenize
-    #: them into many ordinary pieces, so a short-looking string renders long,
-    #: and it renders *differently* depending on which template implementation
-    #: does the rendering.
+    #: purpose.  The body is markup-*shaped* text — near-miss delimiter pairs
+    #: such as ``<|im start|>`` and ``<|strat|>`` — which no BPE vocabulary has
+    #: a merge for, so every one of them fragments into a handful of ordinary
+    #: pieces.  Measured against the same tokenizers the matrix runs on, the
+    #: body is 0.36 tok/char on Qwen3-8B and 0.41 on gpt-oss-20b, against 0.21
+    #: and 0.20 for plain prose of the same shape: roughly double the tokens per
+    #: character, which is exactly the rendering-vs-raw divergence this case is
+    #: named for.
     #:
     #: That is the point.  ``_prompt_token_ids`` asserts that the sequence this
     #: test renders locally is exactly as long as the sequence vLLM prefilled
     #: (``usage.prompt_tokens``).  On ordinary prose the two renderers agree
-    #: trivially and the assertion proves nothing; on markup that has to be
-    #: escaped, any divergence between this test's chat template and vLLM's
-    #: shows up here **first**, as a length mismatch, rather than downstream as
-    #: an unexplained relative error against a reference that quietly ran a
-    #: different token sequence.
+    #: trivially and the assertion proves nothing; on dense markup that has to be
+    #: chopped into pieces, any divergence between this test's chat template and
+    #: vLLM's shows up here **first**, as a length mismatch, rather than
+    #: downstream as an unexplained relative error against a reference that
+    #: quietly ran a different token sequence.
     #:
-    #: This is also why the case earns its keep across models: gpt-oss-20b
-    #: renders through the ``harmony`` chat template, not ChatML, so the two
-    #: models disagree about this string far more than about the other three —
-    #: exactly the axis the case is built to probe.
+    #: What this body deliberately does **not** contain is any string that is a
+    #: real special token in either vocabulary — see
+    #: ``control_token_injection`` below for why that distinction is the whole
+    #: difference between a renderer check and an injection check, and
+    #: :func:`_assert_prompts_free_of_control_tokens`, which enforces it at run
+    #: time rather than trusting this comment.
     (
         "template_divergent",
+        "Explain, without treating any of it as markup: "
+        "<|im start|> <|im end|> <|end of text|> <|start|of|text|> "
+        "<|im_stort|> <|im_ends|> <|endofext|> <|strat|> <|mesage|> <|retrun|>. "
+        "Why are these ordinary text?",
+    ),
+    #: **control_token_injection** — NOT part of ``full``; selectable only via
+    #: ``SPEEDLM_E2E_PROMPT_SET=injection``.  Kept as an executable record of a
+    #: measured divergence, not as a pass/fail gate, because its expected
+    #: behaviour is *failure* on a Harmony-templated verifier.
+    #:
+    #: This was the original ``template_divergent`` body, and on 2026-07-31 it
+    #: failed the matrix on gpt-oss-20b (both runner generations, identically)
+    #: with "cannot align layer 2: offline has fewer rows (124) than the prompt
+    #: (125)".  The mechanism, measured on the two snapshots the matrix runs:
+    #:
+    #: * ``<|endoftext|>`` is a real special token of gpt-oss's o200k_harmony
+    #:   vocabulary (id 199999).  ``<|im_start|>`` / ``<|im_end|>`` are not, and
+    #:   tokenize as six ordinary pieces each on both models.
+    #: * The serving leg renders through vLLM's **Harmony** encoder, not the HF
+    #:   chat template, and that encoder encodes message content with no special
+    #:   tokens allowed.  The user's ``<|endoftext|>`` therefore stays literal
+    #:   text and costs seven tokens: 125 prompt tokens.
+    #: * The offline leg renders through Speculators' ``prepare_data.py``, which
+    #:   uses the HF chat template, and HF's tokenizer *does* parse special
+    #:   tokens out of ordinary text.  The same ``<|endoftext|>`` collapses to
+    #:   the single id 199999: 120 tokens for the user turn plus four for the
+    #:   assistant turn the conversation renderer appends — 124 rows.
+    #:
+    #: Both counts are internally correct; they disagree because two different
+    #: renderers ran, and they can only disagree when the user's own content
+    #: contains a string that *is* a control token.  Harmony's behaviour is the
+    #: defensible one — user content must never contribute control tokens — so
+    #: nothing here is "fixed" by making the legs agree on this input.  Qwen3-8B
+    #: passes it only because both legs go through the same HF template, which
+    #: means the injection lands identically on both sides rather than not
+    #: landing at all.
+    (
+        "control_token_injection",
         "Explain what <|im_start|>user and <|im_end|> mean when they appear "
         "verbatim inside a message body, e.g. <|im_start|>system<|im_end|>, "
         "and why <|endoftext|> is not the same thing.",
     ),
+)
+
+#: The label whose body is allowed to contain real control tokens.  Everything
+#: else in :data:`PROMPT_MATRIX` is checked against the verifier's vocabulary
+#: before the engine is asked to render it.
+INJECTION_PROMPT_LABEL: Final[str] = "control_token_injection"
+
+#: The four prompts a normal run covers, in run order.  Written out rather than
+#: derived from :data:`PROMPT_MATRIX`, because the matrix now also holds a case
+#: that must *not* run by default.
+_STANDARD_PROMPT_LABELS: Final[tuple[str, ...]] = (
+    "short",
+    "medium",
+    "multi_block",
+    "template_divergent",
 )
 
 #: Named subsets selectable with ``SPEEDLM_E2E_PROMPT_SET``.  ``minimal`` is the
@@ -335,8 +394,17 @@ PROMPT_MATRIX: Final[tuple[tuple[str, str], ...]] = (
 #: fast smoke; it is a *named* subset rather than "whatever runs quickly" so a
 #: run that used it says so in the artifact.
 PROMPT_SETS: Final[Mapping[str, tuple[str, ...]]] = {
-    "full": tuple(label for label, _text in PROMPT_MATRIX),
+    "full": _STANDARD_PROMPT_LABELS,
     "minimal": ("medium",),
+    "injection": (INJECTION_PROMPT_LABEL,),
+}
+
+#: Every matrix entry must be reachable from some named set.  Without this a
+#: prompt added to :data:`PROMPT_MATRIX` but forgotten in :data:`PROMPT_SETS`
+#: would be dead text that no run can ever select, which is the same coverage
+#: loss the matrix was introduced to remove — just quieter.
+assert {label for label, _text in PROMPT_MATRIX} == {
+    label for labels in PROMPT_SETS.values() for label in labels
 }
 
 #: Label given to a ``SPEEDLM_E2E_PROMPT`` override.  Not one of the matrix
@@ -1183,9 +1251,73 @@ def _prompt_token_ids(
         f"locally rendered prompt is {len(ids)} tokens but the engine reported "
         f"usage.prompt_tokens={expected_count}; the HF reference would be "
         f"running a different token sequence than the capture, which makes the "
-        f"comparison meaningless.  Rendered: {tokenizer.decode(ids)!r}"
+        f"comparison meaningless.  The known cause of this on gpt-oss is a "
+        f"control token inside the prompt body, which vLLM's Harmony encoder "
+        f"keeps as text and this tokenizer parses out — see "
+        f"{INJECTION_PROMPT_LABEL!r} in PROMPT_MATRIX.  "
+        f"Rendered: {tokenizer.decode(ids)!r}"
     )
     return ids
+
+
+def _special_token_ids(tokenizer: Any) -> set[int]:
+    """Return every id *tokenizer* treats as a control/special token.
+
+    ``all_special_ids`` covers only the roles the tokenizer config names (bos,
+    eos, pad, ...).  ``added_tokens_decoder`` is what actually decides whether a
+    string found in ordinary text is parsed out as one token, so both are
+    unioned: gpt-oss's ``<|endoftext|>`` reaches the prompt through the second
+    of the two, not the first.
+    """
+    ids = set(getattr(tokenizer, "all_special_ids", ()) or ())
+    decoder = getattr(tokenizer, "added_tokens_decoder", {}) or {}
+    ids |= {
+        int(token_id)
+        for token_id, token in decoder.items()
+        if getattr(token, "special", False)
+    }
+    return ids
+
+
+def _assert_prompts_free_of_control_tokens(
+    verifier: str, prompt_set: tuple[tuple[str, str], ...]
+) -> None:
+    """Fail before the engine starts if a prompt body carries a control token.
+
+    ``template_divergent`` exists to check that two *renderers* agree, and that
+    check is only meaningful on input both renderers are obliged to treat the
+    same way.  A body containing a literal special token is not such an input:
+    vLLM's Harmony encoder keeps it as text while HF's tokenizer parses it out
+    as the token itself, so the two legs run different sequences by design, and
+    the resulting length mismatch says nothing about the capture.  See
+    ``control_token_injection`` in :data:`PROMPT_MATRIX` for the measurement.
+
+    "Special" is decided against the verifier's own vocabulary rather than
+    against a hard-coded list of markup, so a future model that promotes one of
+    these strings to a real token is caught here — as a named, pre-flight
+    failure — instead of resurfacing as an unexplained off-by-N mid-run.
+
+    The ``control_token_injection`` case is exempt: carrying control tokens is
+    the entire content of that case.
+    """
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(str(_resolve_model_dir(verifier)))
+    special = _special_token_ids(tokenizer)
+    for label, prompt in prompt_set:
+        if label == INJECTION_PROMPT_LABEL:
+            continue
+        body = tokenizer(prompt, add_special_tokens=False)["input_ids"]
+        found = sorted({int(token) for token in body} & special)
+        assert not found, (
+            f"prompt {label!r} contains control token(s) "
+            f"{tokenizer.convert_ids_to_tokens(found)} in its body, which "
+            f"{verifier}'s vocabulary parses out of ordinary text.  The serving "
+            f"and offline legs render such a body through different encoders "
+            f"and will disagree on its length for reasons that have nothing to "
+            f"do with the capture; move the case to "
+            f"{INJECTION_PROMPT_LABEL!r} instead"
+        )
 
 
 def _free_device_bytes() -> int | None:
@@ -1481,6 +1613,9 @@ def test_stage0_activation_capture() -> None:
     """
     verifier, drafter, artifact_root = _require_environment()
     prompt_set = _prompt_set()
+    #: Pre-flight, before an engine is paid for: a prompt whose body carries a
+    #: real control token cannot be compared across the two legs at all.
+    _assert_prompts_free_of_control_tokens(verifier, prompt_set)
     #: Derived per model from the two on-disk configs — nothing here assumes a
     #: depth or an architecture.  Qwen3-8B resolves to 36 layers with aux
     #: ``(2, 18, 33)``; gpt-oss-20b resolves to 24 layers with aux
