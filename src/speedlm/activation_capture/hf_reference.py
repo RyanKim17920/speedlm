@@ -128,6 +128,33 @@ and 1.6e-1 for the appended final layer —
 tighter than the flat 0.10 in :mod:`speedlm.activation_capture.compare` at
 shallow depth, looser at the bottom of the stack, and in every case one to two
 orders of magnitude below the O(1) error a genuinely wrong quantity produces.
+
+Which of the two checks is sharp
+================================
+
+**The discrimination check is the sharp instrument; the tolerance gate is a
+ceiling.**  They are not two views of the same evidence and they must not be
+quoted as if they were:
+
+* ``within_tolerance`` compares a measured error against a *worst-case* bound
+  that assumes every per-layer rounding aligns.  Real roundoff does not align,
+  so the measurement sits far inside the bound.  Job 369256 used only 21.8 %,
+  11.2 %, 10.7 % and 11.3 % of the budget at aux layers 2, 18, 33 and 36 (see
+  :attr:`HFReferenceLayer.tolerance_budget_used`) — capture fidelity could
+  degrade roughly ninefold and this gate would still pass.  It is a
+  sanity floor, not a precision result.
+* ``identified`` compares the claimed layer against its own immediate
+  neighbours and demands a :data:`DISCRIMINATION_MARGIN`-fold separation.  The
+  same run cleared that 3x margin by factors of 81.46, 23.14, 24.03 and 50.02.
+  This is the check that fails if the capture is off by one layer, post-norm
+  rather than pre-norm, or a different quantity altogether — and it does not
+  depend on the tolerance above being correctly derived.
+
+The tolerance is deliberately *not* tightened to the measured values: those
+come from 18 prompt rows of a single prompt on a single model, and a bound
+fitted to them would flake on any other prompt, model or vLLM build.  Making
+the slack legible via ``tolerance_budget_used`` is the honest alternative to
+fitting the bound to one sample.
 """
 
 from __future__ import annotations
@@ -220,6 +247,30 @@ class HFReferenceLayer:
     #: ``discrimination_ratio >= DISCRIMINATION_MARGIN``.
     identified: bool
 
+    @property
+    def tolerance_budget_used(self) -> float:
+        """``mean_rel_error / tolerance`` -- how much of the bound was spent.
+
+        Recorded so that ``within_tolerance: true`` cannot be misread as a
+        tight result.  :func:`bf16_relative_tolerance` is a **worst-case
+        ceiling**: it assumes every per-layer bf16 rounding aligns in the same
+        direction, which real roundoff does not do.  Job 369256 measured
+        0.218 / 0.112 / 0.107 / 0.113 at aux layers 2 / 18 / 33 / 36 -- i.e.
+        capture fidelity could degrade by roughly 9x and ``within_tolerance``
+        would still report ``true``.
+
+        The sharp check is :attr:`identified`, not this one: it compares the
+        claimed layer against its own neighbours, and the same run cleared its
+        3x margin by factors of 81 / 23 / 24 / 50.  Read the two together and
+        weight the discrimination ratio.
+
+        Deliberately a property rather than a stored field: it is a pure
+        function of two fields that are already measured, so making it storable
+        would create a way for a caller to record a value inconsistent with
+        them.
+        """
+        return self.mean_rel_error / (self.tolerance + _EPSILON)
+
 
 @dataclass(frozen=True)
 class HFReferenceResult:
@@ -269,6 +320,7 @@ class HFReferenceResult:
                     "cosine_similarity": layer.cosine_similarity,
                     "tolerance": layer.tolerance,
                     "within_tolerance": layer.within_tolerance,
+                    "tolerance_budget_used": layer.tolerance_budget_used,
                     "neighbour_rel_errors": layer.neighbour_rel_errors,
                     "best_match_index": layer.best_match_index,
                     "discrimination_ratio": layer.discrimination_ratio,
@@ -313,13 +365,49 @@ def mean_relative_error(captured: Tensor, reference: Tensor) -> float:
     return float((cap - ref).abs().mean()) / (float(ref.abs().mean()) + _EPSILON)
 
 
+def _as_float64(tensor: Tensor) -> Tensor:
+    """Promote anything narrower than float64 to float64.
+
+    ``element_size()`` is used rather than a dtype comparison so this module
+    needs no runtime torch import to be type-checked.
+    """
+    return tensor.double() if tensor.element_size() < 8 else tensor
+
+
 def cosine_similarity(captured: Tensor, reference: Tensor) -> float:
-    """Flattened cosine similarity, computed in float32."""
-    cap = _as_float32(captured).flatten()
-    ref = _as_float32(reference).flatten()
-    return float((cap * ref).sum()) / (
+    """Flattened cosine similarity, accumulated in float64 and clamped.
+
+    **Why float64 and not float32.**  The dot product and the two norms are
+    three *separate* reductions over the same elements, each with its own
+    rounding and its own summation order, so ``dot / (|a| |b|)`` does not
+    telescope back to 1 even when the two tensors are bit-for-bit identical.
+    With a float32 accumulator over a residual-stream tensor -- ~5e4 elements
+    whose magnitudes reach 2e4, so the squares reach 4e8 -- that residue is
+    O(1e-5).  Real Stage 0 artifacts show it: job 369256's transport leg
+    reported cosines of 1.0000027857, 1.0000187356 and 1.0000228824 on tensors
+    for which ``torch.equal`` was ``True`` and every abs/rel error was exactly
+    ``0.0``.  A cosine above 1.0 is arithmetically impossible for real vectors,
+    so those digits were pure accumulator noise.
+
+    Promoting to float64 removes it: the same inputs return exactly ``1.0``.
+    Note that ``_as_float32`` was *not* the bug -- bf16 was already being
+    promoted -- float32 simply is not wide enough for this reduction.
+
+    The result is clamped to ``[-1, 1]``.  Clamping cannot mask a real signal
+    (no true cosine lies outside that interval) and it makes the impossible
+    value unrepresentable rather than merely unlikely.
+
+    **This metric is corroborating only.**  It is dominated by the largest
+    elements of the tensor and stays above 0.99 for tensors that differ by far
+    more than tolerance, so it must never be read as a precision measurement.
+    ``mean_rel_error`` and the neighbour-discrimination ratio carry the verdict.
+    """
+    cap = _as_float64(captured).flatten()
+    ref = _as_float64(reference).flatten()
+    cosine = float(cap.dot(ref)) / (
         float(cap.norm()) * float(ref.norm()) + _EPSILON
     )
+    return min(1.0, max(-1.0, cosine))
 
 
 # ---------------------------------------------------------------------------

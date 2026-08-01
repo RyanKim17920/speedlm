@@ -12,8 +12,12 @@ comparison (serving capture vs. vLLM's offline extraction) returned a perfect
 correctness question. It does not. The two paths transport a single tensor
 object rather than deriving it twice, so bit-identity is the expected outcome
 and says nothing about *which* quantity was captured. The independent evidence
-comes from a separate float32 HuggingFace re-derivation, added afterwards. The
-table in Section 9 says which question each leg answers.
+comes from a separate float32 HuggingFace re-derivation, added afterwards. That
+leg first ran successfully in job 369256 (2026-08-01), which **met** the
+identity criterion — every claimed layer was the strict argmin over its
+neighbours by 23-81x against a 3x margin — on 18 prompt rows of one prompt on
+one model. The table in Section 9 says which question each leg answers, and the
+limitations directly beneath it say what 369256 does not cover.
 
 **Audience:** engineers on SpeedLM who have not followed the investigation that
 produced it. It is written to stand alone.
@@ -466,7 +470,52 @@ statement saying "no hidden states are produced." The inference is
 straightforward — no forward pass, no activations — but it is inference, and it
 should be settled empirically by the prototype rather than argued.
 
-#### 6.1.1 Status: NOT retired. The previous retirement was based on a fabricated value.
+#### 6.1.1 Status: CONFIRMED empirically (job 369256), after a withdrawn retirement and a null first run
+
+**Current status: the hazard is real and has been measured.** Job 369256
+(`prefix_cache_result.json`, 2026-08-01) sent the same ~165-token prompt twice to
+an engine with prefix caching at its default and recorded:
+
+| Counter | Before | After |
+| --- | --- | --- |
+| `vllm:prefix_cache_queries_total` | 165 | 330 |
+| `vllm:prefix_cache_hits_total` | **0** | **144** |
+| captured rows/layer (cold → warm) | 213 | 69 |
+
+144 hit tokens, and 213 − 69 = **144 prompt rows that produced no activation
+row**. The two numbers come from independent sources — one counted off the
+safetensors on disk, one read off `/metrics` — and they agree exactly. The
+expectation was *derived* from vLLM's block arithmetic before the run
+(`((165−1)//16)−1 = 9` hittable blocks × 16 = 144) and is asserted as an
+equality, not as `> 0`, so a change to the block size, to eagle's
+last-matched-block drop, or to the last-token recompute cap fails the test
+rather than silently moving the goalposts.
+
+**What changed since the withdrawal.** Three things, in order:
+
+1. The hardcoded literals were removed and every field made measured — the
+   retirement had rested on `{"cache_hit": true, "rows_missing": 0}` written by a
+   test with no `assert`.
+2. The prompt was lengthened from 18 to ~165 tokens, because at 18 tokens zero
+   hits is the *correct* engine result (the arithmetic below) and the hazard is
+   not representable at all.
+3. The expected hit size was derived from source and asserted exactly.
+
+So the hazard is no longer resting on hardcoded literals *or* on inference from
+an absence claim: a cache hit demonstrably drops rows, in the predicted amount.
+
+**One correction to the artifact.** Job 369256's `prefix_cache_result.json`
+reports `rows_missing: 96`, computed as `prompt_token_count −
+captured_rows_per_layer` = 165 − 69. That is wrong by 48: the warm capture's 69
+rows are 21 prompt rows plus 48 *decode* rows, so the subtraction credited
+decode rows as present prompt rows. The true figure is 144. No verdict moved —
+the assertion was `> 0`, and the exact `hit_tokens` equality carried the proof —
+but **do not quote 96**. The field is now named `prompt_rows_missing`, is
+measured cold-minus-warm, and is asserted equal to the engine's hit-token count.
+
+---
+
+*History, retained because the retirement was cited elsewhere:*
 
 This hazard was previously recorded in this document as **retired empirically**,
 on the strength of `{"cache_hit": true, "rows_missing": 0}` in
@@ -524,13 +573,12 @@ Chunked prefill is not implicated: `get_computed_blocks` runs before any
 chunking and reads the full `request.block_hashes`
 (`V/v1/core/sched/scheduler.py:478-479`).
 
-**Consequence for the hazard.** 6.1 remains **open and unverified**. Nothing
-about job 369236 argues against it — the experiment simply never reached the
-regime where it applies. The test now uses a ~165-token prompt (10 hashable
-blocks, 9 hittable after the two structural drops) and asserts the hit size
-exactly against the block arithmetic above, so the next run either demonstrates
-the hazard or produces a real negative. Until that run exists, treat 6.1 as
-argued-from-source and unconfirmed.
+**Consequence for the hazard.** Nothing about job 369236 argues against 6.1 —
+the experiment simply never reached the regime where it applies. The test moved
+to a ~165-token prompt (10 hashable blocks, 9 hittable after the two structural
+drops) and asserts the hit size exactly against the block arithmetic above.
+**That run is job 369256 and it demonstrated the hazard**; see the top of this
+subsection. 6.1 is confirmed, not argued-from-source.
 
 **Minimum prompt length, for anyone reproducing this.** With block size 16, hit
 blocks = `(N-1)//16 - 1` under eagle. So `N ≥ 33` for any hit at all, and
@@ -659,14 +707,37 @@ Each captured aux layer must satisfy two checks:
    number of times the residual stream has been materialized in bf16. The
    worst-case linear accumulation is used rather than the `sqrt(k)*u`
    random-walk bound because vLLM's reduction order is not statistically
-   independent of HuggingFace's. For Qwen3-8B this is 2.3 %, 6.3 % and 9.8 % at
-   layers 2/12/21 and 15.6 % at the appended final layer — tighter than the flat
-   10 % at shallow depth, and one to two orders of magnitude below the O(1)
-   error a wrong quantity produces.
+   independent of HuggingFace's. For Qwen3-8B, whose aux layers resolve to
+   `[2, 18, 33]`, this is 2.34 %, 8.59 % and 14.45 %, and 15.63 % at the
+   appended final layer 36 — tighter than the flat 10 % at shallow depth, and
+   one to two orders of magnitude below the O(1) error a wrong quantity
+   produces. (An earlier draft quoted `2/12/21` here; those are gpt-oss-20b's
+   layers, misattributed. `bf16_relative_tolerance` is always called with the
+   resolved layer id, never a positional index, so only the worked example was
+   wrong.)
 2. **Identification.** The claimed reference index must beat both neighbouring
    depths by at least 3x. This is the check a lossless round-trip cannot fake:
    an off-by-one layer or a post-norm substitution moves the argmin, and it does
    not depend on the tolerance in (1) being correctly derived.
+
+**Of the two, (2) is the sharp one and (1) is a ceiling.** Job 369256 measured
+0.511 % / 0.963 % / 1.550 % / 1.772 % against bounds of 2.34 % / 8.59 % /
+14.45 % / 15.63 % — 21.8 % / 11.2 % / 10.7 % / 11.3 % of the budget, so capture
+fidelity could degrade about ninefold and (1) would still pass. The
+discrimination ratios from the same run were 81.46 / 23.14 / 24.03 / 50.02
+against the 3.0 margin. Quote those. The budget fraction is recorded per layer
+in the artifact as `tolerance_budget_used` so the looseness is visible rather
+than implied; the bound is deliberately not tightened to the measurement, which
+would fit it to 18 rows of a single prompt. Layer 36's ratio is one-sided — 36
+is the last layer, so only neighbour 35 exists — and what covers the missing
+side is `final_layer_prenorm_confirmed`, not the ratio.
+
+The errors fit `err(k) ≈ 0.391 % + 0.0363 % · k`. The intercept is within
+rounding of one bf16 unit roundoff (`2^-8 = 0.390625 %`), i.e. the
+depth-independent cost of materializing the stream in bf16 at all; the slope is
+~10.8× shallower than the bound's `u` per layer, because the bound assumes
+perfectly correlated per-layer roundoff and real rounding partially cancels.
+That is an explanation of the slack, not a proposed replacement for the bound.
 
 The layer-index mapping is proved, not assumed. vLLM calls
 `_maybe_add_hidden_state([], 0, ...)` with `residual is None` before the decoder
@@ -715,7 +786,22 @@ unchanged.
 The Leg 1 verdict is driven by the *aggregate* relative error
 (`mean_rel_error = mean|cap-off| / mean|off|`, tolerance 0.10) together with the
 shape check and the pre-norm check; cosine similarity is the corroborating
-signal. The 0.10 bound is retained deliberately even though 0.0 is what the
+signal.
+
+**Cosine had a ~2e-5 noise floor and must not be read as precise.** Job 369256's
+Leg 1 reported cosines of 1.0000027857, 1.0000187356 and 1.0000228824 on tensors
+for which `torch.equal` was `True` and every abs/rel error was exactly `0.0`. A
+cosine above 1.0 is arithmetically impossible for real vectors: the dot product
+and the two norms are three separate reductions with three different summation
+orders, and a float32 accumulator over a residual stream (~5e4 elements whose
+magnitudes reach 2e4) leaves an O(1e-5) residue. The metric now accumulates in
+float64 and is clamped to `[-1, 1]`, so a bit-identical pair reports exactly
+`1.0`; artifacts written before that carry the floor and their trailing digits
+are noise. Independently of the floor, cosine is a weak statistic here — it is
+dominated by the largest elements and stays above 0.99 for tensors that differ
+by far more than tolerance — so it corroborates and never gates.
+
+The 0.10 bound is retained deliberately even though 0.0 is what the
 transport actually achieves: it is the correct bound if the two transports ever
 stop being bit-identical (an upstream cast, a fused-MoE reduction-order change),
 and tightening it to 0.0 would turn any benign vLLM change into a red test
@@ -862,7 +948,7 @@ assert `len(loss_mask) == captured_row_count` per row before training starts.
 
 | # | Hazard | Severity | Mitigation | Detector |
 | --- | --- | --- | --- | --- |
-| 6.1 | Prefix-cache coverage holes — **open, not retired** (6.1.1) | **High** (data-dependent, biased) | `--no-enable-prefix-caching` or per-request `skip_reading_prefix_cache` | Per-request row count == prompt + generated; fail closed below a floor |
+| 6.1 | Prefix-cache coverage holes — **confirmed empirically**, job 369256: 144 hit tokens, 144 prompt rows lost (6.1.1) | **High** (data-dependent, biased) | `--no-enable-prefix-caching` or per-request `skip_reading_prefix_cache` | Per-request row count == prompt + generated; fail closed below a floor |
 | 6.2 | Pre-norm vs post-norm target | **High** (wrong quantity, invisible) | Collect the final layer as a 4th aux layer; slice it before drafter `fc` (localized model-runner patch) — does NOT change drafter architecture | Offline-vs-serving elementwise equivalence test |
 | 6.3 | Rejected draft rows | Medium | Filter by `num_rejected_tokens`; handle async deferral | Captured rows == served tokens, per request, exact |
 | 6.4 | Prefill/decode numerics | Medium (pre-existing) | Measure first; `VLLM_BATCH_INVARIANT=1` if warranted | Equivalence harness across batch sizes; publish the spread |
@@ -1030,12 +1116,57 @@ the first version of this document got it wrong, so it is stated explicitly.
 | --- | --- | --- |
 | Can a mechanism reach `aux_hidden_states` in a serving engine? | The capture running at all | **Yes** — `worker_extension_cls` + `_model_forward` monkeypatch (5.2) |
 | Does the capture survive transport to disk intact — right rows, right layers, right order, no truncation? | Leg 1 (capture vs. offline) | **Yes** — job 369229, `max_abs_diff = 0.0` on all three layers. Note the two sides run *different model runners* (capture on V2, offline extraction falls back to V1 for `extract_hidden_states`), which makes the bit-identity a slightly stronger transport result than "same tensor twice" — but still says nothing about identity (see 6.2). |
-| Are the captured values the **same quantity** the trainer expects (pre-norm, layer `k`, not `k±1`)? | Leg 2 (capture vs. HF fp32) | **Not settled by Leg 1.** Leg 1 is a transport check between two views of one tensor (see 6.2); a `0.0` there is expected and carries no information about identity. Leg 2 exists to answer this and its verdict gates the test. |
-| Does a prefix-cache hit genuinely drop rows (6.1)? | `test_prefix_cache_coverage` | **Still open — and the earlier "retired" verdict was withdrawn.** Until 2026-08-01 that test contained no `assert` and wrote `cache_hit: true` / `rows_missing: 0` as hardcoded literals; the retirement of 6.1 rested on those fabricated values. The test now reads `vllm:prefix_cache_hits_total` off the engine, but its first real run (job 369236) measured **zero hits** — correctly, because an 18-token prompt cannot fill a hittable block under eagle3 (see 6.1.1). The prompt has been lengthened to ~165 tokens; the hazard has **not** been demonstrated yet. |
+| Are the captured values the **same quantity** the trainer expects (pre-norm, layer `k`, not `k±1`)? | Leg 2 (capture vs. HF fp32) | **Met — job 369256**, the first run in which the reference leg actually executed. The fp32 reference ran on `cuda`; every claimed layer was the **strict argmin** over `{k−1, k, k+1}`, beating its nearest neighbour by 81.46× / 23.14× / 24.03× / 50.02× at layers 2 / 18 / 33 / 36 against a 3.0× required margin. Per-layer `mean_rel_error` 0.511 % / 0.963 % / 1.550 % / 1.772 %, all inside the derived 2.34 % / 8.59 % / 14.45 % / 15.63 %. Note Leg 1 still says nothing here: a `0.0` there is expected and carries no information about identity. See the limitations below before quoting this. |
+| Does a prefix-cache hit genuinely drop rows (6.1)? | `test_prefix_cache_coverage` | **Demonstrated — job 369256.** `vllm:prefix_cache_hits_total` 0 → 144 on the repeat, captured rows/layer 213 cold → 69 warm, difference exactly 144, matching a hit count *derived* from vLLM's block arithmetic and asserted as an equality. This no longer rests on hardcoded literals (the earlier `cache_hit: true` / `rows_missing: 0` retirement was withdrawn as fabricated) nor on the null first run (job 369236, zero hits — correct, an 18-token prompt cannot fill a hittable block under eagle3, see 6.1.1). The artifact's own `rows_missing: 96` is wrong by 48 and is superseded by `prompt_rows_missing: 144`. |
 | What is the real serving latency cost of capture? | p50/p99 with capture on vs. off | **Still open.** Not measured. |
 
 Do not cite "Stage 0 passed" as settling the correctness question. Cite which
 leg, and what that leg can see.
+
+**Limitations of job 369256 — read these before quoting the numbers above.**
+This is **one model, one prompt, 18 prompt rows**. Specifically:
+
+- **Sample size.** The identity leg compared 18 rows of a single prompt on a
+  single verifier/drafter pair. It is a strong result on that sample and says
+  nothing about prompt-length, batch-composition or model dependence.
+- **Layer 36's discrimination is one-sided.** 36 is the last decoder layer, so
+  the only neighbour available to beat is 35 — there is no `k+1` side. Its
+  50.02× ratio is therefore a weaker structural claim than layer 18's, which was
+  bracketed on both sides. What covers the missing side is a *different* check:
+  `final_layer_prenorm_confirmed`, which shows the post-norm tensor differs from
+  the captured pre-norm one by far more than tolerance.
+- **The tolerance gate is ~9× loose.** The derived bound is a worst case that
+  assumes every per-layer bf16 rounding aligns. The measurements used 21.8 % /
+  11.2 % / 10.7 % / 11.3 % of their budget, so capture fidelity could degrade
+  roughly ninefold and `within_tolerance` would still read `true`. It is a
+  sanity floor. **The discrimination ratio is the sharp instrument** — that is
+  the number to cite. The bound is deliberately *not* tightened to the measured
+  values: fitting it to 18 rows of one prompt would flake on any other model,
+  prompt or vLLM build. The slack is instead recorded per layer as
+  `tolerance_budget_used`.
+- **Cosine similarity carries a noise floor.** Job 369256's transport leg
+  reported cosines of 1.0000027857 / 1.0000187356 / 1.0000228824 on tensors that
+  were bitwise identical — arithmetically impossible, and a ~2e-5 float32
+  accumulator artefact. The metric now accumulates in float64 and is clamped to
+  `[-1, 1]`, so a bit-identical pair reports exactly `1.0`; artifacts written
+  before that fix carry the floor. Cosine is corroborating only in either case:
+  it is dominated by the largest elements and stays above 0.99 for tensors that
+  differ by far more than tolerance.
+
+**Error versus depth.** The four measured errors fit
+`err(k) ≈ 0.391 % + 0.0363 % · k` almost exactly. Two things are worth noting,
+and neither is a tuning knob:
+
+- The **intercept, 0.391 %, is one bf16 unit roundoff** (`2^-8 = 0.390625 %`) —
+  the depth-independent floor you would expect from materializing the residual
+  stream in bf16 at all, before any layer-to-layer accumulation.
+- The **measured slope is ~10.8× shallower** than the bound's slope
+  (`u = 0.391 %` per layer). That is the expected sign and roughly the expected
+  size: the bound assumes perfectly correlated per-layer roundoff (worst-case
+  linear accumulation), while real rounding partially cancels. It is an
+  observation about why the gate is loose, **not** a licence to replace the
+  bound with the fit — a fitted slope from one sample would encode this model's
+  kernel selection as if it were a property of bf16.
 
 This single experiment settles the questions that determine whether the rest of
 the plan is worth writing:
@@ -1058,14 +1189,21 @@ the plan is worth writing:
   bf16 tolerance, *and* are the strict nearest match among neighbouring
   residual-stream depths. This criterion was absent from the original plan;
   without it the previous criterion is satisfiable by any wrong quantity that
-  is transported correctly.
+  is transported correctly. **Met — job 369256**, the first run in which the
+  reference leg executed at all. Every layer was the strict argmin over its
+  neighbours by 81.46× / 23.14× / 24.03× / 50.02× against a 3.0× required
+  margin, and every `mean_rel_error` was inside its derived bound. Cite the
+  discrimination ratios rather than `within_tolerance`, and cite the
+  limitations above alongside them: 18 rows, one prompt, one model, and layer
+  36's discrimination is one-sided.
 - A cache-hit prompt demonstrably yields fewer captured rows than tokens,
-  confirming 6.1 empirically. **Not met.** Now actually asserted, from the
-  engine's own prefix-cache counters rather than from the fact that the same
-  prompt was sent twice — but the first honest run produced *no cache hit*,
-  because the 18-token prompt was shorter than one hittable block under eagle3
-  (6.1.1). The prompt is now ~165 tokens; this criterion stays open until a run
-  reports a nonzero hit.
+  confirming 6.1 empirically. **Met — job 369256.**
+  `vllm:prefix_cache_hits_total` 0 → 144 on the repeat and 213 → 69 captured
+  rows per layer, a shortfall of exactly the 144 hit tokens, against an
+  expectation derived from vLLM's block arithmetic and asserted as an equality
+  rather than as `> 0`. The shortfall is measured cold-minus-warm; the
+  artifact's `rows_missing: 96` conflated 48 decode rows into a prompt-row count
+  and is superseded by `prompt_rows_missing: 144` (6.1.1).
 - Measured p50 and p99 serving latency with capture on versus off, published.
   **Still outstanding.**
 
@@ -1133,16 +1271,21 @@ changes.
    path (6.2). The question that actually matters — *is the captured tensor the
    quantity the trainer expects* — is answered by the independent HuggingFace
    fp32 leg, not by this comparison. Do not let a `0.0` in `result.json` retire
-   this line item.
-3. **Does the prefix-cache absence inference hold?** **Still open.** Section 6.1
-   is inference from what crosses an API boundary, not from an explicit
-   statement in code. Before 2026-08-01 `test_prefix_cache_coverage` asserted
-   nothing and wrote its "findings" as literals, and 6.1 was retired on those
-   literals — so any citation of it as confirmation was citing a fabricated
-   value. The test now reads `vllm:prefix_cache_hits_total` and asserts the warm
-   request captured strictly fewer rows, but its first honest run (job 369236)
-   got zero hits because the prompt was too short to fill a hittable block under
-   eagle3 (6.1.1). The empirical check is still outstanding.
+   this line item. That leg has now run: job 369256 identified every layer by
+   81.46×/23.14×/24.03×/50.02× over its neighbours (Stage 0 table, and the
+   limitations directly under it).
+3. **Does the prefix-cache absence inference hold?** **Answered — yes,
+   measured.** Section 6.1 was inference from what crosses an API boundary; job
+   369256 replaced it with a measurement: `vllm:prefix_cache_hits_total` 0 → 144
+   and 213 → 69 captured rows per layer, a 144-row shortfall matching a derived
+   expectation exactly (6.1.1). Two earlier states of this line item are
+   superseded but worth remembering: before 2026-08-01 `test_prefix_cache_coverage`
+   asserted nothing and wrote its "findings" as literals, and 6.1 was retired on
+   those literals — any citation of *that* was citing a fabricated value; then
+   the first honest run (job 369236) got zero hits because the prompt was too
+   short to fill a hittable block under eagle3. The confirmation comes from
+   neither of those, but from a run with a prompt long enough for the hazard to
+   be representable and an exact assertion on the hit size.
 4. **What did the 16 aborted cycles actually fail on?** The claim that capture
    would have prevented them is currently unsupported. Read the failure records.
 5. **What is the throughput cost of `VLLM_BATCH_INVARIANT=1` on this stack?**

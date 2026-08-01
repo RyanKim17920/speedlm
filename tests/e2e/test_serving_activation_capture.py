@@ -28,6 +28,18 @@ strict nearest match among its neighbouring residual-stream depths.  See
 proof and the tolerance derivation.  This is the leg that can distinguish
 "pre-norm layer 21" from "post-norm layer 21" or "layer 20".
 
+**Of Leg 2's two checks, the neighbour discrimination is the sharp one.**  The
+derived tolerance is a worst-case ceiling that assumes every per-layer bf16
+rounding aligns, so a passing measurement sits far inside it: job 369256 spent
+21.8 %, 11.2 %, 10.7 % and 11.3 % of the budget at aux layers 2, 18, 33 and 36
+(recorded per layer as ``tolerance_budget_used``), meaning capture fidelity
+could degrade roughly ninefold and ``within_tolerance`` would still say
+``true``.  The discrimination ratios from the same run — 81.46, 23.14, 24.03
+and 50.02 against a 3.0 margin — are what actually pin the identity.  Read
+``identified``, not ``within_tolerance``, as the result.  Note also that layer
+36 is the last layer, so its discrimination is **one-sided**: only neighbour 35
+exists to beat.
+
 Required environment:
 * ``SPEEDLM_E2E_ACTIVATION_CAPTURE=1`` — opt-in GPU gate
 * ``SPEEDLM_E2E_VERIFIER_MODEL`` — HuggingFace model ID or local path
@@ -1303,7 +1315,11 @@ def test_stage0_activation_capture() -> None:
         captured_rows_per_layer=captured_rows,
         captured_layer_count=len(aligned_captured),
         cache_hit=False,
-        rows_missing=prompt_token_count - captured_rows,
+        #: ``captured_rows`` is counted on the *aligned* stack, which has
+        #: already been trimmed to the prompt range, so here — and only here —
+        #: subtracting it from ``prompt_token_count`` really does count prompt
+        #: rows.  The assertion directly above pins it to zero.
+        prompt_rows_missing=prompt_token_count - captured_rows,
     )
 
     result = build_result(
@@ -1365,8 +1381,21 @@ def test_prefix_cache_coverage() -> None:
       request.  Sending the same prompt twice is what *should* cause a hit; it
       is not evidence that one occurred.
     * ``captured_rows_per_layer`` is the per-layer row count, not the old
-      ``rows x layers`` sum, so it is comparable to ``prompt_token_count``.
-    * ``rows_missing`` is the difference between them.
+      ``rows x layers`` sum.
+    * ``prompt_rows_missing`` is the cold row count minus the warm one.
+
+    **Why the missing-row count is not** ``prompt_token_count -
+    captured_rows_per_layer``.  It was, until job 369256 wrote
+    ``rows_missing: 96`` for a 165-token prompt whose warm capture held 69 rows
+    per layer.  Those 69 rows are 21 prompt rows plus 48 decode rows, so the
+    subtraction credited 48 decode rows as prompt rows and understated the loss
+    by exactly that much; the true figure is 144, the cold count (213) minus
+    the warm one (69).  The decode rows cancel in the cold-vs-warm difference
+    because both requests send the same prompt and generate the same
+    continuation, and that premise is not assumed — it is asserted below, by
+    requiring the difference to equal the engine's own hit-token count.  The
+    old field name is gone rather than redefined so nothing downstream can keep
+    quoting the wrong number.
 
     **On the apparent conflict with the main test.**  ``result.json`` from
     ``test_stage0_activation_capture`` reports ``cache_hit: false`` while this
@@ -1481,12 +1510,20 @@ def test_prefix_cache_coverage() -> None:
         expected_hit_tokens = _expected_prefix_cache_hit_tokens(
             prompt_token_count
         )
+        #: Prompt rows the warm request never forwarded, measured against the
+        #: cold request rather than against ``prompt_token_count``.  Both
+        #: captures hold prompt rows *plus* decode rows, so the decode rows
+        #: cancel in the difference and do not cancel in
+        #: ``prompt_token_count - second_rows``.  Job 369256 recorded the
+        #: latter as ``rows_missing: 96`` (165 - 69) when the true figure was
+        #: 144 (213 - 69): 48 decode rows counted as present prompt rows.
+        prompt_rows_missing = first_rows - second_rows
         result = PrefixCacheResult(
             prompt_token_count=prompt_token_count,
             captured_rows_per_layer=second_rows,
             captured_layer_count=len(second_captured),
             cache_hit=cache_hit,
-            rows_missing=prompt_token_count - second_rows,
+            prompt_rows_missing=prompt_rows_missing,
         )
         result_path = artifact_dir / "prefix_cache_result.json"
         # Write before asserting: a failing check must not discard the
@@ -1497,7 +1534,7 @@ def test_prefix_cache_coverage() -> None:
                 "captured_rows_per_layer": result.captured_rows_per_layer,
                 "captured_layer_count": result.captured_layer_count,
                 "cache_hit": result.cache_hit,
-                "rows_missing": result.rows_missing,
+                "prompt_rows_missing": result.prompt_rows_missing,
                 "first_request_prompt_tokens": first_prompt_tokens,
                 "first_request_rows_per_layer": first_rows,
                 "prefix_cache_hits_before": hits_before,
@@ -1566,10 +1603,28 @@ def test_prefix_cache_coverage() -> None:
             f"capture is picking up rows the forward did not produce.  Result "
             f"at {result_path}"
         )
-        assert result.rows_missing > 0, (
-            f"captured {second_rows} rows for a {prompt_token_count}-token "
-            f"prompt on a cache hit, i.e. nothing is missing -- which "
+        assert result.prompt_rows_missing > 0, (
+            f"the warm request captured {second_rows} rows per layer against "
+            f"{first_rows} cold, i.e. no prompt row is missing -- which "
             f"contradicts the measured cache hit.  Result at {result_path}"
+        )
+        #: The sharp form of the assertion above, and the reason
+        #: ``prompt_rows_missing`` is measured cold-vs-warm at all: every prompt
+        #: row the engine skipped is a row it reported as a prefix-cache hit,
+        #: so the two independently-sourced numbers -- one counted off the
+        #: safetensors, one read off ``/metrics`` -- must agree exactly.  If
+        #: they diverge, either the capture is emitting rows the forward did
+        #: not produce, or the two requests generated different numbers of
+        #: decode rows and the cold-vs-warm difference is no longer a pure
+        #: prompt-row count.
+        assert result.prompt_rows_missing == hit_tokens, (
+            f"{result.prompt_rows_missing} prompt rows went missing "
+            f"({first_rows} cold - {second_rows} warm) but the engine reported "
+            f"{hit_tokens} prefix-cache hit tokens; every skipped prompt row "
+            f"must be a cache hit and vice versa.  Either the capture is "
+            f"emitting rows the forward did not produce, or the two requests "
+            f"did not generate the same number of decode rows.  Result at "
+            f"{result_path}"
         )
 
     finally:

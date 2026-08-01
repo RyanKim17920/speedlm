@@ -32,6 +32,7 @@ from speedlm.activation_capture.hf_reference import (
     _derive_reference_verdict,
     bf16_relative_tolerance,
     compare_to_hf_reference,
+    cosine_similarity,
     select_reference_device,
 )
 
@@ -458,3 +459,111 @@ class TestComparisonResultIntegration:
         assert payload["hf_reference"]["device"] == "cuda"
         assert payload["hf_reference"]["discrimination_margin"] == DISCRIMINATION_MARGIN
         assert payload["hf_reference"]["layers"][0]["aux_layer_idx"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Tolerance budget (no torch)
+# ---------------------------------------------------------------------------
+
+
+class TestToleranceBudgetUsed:
+    """The tolerance gate is a ceiling; the budget field is what says so."""
+
+    def test_budget_is_error_over_tolerance(self) -> None:
+        layer = _layer(2)
+        assert layer.tolerance_budget_used == pytest.approx(
+            layer.mean_rel_error / layer.tolerance, rel=1e-9
+        )
+
+    def test_a_passing_layer_can_use_a_small_fraction_of_the_budget(self) -> None:
+        """A pass is not a tight result — this is the whole point of the field.
+
+        Job 369256's aux layer 2 measured 0.00511 against a derived 0.0234.
+        """
+        layer = HFReferenceLayer(
+            aux_layer_idx=2,
+            reference_index=2,
+            rows=18,
+            mean_rel_error=0.00511,
+            cosine_similarity=0.9999,
+            tolerance=bf16_relative_tolerance(2),
+            within_tolerance=True,
+            neighbour_rel_errors={"1": 0.416, "2": 0.00511, "3": 0.416},
+            best_match_index=2,
+            discrimination_ratio=81.46,
+            identified=True,
+        )
+        assert layer.within_tolerance
+        assert layer.tolerance_budget_used == pytest.approx(0.218, abs=0.01)
+
+    def test_budget_is_serialized(self) -> None:
+        result = HFReferenceResult(
+            device="cpu",
+            dtype="torch.float32",
+            prompt_token_count=8,
+            layers=[_layer(2)],
+            final_layer_idx=None,
+            final_layer_prenorm_confirmed=None,
+            verdict="PASS",
+        )
+        payload = json.loads(json.dumps(result.to_dict()))
+        assert payload["layers"][0]["tolerance_budget_used"] == pytest.approx(
+            _layer(2).tolerance_budget_used, rel=1e-9
+        )
+
+
+# ---------------------------------------------------------------------------
+# Cosine similarity accumulator (needs torch)
+# ---------------------------------------------------------------------------
+
+
+@requires_torch
+class TestCosineSimilarity:
+    """Regression tests for the >1.0 cosines job 369256 wrote to disk.
+
+    The transport leg compares two views of ONE tensor, so its inputs are
+    bit-identical and the only correct cosine is exactly 1.0.  A float32
+    accumulator returned 1.0000027857 / 1.0000187356 / 1.0000228824 instead.
+    """
+
+    def _residual_like(self, rows: int) -> torch.Tensor:
+        #: Shaped and scaled like a real residual stream: bf16 storage, a few
+        #: thousand hidden units, and a magnitude range wide enough that the
+        #: squares overflow float32's useful precision when summed.
+        generator = torch.Generator().manual_seed(0)
+        t = torch.randn(rows, 2880, generator=generator) * 20.0
+        t[0, 0] = 2.0e4
+        return t.bfloat16()
+
+    @pytest.mark.parametrize("rows", [18, 165, 213])
+    def test_bitwise_identical_is_exactly_one(self, rows: int) -> None:
+        t = self._residual_like(rows)
+        other = t.clone()
+        assert torch.equal(t, other)
+        assert cosine_similarity(t, other) == 1.0
+
+    def test_never_exceeds_one(self) -> None:
+        """The clamp makes an impossible value unrepresentable, not just rare."""
+        t = self._residual_like(213)
+        assert cosine_similarity(t, t.clone()) <= 1.0
+
+    def test_anti_parallel_is_exactly_minus_one(self) -> None:
+        t = self._residual_like(18)
+        assert cosine_similarity(t, -t) == -1.0
+
+    def test_orthogonal_is_zero(self) -> None:
+        a = torch.tensor([[1.0, 0.0]])
+        b = torch.tensor([[0.0, 1.0]])
+        assert cosine_similarity(a, b) == pytest.approx(0.0, abs=1e-12)
+
+    def test_zero_reference_does_not_divide_by_zero(self) -> None:
+        a = torch.ones(4, 8)
+        b = torch.zeros(4, 8)
+        assert cosine_similarity(a, b) == pytest.approx(0.0, abs=1e-9)
+
+    def test_a_real_difference_still_shows(self) -> None:
+        """The clamp must not flatten a genuine mismatch to 1.0."""
+        a = self._residual_like(18)
+        b = a.float().clone()
+        b[:, :1440] *= -1.0
+        assert cosine_similarity(a, b) < 0.9

@@ -91,7 +91,10 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from speedlm.activation_capture.hf_reference import HFReferenceResult
+from speedlm.activation_capture.hf_reference import (
+    HFReferenceResult,
+    cosine_similarity,
+)
 
 if TYPE_CHECKING:
     # Only executed by static type checkers. mypy has per-module overrides for
@@ -177,7 +180,13 @@ class LayerComparison:
     #: p99 of the same floored elementwise ratio; robust companion to
     #: ``max_rel_error``, which is a single extreme order statistic.
     p99_rel_error: float | None = None
-    cosine_similarity: float | None = None   # cosine(captured, offline)
+    #: cosine(captured, offline), from
+    #: :func:`speedlm.activation_capture.hf_reference.cosine_similarity`:
+    #: accumulated in float64 and clamped to ``[-1, 1]``, so a bit-identical
+    #: pair reports exactly ``1.0``.  Corroborating only -- it never gates the
+    #: verdict, and it stays above 0.99 for tensors that differ by far more
+    #: than tolerance.
+    cosine_similarity: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -197,14 +206,29 @@ class PrefixCacheResult:
 
     The row count is **per layer**, not summed over layers.  The old
     ``captured_row_count`` summed ``rows x layers``, which is not comparable to
-    ``prompt_token_count`` and made ``rows_missing`` meaningless; the field was
-    renamed rather than redefined so no stale caller keeps the old meaning.
+    ``prompt_token_count`` and made the missing-row count meaningless; the
+    field was renamed rather than redefined so no stale caller keeps the old
+    meaning.
+
+    ``rows_missing`` was renamed to ``prompt_rows_missing`` for the same reason.
+    It used to be computed as ``prompt_token_count - captured_rows_per_layer``,
+    which is wrong whenever the capture also holds decode rows: job 369256
+    recorded ``rows_missing: 96`` from ``165 - 69`` on a request whose 69
+    captured rows were 21 prompt rows plus 48 decode rows.  The true number of
+    prompt positions that produced no activation row was 144 — the cold row
+    count (213) minus the warm one (69), which is exactly the engine's own
+    prefix-cache hit-token count.  No verdict moved (the sharper
+    ``hit_tokens == expected_hit_tokens`` assertion carried the proof) but the
+    headline number was wrong by 48, so the name no longer survives.
     """
 
     #: The engine's own ``usage.prompt_tokens`` for the request under test.
     prompt_token_count: int
-    #: Rows captured **for a single layer**.  Directly comparable to
-    #: ``prompt_token_count``: one row per forwarded token position.
+    #: Rows captured **for a single layer**.  One row per *forwarded* token
+    #: position, which is the prompt rows the engine actually recomputed plus
+    #: any decode rows the same capture window collected.  It is therefore
+    #: comparable to ``prompt_token_count`` only when the caller has already
+    #: trimmed the stack to the prompt range — do not subtract the two.
     captured_rows_per_layer: int
     #: Number of layers captured.  ``captured_rows_per_layer *
     #: captured_layer_count`` is the total tensor row count.
@@ -213,10 +237,15 @@ class PrefixCacheResult:
     #: read from ``vllm:prefix_cache_hits_total`` on ``/metrics`` — never
     #: inferred from the fact that the same prompt was sent twice.
     cache_hit: bool
-    #: ``prompt_token_count - captured_rows_per_layer``: the prompt positions
-    #: that produced no activation row.  Section 6.1's hazard is real exactly
-    #: when this is positive on a cache hit.
-    rows_missing: int
+    #: Prompt positions that produced no activation row.  Section 6.1's hazard
+    #: is real exactly when this is positive on a cache hit.
+    #:
+    #: **Must be measured against a cold baseline**, as
+    #: ``cold_rows_per_layer - captured_rows_per_layer`` with both requests
+    #: sending the same prompt and generating the same number of decode rows.
+    #: Deriving it from ``prompt_token_count`` instead folds the decode rows
+    #: into a prompt-row count; that is the bug this field is named after.
+    prompt_rows_missing: int
 
 
 # ---------------------------------------------------------------------------
@@ -449,14 +478,13 @@ def compare_layerwise(
             max_rel = float(elem_rel.max())
             p99_rel = _percentile(elem_rel, _REL_ERROR_PERCENTILE)
 
-            # Cosine similarity (scale-invariant, promoted to at least
-            # float32 for precision in the dot product).
-            c_flat = _at_least_float32(c.flatten())
-            o_flat = _at_least_float32(o.flatten())
-            dot = float((c_flat * o_flat).sum())
-            norm_c = float(c_flat.norm())
-            norm_o = float(o_flat.norm())
-            cosine = dot / (norm_c * norm_o + _EPSILON)
+            # Cosine similarity (scale-invariant).  Delegated to
+            # hf_reference so that both legs of Stage 0 report the metric on
+            # identical terms -- float64 accumulation, clamped to [-1, 1].
+            # This module used to inline a float32 version, which returned
+            # values ABOVE 1.0 on bit-identical tensors; see that function's
+            # docstring for the measurement.
+            cosine = cosine_similarity(c, o)
 
             results.append(
                 LayerComparison(

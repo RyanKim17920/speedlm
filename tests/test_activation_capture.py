@@ -664,7 +664,7 @@ class TestBuildResult:
             captured_rows_per_layer=10,
             captured_layer_count=1,
             cache_hit=False,
-            rows_missing=0,
+            prompt_rows_missing=0,
         )
         result = build_result(
             {0: t},
@@ -756,7 +756,7 @@ class TestSerialization:
             captured_rows_per_layer=6,
             captured_layer_count=3,
             cache_hit=True,
-            rows_missing=2,
+            prompt_rows_missing=2,
         )
         result = build_result(
             {0: t},
@@ -769,7 +769,7 @@ class TestSerialization:
         result.write_json(out)
         data = json.loads(out.read_text())
         assert data["prefix_cache_test"]["cache_hit"] is True
-        assert data["prefix_cache_test"]["rows_missing"] == 2
+        assert data["prefix_cache_test"]["prompt_rows_missing"] == 2
 
     def test_write_json_includes_trend(self, tmp_path: Path) -> None:
         t = torch.ones(2, 4)
