@@ -8,6 +8,7 @@ may create children which must be stopped together when serving preempts tuning.
 
 from __future__ import annotations
 
+import contextlib
 import os
 import signal
 import subprocess
@@ -16,12 +17,24 @@ import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import IO, Protocol
+from typing import IO, Final, Protocol
 
 from speedlm.tuner.eagle3 import StageTimeoutError, TrainingError
 from speedlm.tuner.idle import TuningPreempted
 
 AbortCheck = Callable[[], bool]
+
+#: Attribute under which a terminated child's captured streams travel on the
+#: exception that killed it.
+#:
+#: A dedicated attribute rather than a new exception type because the
+#: exceptions in question -- :class:`TuningPreempted`, :class:`StageTimeoutError`,
+#: :class:`~speedlm.tuner.eagle3.ScratchQuotaExceeded`, and whatever the abort
+#: check itself raises -- are raised by four different modules and are matched
+#: by type elsewhere; wrapping them would change control flow, and adding a
+#: ``stderr`` field to each would not cover the ones raised by the standard
+#: library.
+_OUTPUT_ATTRIBUTE: Final = "_speedlm_process_output"
 
 
 @dataclass(frozen=True, slots=True)
@@ -128,8 +141,18 @@ class SubprocessRunner:
         while True:
             try:
                 returncode = self.check_running(handle, should_abort=should_abort)
-            except BaseException:
-                self.terminate(handle, grace_seconds=self.terminate_grace_seconds)
+            except BaseException as error:
+                # terminate() reaps the child and reads its captured streams out
+                # of unnamed temporary files, which are then closed and gone.
+                # Discarding that result threw away the *only* record of what
+                # the child was doing when an abort, a timeout, or a scratch
+                # quota trip killed it.  Carry it on the exception so the
+                # stage's failure path can persist it before it deletes the
+                # stage's output.
+                attach_process_output(
+                    error,
+                    self.terminate(handle, grace_seconds=self.terminate_grace_seconds),
+                )
                 raise
             if returncode is not None:
                 return self._collect(handle, returncode)
@@ -258,6 +281,22 @@ class SubprocessRunner:
         return result
 
 
+def attach_process_output(error: BaseException, result: ProcessResult) -> None:
+    """Record a terminated child's streams on the exception that killed it.
+
+    Best effort: an exception that refuses attribute assignment must not
+    replace the failure it was carrying with an ``AttributeError``.
+    """
+    with contextlib.suppress(AttributeError, TypeError):
+        setattr(error, _OUTPUT_ATTRIBUTE, result)
+
+
+def process_output(error: BaseException) -> ProcessResult | None:
+    """Return the streams :func:`attach_process_output` recorded, if any."""
+    value = getattr(error, _OUTPUT_ATTRIBUTE, None)
+    return value if isinstance(value, ProcessResult) else None
+
+
 def _validated_argv(argv: Sequence[str]) -> tuple[str, ...]:
     command = tuple(argv)
     if not command or any(not isinstance(arg, str) or not arg for arg in command):
@@ -267,6 +306,8 @@ def _validated_argv(argv: Sequence[str]) -> tuple[str, ...]:
 
 __all__ = [
     "ProcessResult",
+    "attach_process_output",
+    "process_output",
     "ProcessRunner",
     "RunningProcess",
     "SubprocessRunner",

@@ -11,6 +11,7 @@ import pytest
 from speedlm.training.backends.eagle3 import (
     DRAFT_COPY_CHUNK_BYTES,
     MAX_SCRATCH_BYTES,
+    STAGE_LOG_DIR_NAME,
     Eagle3Backend,
     EmptySpeculatorsDatasetError,
     FinalAssistantMaskError,
@@ -19,12 +20,16 @@ from speedlm.training.backends.eagle3 import (
     SpeculatorsPipelineConfig,
     TrainingError,
     persist_training_output,
+    preserve_failure_evidence,
 )
 from speedlm.training.backends.speculators_runner import (
     ProcessResult,
     RunningProcess,
+    attach_process_output,
+    process_output,
 )
 from speedlm.training.check_prepared_dataset import _column
+from speedlm.tuner.eagle3 import scratch_usage
 from speedlm.tuner.idle import TuningPreempted
 
 
@@ -963,3 +968,210 @@ def test_materialize_still_enforces_the_scratch_quota_mid_copy(
 
     assert raised.value.used_bytes > DRAFT_COPY_CHUNK_BYTES
     assert not destination.exists()
+
+
+# --- failure evidence ------------------------------------------------------
+
+
+def test_a_failed_extraction_preserves_its_diagnostics_and_deletes_its_output(
+    tmp_path: Path,
+    pipeline: SpeculatorsPipelineConfig,
+) -> None:
+    """The two halves of a failed stage must be treated differently.
+
+    Job 369293 died at extraction with a bare ``FileNotFoundError`` naming a
+    hidden-state shard, and the failure path then removed the whole
+    hidden-states directory -- so the root cause was unrecoverable by
+    construction.  Partial shards still must not survive, because a later
+    stage would read them as a complete extraction; the diagnostics must.
+    """
+    runner = _FakeRunner()
+    backend, work = _backend(tmp_path, pipeline, runner)
+    prepared = backend.prepare(work, should_abort=lambda: False)
+
+    def failing_extraction(argv: tuple[str, ...], _abort: object) -> ProcessResult:
+        _FakeRunner._create_expected_output(argv)
+        output = Path(argv[argv.index("--output") + 1])
+        (output / "hs_1.safetensors").write_bytes(b"partial")
+        return ProcessResult(argv, 3, "generated 1 of 2\n", "row 2: connection reset\n")
+
+    runner.effects.append(failing_extraction)
+
+    with pytest.raises(TrainingError):
+        backend.extract(prepared, work, should_abort=lambda: False)
+
+    # Nothing downstream can mistake a partial extraction for a complete one.
+    assert not (work / "hidden-states").exists()
+
+    stage = work / STAGE_LOG_DIR_NAME / "hidden-state-extraction"
+    assert (stage / "stdout.log").read_text(encoding="utf-8") == "generated 1 of 2\n"
+    assert (stage / "stderr.log").read_text(encoding="utf-8") == (
+        "row 2: connection reset\n"
+    )
+    # The vLLM server's own streams are collected by terminate() and used to
+    # be dropped on the floor with the handle.
+    assert (work / STAGE_LOG_DIR_NAME / "hidden-state-server" / "stderr.log").is_file()
+
+    failure = json.loads((stage / "failure.json").read_text(encoding="utf-8"))
+    assert failure["error_type"] == "TrainingError"
+    inventory = failure["outputs"][0]
+    assert inventory["path"] == str(work / "hidden-states")
+    # The questions a missing shard raises -- how many were produced, under
+    # what names -- are answerable from the record even though the bytes are
+    # gone.
+    assert inventory["entries"] == 2
+    assert sorted(entry["name"] for entry in inventory["sample"]) == [
+        "hs_0.safetensors",
+        "hs_1.safetensors",
+    ]
+
+
+def test_an_aborted_stage_keeps_the_streams_terminate_collected(
+    tmp_path: Path,
+) -> None:
+    """An abort, a timeout, or a quota trip carries no exit status to attach to.
+
+    ``SubprocessRunner.run`` terminates the child and reads its streams out of
+    unnamed temporary files, which are then closed and unrecoverable, so the
+    exception is the only place they can travel.
+    """
+    error = TuningPreempted("incoming request preempted Speculators subprocess")
+    assert process_output(error) is None
+    attach_process_output(
+        error, ProcessResult(("data_generation_offline.py",), -15, "wrote 7\n", "hung\n")
+    )
+
+    directory = preserve_failure_evidence(tmp_path, "hidden-state extraction", error)
+
+    assert directory == tmp_path / STAGE_LOG_DIR_NAME / "hidden-state-extraction"
+    assert directory is not None
+    assert (directory / "stdout.log").read_text(encoding="utf-8") == "wrote 7\n"
+    assert (directory / "stderr.log").read_text(encoding="utf-8") == "hung\n"
+
+
+def test_the_scratch_quota_sweep_records_what_it_is_about_to_delete(
+    tmp_path: Path,
+    pipeline: SpeculatorsPipelineConfig,
+) -> None:
+    """The quota sweep deletes every stage's output, not just the running one."""
+    runner = _FakeRunner()
+    backend, work = _backend(tmp_path, replace(pipeline, scratch_quota_bytes=1), runner)
+
+    with pytest.raises(ScratchQuotaExceeded):
+        backend.prepare(work, should_abort=lambda: False)
+
+    failure = json.loads(
+        (work / STAGE_LOG_DIR_NAME / "scratch-quota" / "failure.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert failure["error_type"] == "ScratchQuotaExceeded"
+    assert {entry["path"] for entry in failure["outputs"]} >= {
+        str(work / "trace-snapshot"),
+        str(work / "hidden-states"),
+    }
+
+
+def test_failure_evidence_is_never_what_fails_a_cycle(tmp_path: Path) -> None:
+    """Recording diagnostics must not replace the failure it documents."""
+    unwritable = tmp_path / "read-only"
+    unwritable.mkdir()
+    unwritable.chmod(0o555)
+    try:
+        assert (
+            preserve_failure_evidence(unwritable, "training", RuntimeError("boom")) is None
+        )
+    finally:
+        unwritable.chmod(0o755)
+
+
+def test_scratch_usage_tolerates_a_shard_renamed_out_from_under_the_walk(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """This walk is the abort check, and it runs while a subprocess writes.
+
+    Extraction writes each shard as ``cmpl-<request id>-<n>-<hash>.safetensors``
+    and immediately renames it to ``hs_<index>.safetensors``, so a path
+    enumerated by ``rglob`` can be gone before it is stat'd.  Letting that
+    escape is what killed job 369293.
+    """
+    (tmp_path / "hs_0.safetensors").write_bytes(b"x" * 10)
+    vanishing = tmp_path / "cmpl-a33033131551f544-0-93304dab.safetensors"
+    vanishing.write_bytes(b"y" * 1000)
+    real_stat = Path.stat
+
+    def racing_stat(self: Path, **kwargs: object) -> object:
+        if self.name == vanishing.name:
+            raise FileNotFoundError(2, "No such file or directory", str(self))
+        return real_stat(self, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(Path, "stat", racing_stat)
+
+    assert scratch_usage(tmp_path) == 10
+
+
+# --- verifier pin provenance ----------------------------------------------
+
+
+def _pinned(pipeline: SpeculatorsPipelineConfig) -> SpeculatorsPipelineConfig:
+    return replace(
+        pipeline,
+        verifier_model="openai/gpt-oss-20b",
+        verifier_revision="6cee5e81ee83917806bbde320786a8fb61efebee",
+    )
+
+
+def test_a_dropped_verifier_pin_is_recorded_rather_than_asserted(
+    tmp_path: Path,
+    pipeline: SpeculatorsPipelineConfig,
+) -> None:
+    """Falling back unpinned must not leave the manifest claiming the pin held.
+
+    The cycle is allowed to continue -- a pin is provenance, not a gate -- but
+    the recorded revision then does not describe the weights that ran, and
+    nothing downstream could tell that apart from a pin that was honoured.
+    """
+    runner = _FakeRunner()
+    backend, work = _backend(tmp_path, _pinned(pipeline), runner)
+    runner.effects.append(
+        lambda argv, _abort: ProcessResult(argv, 0, "SPEEDLM_UNRESOLVED\n", "")
+    )
+
+    backend.prepare(work, should_abort=lambda: False)
+
+    params = backend.describe().training_params
+    assert params["verifier_revision"] is None
+    assert params["verifier_revision_satisfied"] is False
+    assert params["verifier_revision_requested"] == (
+        "6cee5e81ee83917806bbde320786a8fb61efebee"
+    )
+
+    # Durable too: the warning used to live only in the gateway log, which is
+    # not retained with the cycle's artifacts.
+    recorded = json.loads(
+        (work / STAGE_LOG_DIR_NAME / "provenance" / "verifier.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert recorded["verifier_revision_satisfied"] is False
+    assert recorded["verifier_model"] == "openai/gpt-oss-20b"
+
+
+def test_a_satisfied_verifier_pin_still_reaches_the_manifest(
+    tmp_path: Path,
+    pipeline: SpeculatorsPipelineConfig,
+) -> None:
+    runner = _FakeRunner()
+    pinned = _pinned(pipeline)
+    backend, work = _backend(tmp_path, pinned, runner)
+    runner.effects.append(
+        lambda argv, _abort: ProcessResult(argv, 0, "/cache/snapshots/6cee5e81\n", "")
+    )
+
+    backend.prepare(work, should_abort=lambda: False)
+
+    params = backend.describe().training_params
+    assert params["verifier_revision"] == pinned.verifier_revision
+    assert "verifier_revision_requested" not in params
+    assert not (work / STAGE_LOG_DIR_NAME / "provenance").exists()

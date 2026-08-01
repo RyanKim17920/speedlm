@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -22,11 +23,13 @@ from speedlm.training.backends.speculators_runner import (
     ProcessRunner,
     RunningProcess,
     SubprocessRunner,
+    process_output,
 )
 from speedlm.training.masking import FinalAssistantMaskError, MaskPolicy
 from speedlm.tuner.eagle3 import (
     MAX_SCRATCH_BYTES,
     AbortCheck,
+    BackendInfo,
     DraftMaterializer,
     DraftValidator,
     Eagle3Adapter,
@@ -54,6 +57,25 @@ logger = logging.getLogger(__name__)
 #: run cannot fill the scratch quota with its own diagnostics.
 MAX_TRAINING_LOG_BYTES = 2 * 1024 * 1024
 
+#: Directory beneath a cycle's scratch that holds per-stage diagnostics.
+#:
+#: Deliberately a *sibling* of every stage's output directory and never a
+#: child of one.  The failure paths below destroy the stage's output, and a
+#: log written inside that output is destroyed with it -- which is exactly how
+#: the one artifact that would have explained a missing hidden-state shard was
+#: deleted by the error path that was cleaning up after it.  It is also absent
+#: from :data:`_TRANSIENT_NAMES`, so the scratch-quota sweep leaves it alone.
+STAGE_LOG_DIR_NAME: Final = "stage-logs"
+
+#: Output entries named individually in a failed stage's inventory.
+#:
+#: The inventory answers "what did this stage actually produce" -- a count, a
+#: total size, and enough names to see an off-by-one or a naming mismatch --
+#: without retaining gigabytes of unusable shards.  Sixty-four names is enough
+#: to recognise a pattern at both ends of a sorted listing and small enough
+#: that the record stays readable.
+MAX_INVENTORY_ENTRIES: Final = 64
+
 #: Bytes moved between two checkpoints while copying one materialized draft file.
 #:
 #: The unit here is not the read size, it is how often the copy stops to check
@@ -78,6 +100,22 @@ DEFAULT_SPECULATORS_PYTHON = Path(
     os.environ.get("SPEEDLM_TRAINING_PYTHON", sys.executable)
 )
 _SPECULATORS_DATA_NAME = "speculators-conversations.jsonl"
+
+#: Stage outputs a scratch-quota trip removes, and that a failure inventories.
+_TRANSIENT_NAMES: Final = (
+    "trace-snapshot",
+    _SPECULATORS_DATA_NAME,
+    "training-rows",
+    "hidden-states",
+    "speculators-training",
+    "warm-start-pinned",
+)
+#: Stage names used for stage-logs subdirectories.  Named constants because the
+#: same string identifies a stage on its success path and its failure path.
+_EXTRACTION_STAGE: Final = "hidden-state-extraction"
+_ROW_RENDER_STAGE: Final = "training-row-rendering"
+_TRAINING_STAGE: Final = "training"
+_QUOTA_STAGE: Final = "scratch-quota"
 _SPECULATORS_ROLES = {
     "human": "user",
     "user": "user",
@@ -369,6 +407,14 @@ class _State:
     row_count: int | None = None
     verifier: str | None = None
     warm_start: str | None = None
+    #: Whether the configured verifier revision was actually satisfied.
+    #:
+    #: ``None`` until the verifier is resolved, or when no revision was pinned
+    #: at all.  ``False`` records that the pin could not be met and the cycle
+    #: continued unpinned -- the one state the published manifest previously
+    #: could not express, because it copied the *requested* revision whether or
+    #: not resolution had honoured it.
+    verifier_pinned: bool | None = None
 
 
 class _Resolver:
@@ -384,13 +430,19 @@ class _Resolver:
 
     def verifier(self, guard: AbortCheck, scratch: Path) -> str:
         if self.state.verifier is None:
-            self.state.verifier = self._resolve(
+            resolved, pinned = self._resolve(
                 self.config.verifier_model,
                 self.config.verifier_revision,
                 "verifier model resolution",
                 guard,
                 scratch,
             )
+            self.state.verifier = resolved
+            self.state.verifier_pinned = pinned
+            if pinned is False:
+                _record_unpinned_verifier(
+                    scratch, self.config.verifier_model, self.config.verifier_revision
+                )
         return self.state.verifier
 
     def warm_start(self, model: str, guard: AbortCheck, scratch: Path) -> str:
@@ -400,7 +452,7 @@ class _Resolver:
                 if model == self.config.warm_start_model
                 else None
             )
-            self.state.warm_start = self._resolve(
+            self.state.warm_start, _ = self._resolve(
                 model, revision, "warm-start model resolution", guard, scratch
             )
         return self.state.warm_start
@@ -412,9 +464,15 @@ class _Resolver:
         stage: str,
         guard: AbortCheck,
         scratch: Path,
-    ) -> str:
+    ) -> tuple[str, bool | None]:
+        """Resolve *model*, reporting whether its configured pin was honoured.
+
+        The second element is ``None`` when no pin applied -- either none was
+        configured, or *model* is already a concrete on-disk path, which names
+        exact weights and leaves nothing for a revision to pin down.
+        """
         if revision is None or Path(model).exists():
-            return model
+            return model, None
         result = self.runner.run(
             [
                 str(self.config.training_python),
@@ -449,8 +507,8 @@ class _Resolver:
                 revision,
                 model,
             )
-            return model
-        return resolved
+            return model, False
+        return resolved, True
 
 
 class FilesystemTraceSnapshotLeaser:
@@ -491,7 +549,10 @@ class FilesystemTraceSnapshotLeaser:
             _abort(guard, "trace snapshot lease")
             target.chmod(0o444)
             return TraceSnapshot(target, digest.hexdigest())
-        except BaseException:
+        except BaseException as error:
+            preserve_failure_evidence(
+                destination.parent, "trace-snapshot-lease", error, outputs=(destination,)
+            )
             _remove(destination)
             raise
 
@@ -564,6 +625,7 @@ class SpeculatorsTrainingRowRenderer:
                 timeout_seconds=timeout_seconds,
                 should_abort=guard,
             )
+            persist_stage_output(scratch, _ROW_RENDER_STAGE, prepare)
             _success("Speculators prepare", prepare)
             checked = self.runner.run(
                 [
@@ -587,7 +649,10 @@ class SpeculatorsTrainingRowRenderer:
             self.state.prepared = destination
             self.state.row_count = row_count
             return destination
-        except BaseException:
+        except BaseException as error:
+            preserve_failure_evidence(
+                scratch, _ROW_RENDER_STAGE, error, outputs=(destination, data)
+            )
             _remove(destination)
             _remove(data)
             raise
@@ -747,17 +812,32 @@ class SpeculatorsHiddenStateExtractor:
                 timeout_seconds=remaining,
                 should_abort=guard,
             )
+            # Persisted before the status check so a *failed* generation leaves
+            # the same evidence a successful one does.
+            persist_stage_output(scratch, _EXTRACTION_STAGE, generated)
             _success("offline hidden-state generation", generated)
             _check_hidden_state_layers(destination, len(layers), generated)
             return destination
-        except BaseException:
+        except BaseException as error:
+            # Order matters: the inventory of what extraction produced has to
+            # be taken while the shards are still there.
+            preserve_failure_evidence(
+                scratch, _EXTRACTION_STAGE, error, outputs=(destination,)
+            )
             _remove(destination)
             raise
         finally:
             if server is not None:
-                self.runner.terminate(
-                    server,
-                    grace_seconds=self.config.server_shutdown_timeout_seconds,
+                # The vLLM launcher's own output lives in this ProcessResult and
+                # nowhere else; dropping it left the extraction server's side of
+                # every failure unexaminable.
+                persist_stage_output(
+                    scratch,
+                    "hidden-state-server",
+                    self.runner.terminate(
+                        server,
+                        grace_seconds=self.config.server_shutdown_timeout_seconds,
+                    ),
                 )
 
 
@@ -866,7 +946,13 @@ class SpeculatorsTrainingProcess:
                 )
             val_loss = _parse_val_loss(checkpoint)
             return TrainingResult(checkpoint, result.returncode, result.stderr, val_loss=val_loss)
-        except BaseException:
+        except BaseException as error:
+            preserve_failure_evidence(
+                scratch,
+                _TRAINING_STAGE,
+                error,
+                outputs=(destination, scratch / "warm-start-pinned"),
+            )
             _remove(destination)
             _remove(scratch / "warm-start-pinned")
             raise
@@ -922,7 +1008,13 @@ class SpeculatorsDraftMaterializer:
             _abort(guard, "draft materialization")
             _cleanup_transients(destination.parent)
             return destination
-        except BaseException:
+        except BaseException as error:
+            preserve_failure_evidence(
+                destination.parent,
+                "draft-materialization",
+                error,
+                outputs=(destination,),
+            )
             _writable(destination)
             _remove(destination)
             raise
@@ -973,6 +1065,44 @@ class SpeculatorsDraftValidator:
 class Eagle3Backend(Eagle3Adapter):
     """Canonical adapter with a factory for all concrete effects."""
 
+    #: Resolution state shared with the stage components, when built by the
+    #: factory.  ``None`` for an adapter assembled directly in a test.
+    _state: _State | None = None
+
+    def describe(self) -> BackendInfo:
+        """Report the verifier revision that ran, not the one that was asked for.
+
+        The base implementation copies the *configured* pin into the training
+        parameters that become the artifact manifest.  Resolution, though, is
+        allowed to fall back: when the cache cannot satisfy the pin the cycle
+        continues against the bare repo id, because a pin is provenance and
+        must not be able to stop a cycle the unpinned path would have run.
+
+        That fallback is kept.  What is not kept is the manifest asserting a
+        revision the cycle did not verify -- a recorded pin that does not
+        describe the weights that ran is worse than no pin, because nothing
+        downstream can tell the two apart.  So the record is made honest
+        instead of the failure made fatal: ``verifier_revision`` goes null
+        exactly when the cycle could not be pinned, which the base docstring
+        already defines as "ran unpinned", and the request that could not be
+        met is preserved beside it so the drop is visible rather than merely
+        absent.  ``describe`` is read after training, so the resolution this
+        consults is the one the cycle actually used.
+        """
+        info = super().describe()
+        if self._state is None or self._state.verifier_pinned is not False:
+            return info
+        params = dict(info.training_params)
+        params["verifier_revision"] = None
+        params["verifier_revision_requested"] = self.config.verifier_revision
+        params["verifier_revision_satisfied"] = False
+        return BackendInfo(
+            verifier_model=info.verifier_model,
+            draft_model=info.draft_model,
+            from_pretrained=info.from_pretrained,
+            training_params=params,
+        )
+
     @classmethod
     def from_speculators(
         cls,
@@ -1007,7 +1137,7 @@ class Eagle3Backend(Eagle3Adapter):
             timeouts=pipeline.timeouts,
             scratch_quota_bytes=pipeline.scratch_quota_bytes,
         )
-        return cls(
+        backend = cls(
             config,
             leaser=(
                 trace_leaser
@@ -1038,11 +1168,19 @@ class Eagle3Backend(Eagle3Adapter):
             validator=SpeculatorsDraftValidator(pipeline, process_runner, resolver),
             clock=clock,
         )
+        backend._state = state
+        return backend
 
     def _check(self, work_dir: Path, should_abort: AbortCheck) -> None:
         try:
             super()._check(work_dir, should_abort)
-        except ScratchQuotaExceeded:
+        except ScratchQuotaExceeded as error:
+            preserve_failure_evidence(
+                work_dir,
+                _QUOTA_STAGE,
+                error,
+                outputs=tuple(work_dir / name for name in _TRANSIENT_NAMES),
+            )
             _cleanup_transients(work_dir)
             raise
 
@@ -1225,12 +1363,18 @@ def _pin_warm_start(
         _abort(guard, "warm-start pinning")
         return str(destination)
     except (KeyError, TypeError, json.JSONDecodeError) as error:
+        preserve_failure_evidence(
+            destination.parent, "warm-start-pinning", error, outputs=(destination,)
+        )
         _remove(destination)
         raise TrainingError(
             f"warm-start config is not a Speculators draft: {config_path}",
             stderr=str(error),
         ) from error
-    except BaseException:
+    except BaseException as error:
+        preserve_failure_evidence(
+            destination.parent, "warm-start-pinning", error, outputs=(destination,)
+        )
         _remove(destination)
         raise
 
@@ -1257,17 +1401,174 @@ def persist_training_output(
     Persisting is best effort and returns ``None`` on failure: losing
     diagnostics must never be what fails a cycle that otherwise succeeded.
     """
-    directory = run_dir / "training-logs"
+    return _persist_streams(run_dir / "training-logs", result, max_bytes=max_bytes)
+
+
+def persist_stage_output(
+    run_dir: Path,
+    stage: str,
+    result: ProcessResult,
+    *,
+    max_bytes: int = MAX_TRAINING_LOG_BYTES,
+) -> Path | None:
+    """Write one stage's subprocess streams under ``<run_dir>/stage-logs/<stage>``.
+
+    Training was the only stage that kept its subprocess output.  Every other
+    stage surfaced it solely by attaching stderr to an exception, so a stage
+    that failed for a reason *other* than a non-zero exit -- an abort, a
+    timeout, a quota trip, or an error raised in this process while the child
+    ran -- left no trace of what the child had been doing, and the failure
+    path then deleted the child's output directory as well.
+
+    Persisting is best effort and returns ``None`` on failure: losing
+    diagnostics must never be what fails a cycle.
+    """
+    return _persist_streams(
+        run_dir / STAGE_LOG_DIR_NAME / _slug(stage), result, max_bytes=max_bytes
+    )
+
+
+def preserve_failure_evidence(
+    run_dir: Path,
+    stage: str,
+    error: BaseException,
+    *,
+    outputs: Sequence[Path] = (),
+) -> Path | None:
+    """Record why a stage failed and what it had produced, before that is deleted.
+
+    A stage's cleanup exists so a half-written output cannot be mistaken for a
+    complete one by a later stage, and that requirement is real -- partial
+    hidden states or a partial draft must not survive in consumable form.  But
+    deleting the output also deleted the only evidence of the failure, so the
+    root cause of a failed cycle was unrecoverable by construction.
+
+    The two are separated here rather than traded off.  What survives is the
+    child's streams (if the exception carries them) and an *inventory* of the
+    output: how many entries it held, how many bytes, and up to
+    :data:`MAX_INVENTORY_ENTRIES` names with sizes.  That answers the
+    questions a missing shard raises -- how many shards existed, whether the
+    count was off by one, whether a name did not match -- while the bytes
+    themselves, which are what a downstream stage could consume and what would
+    fill the scratch quota, are still destroyed by the caller.
+
+    Writing evidence must never mask the failure it documents, so every error
+    here is swallowed and reported as ``None``.
+    """
+    directory = run_dir / STAGE_LOG_DIR_NAME / _slug(stage)
+    captured = process_output(error)
+    if captured is not None:
+        _persist_streams(directory, captured)
+    record: dict[str, Any] = {
+        "schema_version": 1,
+        "stage": stage,
+        "recorded_at": time.time(),
+        "error_type": type(error).__name__,
+        "error": str(error),
+        "outputs": [_inventory(path) for path in dict.fromkeys(outputs)],
+    }
     try:
         directory.mkdir(parents=True, exist_ok=True)
+        (directory / "failure.json").write_text(
+            json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+    except (OSError, TypeError, ValueError) as exc:
+        logger.warning("could not preserve failure evidence in %s: %s", directory, exc)
+        return None
+    return directory
+
+
+def _record_unpinned_verifier(
+    run_dir: Path,
+    model: str,
+    revision: str | None,
+) -> Path | None:
+    """Leave a durable record that a cycle ran on an unpinned verifier.
+
+    The warning that used to be the only trace of this lived in the gateway
+    log, which is not part of the cycle's artifacts and is not retained with
+    them.  A cycle that then failed -- as this one did -- left nothing to say
+    the pin had been dropped.  Best effort, like every other diagnostic write.
+    """
+    directory = run_dir / STAGE_LOG_DIR_NAME / "provenance"
+    record = {
+        "schema_version": 1,
+        "recorded_at": time.time(),
+        "verifier_model": model,
+        "verifier_revision_requested": revision,
+        "verifier_revision_satisfied": False,
+    }
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "verifier.json").write_text(
+            json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+    except OSError as exc:
+        logger.warning("could not record verifier provenance in %s: %s", directory, exc)
+        return None
+    return directory
+
+
+def _inventory(path: Path) -> dict[str, Any]:
+    """Summarise what a stage produced at *path* without retaining it.
+
+    Tolerates entries vanishing under the walk for the same reason
+    :func:`~speedlm.tuner.eagle3.scratch_usage` does: the stage's subprocess
+    may still be terminating while this runs.
+    """
+    entry: dict[str, Any] = {"path": str(path), "exists": path.exists()}
+    if not entry["exists"]:
+        return entry
+    if path.is_file():
+        with contextlib.suppress(OSError):
+            entry["bytes"] = path.stat().st_size
+        return entry
+    names: list[dict[str, Any]] = []
+    entries = 0
+    total = 0
+    for child in sorted(path.rglob("*")):
+        try:
+            if not child.is_file():
+                continue
+            size = child.stat().st_size
+        except OSError:
+            continue
+        entries += 1
+        total += size
+        if len(names) < MAX_INVENTORY_ENTRIES:
+            names.append({"name": str(child.relative_to(path)), "bytes": size})
+    entry["entries"] = entries
+    entry["bytes"] = total
+    entry["sample"] = names
+    entry["truncated"] = entries > len(names)
+    return entry
+
+
+def _persist_streams(
+    directory: Path,
+    result: ProcessResult,
+    *,
+    max_bytes: int = MAX_TRAINING_LOG_BYTES,
+) -> Path | None:
+    try:
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "command.txt").write_text(
+            " ".join(result.argv) + "\n", encoding="utf-8"
+        )
         for name, stream in (("stdout", result.stdout), ("stderr", result.stderr)):
             (directory / f"{name}.log").write_text(
                 _bounded(stream or "", max_bytes), encoding="utf-8"
             )
     except OSError as exc:
-        logger.warning("could not persist training output to %s: %s", directory, exc)
+        logger.warning("could not persist subprocess output to %s: %s", directory, exc)
         return None
     return directory
+
+
+def _slug(stage: str) -> str:
+    """Reduce a stage name to a safe single path component."""
+    cleaned = re.sub(r"[^a-z0-9]+", "-", stage.lower()).strip("-")
+    return cleaned or "stage"
 
 
 def _bounded(text: str, max_bytes: int) -> str:
@@ -1298,10 +1599,21 @@ def _guard(
     def check() -> bool:
         used = scratch_usage(scratch)
         if used > quota:
+            # This sweep is the broadest deleter in the pipeline -- it removes
+            # every stage's output, not just the running stage's -- so the
+            # inventory is taken first.  Without it a quota trip erased the
+            # very sizes that would show which stage overran the quota.
+            error = ScratchQuotaExceeded(used, quota)
+            preserve_failure_evidence(
+                scratch,
+                _QUOTA_STAGE,
+                error,
+                outputs=(*cleanup, *(scratch / name for name in _TRANSIENT_NAMES)),
+            )
             for path in cleanup:
                 _remove(path)
             _cleanup_transients(scratch)
-            raise ScratchQuotaExceeded(used, quota)
+            raise error
         return should_abort()
 
     return check
@@ -1404,10 +1716,19 @@ def _remove(path: Path) -> None:
 
 
 def _writable(path: Path) -> None:
+    """Re-open a tree for deletion, tolerating entries that vanish under the walk.
+
+    Same race as :func:`~speedlm.tuner.eagle3.scratch_usage`: this runs on the
+    failure path while the stage's subprocess may still be renaming files out
+    from under it, and an entry that disappeared needs no chmod.  Suppressing
+    the error hides nothing -- if a permission really cannot be relaxed, the
+    ``shutil.rmtree`` this prepares for fails loudly on the same path.
+    """
     if not path.exists():
         return
     for child in path.rglob("*"):
-        child.chmod(0o755 if child.is_dir() else 0o644)
+        with contextlib.suppress(OSError):
+            child.chmod(0o755 if child.is_dir() else 0o644)
     path.chmod(0o755)
 
 
@@ -1437,14 +1758,7 @@ def _parse_val_loss(checkpoint_best: Path) -> float | None:
 
 
 def _cleanup_transients(work_dir: Path) -> None:
-    for name in (
-        "trace-snapshot",
-        _SPECULATORS_DATA_NAME,
-        "training-rows",
-        "hidden-states",
-        "speculators-training",
-        "warm-start-pinned",
-    ):
+    for name in _TRANSIENT_NAMES:
         _remove(work_dir / name)
 
 
@@ -1458,6 +1772,10 @@ def _health(url: str, timeout: float) -> bool:
 
 __all__ = [
     "DEFAULT_SPECULATORS_PYTHON",
+    "MAX_INVENTORY_ENTRIES",
+    "STAGE_LOG_DIR_NAME",
+    "persist_stage_output",
+    "preserve_failure_evidence",
     "DEFAULT_SPECULATORS_REPO",
     "DRAFT_COPY_CHUNK_BYTES",
     "MAX_SCRATCH_BYTES",

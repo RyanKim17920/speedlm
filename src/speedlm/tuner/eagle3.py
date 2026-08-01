@@ -596,15 +596,35 @@ class Eagle3Adapter:
 
 
 def scratch_usage(path: Path) -> int:
-    """Return bytes occupied by regular files beneath *path* without following links."""
+    """Return bytes occupied by regular files beneath *path* without following links.
+
+    Entries that vanish between enumeration and ``stat`` are skipped rather
+    than raised.  This walk runs as the abort check of every EAGLE-3 stage, so
+    it re-walks the scratch tree roughly ten times a second *while a
+    subprocess is writing into it* -- and hidden-state extraction in
+    particular churns that tree hard: the server writes each shard as
+    ``cmpl-<request id>-<n>-<hash>.safetensors`` and the client immediately
+    renames it to ``hs_<index>.safetensors``, so hundreds of paths appear and
+    disappear under the walk.  A path enumerated a moment before the rename is
+    simply gone when it is stat'd.
+
+    Letting that race escape turned an ordinary interleaving into a failed
+    cycle whose ``FileNotFoundError`` named a transient shard, which read like
+    a missing output rather than the measurement artefact it was.  A vanished
+    file occupies no bytes; skipping it is exact, not a weakened check -- a
+    file that is still there is still counted, and the quota still trips.
+    """
     if not path.exists():
         return 0
     total = 0
     for entry in path.rglob("*"):
-        if entry.is_symlink():
-            total += entry.lstat().st_size
-        elif entry.is_file():
-            total += entry.stat().st_size
+        try:
+            if entry.is_symlink():
+                total += entry.lstat().st_size
+            elif entry.is_file():
+                total += entry.stat().st_size
+        except OSError:
+            continue
     return total
 
 

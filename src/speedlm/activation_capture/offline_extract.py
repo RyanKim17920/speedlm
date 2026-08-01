@@ -11,6 +11,7 @@ that run under the vLLM venv.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import subprocess
@@ -92,6 +93,25 @@ def _read_log_tail(log_path: Path, lines: int = 100) -> str:
         return "\n".join(tail)
     except FileNotFoundError:
         return "(log file not found)"
+
+
+def _persist_captured(
+    output_dir: Path,
+    name: str,
+    result: subprocess.CompletedProcess[bytes],
+) -> None:
+    """Write a captured child's streams beside the server log.
+
+    ``capture_output=True`` holds both streams in memory and the callers below
+    surface only stderr, and only on a non-zero exit -- so stdout was always
+    discarded, and a run that failed for any other reason left nothing.  The
+    server leg already keeps a durable log; these two now do too.
+
+    Best effort: losing diagnostics must not be what fails an extraction.
+    """
+    for stream, payload in (("stdout", result.stdout), ("stderr", result.stderr)):
+        with contextlib.suppress(OSError):
+            (output_dir / f"{name}.{stream}.log").write_bytes(payload or b"")
 
 
 def _wait_for_health(
@@ -225,6 +245,7 @@ def extract(
         capture_output=True,
         timeout=extraction_timeout,
     )
+    _persist_captured(output_dir, "offline_prepare", prepare_result)
     if prepare_result.returncode != 0:
         stderr = prepare_result.stderr.decode(errors="replace")
         raise RuntimeError(
@@ -243,6 +264,12 @@ def extract(
 
     # Step 3: launch hidden-state server with output captured to a log file
     server_log = output_dir / "offline_vllm.log"
+    # Opening for write truncates, so the ordinary debug loop -- run it again
+    # and watch -- destroyed the log of the run that actually failed.  Keep the
+    # previous attempt beside the current one; one generation is enough for
+    # "it worked last time" and cannot grow without bound.
+    if server_log.exists():
+        server_log.replace(output_dir / "offline_vllm.previous.log")
     log_handle = server_log.open("wb")
     server = subprocess.Popen(
         [
@@ -301,6 +328,7 @@ def extract(
             capture_output=True,
             timeout=extraction_timeout,
         )
+        _persist_captured(output_dir, "offline_generation", gen_result)
         if gen_result.returncode != 0:
             stderr = gen_result.stderr.decode(errors="replace")
             raise RuntimeError(
@@ -310,13 +338,17 @@ def extract(
         return hs_dir
 
     finally:
-        server.terminate()
         try:
-            server.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            server.kill()
-            server.wait()
-        log_handle.close()
+            server.terminate()
+            try:
+                server.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                server.kill()
+                server.wait()
+        finally:
+            # Nested so a terminate() that raises cannot leave the server log
+            # unflushed -- that log is the only record of the server's side.
+            log_handle.close()
 
 
 def load_hidden_states(
