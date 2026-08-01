@@ -43,9 +43,40 @@ _DEFAULT_SPECULATORS_REPO = Path(
 DEFAULT_GPU_MEMORY_UTILIZATION: float = 0.5
 
 
+#: Environment variables that must NOT leak from the caller into the offline
+#: extraction engine.
+#:
+#: ``VLLM_USE_V2_MODEL_RUNNER`` forces the runner generation
+#: (``vllm/config/vllm.py:519-522`` returns it verbatim before any of vLLM's
+#: own capability checks run).  The serving-time capture e2e sets it to pin
+#: the axis it is testing, and ``_environ`` copies ``os.environ`` wholesale,
+#: so without this filter the setting would follow the caller into the
+#: offline engine too.
+#:
+#: That would be fatal rather than merely wrong.  The offline engine runs the
+#: ``extract_hidden_states`` speculative method, which V2 does not implement.
+#: Left to itself vLLM notices and downgrades, logging "Model Runner V2 does
+#: not yet support speculative method 'extract_hidden_states'; using the V1
+#: model runner instead" (``vllm/config/vllm.py:546-553``).  But that
+#: graceful fallback is only reachable when the env var is *unset*: with it
+#: set to ``1`` the property short-circuits and ``_validate_v2_model_runner``
+#: raises ``ValueError`` instead (``vllm/config/vllm.py:2137-2147``).
+#:
+#: The offline leg is the independent reference the capture is compared
+#: against, so it must run whatever generation vLLM considers correct for
+#: *its own* config -- never whatever the capture leg was pinned to.
+_ISOLATED_ENV_VARS: tuple[str, ...] = ("VLLM_USE_V2_MODEL_RUNNER",)
+
+
 def _environ(speculators_repo: Path) -> dict[str, str]:
-    """Build the environment for Speculators subprocesses."""
+    """Build the environment for Speculators subprocesses.
+
+    Inherits the caller's environment except for :data:`_ISOLATED_ENV_VARS`,
+    which are stripped so the offline engine picks its own model runner.
+    """
     env = dict(os.environ)
+    for name in _ISOLATED_ENV_VARS:
+        env.pop(name, None)
     source = str(speculators_repo / "src")
     previous = env.get("PYTHONPATH")
     env["PYTHONPATH"] = source if not previous else f"{source}{os.pathsep}{previous}"

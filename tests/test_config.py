@@ -587,3 +587,43 @@ def test_restore_fast_path_timeout_is_configurable_and_defaults_unchanged() -> N
         SpeedLMConfig.from_dict(config.to_dict()).tuning
         == config.tuning
     )
+
+
+def test_warmup_repeats_round_trips_through_config() -> None:
+    """The knob that was previously reachable only as a runner constructor default."""
+    config = SpeedLMConfig.from_dict(
+        {"model": "m", "tuning": {"warmup_repeats": 4, "benchmark_repeats": 12}}
+    )
+
+    assert config.tuning.warmup_repeats == 4
+    assert config.tuning.benchmark_repeats == 12
+    assert config.to_dict()["tuning"]["warmup_repeats"] == 4
+    assert config.to_dict()["tuning"]["benchmark_repeats"] == 12
+
+
+def test_warmup_repeats_default_matches_what_production_already_ran() -> None:
+    """Surfacing the knob must not move the measurement it exposes."""
+    assert SpeedLMConfig(model="m").tuning.warmup_repeats == 1
+
+
+def test_warmup_repeats_may_be_disabled_but_not_negative() -> None:
+    assert IdleTuningConfig(warmup_repeats=0).warmup_repeats == 0
+    with pytest.raises(ConfigError, match="tuning.warmup_repeats"):
+        IdleTuningConfig(warmup_repeats=-1)
+
+
+@pytest.mark.parametrize("value", ["x", 1.5, True])
+def test_invalid_warmup_repeats_is_rejected(value: object) -> None:
+    with pytest.raises(ConfigError, match="tuning.warmup_repeats"):
+        IdleTuningConfig(warmup_repeats=value)
+
+
+def test_benchmark_repeats_is_unbounded_above_for_characterisation_runs() -> None:
+    """The diagnostic mode is a config value, not a separate code path.
+
+    Finding where the warming curve flattens needs scored repeats past five,
+    and nothing may cap that: a run configured for twenty is the measurement,
+    and the production default of five is untouched by its existence.
+    """
+    assert IdleTuningConfig(benchmark_repeats=20).benchmark_repeats == 20
+    assert SpeedLMConfig(model="m").tuning.benchmark_repeats == 5

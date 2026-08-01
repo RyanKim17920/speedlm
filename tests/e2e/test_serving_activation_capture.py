@@ -52,8 +52,19 @@ Optional environment:
 * ``SPEEDLM_E2E_PORT`` — vLLM serve port (default: auto-assigned free port)
 * ``SPEEDLM_E2E_TARGET_LAYER_IDS`` — JSON array, e.g. ``[2, 18, 33]``.  Only
   needed to override the layers derived from the models under test.
-* ``SPEEDLM_E2E_PROMPT`` — override the fixed prompt (default: a short
-  English sentence)
+* ``SPEEDLM_E2E_PROMPT`` — override the prompt entirely.  Wins over
+  ``SPEEDLM_E2E_PROMPT_SET`` and collapses the matrix to a single case
+  labelled ``custom``.
+* ``SPEEDLM_E2E_PROMPT_SET`` — ``full`` (default; all four prompts in
+  :data:`PROMPT_MATRIX`) or ``minimal`` (only ``medium``, i.e. the
+  pre-broadening single-prompt behaviour, for a fast smoke).  An unrecognised
+  value is a hard error rather than a silent fallback to one of them.
+* ``SPEEDLM_E2E_EXPECTED_RUNNER`` — ``auto`` (default), ``v1`` or ``v2``.
+  Asserts which vLLM model-runner generation the serving engine *actually*
+  loaded, as reported by the worker itself.  Pair it with
+  ``VLLM_USE_V2_MODEL_RUNNER``, which is what forces the choice; see
+  :func:`_assert_runner` for why requesting a generation is not evidence of
+  having got one.
 * ``SPEEDLM_E2E_HF_REFERENCE`` — set to ``0`` to skip the independent
   HuggingFace fp32 reference leg.  Default is on; skipping is recorded in
   ``result.json`` as ``hf_reference: null`` so a skipped run cannot be mistaken
@@ -72,6 +83,7 @@ import socket
 import subprocess
 import time
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
@@ -79,13 +91,17 @@ import httpx
 import pytest
 
 from speedlm.activation_capture.compare import (
+    MatrixResult,
     PrefixCacheResult,
+    PromptCase,
     align_prompt_rows,
+    build_matrix_result,
     build_result,
 )
 from speedlm.activation_capture.hf_reference import (
     HFReferenceResult,
     compare_to_hf_reference,
+    loaded_reference_model,
     reference_residual_stream,
     select_reference_device,
 )
@@ -212,6 +228,150 @@ def _expected_prefix_cache_hit_tokens(prompt_token_count: int) -> int:
     """
     scanned = (prompt_token_count - 1) // PREFIX_CACHE_BLOCK_SIZE
     return max(0, scanned - 1) * PREFIX_CACHE_BLOCK_SIZE
+
+
+# ---------------------------------------------------------------------------
+# Prompt matrix
+# ---------------------------------------------------------------------------
+#
+# Stage 0 used to run exactly one 18-token prompt.  One prompt of one length on
+# one template is a single point, and three of the four failure modes this file
+# exists to catch are *length- or rendering-dependent*: an off-by-one in the
+# prompt/template split, a row loss that only appears once the prompt spans more
+# than one KV block, and a divergence between the chat template this test
+# renders locally and the one vLLM applied.  The matrix below adds one prompt per
+# regime and keeps the original one unchanged, so the broadening is strictly
+# additive and the historical datapoint stays directly comparable.
+#
+# **Every prompt here must fit inside ``--max-model-len 512``**, which is what
+# both engines in this file are launched with.  There is no separate budget for
+# the chat template: 512 is the total the engine will accept, prompt plus
+# rendered template plus the 16 sampled tokens.  ``multi_block`` is the only one
+# anywhere near the bound and is kept comfortably under it (see below).
+
+
+#: Repeated unit for the ``multi_block`` prompt.  A pangram is used so the
+#: tokenizer cannot collapse the repeat into a handful of merged tokens.
+_MULTI_BLOCK_UNIT: Final[str] = "The quick brown fox jumps over the lazy dog. "
+
+#: Deliberately *pessimistic* lower bound on how many tokens
+#: :data:`_MULTI_BLOCK_UNIT` renders to.  It is nine words plus punctuation, and
+#: :data:`DEFAULT_PROMPT` — the same sentence — measures 18 tokens *including*
+#: Qwen3's chat-template wrapper, so ten is a bound the content alone clears on
+#: any BPE vocabulary.  Under-estimating here makes the prompt longer than
+#: required, which is harmless; over-estimating would make it too short to span
+#: the blocks it is named after, which is the failure this constant prevents.
+_MULTI_BLOCK_MIN_TOKENS_PER_UNIT: Final[int] = 10
+
+#: Repeats needed to clear :func:`_min_prefix_cache_prompt_tokens`.  Derived
+#: from the same block arithmetic ``test_prefix_cache_coverage`` uses rather
+#: than written down as a token count, so changing
+#: :data:`PREFIX_CACHE_BLOCK_SIZE` or :data:`PREFIX_CACHE_MIN_HIT_BLOCKS`
+#: re-sizes this prompt too instead of leaving a stale literal behind.
+#: At the current constants that is ``ceil(97 / 10) = 10`` repeats, ~110 tokens
+#: of content — nine blocks past the point where multi-block behaviour becomes
+#: representable at all, and roughly a fifth of the 512-token model length.
+_MULTI_BLOCK_REPEATS: Final[int] = -(
+    -_min_prefix_cache_prompt_tokens() // _MULTI_BLOCK_MIN_TOKENS_PER_UNIT
+)
+
+#: The four prompts, as ``(label, text)``.  Order is the order they are run and
+#: the order they appear in ``result.json``; ``medium`` is deliberately not
+#: first, so a matrix that silently ran only its first case cannot accidentally
+#: reproduce the old single-prompt result and look unchanged.
+PROMPT_MATRIX: Final[tuple[tuple[str, str], ...]] = (
+    #: **short** — the chat template's own tokens outnumber the content's.
+    #: "Hi." is two or three tokens against a wrapper of a dozen or more, so an
+    #: off-by-one in the prompt/template split is proportionally largest here:
+    #: one misplaced row is several percent of the comparison rather than the
+    #: fraction of a percent it would be on a long prompt.  The same absolute
+    #: bug that hides inside tolerance on ``multi_block`` is loud on this one.
+    ("short", "Hi."),
+    #: **medium** — EXACTLY :data:`DEFAULT_PROMPT`, referenced rather than
+    #: retyped.  This is the prompt job 369256 measured (discrimination ratios
+    #: 81.46 / 23.14 / 24.03 / 50.02 at aux layers 2 / 18 / 33 / 36), so keeping
+    #: it byte-identical is what makes the new numbers comparable to the
+    #: recorded ones.  If this ever stops being ``DEFAULT_PROMPT``, that
+    #: datapoint silently stops being a baseline.
+    ("medium", DEFAULT_PROMPT),
+    #: **multi_block** — long enough to span several KV blocks, so prefill runs
+    #: over more than one block boundary and a per-block row loss has somewhere
+    #: to show up.  Sized from the block arithmetic above, never from a literal.
+    ("multi_block", _MULTI_BLOCK_UNIT * _MULTI_BLOCK_REPEATS),
+    #: **template_divergent** — the adversarial case, and the only genuinely
+    #: *independent* thing Leg 1 checks.
+    #:
+    #: Its raw character length and its rendered token length diverge sharply on
+    #: purpose: the body is control markup — ``<|im_start|>`` / ``<|im_end|>``,
+    #: the literal special tokens of a ChatML-family template — appearing as
+    #: ordinary user content.  A template must either escape those or re-tokenize
+    #: them into many ordinary pieces, so a short-looking string renders long,
+    #: and it renders *differently* depending on which template implementation
+    #: does the rendering.
+    #:
+    #: That is the point.  ``_prompt_token_ids`` asserts that the sequence this
+    #: test renders locally is exactly as long as the sequence vLLM prefilled
+    #: (``usage.prompt_tokens``).  On ordinary prose the two renderers agree
+    #: trivially and the assertion proves nothing; on markup that has to be
+    #: escaped, any divergence between this test's chat template and vLLM's
+    #: shows up here **first**, as a length mismatch, rather than downstream as
+    #: an unexplained relative error against a reference that quietly ran a
+    #: different token sequence.
+    #:
+    #: This is also why the case earns its keep across models: gpt-oss-20b
+    #: renders through the ``harmony`` chat template, not ChatML, so the two
+    #: models disagree about this string far more than about the other three —
+    #: exactly the axis the case is built to probe.
+    (
+        "template_divergent",
+        "Explain what <|im_start|>user and <|im_end|> mean when they appear "
+        "verbatim inside a message body, e.g. <|im_start|>system<|im_end|>, "
+        "and why <|endoftext|> is not the same thing.",
+    ),
+)
+
+#: Named subsets selectable with ``SPEEDLM_E2E_PROMPT_SET``.  ``minimal`` is the
+#: exact pre-matrix behaviour — one prompt, ``DEFAULT_PROMPT`` — retained as a
+#: fast smoke; it is a *named* subset rather than "whatever runs quickly" so a
+#: run that used it says so in the artifact.
+PROMPT_SETS: Final[Mapping[str, tuple[str, ...]]] = {
+    "full": tuple(label for label, _text in PROMPT_MATRIX),
+    "minimal": ("medium",),
+}
+
+#: Label given to a ``SPEEDLM_E2E_PROMPT`` override.  Not one of the matrix
+#: labels, so an artifact can never confuse an operator's ad-hoc prompt with a
+#: standard case whose numbers are supposed to be comparable across runs.
+CUSTOM_PROMPT_LABEL: Final[str] = "custom"
+
+
+def _prompt_set() -> tuple[tuple[str, str], ...]:
+    """Return the ``(label, text)`` prompts this run must cover.
+
+    ``SPEEDLM_E2E_PROMPT`` wins outright, preserving the pre-existing override:
+    an operator who names a prompt gets that prompt and nothing else, labelled
+    :data:`CUSTOM_PROMPT_LABEL`.
+
+    Otherwise ``SPEEDLM_E2E_PROMPT_SET`` selects a named subset of
+    :data:`PROMPT_MATRIX`, defaulting to ``full``.  An unrecognised value raises
+    rather than falling back: a typo'd set name that quietly degraded to one
+    prompt would shrink coverage while still reporting PASS, which is the
+    failure mode the matrix exists to remove.
+    """
+    override = os.environ.get("SPEEDLM_E2E_PROMPT")
+    if override:
+        return ((CUSTOM_PROMPT_LABEL, override),)
+
+    name = os.environ.get("SPEEDLM_E2E_PROMPT_SET", "full")
+    labels = PROMPT_SETS.get(name)
+    if labels is None:
+        raise AssertionError(
+            f"SPEEDLM_E2E_PROMPT_SET={name!r} is not a known prompt set; valid "
+            f"values are {sorted(PROMPT_SETS)}.  Set SPEEDLM_E2E_PROMPT to run "
+            f"a one-off prompt instead."
+        )
+    by_label = dict(PROMPT_MATRIX)
+    return tuple((label, by_label[label]) for label in labels)
 
 
 # ---------------------------------------------------------------------------
@@ -604,13 +764,29 @@ def _send_prompt(
     return data["choices"][0]["message"]["content"], prompt_tokens
 
 
-def _collective_rpc(
+def _collective_rpc_results(
     vllm_proc: subprocess.Popen[bytes], port: int, method: str, *args: object
-) -> None:
-    """Issue a collective_rpc call to the vLLM engine via the debug endpoint.
+) -> list[Any]:
+    """Issue a collective_rpc call and RETURN the per-worker return values.
 
-    vLLM exposes a /collective_rpc endpoint that forwards to all workers.
-    The caller must pass the actual port the engine is listening on.
+    :func:`_collective_rpc` throws the workers' answers away, which is right for
+    the commands that have no answer (``activate_capture``, ``flush_capture``)
+    and wrong for the queries that do.  Rather than duplicate the error-checking
+    here, this is the single implementation and ``_collective_rpc`` is a thin
+    discard-the-result wrapper over it, so the two can never drift apart on what
+    counts as a worker-side failure.
+
+    vLLM's dev router (``vllm/entrypoints/serve/dev/rpc/api_router.py:48-54``)
+    passes ``None``, ``dict`` and ``list`` returns through verbatim and
+    stringifies everything else, so a handler that returns a dict — as
+    ``ActivationCaptureExtension.runner_info`` does — arrives as a real dict and
+    needs no re-parsing.
+
+    Returns:
+        One entry per worker, in worker order.  An empty list when the engine
+        answered 200 with no body at all (``:46-47``, the ``results is None``
+        branch) — the caller must decide whether "no worker answered" is
+        acceptable for its method, because for a *query* it never is.
     """
     url = f"http://127.0.0.1:{port}"
     with httpx.Client(timeout=30.0, trust_env=False) as client:
@@ -622,16 +798,130 @@ def _collective_rpc(
             raise RuntimeError(
                 f"collective_rpc {method} failed: {resp.status_code} {resp.text}"
             )
+        if not resp.content:
+            return []
         # vLLM returns {"results": [...]} on success.  Each entry is the
         # worker's return value (None, a dict/list, or str(result)).  If a
         # worker-side method raised, the entry may contain error information.
         body = resp.json()
-        if "results" in body:
-            for i, result in enumerate(body["results"]):
-                if isinstance(result, dict) and result.get("error"):
-                    raise RuntimeError(
-                        f"collective_rpc {method} worker {i} error: {result['error']}"
-                    )
+    results = body.get("results")
+    if not isinstance(results, list):
+        return []
+    for i, result in enumerate(results):
+        if isinstance(result, dict) and result.get("error"):
+            raise RuntimeError(
+                f"collective_rpc {method} worker {i} error: {result['error']}"
+            )
+    return results
+
+
+def _collective_rpc(
+    vllm_proc: subprocess.Popen[bytes], port: int, method: str, *args: object
+) -> None:
+    """Issue a collective_rpc call to the vLLM engine via the debug endpoint.
+
+    vLLM exposes a /collective_rpc endpoint that forwards to all workers.
+    The caller must pass the actual port the engine is listening on.
+
+    Signature and behaviour are unchanged; use
+    :func:`_collective_rpc_results` when the workers' return values matter.
+    """
+    _collective_rpc_results(vllm_proc, port, method, *args)
+
+
+#: Values ``SPEEDLM_E2E_EXPECTED_RUNNER`` accepts.  ``auto`` means "record
+#: whichever runner vLLM chose", not "skip the check": ``_assert_runner`` still
+#: refuses an ``unknown`` generation under ``auto``.
+_EXPECTED_RUNNERS: Final[tuple[str, ...]] = ("auto", "v1", "v2")
+
+
+def _expected_runner() -> str:
+    """Return the model-runner generation this run demands, or ``"auto"``."""
+    value = os.environ.get("SPEEDLM_E2E_EXPECTED_RUNNER", "auto")
+    assert value in _EXPECTED_RUNNERS, (
+        f"SPEEDLM_E2E_EXPECTED_RUNNER={value!r} is not one of "
+        f"{list(_EXPECTED_RUNNERS)}"
+    )
+    return value
+
+
+def _assert_runner(vllm_proc: subprocess.Popen[bytes], port: int) -> str:
+    """Prove which vLLM model-runner generation the engine actually loaded.
+
+    **This exists because the runner axis has been assumed twice and been wrong
+    both times.**  A V1-only capture hook and a V1-only drafter lookup each
+    shipped undetected, because every run that exercised them merely *requested*
+    a generation and nothing ever checked what it got.  Requesting is not
+    getting, and the gap is not hypothetical — it is how vLLM is written:
+
+    * ``vllm/config/vllm.py:519-522`` — ``use_v2_model_runner`` returns
+      ``envs.VLLM_USE_V2_MODEL_RUNNER`` verbatim when it is set, before any
+      capability check, so the variable really is a forcing knob;
+    * ``vllm/envs.py:264`` and ``:1867-1868`` — that variable is declared and
+      parsed through ``maybe_convert_bool``;
+    * ``vllm/config/vllm.py:546-553`` — when it is **unset**, vLLM may silently
+      downgrade V2 to V1 and only *log* the fact, which no assertion reads;
+    * ``vllm/config/vllm.py:2137-2147`` — when it is **set to 1** on an
+      unsupported config, vLLM raises instead of downgrading, so a forced run
+      that starts at all really is running what it asked for;
+    * ``vllm/v1/worker/gpu_worker.py:384-398`` — the worker selects the runner
+      class off that property.
+
+    So the answer is knowable, and it is read from the worker itself
+    (``ActivationCaptureExtension.runner_info``) rather than inferred from the
+    environment the harness set.
+
+    Returns:
+        The observed generation (``"v1"`` or ``"v2"``), for recording into
+        :attr:`MatrixResult.runner` so the artifact says which runner ran even
+        when the run did not pin one.
+    """
+    infos = [
+        info
+        for info in _collective_rpc_results(vllm_proc, port, "runner_info")
+        if isinstance(info, dict)
+    ]
+    assert infos, (
+        "collective_rpc runner_info returned no worker results, so this run "
+        "cannot say which model runner it exercised; every downstream number "
+        "would be attributed to a runner nobody verified"
+    )
+    logger.info("vLLM runner_info (per worker): %s", infos)
+
+    generations = {str(info.get("generation")) for info in infos}
+    assert len(generations) == 1, (
+        f"workers disagree about the model runner generation: {infos}.  A "
+        f"split engine cannot be summarized by one runner label, and the "
+        f"capture hook only intercepts the generation it was written for"
+    )
+    observed = generations.pop()
+
+    #: ``unknown`` means the hook resolved *no* interception point against the
+    #: live runner class, i.e. nothing was captured from a known location.  The
+    #: whole capture is unsound at that point, so this fails ahead of the
+    #: expected-runner comparison and regardless of it.
+    assert observed != "unknown", (
+        f"the capture hook found no interception point on runner class "
+        f"{infos[0].get('runner_class')!r}, so it does not know where — or "
+        f"whether — it captured anything.  Every tensor this run produced is "
+        f"of unproven provenance; the comparison below would be measuring the "
+        f"transport of an unidentified quantity"
+    )
+
+    expected = _expected_runner()
+    if expected != "auto":
+        assert observed == expected, (
+            f"SPEEDLM_E2E_EXPECTED_RUNNER={expected!r} but the engine loaded "
+            f"the {observed!r} model runner (runner_class="
+            f"{infos[0].get('runner_class')!r}, hook_point="
+            f"{infos[0].get('hook_point')!r}, config_use_v2="
+            f"{infos[0].get('config_use_v2')!r}).  VLLM_USE_V2_MODEL_RUNNER is "
+            f"what forces this choice; the request was ignored or downgraded "
+            f"(vllm/config/vllm.py:546-553 downgrades silently when the "
+            f"variable is unset).  This run did NOT exercise the runner it "
+            f"claims to have exercised"
+        )
+    return observed
 
 
 def _load_captured_safetensors(capture_dir: Path) -> dict[int, torch.Tensor]:
@@ -906,15 +1196,32 @@ def _free_device_bytes() -> int | None:
     return int(free)
 
 
-def _run_hf_reference(
-    verifier: str,
-    prompt: str,
-    captured: dict[int, torch.Tensor],
-    *,
-    prompt_token_count: int,
-    final_layer_idx: int | None,
-) -> HFReferenceResult:
-    """Re-derive the captured activations with HuggingFace transformers, fp32.
+@dataclass(frozen=True)
+class _HFReferenceSetup:
+    """Everything the reference leg decides **once**, before any prompt runs.
+
+    Split out of :func:`_run_hf_reference` so that an N-prompt matrix pays the
+    device selection, the parameter-count read and — above all — the model load
+    exactly once.  The load dominates this leg by orders of magnitude (a float32
+    copy of an 8B verifier is ~30 GiB to materialize and move; the forward
+    itself is seconds), so a per-prompt reload would make the matrix N times
+    slower while changing not one number it reports.
+    """
+
+    #: Resolved snapshot directory for the verifier.
+    model_dir: Path
+    #: ``"cuda"`` or ``"cpu"`` for the reference forward.
+    device: str
+    #: Decoder depth, read off disk.  Held only to be logged: the *checked*
+    #: version of this claim is the ``L+1`` hidden-state assertion inside
+    #: ``hf_reference._forward_residual_stream``.
+    num_hidden_layers: int
+    #: Estimated parameter count, or ``None`` when the index was unreadable.
+    num_parameters: int | None
+
+
+def _prepare_hf_reference(verifier: str) -> _HFReferenceSetup:
+    """Choose the device for the reference leg and free the GPU for it.
 
     Runs **after** both vLLM engines are gone, reusing
     :func:`_wait_for_gpu_memory_release` — the same nvidia-smi-polling
@@ -923,11 +1230,10 @@ def _run_hf_reference(
     ``hf_reference.select_reference_device`` for why GPU-after-teardown was
     chosen over CPU-fp32 or a smaller model, and why CPU remains the automatic
     fallback.
-    """
-    token_ids = _prompt_token_ids(
-        verifier, prompt, expected_count=prompt_token_count
-    )
 
+    Called once per run, not once per prompt: the wait is a property of the
+    engines having been torn down, which happens once.
+    """
     _wait_for_gpu_memory_release(gpu_memory_fraction=0.5)
 
     model_dir = _resolve_model_dir(verifier)
@@ -954,12 +1260,51 @@ def _run_hf_reference(
             free_device_bytes=_free_device_bytes(),
         )
     logger.info(
-        "HF fp32 reference: %d params, device=%s, %d prompt tokens, %d layers",
-        num_parameters or -1, device, len(token_ids), num_hidden_layers,
+        "HF fp32 reference: %d params, device=%s, %d layers",
+        num_parameters or -1, device, num_hidden_layers,
+    )
+    return _HFReferenceSetup(
+        model_dir=model_dir,
+        device=device,
+        num_hidden_layers=num_hidden_layers,
+        num_parameters=num_parameters,
+    )
+
+
+def _run_hf_reference(
+    verifier: str,
+    prompt: str,
+    captured: dict[int, torch.Tensor],
+    *,
+    prompt_token_count: int,
+    final_layer_idx: int | None,
+    setup: _HFReferenceSetup,
+    model: Any,
+    prompt_label: str,
+) -> HFReferenceResult:
+    """Re-derive one prompt's captured activations with HF transformers, fp32.
+
+    The per-prompt half of the reference leg: render the prompt to token ids,
+    forward them on the **already-loaded** *model*, and compare.  Everything
+    that does not vary with the prompt lives in :func:`_prepare_hf_reference`
+    and :func:`loaded_reference_model`.
+
+    *model* is passed straight through to ``reference_residual_stream``'s reuse
+    path, which runs the identical forward body as the load-and-free path, so
+    amortizing the load cannot quietly change what is measured.
+
+    *prompt_label* is recorded on the result: a row of an N-prompt matrix that
+    cannot be attributed to a prompt is a number nobody can re-run.
+    """
+    token_ids = _prompt_token_ids(
+        verifier, prompt, expected_count=prompt_token_count
+    )
+    logger.info(
+        "HF fp32 reference: prompt %r, %d tokens", prompt_label, len(token_ids)
     )
 
     stream, post_norm_final, dtype_name = reference_residual_stream(
-        str(model_dir), token_ids, device=device
+        str(setup.model_dir), token_ids, device=setup.device, model=model
     )
     return compare_to_hf_reference(
         captured,
@@ -967,8 +1312,9 @@ def _run_hf_reference(
         post_norm_final,
         prompt_token_count=prompt_token_count,
         final_layer_idx=final_layer_idx,
-        device=device,
+        device=setup.device,
         dtype=dtype_name,
+        prompt_label=prompt_label,
     )
 
 
@@ -1064,27 +1410,82 @@ def _rows_per_layer(captured: dict[int, torch.Tensor]) -> int:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class _CapturedPrompt:
+    """One prompt's serving-time capture, as read back off disk."""
+
+    #: matrix label; becomes :attr:`PromptCase.label`
+    label: str
+    #: the prompt text that was sent
+    text: str
+    #: per-prompt capture directory, so one prompt's flush cannot be read as
+    #: another's
+    capture_dir: Path
+    #: the engine's own ``usage.prompt_tokens`` for this prompt
+    prompt_token_count: int
+    #: ``{layer id: tensor}`` from ``captured.safetensors``
+    tensors: dict[int, torch.Tensor]
+    #: the hook's metadata sidecar for this flush
+    metadata: dict[str, Any]
+    #: the appended final decoder layer, or ``None``
+    final_layer_idx: int | None
+
+
+@dataclass(frozen=True)
+class _AlignedPrompt:
+    """One prompt after Leg 1's split/align, ready for the reference leg."""
+
+    capture: _CapturedPrompt
+    aligned_captured: dict[int, torch.Tensor]
+    aligned_offline: dict[int, torch.Tensor]
+    captured_final: torch.Tensor | None
+    offline_final: torch.Tensor | None
+    prefix_cache: PrefixCacheResult
+
+
 def test_stage0_activation_capture() -> None:
-    """Full Stage 0 experiment: serve one prompt with capture, compare offline.
+    """Full Stage 0 experiment: a prompt MATRIX with capture, compared offline.
 
     This test:
     1. Starts a vLLM engine with the EAGLE-3 speculator and capture extension.
-    2. Sends a single fixed prompt.
-    3. Flushes captured activations to disk.
+    2. Proves which model-runner generation that engine actually loaded.
+    3. Sends every prompt in the selected set through that ONE engine,
+       flushing each prompt's activations to its own directory.
     4. Tears down the capture engine.
     5. Waits for GPU memory to be released.
-    6. Runs the offline extraction on the same prompt.
-    7. Compares the two tensor stacks elementwise per layer (Leg 1 —
-       transport; bit-identical is the expected result, see module docstring).
+    6. Runs the offline extraction on each prompt, on its own port.
+    7. Compares the two tensor stacks elementwise per layer, per prompt (Leg 1
+       — transport; bit-identical is the expected result, see module docstring).
     8. Re-derives the same activations with HuggingFace transformers in fp32
-       and checks tolerance *and* neighbour discrimination (Leg 2 — identity).
-    9. Writes a JSON result with PASS/FAIL verdict.
+       and checks tolerance *and* neighbour discrimination, per prompt (Leg 2 —
+       identity), loading the fp32 model ONCE for the whole matrix.
+    9. Writes a JSON matrix result with a per-case and aggregate verdict.
 
     Only step 8 can distinguish a correct capture from a well-transported
     wrong quantity.  Step 7 returning 0.0 is not evidence of correctness.
+
+    **Why a matrix and not a prompt.**  The single 18-token prompt this test
+    used to run could not see a length-dependent bug at all: an off-by-one in
+    the prompt/template split, a row loss at a KV-block boundary, and a
+    divergence between this test's chat-template rendering and vLLM's are all
+    invisible at one length on one template.  See :data:`PROMPT_MATRIX` for what
+    each prompt buys.  The engine is started once and reused across prompts —
+    the engine lifecycle, not the comparison, is what costs time here.
+
+    **Every assertion is per case.**  Widening coverage is worthless if the
+    aggregate can hide a member, so nothing is checked "for the run": the
+    drafter-layer match, the captured-key set, the row-count check and the
+    reference-ran check all run inside the per-prompt loop, and
+    ``derive_matrix_verdict`` names every failing case rather than reducing
+    them to a worst case.
     """
     verifier, drafter, artifact_root = _require_environment()
-    prompt = os.environ.get("SPEEDLM_E2E_PROMPT", DEFAULT_PROMPT)
+    prompt_set = _prompt_set()
+    #: Derived per model from the two on-disk configs — nothing here assumes a
+    #: depth or an architecture.  Qwen3-8B resolves to 36 layers with aux
+    #: ``(2, 18, 33)``; gpt-oss-20b resolves to 24 layers with aux
+    #: ``(2, 12, 21)``.  Both come out of the same resolution path, which is
+    #: why switching ``SPEEDLM_E2E_VERIFIER_MODEL`` needs no change here.
     target_layers = _target_layer_ids(verifier, drafter)
     artifact_dir = _create_artifact_dir(artifact_root)
     port = int(os.environ.get("SPEEDLM_E2E_PORT", _free_port()))
@@ -1096,8 +1497,8 @@ def test_stage0_activation_capture() -> None:
         "model": drafter,
     }
 
-    capture_dir = artifact_dir / "captured"
-    capture_dir.mkdir(exist_ok=True)
+    capture_root = artifact_dir / "captured"
+    capture_root.mkdir(exist_ok=True)
 
     vllm_log = artifact_dir / "vllm.log"
     log_handle = vllm_log.open("wb")
@@ -1113,6 +1514,8 @@ def test_stage0_activation_capture() -> None:
             "speedlm.activation_capture.hook.ActivationCaptureExtension",
             "--port",
             str(port),
+            #: Every prompt in :data:`PROMPT_MATRIX` must render inside this
+            #: bound, template and sampled tokens included.
             "--max-model-len",
             "512",
             "--max-num-seqs",
@@ -1128,53 +1531,93 @@ def test_stage0_activation_capture() -> None:
         env=_vllm_env(),
     )
 
-    # Phase 1: capture engine — serve, capture, and tear down.
+    # Phase 1: ONE capture engine, every prompt — serve, capture, tear down.
+    #
+    # The engine is started once for the whole matrix.  Loading the verifier and
+    # the speculator is what makes this test slow; a prompt is a request.
     url = f"http://127.0.0.1:{port}"
+    captures: list[_CapturedPrompt] = []
     try:
         _wait_for_ready(url, vllm_proc, timeout, log_path=vllm_log)
 
         served_model_id = _get_served_model_id(url)
 
-        # Step 2: Activate capture via collective_rpc, send prompt, flush
-        _collective_rpc(vllm_proc, port, "activate_capture", str(capture_dir))
-        _, prompt_token_count = _send_prompt(
-            url, prompt, served_model_id=served_model_id
-        )
-        logger.info("Engine reported %d prompt tokens", prompt_token_count)
-        # Small pause to let the hook buffer finish
-        time.sleep(0.5)
-        _collective_rpc(vllm_proc, port, "flush_capture")
+        # Asserted once, immediately: the runner is a property of the engine,
+        # not of a prompt, and every prompt below inherits this answer.
+        observed_runner = _assert_runner(vllm_proc, port)
 
-        # Step 3: Load captured tensors
-        captured_tensors = _load_captured_safetensors(capture_dir)
-        logger.info("Captured layers: %s", sorted(captured_tensors.keys()))
+        for label, prompt in prompt_set:
+            #: Per-prompt directory: ``flush_capture`` drains the buffer, but
+            #: writing every prompt to one directory would still have each
+            #: flush overwrite the last one's ``captured.safetensors``.
+            capture_dir = capture_root / label
+            capture_dir.mkdir(exist_ok=True)
 
-        # Load metadata written by the hook during flush_capture so we can
-        # correctly distinguish drafter-input layers from the appended final
-        # regression-target layer.
-        meta = _load_capture_metadata(capture_dir)
-        final_layer_idx = meta["final_layer_idx"]
-        original_aux = meta["original_aux_layers"]
+            #: No deactivate RPC between prompts: ``activate_capture`` already
+            #: resets an active capture itself — ``hook.py:162-164`` logs
+            #: "capture already active; resetting" and calls
+            #: ``_deactivate_impl`` before re-arming — so the second and later
+            #: prompts start from the same clean state as the first.
+            _collective_rpc(
+                vllm_proc, port, "activate_capture", str(capture_dir)
+            )
+            _, prompt_token_count = _send_prompt(
+                url, prompt, served_model_id=served_model_id
+            )
+            logger.info(
+                "Prompt %r: engine reported %d prompt tokens",
+                label, prompt_token_count,
+            )
+            # Small pause to let the hook buffer finish
+            time.sleep(0.5)
+            _collective_rpc(vllm_proc, port, "flush_capture")
 
-        # Verify the drafter-input layers match the test's expectations.
-        assert sorted(original_aux) == target_layers, (
-            f"Captured drafter-input layers {sorted(original_aux)} do not match "
-            f"target_layers {target_layers} — offline extraction will use "
-            f"wrong keys.  target_layers were derived from the drafter/"
-            f"verifier configs on disk, so a mismatch means vLLM's in-engine "
-            f"derivation disagrees with speedlm.profiles.resolve_target_"
-            f"layer_ids.  Set SPEEDLM_E2E_TARGET_LAYER_IDS to override."
-        )
+            # Load captured tensors
+            captured_tensors = _load_captured_safetensors(capture_dir)
+            logger.info(
+                "Prompt %r captured layers: %s",
+                label, sorted(captured_tensors.keys()),
+            )
 
-        # The captured keys must be exactly original_aux + final_layer_idx.
-        _extra = [final_layer_idx] if final_layer_idx is not None else []
-        expected_captured = sorted(original_aux + _extra)
-        actual_captured = sorted(captured_tensors.keys())
-        assert actual_captured == expected_captured, (
-            f"Captured layer keys {actual_captured} do not match expected "
-            f"{expected_captured} (original_aux={original_aux}, "
-            f"final_layer_idx={final_layer_idx})"
-        )
+            # Load metadata written by the hook during flush_capture so we can
+            # correctly distinguish drafter-input layers from the appended final
+            # regression-target layer.
+            meta = _load_capture_metadata(capture_dir)
+            final_layer_idx = meta["final_layer_idx"]
+            original_aux = meta["original_aux_layers"]
+
+            # Verify the drafter-input layers match the test's expectations.
+            assert sorted(original_aux) == target_layers, (
+                f"[{label}] Captured drafter-input layers "
+                f"{sorted(original_aux)} do not match "
+                f"target_layers {target_layers} — offline extraction will use "
+                f"wrong keys.  target_layers were derived from the drafter/"
+                f"verifier configs on disk, so a mismatch means vLLM's in-engine "
+                f"derivation disagrees with speedlm.profiles.resolve_target_"
+                f"layer_ids.  Set SPEEDLM_E2E_TARGET_LAYER_IDS to override."
+            )
+
+            # The captured keys must be exactly original_aux + final_layer_idx.
+            _extra = [final_layer_idx] if final_layer_idx is not None else []
+            expected_captured = sorted(original_aux + _extra)
+            actual_captured = sorted(captured_tensors.keys())
+            assert actual_captured == expected_captured, (
+                f"[{label}] Captured layer keys {actual_captured} do not match "
+                f"expected {expected_captured} (original_aux={original_aux}, "
+                f"final_layer_idx={final_layer_idx})"
+            )
+
+            captures.append(
+                _CapturedPrompt(
+                    label=label,
+                    text=prompt,
+                    capture_dir=capture_dir,
+                    prompt_token_count=prompt_token_count,
+                    tensors=captured_tensors,
+                    metadata=meta,
+                    final_layer_idx=final_layer_idx,
+                )
+            )
 
     finally:
         vllm_proc.terminate()
@@ -1185,155 +1628,239 @@ def test_stage0_activation_capture() -> None:
             vllm_proc.wait()
         log_handle.close()
 
-    # Phase 2: wait for GPU memory release before launching offline engine.
+    # Phase 2: wait for GPU memory release before launching offline engines.
     # The capture engine held GPU memory; the offline engine must not start
     # until the device memory is actually returned, otherwise both engines
     # compete for the same GPU and the second crashes.
     _wait_for_gpu_memory_release(gpu_memory_fraction=0.5)
 
-    # Phase 3: offline extraction — now the GPU is free.
-    offline_target_layers = list(target_layers)
-    if final_layer_idx is not None:
-        offline_target_layers.append(final_layer_idx)
-    offline_dir = artifact_dir / "offline"
-    hs_dir = _run_offline_extract(
-        verifier,
-        prompt,
-        offline_target_layers,
-        offline_dir,
-        port=port + 1000,  # Different port
-    )
-    offline_tensors = _load_offline_hidden_states(hs_dir, target_layers=offline_target_layers)
-    logger.info("Offline layers: %s", sorted(offline_tensors.keys()))
+    # Phase 3 + 4: per prompt, extract offline and align against the capture.
+    #
+    # These run in one loop because phase 4 consumes exactly what phase 3
+    # produces for that prompt, and keeping them together means a prompt's
+    # offline stack is never in scope while another prompt's alignment runs.
+    aligned_prompts: list[_AlignedPrompt] = []
+    for index, capture in enumerate(captures):
+        label = capture.label
+        prompt_token_count = capture.prompt_token_count
+        final_layer_idx = capture.final_layer_idx
 
-    # Phase 4: Align and compare — using explicit split to avoid comparing
-    # drafter-input layers against the regression target or vice versa.
+        # Phase 3: offline extraction — now the GPU is free.
+        offline_target_layers = list(target_layers)
+        if final_layer_idx is not None:
+            offline_target_layers.append(final_layer_idx)
+        offline_dir = artifact_dir / "offline" / label
+        #: Each prompt's offline engine gets its own port.  ``port + 1000`` was
+        #: already the "different port" for the single-prompt case; the ``+
+        #: index`` term is what keeps the matrix's engines from colliding with
+        #: each other.  They are strictly sequential (the previous one is gone
+        #: before the next starts), so this only has to be collision-free, not
+        #: simultaneously bindable.
+        offline_port = port + 1000 + index
+        hs_dir = _run_offline_extract(
+            verifier,
+            capture.text,
+            offline_target_layers,
+            offline_dir,
+            port=offline_port,
+        )
+        offline_tensors = _load_offline_hidden_states(
+            hs_dir, target_layers=offline_target_layers
+        )
+        logger.info(
+            "Prompt %r offline layers: %s", label, sorted(offline_tensors.keys())
+        )
 
-# Split captured tensors into drafter-inputs and regression-target.
-    (
-        captured_drafter_ids,
-        captured_final_idx,
-        captured_drafter,
-        captured_regression,
-    ) = _split_captured_layers(captured_tensors, meta)
+        # Phase 4: Align and compare — using explicit split to avoid comparing
+        # drafter-input layers against the regression target or vice versa.
 
-    # Split offline tensors into drafter-inputs and regression-target.
-    (
-        offline_drafter_ids,
-        offline_final_idx,
-        offline_drafter,
-        offline_regression,
-    ) = _split_offline_layers(offline_tensors, offline_target_layers)
+        # Split captured tensors into drafter-inputs and regression-target.
+        (
+            captured_drafter_ids,
+            captured_final_idx,
+            captured_drafter,
+            captured_regression,
+        ) = _split_captured_layers(capture.tensors, capture.metadata)
 
-    # The drafter-input layer ids must match between captured and offline.
-    assert captured_drafter_ids == offline_drafter_ids, (
-        f"Drafter-input layer mismatch: captured {captured_drafter_ids} "
-        f"vs offline {offline_drafter_ids}"
-    )
+        # Split offline tensors into drafter-inputs and regression-target.
+        (
+            offline_drafter_ids,
+            offline_final_idx,
+            offline_drafter,
+            offline_regression,
+        ) = _split_offline_layers(offline_tensors, offline_target_layers)
 
-    # The final layer indices must also match.
-    assert captured_final_idx == offline_final_idx, (
-        f"Final layer index mismatch: captured {captured_final_idx} "
-        f"vs offline {offline_final_idx}"
-    )
+        # The drafter-input layer ids must match between captured and offline.
+        assert captured_drafter_ids == offline_drafter_ids, (
+            f"[{label}] Drafter-input layer mismatch: captured "
+            f"{captured_drafter_ids} vs offline {offline_drafter_ids}"
+        )
 
-    # The comparable row range is the PROMPT, and only the prompt.  The
-    # engine's own usage.prompt_tokens is the authority; the offline row count
-    # is not — it also covers the assistant turn that prepare_data.py renders
-    # into the conversation, whose tokens the serving engine never saw.  See
-    # ``align_prompt_rows``.
-    offline_rows = next(iter(offline_drafter.values())).shape[0]
-    logger.info(
-        "Aligning on %d prompt rows (offline stack has %d rows; the extra "
-        "%d are the template's assistant turn and are NOT comparable)",
-        prompt_token_count, offline_rows, offline_rows - prompt_token_count,
-    )
+        # The final layer indices must also match.
+        assert captured_final_idx == offline_final_idx, (
+            f"[{label}] Final layer index mismatch: captured "
+            f"{captured_final_idx} vs offline {offline_final_idx}"
+        )
 
-    # Align drafter-input layers (same key set on both sides)
-    aligned_captured: dict[int, torch.Tensor] = {}
-    aligned_offline: dict[int, torch.Tensor] = {}
-    for idx in offline_drafter_ids:
-        cap = captured_drafter[idx]
-        off = offline_drafter[idx]
-        try:
-            c_aligned, o_aligned = _align_token_count(cap, off, prompt_token_count)
-        except ValueError as exc:
-            raise AssertionError(f"cannot align layer {idx}: {exc}") from exc
-        aligned_captured[idx] = c_aligned
-        aligned_offline[idx] = o_aligned
+        # The comparable row range is the PROMPT, and only the prompt.  The
+        # engine's own usage.prompt_tokens is the authority; the offline row
+        # count is not — it also covers the assistant turn that prepare_data.py
+        # renders into the conversation, whose tokens the serving engine never
+        # saw.  See ``align_prompt_rows``.
+        offline_rows = next(iter(offline_drafter.values())).shape[0]
+        logger.info(
+            "Prompt %r: aligning on %d prompt rows (offline stack has %d rows; "
+            "the extra %d are the template's assistant turn and are NOT "
+            "comparable)",
+            label, prompt_token_count, offline_rows,
+            offline_rows - prompt_token_count,
+        )
 
-    # Align the regression-target (final layer) separately
-    captured_final: torch.Tensor | None = None
-    offline_final: torch.Tensor | None = None
-    if captured_regression is not None and offline_regression is not None:
-        try:
-            captured_final, offline_final = _align_token_count(
-                captured_regression, offline_regression, prompt_token_count,
+        # Align drafter-input layers (same key set on both sides)
+        aligned_captured: dict[int, torch.Tensor] = {}
+        aligned_offline: dict[int, torch.Tensor] = {}
+        for idx in offline_drafter_ids:
+            cap = captured_drafter[idx]
+            off = offline_drafter[idx]
+            try:
+                c_aligned, o_aligned = _align_token_count(
+                    cap, off, prompt_token_count
+                )
+            except ValueError as exc:
+                raise AssertionError(
+                    f"[{label}] cannot align layer {idx}: {exc}"
+                ) from exc
+            aligned_captured[idx] = c_aligned
+            aligned_offline[idx] = o_aligned
+
+        # Align the regression-target (final layer) separately
+        captured_final: torch.Tensor | None = None
+        offline_final: torch.Tensor | None = None
+        if captured_regression is not None and offline_regression is not None:
+            try:
+                captured_final, offline_final = _align_token_count(
+                    captured_regression, offline_regression, prompt_token_count,
+                )
+            except ValueError as exc:
+                raise AssertionError(
+                    f"[{label}] cannot align final layer: {exc}"
+                ) from exc
+
+        # This engine ran with --no-enable-prefix-caching, so cache_hit is False
+        # by construction rather than by measurement -- and it is verified as
+        # such: every prompt row must have produced an activation row.  The
+        # measured cache-hit case lives in test_prefix_cache_coverage.
+        captured_rows = _rows_per_layer(aligned_captured)
+        assert captured_rows == prompt_token_count, (
+            f"[{label}] prefix caching is disabled on this engine, so all "
+            f"{prompt_token_count} prompt positions must have been forwarded, "
+            f"but only {captured_rows} rows were captured per layer"
+        )
+        prefix_cache = PrefixCacheResult(
+            prompt_token_count=prompt_token_count,
+            captured_rows_per_layer=captured_rows,
+            captured_layer_count=len(aligned_captured),
+            cache_hit=False,
+            #: ``captured_rows`` is counted on the *aligned* stack, which has
+            #: already been trimmed to the prompt range, so here — and only
+            #: here — subtracting it from ``prompt_token_count`` really does
+            #: count prompt rows.  The assertion directly above pins it to zero.
+            prompt_rows_missing=prompt_token_count - captured_rows,
+        )
+
+        aligned_prompts.append(
+            _AlignedPrompt(
+                capture=capture,
+                aligned_captured=aligned_captured,
+                aligned_offline=aligned_offline,
+                captured_final=captured_final,
+                offline_final=offline_final,
+                prefix_cache=prefix_cache,
             )
-        except ValueError as exc:
-            raise AssertionError(f"cannot align final layer: {exc}") from exc
+        )
+
     # Phase 5: independent HuggingFace fp32 re-derivation (Leg 2).
     #
     # Leg 1 above is a transport check between two views of ONE tensor (see
     # the module docstring).  This is the only part of the test that runs a
     # second, independent forward, and therefore the only part that can tell
     # a correct capture from a well-transported wrong quantity.
-    hf_reference: HFReferenceResult | None = None
+    #
+    # The fp32 model is loaded ONCE for the whole matrix.  That is the entire
+    # reason ``loaded_reference_model`` exists: the load is ~30 GiB of weights
+    # to materialize and move for an 8B verifier, while each prompt's forward is
+    # seconds, so a per-prompt reload would multiply this leg's cost by the
+    # number of prompts and change none of its numbers.
+    hf_references: dict[str, HFReferenceResult] = {}
     reference_enabled = os.environ.get("SPEEDLM_E2E_HF_REFERENCE", "1") != "0"
     if reference_enabled:
-        hf_reference = _run_hf_reference(
-            verifier,
-            prompt,
-            captured_tensors,
-            prompt_token_count=prompt_token_count,
-            final_layer_idx=final_layer_idx,
+        setup = _prepare_hf_reference(verifier)
+        with loaded_reference_model(
+            str(setup.model_dir), device=setup.device
+        ) as reference_model:
+            for aligned in aligned_prompts:
+                label = aligned.capture.label
+                hf_result = _run_hf_reference(
+                    verifier,
+                    aligned.capture.text,
+                    aligned.capture.tensors,
+                    prompt_token_count=aligned.capture.prompt_token_count,
+                    final_layer_idx=aligned.capture.final_layer_idx,
+                    setup=setup,
+                    model=reference_model,
+                    prompt_label=label,
+                )
+                hf_references[label] = hf_result
+                logger.info(
+                    "Prompt %r HF fp32 reference verdict=%s device=%s layers=%s",
+                    label,
+                    hf_result.verdict,
+                    hf_result.device,
+                    [
+                        (layer.aux_layer_idx, layer.mean_rel_error, layer.tolerance)
+                        for layer in hf_result.layers
+                    ],
+                )
+
+    # Phase 6: Build one case per prompt, then the matrix verdict.
+    cases: list[PromptCase] = []
+    for aligned in aligned_prompts:
+        label = aligned.capture.label
+        result = build_result(
+            aligned.aligned_captured,
+            aligned.aligned_offline,
+            captured_final_pre_norm=aligned.captured_final,
+            offline_final_pre_norm=aligned.offline_final,
+            prefix_cache=aligned.prefix_cache,
+            hf_reference=hf_references.get(label),
+        )
+        cases.append(
+            PromptCase(
+                label=label,
+                prompt_token_count=aligned.capture.prompt_token_count,
+                result=result,
+            )
         )
         logger.info(
-            "HF fp32 reference verdict=%s device=%s layers=%s",
-            hf_reference.verdict,
-            hf_reference.device,
-            [
-                (layer.aux_layer_idx, layer.mean_rel_error, layer.tolerance)
-                for layer in hf_reference.layers
-            ],
+            "Prompt %r (%d tokens) verdict=%s trend=%s",
+            label, aligned.capture.prompt_token_count,
+            result.verdict, result.rel_error_trend,
         )
 
-    # Phase 6: Build verdict.
-    #
-    # This engine ran with --no-enable-prefix-caching, so cache_hit is False by
-    # construction rather than by measurement -- and it is verified as such:
-    # every prompt row must have produced an activation row.  The measured
-    # cache-hit case lives in test_prefix_cache_coverage.
-    captured_rows = _rows_per_layer(aligned_captured)
-    assert captured_rows == prompt_token_count, (
-        f"prefix caching is disabled on this engine, so all "
-        f"{prompt_token_count} prompt positions must have been forwarded, but "
-        f"only {captured_rows} rows were captured per layer"
+    #: ``observed_runner``, not the requested one: under ``auto`` the artifact
+    #: must still record which generation actually ran, or a later reader cannot
+    #: tell a V2 result from a V1 one.
+    matrix: MatrixResult = build_matrix_result(
+        model=served_model_id,
+        runner=observed_runner,
+        cases=cases,
     )
-    prefix_cache = PrefixCacheResult(
-        prompt_token_count=prompt_token_count,
-        captured_rows_per_layer=captured_rows,
-        captured_layer_count=len(aligned_captured),
-        cache_hit=False,
-        #: ``captured_rows`` is counted on the *aligned* stack, which has
-        #: already been trimmed to the prompt range, so here — and only here —
-        #: subtracting it from ``prompt_token_count`` really does count prompt
-        #: rows.  The assertion directly above pins it to zero.
-        prompt_rows_missing=prompt_token_count - captured_rows,
-    )
-
-    result = build_result(
-        aligned_captured,
-        aligned_offline,
-        captured_final_pre_norm=captured_final,
-        offline_final_pre_norm=offline_final,
-        prefix_cache=prefix_cache,
-        hf_reference=hf_reference,
-    )
-
     result_path = artifact_dir / "result.json"
-    result.write_json(result_path)
-    logger.info("Result written to %s — verdict: %s", result_path, result.verdict)
+    matrix.write_json(result_path)
+    logger.info(
+        "Matrix result written to %s — runner=%s verdict: %s",
+        result_path, matrix.runner, matrix.verdict,
+    )
 
     # By default, a FAIL verdict fails the test so that regressions are caught.
     # Set SPEEDLM_E2E_STRICT_VERDICT=0 to skip this assertion for exploratory runs.
@@ -1342,16 +1869,47 @@ def test_stage0_activation_capture() -> None:
         # A skipped reference leg must never read as a pass.  ``build_result``
         # deliberately does not fail on ``hf_reference is None`` (that would
         # flip the verdict for every pre-existing caller), so the harness that
-        # asked for the leg is the one that insists it ran.
-        assert not reference_enabled or hf_reference is not None, (
-            "SPEEDLM_E2E_HF_REFERENCE is enabled but no reference result was "
-            "produced; the run proves only that one tensor round-trips two "
-            "ways, not that it is the right tensor"
+        # asked for the leg is the one that insists it ran.  Checked PER CASE:
+        # a reference that ran for one prompt says nothing about the others.
+        for case in cases:
+            assert not reference_enabled or case.result.hf_reference is not None, (
+                f"[{case.label}] SPEEDLM_E2E_HF_REFERENCE is enabled but no "
+                f"reference result was produced; the run proves only that one "
+                f"tensor round-trips two ways, not that it is the right tensor"
+            )
+        #: Every selected prompt must have produced a case.  A prompt that was
+        #: skipped — by an early ``continue``, a swallowed exception, or a
+        #: mis-wired loop — would otherwise shrink coverage silently while the
+        #: remaining cases still reported PASS.
+        assert len(cases) == len(prompt_set), (
+            f"{len(prompt_set)} prompts were selected "
+            f"({[label for label, _text in prompt_set]}) but only "
+            f"{len(cases)} produced a case "
+            f"({[case.label for case in cases]}); a prompt that silently ran "
+            f"no comparison is a coverage regression, not a pass"
         )
-        assert result.verdict == "PASS", (
-            f"Activation capture comparison failed: verdict={result.verdict}, "
-            f"rel_error_trend={result.rel_error_trend}, "
-            f"hf_reference={(hf_reference.verdict if hf_reference else 'not run')}. "
+        #: Surfaced per case rather than only as the aggregate label: the
+        #: aggregate names *which* cases failed, this names what each of them
+        #: reported, so the failure text alone says whether the divergence is a
+        #: transport problem (Leg 1 verdict), an identity problem (the reference
+        #: verdict) or a drift (the trend) — without opening the artifact.
+        case_summary = [
+            (
+                case.label,
+                case.result.verdict,
+                case.result.rel_error_trend,
+                (
+                    case.result.hf_reference.verdict
+                    if case.result.hf_reference is not None
+                    else "not run"
+                ),
+            )
+            for case in cases
+        ]
+        assert matrix.verdict == "PASS", (
+            f"Activation capture matrix failed: verdict={matrix.verdict}, "
+            f"runner={matrix.runner}, "
+            f"cases (label, verdict, trend, hf_reference)={case_summary}. "
             f"Full result at {result_path}"
         )
 

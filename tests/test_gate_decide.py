@@ -1315,3 +1315,140 @@ def test_trend_needs_two_repeats_before_it_means_anything() -> None:
     assert dec.throughput_dispersion is DispersionBasis.UNSAMPLED
     assert dec.throughput_delta_standard_error_pct is None
     assert dec.acceptance_dispersion is DispersionBasis.UNSAMPLED
+
+
+# ---------------------------------------------------------------------------
+# Where the warming stops: the measurement ``warmup_repeats`` needs
+# ---------------------------------------------------------------------------
+
+def test_a_plateauing_arm_reports_the_repeat_its_warming_stopped_at() -> None:
+    """The number ``tuning.warmup_repeats`` has to be argued from.
+
+    A candidate that climbs for two repeats and then settles should report
+    ``2``: repeats 2.. are mutually exchangeable, so two extra unscored passes
+    would have opened the measurement window warm.
+    """
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.60),
+        _make_delta(acceptance_rate=0.70),
+        _replay_with_tps_series([100.0] * 8),
+        _replay_with_tps_series([90.0, 95.0, 100.0, 100.1, 99.9, 100.0, 100.1, 99.9]),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+
+    assert dec.candidate_throughput_flat_from_repeat == 2
+    record = dec.to_dict()
+    assert record["candidate_throughput_flat_from_repeat"] == 2
+    assert record["stock_throughput_flat_from_repeat"] == 0
+
+
+def test_an_arm_still_warming_at_the_last_repeat_reports_no_flat_index() -> None:
+    """The signature jobs 369161/369162 produced, and why they settled nothing.
+
+    Both runs scored five repeats and the candidate trended upward across all
+    of them.  ``None`` is the honest answer -- "it had not flattened yet" --
+    and it is what says the characterisation run needs more repeats, not that
+    warmup should be raised to some guessed value.
+    """
+    series = [96.0, 98.3, 99.7, 102.2, 104.1]
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.60),
+        _make_delta(acceptance_rate=0.70),
+        _replay_with_tps_series([100.0, 100.4, 99.7, 100.2, 99.8]),
+        _replay_with_tps_series(series),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+
+    assert dec.candidate_throughput_flat_from_repeat is None
+    assert dec.to_dict()["candidate_throughput_flat_from_repeat"] is None
+    # The trend is what says the ``None`` means "still climbing" rather than
+    # "too few samples"; the two are published together for exactly that reason.
+    trend = dec.candidate_throughput_trend_pct_per_repeat
+    assert trend is not None and trend > 0.0
+
+
+def test_extending_a_warming_run_is_what_finds_the_flat_index() -> None:
+    """Why the characterisation run raises ``benchmark_repeats`` rather than warmup.
+
+    The same arm, scored over five repeats and then over ten: five cannot see
+    the plateau that ten resolves.  This is the whole payoff of the diagnostic
+    mode -- the answer is a property of how long the window is, not of how the
+    detector is tuned.
+    """
+    warming = [90.0, 94.0, 97.0, 99.0, 100.0]
+    settled = [100.1, 99.9, 100.0, 100.2, 99.8]
+    stock = [100.0, 100.3, 99.8, 100.1, 99.9]
+
+    short = decide_promotion(
+        _make_delta(acceptance_rate=0.60),
+        _make_delta(acceptance_rate=0.70),
+        _replay_with_tps_series(stock),
+        _replay_with_tps_series(warming),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+    long = decide_promotion(
+        _make_delta(acceptance_rate=0.60),
+        _make_delta(acceptance_rate=0.70),
+        _replay_with_tps_series(stock + stock),
+        _replay_with_tps_series(warming + settled),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+
+    assert short.candidate_throughput_flat_from_repeat is None
+    assert long.candidate_throughput_flat_from_repeat is not None
+    assert long.candidate_throughput_flat_from_repeat > 0
+
+
+def test_a_perfectly_linear_ramp_never_reads_as_flat() -> None:
+    """Zero residual must not be mistaken for zero slope.
+
+    A stubbed arm that ramps exactly has no noise to compare its slope
+    against.  Reporting it flat would be the mirror of the bug
+    :class:`DispersionBasis` exists to prevent -- a stub reading as a perfect
+    measurement.
+    """
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.60),
+        _make_delta(acceptance_rate=0.70),
+        _replay_with_tps_series([100.0] * 5),
+        _replay_with_tps_series([96.0, 98.0, 100.0, 102.0, 104.0]),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+
+    assert dec.candidate_throughput_flat_from_repeat is None
+    # A constant column is the other exactly-collinear case, and it *is* flat.
+    assert dec.stock_throughput_flat_from_repeat == 0
+
+
+def test_the_flat_index_needs_three_repeats_before_it_means_anything() -> None:
+    """Two points fit their own slope exactly, so every pair would read flat."""
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.60),
+        _make_delta(acceptance_rate=0.70),
+        _replay_with_tps_series([100.0, 103.0]),
+        _replay_with_tps_series([100.0, 106.0]),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+
+    assert dec.num_repeats == 2
+    assert dec.candidate_throughput_trend_pct_per_repeat is not None
+    assert dec.candidate_throughput_flat_from_repeat is None
+    assert dec.stock_throughput_flat_from_repeat is None
+
+
+def test_the_flat_index_is_the_earliest_qualifying_window_not_the_shortest() -> None:
+    """Scanning latest-first would answer ``n - 3`` on almost any column.
+
+    Later suffixes are shorter and easier to call flat by accident, so the
+    scan takes the earliest window that clears the bar.  Here every window from
+    repeat two on is flat, and two is the answer.
+    """
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.60),
+        _make_delta(acceptance_rate=0.70),
+        _replay_with_tps_series([100.0] * 8),
+        _replay_with_tps_series([80.0, 90.0, 100.0, 100.2, 99.8, 100.1, 99.9, 100.0]),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+
+    assert dec.candidate_throughput_flat_from_repeat == 2

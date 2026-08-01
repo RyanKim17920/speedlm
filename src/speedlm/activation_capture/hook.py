@@ -240,6 +240,82 @@ class ActivationCaptureExtension:
         logger.info("Flushed %d layer activations to %s", len(saved), path)
         return path
 
+    def runner_info(self) -> dict:
+        """Report which model runner generation this worker actually loaded.
+
+        Called via collective_rpc from the driver process.
+
+        This exists so a test can *prove* which runner it exercised rather
+        than assuming.  vLLM picks the generation from
+        ``VllmConfig.use_v2_model_runner`` (``vllm/config/vllm.py:519-522``),
+        which honours ``VLLM_USE_V2_MODEL_RUNNER`` when set but otherwise
+        derives the answer from the model architecture, the speculative
+        method and Triton availability -- and silently falls back to V1 when
+        V2 does not support the config (``vllm/config/vllm.py:546-553``).
+        A run that merely *requested* a generation therefore cannot be assumed
+        to have *got* it, and a V1-only capture hook has already shipped
+        undetected twice for exactly that reason.
+
+        Three independent signals are returned so a disagreement between them
+        is visible rather than papered over:
+
+        * ``runner_class`` -- the live runner's ``module.QualName``.  The two
+          generations live in different modules that ship side by side.
+        * ``hook_point`` -- the attribute the hook resolved against the live
+          class, or ``None`` when neither is present.
+        * ``config_use_v2`` -- what the worker's own ``VllmConfig`` says, when
+          reachable.  This is the value vLLM itself branched on.
+
+        ``generation`` is derived from ``hook_point`` because that is the axis
+        the capture hook actually depends on: V1 exposes ``_model_forward``,
+        V2 does not (see :data:`HOOK_POINTS`).
+
+        Returns:
+            Dict with keys ``generation`` (``"v1"``/``"v2"``/``"unknown"``),
+            ``runner_class`` (str), ``hook_point`` (str or None) and
+            ``config_use_v2`` (bool or None).
+        """
+        self._ensure_init()
+        runner = self.model_runner  # type: ignore[attr-defined]
+        runner_cls = type(runner)
+
+        hook_point: str | None = None
+        for name in HOOK_POINTS:
+            if hasattr(runner_cls, name):
+                hook_point = name
+                break
+
+        #: ``_model_forward`` is V1-only; ``sample_tokens`` exists on both, so
+        #: resolving in HOOK_POINTS order makes this an exact discriminator.
+        if hook_point == "_model_forward":
+            generation = "v1"
+        elif hook_point is not None:
+            generation = "v2"
+        else:
+            generation = "unknown"
+
+        #: Best-effort: the config may hang off the worker or the runner
+        #: depending on the vLLM build, and the property can raise on a
+        #: partially-built config.  A missing third signal must not break the
+        #: two that matter.
+        config_use_v2: bool | None = None
+        for holder in (self, runner):
+            vllm_config = getattr(holder, "vllm_config", None)
+            if vllm_config is None:
+                continue
+            try:
+                config_use_v2 = bool(vllm_config.use_v2_model_runner)
+            except Exception:  # noqa: BLE001 -- diagnostic only, never fatal
+                config_use_v2 = None
+            break
+
+        return {
+            "generation": generation,
+            "runner_class": f"{runner_cls.__module__}.{runner_cls.__qualname__}",
+            "hook_point": hook_point,
+            "config_use_v2": config_use_v2,
+        }
+
     def capture_info(self) -> dict:
         """Return metadata about the active capture session.
 

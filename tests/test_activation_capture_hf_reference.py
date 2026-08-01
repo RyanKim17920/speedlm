@@ -19,6 +19,9 @@ To execute the tensor tests, put the vLLM venv on the path:
 from __future__ import annotations
 
 import json
+import sys
+import types
+from typing import Any
 
 import pytest
 
@@ -33,6 +36,7 @@ from speedlm.activation_capture.hf_reference import (
     bf16_relative_tolerance,
     compare_to_hf_reference,
     cosine_similarity,
+    reference_residual_stream,
     select_reference_device,
 )
 
@@ -392,6 +396,414 @@ class TestCompareToHFReference:
                 device="cpu",
                 dtype="torch.float32",
             )
+
+
+# ---------------------------------------------------------------------------
+# Two-sided discrimination for the FINAL aux layer (needs torch)
+# ---------------------------------------------------------------------------
+
+
+@requires_torch
+class TestFinalLayerTwoSidedDiscrimination:
+    """The final aux layer's argmin must have a rival on the far side too.
+
+    ``k+1`` does not exist in the residual stream for ``k == L``, so the
+    integer candidate set clips it away and only ``k-1`` competes.  The real
+    other side is ``post_norm_final`` — the only quantity the model produces
+    downstream of layer ``L`` — which used to be spent solely on the separate
+    ``final_layer_prenorm_confirmed`` check.
+    """
+
+    def test_post_norm_capture_is_not_identified(self) -> None:
+        """The regression this change buys.
+
+        The dangerous post-norm tensor is not a wildly different one — it is a
+        *mild rescaling* of layer ``L``, which is what an RMSNorm whose learned
+        gains sit near one actually produces.  Against ``k-1`` alone such a
+        capture looks excellent: it clears the 3x margin comfortably, because
+        the only competitor is a whole decoder layer away.  Nothing above it
+        exists in the stream to object, so the one-sided argmin identified it
+        as layer ``L``.
+
+        With ``post_norm_final`` in the rival set its true source competes, and
+        wins outright.
+        """
+        stream = _stream(5)
+        #: Close enough to layer 5 to beat layer 4 easily; that is the trap.
+        post_norm = stream[5] * 1.02
+        result = compare_to_hf_reference(
+            {5: post_norm.clone()},
+            stream,
+            post_norm,
+            prompt_token_count=6,
+            final_layer_idx=5,
+            device="cpu",
+            dtype="torch.float32",
+        )
+        layer = result.layers[0]
+        rivals = dict(layer.rival_errors)
+
+        #: What the OLD one-sided check saw: k-1 as the sole rival, clearing
+        #: the margin. Pinned so the regression cannot be quietly reintroduced.
+        assert rivals["4"] / layer.mean_rel_error > DISCRIMINATION_MARGIN
+
+        #: What the two-sided check sees: the capture IS the post-norm tensor,
+        #: so that rival is an exact match and beats the claimed layer.
+        assert rivals["post_norm"] < layer.mean_rel_error
+        assert not layer.identified
+        assert layer.discrimination_ratio < DISCRIMINATION_MARGIN
+        assert result.verdict != "PASS"
+
+    def test_true_final_layer_is_still_identified(self) -> None:
+        """Adding a rival must not cost a genuine capture its identification."""
+        stream = _stream(5)
+        post_norm = stream[5] / stream[5].norm(dim=-1, keepdim=True)
+        result = compare_to_hf_reference(
+            {5: stream[5].clone()},
+            stream,
+            post_norm,
+            prompt_token_count=6,
+            final_layer_idx=5,
+            device="cpu",
+            dtype="torch.float32",
+        )
+        layer = result.layers[0]
+        assert "post_norm" in dict(layer.rival_errors)
+        assert layer.identified
+        assert layer.two_sided
+        assert result.verdict == "PASS"
+
+    def test_bf16_final_layer_still_beats_the_post_norm_rival(self) -> None:
+        """A realistic bf16 capture, not just a bit-exact one, must survive."""
+        stream = _stream(5)
+        post_norm = stream[5] / stream[5].norm(dim=-1, keepdim=True)
+        result = compare_to_hf_reference(
+            {5: stream[5].to(torch.bfloat16).float()},
+            stream,
+            post_norm,
+            prompt_token_count=6,
+            final_layer_idx=5,
+            device="cpu",
+            dtype="torch.float32",
+        )
+        assert result.layers[0].identified
+        assert result.verdict == "PASS"
+
+    def test_rival_errors_and_two_sided_for_final_vs_middle(self) -> None:
+        """Labels differ by position; both ends of a real stack are bracketed."""
+        stream = _stream(5)
+        post_norm = stream[5] / stream[5].norm(dim=-1, keepdim=True)
+        result = compare_to_hf_reference(
+            {2: stream[2].clone(), 5: stream[5].clone()},
+            stream,
+            post_norm,
+            prompt_token_count=6,
+            final_layer_idx=5,
+            device="cpu",
+            dtype="torch.float32",
+        )
+        middle, final = result.layers
+        assert set(dict(middle.rival_errors)) == {"1", "3"}
+        assert middle.two_sided
+        #: The final layer's upper rival is the post-norm tensor, not "6".
+        assert set(dict(final.rival_errors)) == {"4", "post_norm"}
+        assert final.two_sided
+
+    def test_layer_zero_is_reported_as_one_sided(self) -> None:
+        """Layer 0 has no lower rival; the flag must say so rather than lie."""
+        stream = _stream(5)
+        result = compare_to_hf_reference(
+            {0: stream[0].clone()},
+            stream,
+            stream[5],
+            prompt_token_count=6,
+            final_layer_idx=None,
+            device="cpu",
+            dtype="torch.float32",
+        )
+        assert set(dict(result.layers[0].rival_errors)) == {"1"}
+        assert not result.layers[0].two_sided
+
+    def test_rival_errors_survive_serialization(self) -> None:
+        stream = _stream(5)
+        post_norm = stream[5] / stream[5].norm(dim=-1, keepdim=True)
+        result = compare_to_hf_reference(
+            {5: stream[5].clone()},
+            stream,
+            post_norm,
+            prompt_token_count=6,
+            final_layer_idx=5,
+            device="cpu",
+            dtype="torch.float32",
+        )
+        payload = json.loads(json.dumps(result.to_dict()))
+        entry = payload["layers"][0]
+        assert entry["two_sided"] is True
+        assert [label for label, _error in entry["rival_errors"]] == [
+            "4",
+            "post_norm",
+        ]
+
+
+# ---------------------------------------------------------------------------
+# Why the rival is post_norm and not k-2 (no torch)
+# ---------------------------------------------------------------------------
+
+
+class TestKMinusTwoIsANoOp:
+    """Documents why ``k-2`` was rejected as the final layer's second rival.
+
+    The stated worry is an error metric that grows monotonically as you move
+    away from the true layer *in the direction of the final layer*.  Under
+    exactly that assumption ``err(k-2) > err(k-1)``, so ``k-2`` can never be
+    ``min(rivals)`` and the pass/fail outcome is bit-identical with or without
+    it.  A rival that cannot change the verdict is not discrimination, which is
+    why the genuinely downstream quantity (``post_norm``) is used instead.
+    """
+
+    #: A monotonic profile around a true layer 36: error grows with distance.
+    _MONOTONIC = {34: 0.42, 35: 0.21, 36: 0.005}
+
+    def test_adding_k_minus_two_does_not_change_min_rivals(self) -> None:
+        own = self._MONOTONIC[36]
+        one_sided = [self._MONOTONIC[35]]
+        with_k_minus_two = [self._MONOTONIC[35], self._MONOTONIC[34]]
+        assert min(with_k_minus_two) == min(one_sided)
+        assert (
+            min(with_k_minus_two) / own == min(one_sided) / own
+        )
+
+    def test_the_post_norm_rival_can_change_min_rivals(self) -> None:
+        """The contrast: a downstream rival is the one that can actually bite."""
+        own = self._MONOTONIC[36]
+        one_sided = [self._MONOTONIC[35]]
+        with_post_norm = [self._MONOTONIC[35], 0.0005]
+        assert min(with_post_norm) < min(one_sided)
+        assert min(with_post_norm) / own < DISCRIMINATION_MARGIN
+
+
+# ---------------------------------------------------------------------------
+# Prompt identity (no torch)
+# ---------------------------------------------------------------------------
+
+
+def _result(**overrides: Any) -> HFReferenceResult:
+    kwargs: dict[str, Any] = {
+        "device": "cpu",
+        "dtype": "torch.float32",
+        "prompt_token_count": 8,
+        "layers": [_layer(2)],
+        "final_layer_idx": None,
+        "final_layer_prenorm_confirmed": None,
+        "verdict": "PASS",
+    }
+    kwargs.update(overrides)
+    return HFReferenceResult(**kwargs)
+
+
+class TestPromptLabel:
+    """A multi-prompt matrix whose rows cannot be attributed is unusable."""
+
+    def test_defaults_to_none_so_existing_callers_are_unchanged(self) -> None:
+        assert _result().prompt_label is None
+
+    def test_round_trips_into_the_serialized_dict(self) -> None:
+        payload = json.loads(json.dumps(_result(prompt_label="short_en").to_dict()))
+        assert payload["prompt_label"] == "short_en"
+
+    def test_absent_label_serializes_as_null_not_missing(self) -> None:
+        """A missing key and a null mean different things to a consumer."""
+        payload = json.loads(json.dumps(_result().to_dict()))
+        assert "prompt_label" in payload
+        assert payload["prompt_label"] is None
+
+
+@requires_torch
+class TestPromptLabelThreading:
+    def test_compare_threads_the_label_through(self) -> None:
+        stream = _stream(5)
+        result = compare_to_hf_reference(
+            {2: stream[2].clone()},
+            stream,
+            stream[5],
+            prompt_token_count=6,
+            final_layer_idx=None,
+            device="cpu",
+            dtype="torch.float32",
+            prompt_label="prompt_3",
+        )
+        assert result.prompt_label == "prompt_3"
+        assert json.loads(json.dumps(result.to_dict()))["prompt_label"] == "prompt_3"
+
+
+# ---------------------------------------------------------------------------
+# Reference model reuse across prompts (no torch -- torch is faked)
+# ---------------------------------------------------------------------------
+
+
+class _FakeTensor:
+    """The narrow surface ``_forward_residual_stream`` touches on a tensor."""
+
+    def __getitem__(self, index: Any) -> _FakeTensor:
+        return self
+
+    def detach(self) -> _FakeTensor:
+        return self
+
+    def cpu(self) -> _FakeTensor:
+        return self
+
+
+class _FakeHandle:
+    def __init__(self, layer: _FakeLayer, hook: Any) -> None:
+        self._layer = layer
+        self._hook = hook
+
+    def remove(self) -> None:
+        self._layer.hooks.remove(self._hook)
+
+
+class _FakeLayer:
+    def __init__(self) -> None:
+        self.hooks: list[Any] = []
+
+    def register_forward_hook(self, hook: Any) -> _FakeHandle:
+        self.hooks.append(hook)
+        return _FakeHandle(self, hook)
+
+
+class _FakeModel:
+    """Counts forwards and fires the last layer's hook like a real module."""
+
+    def __init__(self, num_layers: int = 3) -> None:
+        self.layers = [_FakeLayer() for _ in range(num_layers)]
+        self.model = types.SimpleNamespace(layers=self.layers)
+        self.forwards = 0
+
+    def eval(self) -> None:
+        return None
+
+    def to(self, device: str) -> None:
+        return None
+
+    def float(self) -> None:
+        return None
+
+    def __call__(self, **_kwargs: Any) -> Any:
+        self.forwards += 1
+        last = self.layers[-1]
+        for hook in list(last.hooks):
+            hook(last, (), _FakeTensor())
+        return types.SimpleNamespace(
+            hidden_states=tuple(_FakeTensor() for _ in range(len(self.layers) + 1))
+        )
+
+
+class _LoadCounter:
+    def __init__(self, model: _FakeModel) -> None:
+        self.model = model
+        self.calls = 0
+
+    def from_pretrained(self, *_args: Any, **_kwargs: Any) -> _FakeModel:
+        self.calls += 1
+        return self.model
+
+
+@pytest.fixture
+def fake_hf(monkeypatch: pytest.MonkeyPatch) -> _LoadCounter:
+    """Install fake ``torch`` and ``transformers`` modules for the lazy imports.
+
+    ``reference_residual_stream`` imports both inside the function body, so
+    swapping ``sys.modules`` is enough and the test runs in the PROJECT venv
+    where neither package is installed. That matters: the point of this test is
+    to count *loads*, and a test that only runs under a hand-set PYTHONPATH
+    would not be counting them in the default suite.
+    """
+    model = _FakeModel()
+    loader = _LoadCounter(model)
+    float32 = object()
+    fake_torch = types.SimpleNamespace(
+        float32=float32,
+        long=object(),
+        tensor=lambda *_a, **_k: _FakeTensor(),
+        no_grad=lambda: _NullContext(),
+        cuda=types.SimpleNamespace(empty_cache=lambda: None),
+    )
+    fake_transformers = types.SimpleNamespace(AutoModelForCausalLM=loader)
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+    return loader
+
+
+class _NullContext:
+    def __enter__(self) -> None:
+        return None
+
+    def __exit__(self, *_exc: Any) -> bool:
+        return False
+
+
+class TestReferenceModelReuse:
+    """A multi-prompt Stage 0 must not reload ~30 GiB of fp32 weights per prompt."""
+
+    def test_without_model_the_reference_is_loaded_once(
+        self, fake_hf: _LoadCounter, tmp_path: Any
+    ) -> None:
+        stream, _post_norm, dtype_name = reference_residual_stream(
+            str(tmp_path), [1, 2, 3]
+        )
+        assert fake_hf.calls == 1
+        assert fake_hf.model.forwards == 1
+        #: L + 1 entries: L from the HF tuple plus the hooked pre-norm final.
+        assert len(stream) == len(fake_hf.model.layers) + 1
+        assert dtype_name == "torch.float32"
+
+    def test_passing_model_performs_zero_loads(
+        self, fake_hf: _LoadCounter, tmp_path: Any
+    ) -> None:
+        """The whole point of the reuse path."""
+        reference_residual_stream(str(tmp_path), [1, 2, 3], model=fake_hf.model)
+        assert fake_hf.calls == 0
+        assert fake_hf.model.forwards == 1
+
+    def test_reuse_across_several_prompts_loads_nothing(
+        self, fake_hf: _LoadCounter, tmp_path: Any
+    ) -> None:
+        for _ in range(4):
+            reference_residual_stream(str(tmp_path), [1, 2, 3], model=fake_hf.model)
+        assert fake_hf.calls == 0
+        assert fake_hf.model.forwards == 4
+
+    def test_the_hook_is_removed_on_every_forward(
+        self, fake_hf: _LoadCounter, tmp_path: Any
+    ) -> None:
+        """A hook left installed would accumulate and corrupt later prompts."""
+        for _ in range(3):
+            reference_residual_stream(str(tmp_path), [1, 2, 3], model=fake_hf.model)
+        assert fake_hf.model.layers[-1].hooks == []
+
+    def test_a_short_hidden_state_tuple_is_rejected(
+        self, fake_hf: _LoadCounter, tmp_path: Any
+    ) -> None:
+        """The index mapping is asserted on BOTH paths, not just the load one."""
+        with pytest.raises(AssertionError, match="hidden states"):
+            reference_residual_stream(
+                str(tmp_path), [1, 2, 3], model=_ShortModel()
+            )
+
+
+class _ShortModel(_FakeModel):
+    """A model whose forward returns too few hidden states.
+
+    The ``L + 1`` assertion is what pins the aux-layer index mapping, so it has
+    to hold on the reuse path too — that path skips the loader, not the checks.
+    """
+
+    def __call__(self, **_kwargs: Any) -> Any:
+        last = self.layers[-1]
+        for hook in list(last.hooks):
+            hook(last, (), _FakeTensor())
+        return types.SimpleNamespace(hidden_states=(_FakeTensor(),))
 
 
 # ---------------------------------------------------------------------------

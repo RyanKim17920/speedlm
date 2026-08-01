@@ -382,6 +382,38 @@ class Decision:
         return _trend_pct_per_repeat([r.candidate_tok_per_sec for r in self.per_repeat])
 
     @property
+    def stock_throughput_flat_from_repeat(self) -> int | None:
+        """Earliest repeat the stock arm had stopped warming from, if it did."""
+        return _flat_from_repeat([r.stock_tok_per_sec for r in self.per_repeat])
+
+    @property
+    def candidate_throughput_flat_from_repeat(self) -> int | None:
+        """Earliest repeat the candidate arm had stopped warming from, if it did.
+
+        The trend properties say an arm is still warming; this says *for how
+        long*, which is the number ``tuning.warmup_repeats`` has to be argued
+        from.  ``None`` is the answer jobs 369161/369162 would give: they show
+        only that the candidate had not flattened by repeat five, and neither
+        run scored enough repeats to find where it does.
+
+        Reading it: a value of ``k`` means repeats ``k..n-1`` are mutually
+        exchangeable, so an arm given ``warmup_repeats + k`` unscored passes
+        would open its measurement window warm.  ``0`` means the arm was
+        already warm at the first scored repeat and the existing warmup was
+        sufficient.
+
+        It does not gate, and deliberately so: it is a diagnostic over a single
+        run's five-to-N samples, and the gate is the only safeguard with no
+        rollback behind it.  Its job is to accumulate across runs so that the
+        warmup/repeat trade stops being an argument.  That trade is *not* a
+        free efficiency win -- a warmup pass costs exactly what a scored repeat
+        costs (see :class:`speedlm.config.IdleTuningConfig.warmup_repeats`), so
+        buying an unbiased window at ``k > 0`` strictly adds passes unless
+        ``k`` is small enough that ``warmup + repeats`` still falls.
+        """
+        return _flat_from_repeat([r.candidate_tok_per_sec for r in self.per_repeat])
+
+    @property
     def output_early_divergences(self) -> int:
         """Divergences early enough to count against ``max_output_mismatches``."""
         return sum(1 for d in self.output_divergences if d.early)
@@ -461,6 +493,15 @@ class Decision:
             ),
             "candidate_throughput_trend_pct_per_repeat": (
                 self.candidate_throughput_trend_pct_per_repeat
+            ),
+            # Where the drift above stops, or ``null`` if it had not stopped by
+            # the last scored repeat.  See
+            # ``candidate_throughput_flat_from_repeat``.
+            "stock_throughput_flat_from_repeat": (
+                self.stock_throughput_flat_from_repeat
+            ),
+            "candidate_throughput_flat_from_repeat": (
+                self.candidate_throughput_flat_from_repeat
             ),
             "stock_prometheus_decode_tok_per_sec": (
                 self.stock_prometheus_decode_tok_per_sec
@@ -556,6 +597,83 @@ def _trend_pct_per_repeat(values: list[float]) -> float | None:
     denominator = sum((i - mean_x) ** 2 for i in range(n))
     numerator = sum((i - mean_x) * (v - mean) for i, v in enumerate(values))
     return numerator / denominator / mean * 100.0
+
+
+#: Repeats a trailing window needs before it may be called flat.
+#:
+#: Three is the floor at which an OLS slope has a residual degree of freedom
+#: (``m - 2``) and therefore a standard error at all.  Two points fit their own
+#: slope exactly, leaving zero residual, so on a two-point rule *every* window
+#: would read flat and the answer would be "repeat n-2" on every run regardless
+#: of the data.
+MIN_FLAT_WINDOW: Final = 3
+
+#: ``|slope| / SE(slope)`` below which a trailing window has stopped trending.
+#:
+#: One standard error -- a deliberately lenient bar, chosen against how large
+#: the drift being detected actually is.  The full five-repeat candidate
+#: windows on jobs 369161/369162 explain 83% and 94% of their own variance,
+#: which for ``n=5`` is ``|t| = sqrt(R^2/(1-R^2) * (n-2))`` = 3.8 and 6.9.  The
+#: warming signal this has to *not* miss therefore sits at 4-7 standard errors,
+#: so a 1.0 bar separates it by a wide margin while still being reachable by a
+#: genuinely settled window.
+#:
+#: Erring lenient is the right direction here because nothing downstream gates
+#: on this: it is published so that raising ``warmup_repeats`` can be argued
+#: from a measured index instead of a guess, and a bar so strict that no real
+#: column ever clears it would answer "never flat" forever and teach nothing.
+FLAT_TREND_T_STATISTIC: Final = 1.0
+
+
+def _slope_t_statistic(values: list[float]) -> float | None:
+    """``|slope| / SE(slope)`` of an OLS fit of *values* against repeat index.
+
+    ``None`` below :data:`MIN_FLAT_WINDOW` points, where the residual variance
+    has no degrees of freedom to be estimated from.
+    """
+    n = len(values)
+    if n < MIN_FLAT_WINDOW:
+        return None
+    mean_x = (n - 1) / 2.0
+    mean_y = _mean(values)
+    sxx = sum((i - mean_x) ** 2 for i in range(n))
+    sxy = sum((i - mean_x) * (v - mean_y) for i, v in enumerate(values))
+    slope = sxy / sxx
+    intercept = mean_y - slope * mean_x
+    ssr = sum((v - (intercept + slope * i)) ** 2 for i, v in enumerate(values))
+    if ssr <= 0.0:
+        # Exactly collinear: no residual to build a standard error from, but
+        # the verdict is not ambiguous either way.  A constant column is flat;
+        # a perfect ramp is not.  Both are stub signatures rather than live
+        # measurements -- see :class:`DispersionBasis` -- and reporting each as
+        # what it plainly is beats reporting both as unknown.
+        return 0.0 if slope == 0.0 else math.inf
+    return abs(slope) / math.sqrt(ssr / (n - 2) / sxx)
+
+
+def _flat_from_repeat(values: list[float]) -> int | None:
+    """Earliest repeat index from which the trailing window stopped trending.
+
+    Answers "how many passes does this arm need before it is warm" by asking,
+    for each suffix of the per-repeat column, whether that suffix still has a
+    slope its own residual noise cannot explain -- the trend of the trailing
+    window falling below its own noise.  The earliest suffix that clears
+    :data:`FLAT_TREND_T_STATISTIC` is returned; ``None`` means no suffix of at
+    least :data:`MIN_FLAT_WINDOW` repeats did, i.e. the arm was still warming
+    when the last scored repeat ended.
+
+    Suffixes are scanned earliest-first on purpose.  The quantity wanted is the
+    *first* index that is safe to measure from, and later suffixes are shorter
+    and therefore easier to call flat by accident; taking the earliest one that
+    passes keeps the answer from drifting toward ``n - MIN_FLAT_WINDOW`` as the
+    window shrinks.
+    """
+    n = len(values)
+    for start in range(n - MIN_FLAT_WINDOW + 1):
+        statistic = _slope_t_statistic(values[start:])
+        if statistic is not None and statistic < FLAT_TREND_T_STATISTIC:
+            return start
+    return None
 
 
 def first_divergence(

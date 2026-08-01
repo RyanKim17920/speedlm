@@ -430,6 +430,11 @@ def test_create_production_tuner_assembles_profile_bound_collaborators(
     # The gate replay was serialized until this reached it; a default that
     # never leaves composition is the same bug in a different place.
     assert captured["gate"]["repeats"] == config.tuning.benchmark_repeats
+    # Same bug, same place: warmup was the runner's own constructor default and
+    # composition never passed it, so the one knob ``benchmark_repeats``' own
+    # analysis names as the honest direction to move was unreachable from a
+    # config file.
+    assert captured["gate"]["warmup_repeats"] == config.tuning.warmup_repeats
     assert (
         captured["gate"]["replay_concurrency"]
         == config.tuning.benchmark_concurrency

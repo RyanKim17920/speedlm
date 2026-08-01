@@ -26,6 +26,10 @@ from pathlib import Path
 
 import pytest
 
+#: Imported as a module rather than by name: the tests below exercise the
+#: private ``_environ`` helper, whose whole job is what it does to a copied
+#: process environment.
+from speedlm.activation_capture import offline_extract
 from speedlm.activation_capture.compare import (
     DEFAULT_RELATIVE_TOLERANCE,
     DEFAULT_TOLERANCE,
@@ -1061,6 +1065,164 @@ class TestRunnerTopologyHook:
 
 
 # ---------------------------------------------------------------------------
+# Runner reporting (hook.py)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.no_torch
+class TestRunnerInfo:
+    """``runner_info`` must report the generation that actually loaded.
+
+    The e2e harness pins a generation with ``VLLM_USE_V2_MODEL_RUNNER`` but
+    cannot trust that it got one: ``vllm/config/vllm.py:546-553`` downgrades
+    V2 to V1 silently when the variable is unset, and that silent downgrade is
+    how a V1-only capture hook shipped undetected twice.  ``runner_info`` is
+    the RPC the harness asserts on, so its answer must be derived from the
+    live runner rather than from what was requested.
+    """
+
+    @pytest.mark.parametrize("generation", RUNNER_GENERATIONS)
+    def test_generation_matches_the_live_runner(self, generation: str) -> None:
+        """The reported generation is read off the runner, not a config."""
+        runner_cls = _make_runner_cls(generation)
+        ext = _make_capture_extension(runner_cls())
+
+        info = ext.runner_info()
+
+        assert info["generation"] == generation
+        #: The discriminator is the interception point, because that is the
+        #: axis the capture hook actually depends on: ``_model_forward`` is
+        #: V1-only while ``sample_tokens`` exists on both.
+        expected_hook = "_model_forward" if generation == "v1" else "sample_tokens"
+        assert info["hook_point"] == expected_hook
+        assert runner_cls.__qualname__ in info["runner_class"]
+
+    def test_generation_is_reported_before_activation(self) -> None:
+        """``runner_info`` must not require an active capture.
+
+        The harness calls it as soon as the engine is ready, so that a run
+        against the wrong runner fails before it spends a prefill proving it.
+        """
+        ext = _make_capture_extension(_make_runner_cls("v2")())
+        assert ext.runner_info()["generation"] == "v2"
+
+    def test_unknown_topology_is_reported_not_guessed(self) -> None:
+        """A runner with no known hook point reports ``unknown``, never a guess.
+
+        ``activate_capture`` raises on this shape.  ``runner_info`` instead has
+        to answer, because the harness calls it to *decide* whether the run is
+        sound -- so the one thing it must not do is pick a plausible-looking
+        generation for a runner it does not recognise.
+        """
+
+        class _FutureRunner:
+            def __init__(self) -> None:
+                self.model = _FakeTargetModel()
+                self.vllm_config = _FakeVllmConfig()
+
+        info = _make_capture_extension(_FutureRunner()).runner_info()
+
+        assert info["generation"] == "unknown"
+        assert info["hook_point"] is None
+        assert "_FutureRunner" in info["runner_class"]
+
+    def test_unreadable_config_does_not_break_the_report(self) -> None:
+        """A raising ``use_v2_model_runner`` costs the third signal, not the two.
+
+        ``config_use_v2`` is a diagnostic cross-check on a property that can
+        raise on a partially-built config.  Losing it must not take down the
+        report the harness actually asserts on.
+        """
+
+        class _ExplodingConfig:
+            @property
+            def use_v2_model_runner(self) -> bool:
+                raise RuntimeError("config not finished building")
+
+        runner = _make_runner_cls("v1")()
+        runner.vllm_config = _ExplodingConfig()
+        info = _make_capture_extension(runner).runner_info()
+
+        assert info["generation"] == "v1"
+        assert info["config_use_v2"] is None
+
+
+# ---------------------------------------------------------------------------
+# Offline-engine environment isolation (offline_extract.py)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.no_torch
+class TestOfflineEngineEnvIsolation:
+    """The offline engine must pick its own model runner.
+
+    ``_environ`` copies ``os.environ`` wholesale, and the capture leg now sets
+    ``VLLM_USE_V2_MODEL_RUNNER`` to pin the axis under test.  Left to leak,
+    that setting would not merely bias the offline engine -- it would kill it.
+    The offline leg runs the ``extract_hidden_states`` speculative method,
+    which V2 does not implement; with the variable unset vLLM downgrades to V1
+    and logs it (``vllm/config/vllm.py:546-553``), but with it set to ``1`` the
+    property short-circuits and ``_validate_v2_model_runner`` raises instead
+    (``vllm/config/vllm.py:2137-2147``).
+
+    The offline extraction is the independent reference the capture is
+    compared against, so it has to run whatever generation vLLM considers
+    correct for its own config.
+    """
+
+    @pytest.mark.parametrize("value", ["0", "1"])
+    def test_forced_runner_does_not_leak_into_the_offline_engine(
+        self, monkeypatch: pytest.MonkeyPatch, value: str
+    ) -> None:
+        """Both pinned values are stripped, not just the fatal one."""
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", value)
+
+        env = offline_extract._environ(Path("/nonexistent/speculators"))
+
+        assert "VLLM_USE_V2_MODEL_RUNNER" not in env
+
+    def test_unrelated_environment_still_passes_through(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Isolation is surgical: only the named variables are removed.
+
+        The offline subprocesses need the inherited HF cache and offline-mode
+        settings, so a blanket scrub would break them.
+        """
+        monkeypatch.setenv("HF_HOME", "/data/ryan.kim/hf-cache")
+        monkeypatch.setenv("HF_HUB_OFFLINE", "1")
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+
+        env = offline_extract._environ(Path("/nonexistent/speculators"))
+
+        assert env["HF_HOME"] == "/data/ryan.kim/hf-cache"
+        assert env["HF_HUB_OFFLINE"] == "1"
+        assert "VLLM_USE_V2_MODEL_RUNNER" not in env
+
+    def test_pythonpath_still_gains_the_speculators_source(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The pre-existing PYTHONPATH prepend survives the new filtering."""
+        monkeypatch.setenv("PYTHONPATH", "/existing/path")
+        monkeypatch.setenv("VLLM_USE_V2_MODEL_RUNNER", "1")
+
+        env = offline_extract._environ(Path("/repo/speculators"))
+
+        assert env["PYTHONPATH"].startswith("/repo/speculators/src")
+        assert env["PYTHONPATH"].endswith("/existing/path")
+
+    def test_absent_variable_is_not_an_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The common case -- an unpinned run -- must not raise on the pop."""
+        monkeypatch.delenv("VLLM_USE_V2_MODEL_RUNNER", raising=False)
+
+        env = offline_extract._environ(Path("/repo/speculators"))
+
+        assert "VLLM_USE_V2_MODEL_RUNNER" not in env
+
+
+# ---------------------------------------------------------------------------
 # Slice-before-drafter logic (hook.py)
 # ---------------------------------------------------------------------------
 
@@ -1836,3 +1998,178 @@ class TestDeriveVerdictPreNormInvariant:
             # The assertion would be skipped
         finally:
             del os.environ["SPEEDLM_E2E_STRICT_VERDICT"]
+
+# ---------------------------------------------------------------------------
+# Matrix aggregation (PromptCase / MatrixResult / derive_matrix_verdict)
+#
+# APPENDED SECTION -- self-contained. These tests are torch-free (the matrix
+# layer only reads already-computed ComparisonResult verdicts), so they carry
+# ``@pytest.mark.no_torch`` and run in the PROJECT venv. The whole point of the
+# matrix is to widen Stage 0 coverage across prompts; a matrix layer that only
+# executed under a hand-set PYTHONPATH would be untested in the default suite.
+# ---------------------------------------------------------------------------
+
+
+def _matrix_result(verdict: str) -> ComparisonResult:
+    """A minimal ComparisonResult carrying a chosen verdict.
+
+    Built the same way the ``TestDeriveVerdict`` helper above builds one --
+    a literal ``LayerComparison`` list, no tensors -- so nothing here needs
+    torch. The layer content is irrelevant to the matrix layer, which reads
+    only ``result.verdict``.
+    """
+    return ComparisonResult(
+        layers=[
+            LayerComparison(0, (4, 8), (4, 8), True, 0.001, 0.001,
+                            mean_rel_error=0.001),
+        ],
+        pre_norm_match=True,
+        prefix_cache_test=None,
+        tolerance=DEFAULT_TOLERANCE,
+        verdict=verdict,
+    )
+
+
+def _matrix_case(label: str, verdict: str, prompt_token_count: int = 16):
+    from speedlm.activation_capture.compare import PromptCase
+
+    return PromptCase(
+        label=label,
+        prompt_token_count=prompt_token_count,
+        result=_matrix_result(verdict),
+    )
+
+
+class TestDeriveMatrixVerdict:
+    """A matrix verdict must never hide a failing prompt."""
+
+    @pytest.mark.no_torch
+    def test_empty_cases_is_fail_not_pass(self) -> None:
+        """A matrix that compared nothing must NOT be a PASS.
+
+        This is the load-bearing assertion of the whole matrix layer: a
+        mis-wired matrix that silently covers zero prompts would otherwise
+        report green on vacuous truth.
+        """
+        from speedlm.activation_capture.compare import derive_matrix_verdict
+
+        assert derive_matrix_verdict([]) != "PASS"
+        assert derive_matrix_verdict([]) == "FAIL_empty"
+
+    @pytest.mark.no_torch
+    def test_all_cases_pass(self) -> None:
+        from speedlm.activation_capture.compare import derive_matrix_verdict
+
+        cases = [
+            _matrix_case("short", "PASS"),
+            _matrix_case("medium", "PASS"),
+            _matrix_case("long", "PASS"),
+        ]
+        assert derive_matrix_verdict(cases) == "PASS"
+
+    @pytest.mark.no_torch
+    def test_one_failing_case_is_named(self) -> None:
+        """One failure among passes must surface that case's label + verdict."""
+        from speedlm.activation_capture.compare import derive_matrix_verdict
+
+        cases = [
+            _matrix_case("short", "PASS"),
+            _matrix_case("medium", "FAIL_tolerance"),
+            _matrix_case("long", "PASS"),
+        ]
+        verdict = derive_matrix_verdict(cases)
+        assert verdict != "PASS"
+        assert verdict == "FAIL_cases:medium=FAIL_tolerance"
+        assert "medium" in verdict
+        assert "FAIL_tolerance" in verdict
+
+    @pytest.mark.no_torch
+    def test_two_failing_cases_both_named_in_order(self) -> None:
+        """Both failures appear, in case order -- no averaging, no worst-of."""
+        from speedlm.activation_capture.compare import derive_matrix_verdict
+
+        cases = [
+            _matrix_case("short", "FAIL_shape"),
+            _matrix_case("medium", "PASS"),
+            _matrix_case("long", "FAIL_tolerance"),
+        ]
+        verdict = derive_matrix_verdict(cases)
+        assert verdict != "PASS"
+        assert verdict == "FAIL_cases:short=FAIL_shape,long=FAIL_tolerance"
+        assert verdict.index("short") < verdict.index("long")
+
+    @pytest.mark.no_torch
+    def test_build_matrix_result_sets_verdict(self) -> None:
+        from speedlm.activation_capture.compare import build_matrix_result
+
+        matrix = build_matrix_result(
+            model="Qwen/Qwen3-8B",
+            runner="v1",
+            cases=[_matrix_case("short", "PASS"), _matrix_case("long", "PASS")],
+        )
+        assert matrix.model == "Qwen/Qwen3-8B"
+        assert matrix.runner == "v1"
+        assert isinstance(matrix.cases, tuple)
+        assert matrix.verdict == "PASS"
+
+        failing = build_matrix_result(
+            model="Qwen/Qwen3-8B",
+            runner="v2",
+            cases=[_matrix_case("short", "PASS"), _matrix_case("long", "FAIL_empty")],
+        )
+        assert failing.verdict == "FAIL_cases:long=FAIL_empty"
+
+    @pytest.mark.no_torch
+    def test_build_matrix_result_empty_is_not_pass(self) -> None:
+        from speedlm.activation_capture.compare import build_matrix_result
+
+        matrix = build_matrix_result(model="m", runner="v1", cases=[])
+        assert matrix.cases == ()
+        assert matrix.verdict != "PASS"
+        assert matrix.verdict == "FAIL_empty"
+
+
+class TestMatrixResultSerialization:
+    @pytest.mark.no_torch
+    def test_to_dict_is_json_serializable_and_complete(self) -> None:
+        from speedlm.activation_capture.compare import build_matrix_result
+
+        cases = [
+            _matrix_case("short", "PASS", prompt_token_count=8),
+            _matrix_case("long", "FAIL_tolerance", prompt_token_count=128),
+        ]
+        matrix = build_matrix_result(model="model-x", runner="v2", cases=cases)
+        payload = matrix.to_dict()
+
+        # Round-trips through json without a custom encoder.
+        reparsed = json.loads(json.dumps(payload))
+        assert reparsed == payload
+
+        assert reparsed["model"] == "model-x"
+        assert reparsed["runner"] == "v2"
+        assert reparsed["verdict"] == "FAIL_cases:long=FAIL_tolerance"
+        assert [c["label"] for c in reparsed["cases"]] == ["short", "long"]
+        assert [c["prompt_token_count"] for c in reparsed["cases"]] == [8, 128]
+        # The nested per-prompt comparison dicts are carried whole.
+        for case, expected in zip(reparsed["cases"], cases, strict=True):
+            assert case["result"] == expected.result.to_dict()
+            assert case["result"]["verdict"] == expected.result.verdict
+
+    @pytest.mark.no_torch
+    def test_write_json_matches_to_dict(self, tmp_path: Path) -> None:
+        from speedlm.activation_capture.compare import build_matrix_result
+
+        matrix = build_matrix_result(
+            model="model-x",
+            runner="v1",
+            cases=[
+                _matrix_case("short", "PASS"),
+                _matrix_case("long", "PASS"),
+            ],
+        )
+        out = tmp_path / "matrix.json"
+        matrix.write_json(out)
+
+        text = out.read_text(encoding="utf-8")
+        assert text.endswith("\n")
+        assert json.loads(text) == matrix.to_dict()

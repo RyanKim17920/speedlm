@@ -424,6 +424,10 @@ def create_production_tuner(
         endpoint=endpoint,
         metrics_source=_MetricsSource(http),
         repeats=tuning.benchmark_repeats,
+        # Was the runner's own default of 1 and unreachable from config, which
+        # left the arms' cold start unmeasurable in production; see
+        # ``IdleTuningConfig.warmup_repeats``.  The default is unchanged.
+        warmup_repeats=tuning.warmup_repeats,
         replay_concurrency=tuning.benchmark_concurrency,
         correctness_max_tokens=tuning.correctness_max_tokens,
         benchmark_max_tokens=tuning.benchmark_max_tokens,

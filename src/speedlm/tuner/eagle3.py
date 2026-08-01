@@ -399,7 +399,47 @@ class Eagle3Adapter:
         *,
         should_abort: AbortCheck,
     ) -> Path:
-        """Extract verifier hidden states."""
+        """Extract verifier hidden states.
+
+        Unconditionally, every cycle, over the whole leased window.  That is
+        the dominant non-benchmark cost of a cycle -- 205.8s on job 369161 and
+        303.8s on job 369162 -- and it is *not* incremental: with
+        ``training_window_records=512`` over 513 buffered records, 511 of the
+        512 rows were re-extracted from scratch.  A content-hash cache over
+        those rows was assessed and deliberately not built, for four reasons in
+        increasing order of severity.
+
+        The hit rate would be ~0 at the only granularity that is addressable.
+        :meth:`~speedlm.training.split.HeldOutTraceSnapshotLeaser._select_window`
+        recomputes its offset from ``count_records()`` on every lease, so one
+        new trace shifts the whole window by one record and the snapshot digest
+        changes completely.  A snapshot-keyed cache therefore misses every time
+        despite ~511/512 rows being identical; only a *per-row* cache would hit.
+
+        Per-row is not reachable from here.  Extraction is a subprocess over a
+        whole rows file that emits packed ``hs_*.safetensors`` shards, with no
+        per-row addressing and shard boundaries that depend on the row set.
+        Serving a partially-hit window would mean splicing third-party shards
+        by hand -- which is exactly the code whose bugs produce a head trained
+        against the wrong hidden states.
+
+        Two of the four required invalidation keys are not observable.
+        ``verifier_revision`` silently degrades to unpinned when the local HF
+        cache cannot satisfy the pin (see
+        :mod:`speedlm.training.backends.eagle3`), so the configured revision is
+        not the identity of the weights that ran; and there is no ``dtype``
+        knob anywhere in this pipeline -- precision is inherited from the
+        verifier snapshot's own config and never read back -- so a dtype change
+        cannot be detected at all.  A key that cannot see two of the things it
+        must invalidate on is not a cache, it is a silent correctness hazard,
+        and a stale entry here trains the head on another model's activations.
+
+        And the saving is smaller than it looks.  Extraction stands up its own
+        ``--enforce-eager`` vLLM server, loads the verifier and tears it down;
+        engine lifecycle, not per-row forward passes, is most of that 200-300s,
+        and no row cache touches it.  The addressable win in this stage is
+        removing an engine start, not avoiding re-extraction.
+        """
         self._check(work_dir, should_abort)
         started = self._clock()
         hidden_states = _call_with_supported_keywords(

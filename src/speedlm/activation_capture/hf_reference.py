@@ -101,6 +101,16 @@ index must be the strict argmin by a factor of
 below being correctly derived, and it is what a lossless round-trip cannot
 fake: an off-by-one layer or a post-norm substitution moves the argmin.
 
+For the **final** aux layer ``k == L`` there is no ``k+1`` in the stream, so
+the rival on that side is the post-norm tensor — the only quantity the model
+produces downstream of layer ``L``.  Without it that layer's argmin would be
+one-sided and a post-norm capture would win it uncontested; the post-norm
+tensor is therefore a *rival* in the argmin as well as the subject of the
+separate ``final_layer_prenorm_confirmed`` check.  ``k-2`` is deliberately not
+used as a substitute: the concern is an error metric that grows monotonically
+away from the true layer, and under that assumption ``err(k-2) > err(k-1)``, so
+``min(rivals)`` and the verdict would be unchanged.
+
 Tolerance derivation
 ====================
 
@@ -159,6 +169,7 @@ fitting the bound to one sample.
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -166,6 +177,8 @@ if TYPE_CHECKING:
     # Only executed by static type checkers.  mypy has per-module overrides for
     # torch/safetensors/vllm/transformers (see pyproject.toml), so this module
     # keeps a torch-free import surface for the project venv.
+    from collections.abc import Iterator
+
     from torch import Tensor
 
 # ---------------------------------------------------------------------------
@@ -246,6 +259,23 @@ class HFReferenceLayer:
     #: ``best_match_index == reference_index`` and
     #: ``discrimination_ratio >= DISCRIMINATION_MARGIN``.
     identified: bool
+    #: Every rival this layer was actually discriminated against, as
+    #: ``(label, mean_rel_error)`` in the order they were considered.  Labels
+    #: are stringified reference indices (``"35"``) except for the post-norm
+    #: rival, labelled ``"post_norm"``.  Recorded because
+    #: :attr:`discrimination_ratio` collapses the whole set to one number, and
+    #: an artifact that only reports the ratio cannot be re-audited for *which*
+    #: quantities the claim was made against.  Empty tuple only when there was
+    #: nothing to compete with (a single-entry reference stream).
+    rival_errors: tuple[tuple[str, float], ...] = ()
+    #: ``True`` when the rival set brackets the claimed layer on both sides.
+    #: For an interior layer that is ``k-1`` and ``k+1``.  For the FINAL layer
+    #: ``k+1`` does not exist as a residual-stream entry, so the other side is
+    #: the post-norm tensor — the only quantity in the model downstream of
+    #: layer ``k``.  Without it the final layer's argmin is one-sided and a
+    #: post-norm capture can win it by default, which is exactly the confusion
+    #: this module exists to rule out.
+    two_sided: bool = False
 
     @property
     def tolerance_budget_used(self) -> float:
@@ -294,6 +324,13 @@ class HFReferenceResult:
     #: ``"PASS"``, or one of ``"FAIL_empty"`` / ``"FAIL_tolerance"`` /
     #: ``"FAIL_identification"`` / ``"FAIL_pre_norm"``.
     verdict: str
+    #: Which prompt this verdict is about, when the caller ran more than one.
+    #: ``None`` for a single-prompt run, which is why it defaults: a result
+    #: without a label is a result that predates the multi-prompt matrix, not a
+    #: result about an unknown prompt.  Carried so that a row of an N-prompt
+    #: matrix can be attributed after the fact — an unlabelled matrix is a set
+    #: of numbers nobody can re-run.
+    prompt_label: str | None = None
 
     @property
     def passed(self) -> bool:
@@ -304,6 +341,7 @@ class HFReferenceResult:
         return {
             "device": self.device,
             "dtype": self.dtype,
+            "prompt_label": self.prompt_label,
             "prompt_token_count": self.prompt_token_count,
             "bf16_unit_roundoff": BF16_UNIT_ROUNDOFF,
             "bf16_depth_offset": BF16_DEPTH_OFFSET,
@@ -325,6 +363,12 @@ class HFReferenceResult:
                     "best_match_index": layer.best_match_index,
                     "discrimination_ratio": layer.discrimination_ratio,
                     "identified": layer.identified,
+                    #: A list of pairs rather than a mapping so the order the
+                    #: rivals were considered survives the JSON round-trip.
+                    "rival_errors": [
+                        [label, error] for label, error in layer.rival_errors
+                    ],
+                    "two_sided": layer.two_sided,
                 }
                 for layer in self.layers
             ],
@@ -483,39 +527,29 @@ def _checkpoint_dtype(model_dir: str) -> str:
     return ""
 
 
-def reference_residual_stream(
-    model_dir: str,
-    token_ids: list[int],
-    *,
-    device: str = "cpu",
-) -> tuple[list[Tensor], Tensor, str]:
-    """Run *token_ids* through HuggingFace transformers in float32.
+@contextmanager
+def loaded_reference_model(model_dir: str, *, device: str = "cpu") -> Iterator[Any]:
+    """Load the fp32 reference once and free it deterministically on exit.
 
-    Returns the full **residual stream** — the quantity vLLM's aux collection
-    stores — indexed so that entry ``k`` is directly comparable to vLLM aux
-    layer id ``k`` for every ``k`` in ``0..L``:
+    Split out of :func:`reference_residual_stream` so that a caller running
+    several prompts pays the load exactly once.  The load is the dominant cost
+    of this leg — a float32 Qwen3-8B is ~30 GiB of weights to materialize and
+    move — while the forward itself is seconds, so a per-prompt reload turns an
+    N-prompt Stage 0 matrix into N full loads for no numerical gain.
 
-    * entries ``0..L-1`` come from ``output_hidden_states`` unchanged;
-    * entry ``L`` comes from a forward hook on ``model.layers[L-1]``, because
-      HuggingFace overwrites the last tuple entry with the **post-norm**
-      ``last_hidden_state`` (``transformers/utils/output_capturing.py:264-266``).
+    Teardown lives in the ``finally`` branch rather than at the end of the body
+    so the weights are released even when the caller's forward raises: on
+    ``"cuda"`` the allocator would otherwise keep the whole fp32 copy reserved
+    for the rest of the process, and the Stage 0 harness hands the same card on
+    to the next consumer.
 
     Args:
         model_dir: resolved local snapshot directory for the verifier.
-        token_ids: the exact prompt token ids the serving engine prefilled.
         device: ``"cuda"`` or ``"cpu"``; see :func:`select_reference_device`.
 
-    Returns:
-        ``(residual_stream, post_norm_final, dtype_name)`` where
-        ``residual_stream`` has ``L + 1`` entries of shape ``(len(token_ids),
-        hidden_size)`` on CPU, and ``post_norm_final`` is HF's own
-        ``hidden_states[-1]`` retained so the caller can prove the final
-        RMSNorm really is applied there.
-
-    Raises:
-        AssertionError: if HF returns an unexpected number of hidden states,
-            or the hook did not fire — either would silently invalidate the
-            index mapping the whole comparison rests on.
+    Yields:
+        The loaded ``AutoModelForCausalLM``, in eval mode, on *device*, with
+        float32 arithmetic.
     """
     import torch  # lazy: only present in the vLLM venv
 
@@ -553,6 +587,41 @@ def reference_residual_stream(
     model.to(device)
     if load_dtype is not torch.float32:
         model.float()
+
+    try:
+        yield model
+    finally:
+        del model
+        if device == "cuda":
+            torch.cuda.empty_cache()
+
+
+def _forward_residual_stream(
+    model: Any,
+    token_ids: list[int],
+    device: str,
+) -> tuple[list[Tensor], Tensor, str]:
+    """Prefill *token_ids* on an already-loaded *model* and extract the stream.
+
+    The single copy of the forward logic: both the load-and-forward path and
+    the reuse path of :func:`reference_residual_stream` call this, so the hook
+    installation, the hidden-state count assertion and the index mapping cannot
+    drift apart between them.
+
+    Args:
+        model: a model as yielded by :func:`loaded_reference_model`.
+        token_ids: the exact prompt token ids the serving engine prefilled.
+        device: the device *model* already lives on.
+
+    Returns:
+        As :func:`reference_residual_stream`.
+
+    Raises:
+        AssertionError: if HF returns an unexpected number of hidden states,
+            or the hook did not fire — either would silently invalidate the
+            index mapping the whole comparison rests on.
+    """
+    import torch  # lazy: only present in the vLLM venv
 
     inner = model.model
     layers = inner.layers
@@ -596,11 +665,62 @@ def reference_residual_stream(
     stream.append(captured_final[-1][0].detach().cpu())
     post_norm_final = hidden[num_layers][0].detach().cpu()
 
-    del model
-    if device == "cuda":
-        torch.cuda.empty_cache()
-
     return stream, post_norm_final, "torch.float32"
+
+
+def reference_residual_stream(
+    model_dir: str,
+    token_ids: list[int],
+    *,
+    device: str = "cpu",
+    model: Any | None = None,
+) -> tuple[list[Tensor], Tensor, str]:
+    """Run *token_ids* through HuggingFace transformers in float32.
+
+    Returns the full **residual stream** — the quantity vLLM's aux collection
+    stores — indexed so that entry ``k`` is directly comparable to vLLM aux
+    layer id ``k`` for every ``k`` in ``0..L``:
+
+    * entries ``0..L-1`` come from ``output_hidden_states`` unchanged;
+    * entry ``L`` comes from a forward hook on ``model.layers[L-1]``, because
+      HuggingFace overwrites the last tuple entry with the **post-norm**
+      ``last_hidden_state`` (``transformers/utils/output_capturing.py:264-266``).
+
+    **Why the reuse path exists.**  The default behaviour — load, forward, free
+    — is correct for one prompt and wasteful for several: a Stage 0 matrix over
+    N prompts would materialize and free a ~30 GiB float32 copy of an 8B model N
+    times, which dominates the runtime of this leg while changing nothing about
+    the numbers.  Passing an already-loaded *model* (from
+    :func:`loaded_reference_model`) amortizes that over the whole matrix.  Both
+    paths run the identical :func:`_forward_residual_stream` body, so the reuse
+    path cannot quietly diverge from the one-shot path it replaces.
+
+    Args:
+        model_dir: resolved local snapshot directory for the verifier.  Still
+            required on the reuse path so the two call shapes stay
+            interchangeable at the call site.
+        token_ids: the exact prompt token ids the serving engine prefilled.
+        device: ``"cuda"`` or ``"cpu"``; see :func:`select_reference_device`.
+        model: an already-loaded reference model to forward on.  When given,
+            no load and no teardown happen here — the caller's
+            :func:`loaded_reference_model` scope owns the weights.
+
+    Returns:
+        ``(residual_stream, post_norm_final, dtype_name)`` where
+        ``residual_stream`` has ``L + 1`` entries of shape ``(len(token_ids),
+        hidden_size)`` on CPU, and ``post_norm_final`` is HF's own
+        ``hidden_states[-1]`` retained so the caller can prove the final
+        RMSNorm really is applied there.
+
+    Raises:
+        AssertionError: if HF returns an unexpected number of hidden states,
+            or the hook did not fire — either would silently invalidate the
+            index mapping the whole comparison rests on.
+    """
+    if model is not None:
+        return _forward_residual_stream(model, token_ids, device)
+    with loaded_reference_model(model_dir, device=device) as loaded:
+        return _forward_residual_stream(loaded, token_ids, device)
 
 
 # ---------------------------------------------------------------------------
@@ -617,6 +737,7 @@ def compare_to_hf_reference(
     final_layer_idx: int | None,
     device: str,
     dtype: str,
+    prompt_label: str | None = None,
 ) -> HFReferenceResult:
     """Compare captured aux layers against the fp32 HF residual stream.
 
@@ -631,6 +752,11 @@ def compare_to_hf_reference(
        lossless round-trip cannot pass by construction, and it does not depend
        on (1)'s tolerance being correctly derived.
 
+    For the **final** aux layer the second neighbour is *post_norm_final*
+    rather than ``k+1``, which does not exist in the stream; see the inline
+    note at the rival-set construction for why that, and not ``k-2``, is the
+    real other side.
+
     When *final_layer_idx* is captured, the post-norm tensor is additionally
     required to be materially *worse* than the hooked pre-norm one, which
     proves the capture is the pre-norm quantity the trainer expects rather
@@ -644,6 +770,9 @@ def compare_to_hf_reference(
         final_layer_idx: the appended final decoder layer, or ``None``.
         device: recorded verbatim into the result.
         dtype: recorded verbatim into the result.
+        prompt_label: identifies which prompt this verdict is about, so a
+            multi-prompt matrix stays attributable.  ``None`` for a
+            single-prompt run.
 
     Raises:
         ValueError: if *prompt_token_count* is not positive, or a captured
@@ -683,16 +812,57 @@ def compare_to_hf_reference(
             for idx in candidates
         }
         own = errors[aux_idx]
-        rivals = [err for idx, err in errors.items() if idx != aux_idx]
+        rival_errors: list[tuple[str, float]] = [
+            (str(idx), err) for idx, err in errors.items() if idx != aux_idx
+        ]
+
+        #: The final layer has no ``k+1`` *inside* the residual stream, so the
+        #: integer candidate set above clips it away and the argmin becomes
+        #: one-sided: only ``k-1`` competes, and a capture that is really the
+        #: model's post-norm output wins by default.
+        #:
+        #: The genuine two-sided rival already exists — ``post_norm_final`` is
+        #: the ONLY tensor downstream of layer ``k``, i.e. the true "k+1" on the
+        #: other side — it was simply spent on the separate
+        #: ``final_layer_prenorm_confirmed`` check below and never entered the
+        #: argmin that sets ``identified``.  It is entered here.
+        #:
+        #: Adding ``k-2`` instead was rejected: the stated worry is an error
+        #: metric that grows monotonically as you move away from the true layer
+        #: *towards* the end of the stack, and under exactly that assumption
+        #: ``err(k-2) > err(k-1)``, so ``min(rivals)`` — and therefore the
+        #: pass/fail outcome — is bit-identical with or without it.  A rival
+        #: that cannot change the verdict is not discrimination.
+        is_final_layer = aux_idx == last_index
+        if is_final_layer:
+            rival_errors.append(
+                (
+                    "post_norm",
+                    mean_relative_error(cap, post_norm_final[:prompt_token_count]),
+                )
+            )
+
+        rivals = [err for _label, err in rival_errors]
         best_index = min(errors, key=lambda idx: errors[idx])
         if own <= _EPSILON:
             ratio = float("inf")
         elif rivals:
+            #: Over the *enlarged* set, so this can only shrink.  That is the
+            #: point: the extra rival may reveal a separation that was never
+            #: there, it may never manufacture one.
             ratio = min(rivals) / own
         else:
             #: A single-entry stream leaves nothing to discriminate against;
             #: report 0.0 so ``identified`` is False rather than vacuously True.
             ratio = 0.0
+
+        #: Bracketed on both sides.  ``aux_idx - 1`` supplies the lower side;
+        #: the upper side is ``aux_idx + 1`` for an interior layer and the
+        #: post-norm tensor for the final one.  Layer 0 of a real stack has no
+        #: lower side and is honestly reported as one-sided.
+        two_sided = (aux_idx - 1) in errors and (
+            (aux_idx + 1) in errors or is_final_layer
+        )
         tolerance = bf16_relative_tolerance(aux_idx)
         layers.append(
             HFReferenceLayer(
@@ -708,9 +878,19 @@ def compare_to_hf_reference(
                 neighbour_rel_errors={str(k): v for k, v in errors.items()},
                 best_match_index=best_index,
                 discrimination_ratio=ratio,
+                #: ``min(rivals) < own`` already drives ``ratio`` below 1 and so
+                #: below the margin whenever a rival — including the post-norm
+                #: one — is the strict minimum.  The explicit ``own <= min``
+                #: term states that independently of the ratio arithmetic, so a
+                #: future change to ``ratio`` cannot quietly let a strictly
+                #: better rival through.
                 identified=(
-                    best_index == aux_idx and ratio >= DISCRIMINATION_MARGIN
+                    best_index == aux_idx
+                    and (not rivals or own <= min(rivals))
+                    and ratio >= DISCRIMINATION_MARGIN
                 ),
+                rival_errors=tuple(rival_errors),
+                two_sided=two_sided,
             )
         )
 
@@ -738,6 +918,7 @@ def compare_to_hf_reference(
         final_layer_idx=final_layer_idx,
         final_layer_prenorm_confirmed=prenorm_confirmed,
         verdict=_derive_reference_verdict(layers, prenorm_confirmed),
+        prompt_label=prompt_label,
     )
 
 

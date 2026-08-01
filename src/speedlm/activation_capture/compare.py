@@ -87,6 +87,7 @@ The trend is reported as one of: ``"constant"``, ``"growing"``, or
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -325,6 +326,71 @@ class ComparisonResult:
             "rel_error_trend": self.rel_error_trend,
             "all_shapes_match": self.all_shapes_match,
             "all_within_tolerance": self.all_within_tolerance,
+        }
+
+    def write_json(self, path: Path) -> None:
+        """Write the result as a pretty-printed JSON file."""
+        path.write_text(
+            json.dumps(self.to_dict(), indent=2, sort_keys=False) + "\n",
+            encoding="utf-8",
+        )
+
+
+# ---------------------------------------------------------------------------
+# Matrix result (many prompts x one model x one runner)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PromptCase:
+    """One prompt's comparison within a matrix run."""
+
+    #: stable label identifying the prompt within the matrix
+    label: str
+    #: number of prompt tokens the engine reported for this case
+    prompt_token_count: int
+    #: the single-prompt comparison for this case
+    result: ComparisonResult
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a JSON-safe dict."""
+        return {
+            "label": self.label,
+            "prompt_token_count": self.prompt_token_count,
+            "result": self.result.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class MatrixResult:
+    """Aggregate of several :class:`PromptCase` runs on one model + runner.
+
+    A matrix exists to widen coverage, so its verdict must never be able to
+    hide a failing member.  There is no averaging and no "worst case" here:
+    :func:`derive_matrix_verdict` names *every* failing case, and an empty
+    matrix — one that compared nothing at all — is a failure rather than a
+    vacuous pass.  A mis-wired matrix that silently covers zero prompts is the
+    exact failure this type is shaped to catch.
+    """
+
+    #: verifier model id or resolved snapshot path the matrix ran against
+    model: str
+    #: vLLM model runner generation the serving engine actually ran ("v1"/"v2")
+    runner: str
+    #: per-prompt cases, in the order they were run
+    cases: tuple[PromptCase, ...]
+    #: aggregate verdict; PASS only when every case passed
+    verdict: str
+
+    # -- serialization --
+
+    def to_dict(self) -> dict[str, Any]:
+        """Serialize to a JSON-safe dict."""
+        return {
+            "model": self.model,
+            "runner": self.runner,
+            "cases": [case.to_dict() for case in self.cases],
+            "verdict": self.verdict,
         }
 
     def write_json(self, path: Path) -> None:
@@ -712,4 +778,53 @@ def build_result(
         relative_tolerance=result.relative_tolerance,
         verdict=derive_verdict(result),
         rel_error_trend=result.rel_error_trend,
+    )
+
+
+def derive_matrix_verdict(cases: Sequence[PromptCase]) -> str:
+    """Derive an aggregate verdict for a matrix of per-prompt comparisons.
+
+    Verdict rules:
+    - **FAIL_empty**: no cases at all.  A matrix that ran nothing must never
+      report PASS: an empty ``cases`` is the signature of a mis-wired matrix
+      that silently covered zero prompts, which is precisely the condition a
+      "PASS on vacuous truth" would hide.
+    - **PASS**: every case's ``result.verdict`` is ``"PASS"``.
+    - **FAIL_cases:<label>=<verdict>[,<label>=<verdict>...]**: one or more
+      cases did not pass.  *Every* failing case is named, in case order, with
+      the verdict it reported.  The failures are deliberately not aggregated,
+      averaged, or reduced to the "worst" one — a matrix is run to widen
+      coverage, so collapsing several distinct failures into a single label
+      would throw away exactly the information the extra prompts bought.
+    """
+    if not cases:
+        return "FAIL_empty"
+    failures = [
+        f"{case.label}={case.result.verdict}"
+        for case in cases
+        if case.result.verdict != "PASS"
+    ]
+    if not failures:
+        return "PASS"
+    return "FAIL_cases:" + ",".join(failures)
+
+
+def build_matrix_result(
+    *,
+    model: str,
+    runner: str,
+    cases: Sequence[PromptCase],
+) -> MatrixResult:
+    """Build a complete MatrixResult from per-prompt cases.
+
+    This is the primary entry point for constructing a matrix result.  The
+    verdict is computed from *cases* before construction, so the result is
+    built exactly once (unlike :func:`build_result`, which constructs a
+    throwaway instance to feed :func:`derive_verdict`).
+    """
+    return MatrixResult(
+        model=model,
+        runner=runner,
+        cases=tuple(cases),
+        verdict=derive_matrix_verdict(cases),
     )

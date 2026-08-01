@@ -553,6 +553,33 @@ class IdleTuningConfig:
     #: ``Decision.candidate_throughput_trend_pct_per_repeat`` is now published on
     #: every decision so that measurement accumulates by itself.
     benchmark_repeats: int = 5
+    #: Unscored suite passes each arm runs after activation, before its
+    #: measurement window opens.
+    #:
+    #: This existed only as a :class:`speedlm.gate.runner.BenchmarkGateRunner`
+    #: constructor default of 1, which production never passed, so the one knob
+    #: that ``benchmark_repeats``' own analysis names as "the honest direction
+    #: is *up*" was the one knob an operator could not turn.  The default here
+    #: is 1 precisely so that surfacing it changes nothing that runs today.
+    #:
+    #: A warmup pass and a scored repeat are *the same suite pass at the same
+    #: cost*: :meth:`~speedlm.gate.runner.BenchmarkGateRunner._warmup` calls the
+    #: same replay under the same ``benchmark_max_tokens``, and
+    #: :func:`speedlm.tuner.orchestrator.derive_benchmark_timeout` charges them
+    #: identically as ``arms x (warmup_repeats + repeats) x num_contexts``.
+    #: That equality is what makes the trade arithmetic, not a judgement call:
+    #: on jobs 369161/369162 one pass-index costs ~174s (Qwen3-8B) and ~301s
+    #: (gpt-oss-20b) of the 1043.4s and 1808.5s benchmark phases, so moving a
+    #: pass from ``benchmark_repeats`` to here is *exactly* a wash and only
+    #: ``warmup_repeats + benchmark_repeats < 6`` saves wall clock at all.
+    #:
+    #: Raising this is therefore not an efficiency lever.  It is a *bias* lever:
+    #: it buys an unbiased delta, at the price of the extra passes, and only
+    #: once the warming curve is known to flatten inside the window it opens.
+    #: See ``Decision.candidate_throughput_flat_from_repeat``, which is what
+    #: measures that, and raise ``benchmark_repeats`` -- already unbounded above
+    #: -- to characterise the curve rather than raising this one blind.
+    warmup_repeats: int = 1
     #: Held-out requests kept in flight per arm during a gate replay.
     #:
     #: Before this existed the replay was strictly serial and the served engine
@@ -739,6 +766,9 @@ class IdleTuningConfig:
             0,
         )
         _validate_int_gte(self.benchmark_repeats, "tuning.benchmark_repeats", 3)
+        # Zero is legal: it restores the pre-warmup behaviour, which is a
+        # measurement an operator may legitimately want back for comparison.
+        _validate_int_gte(self.warmup_repeats, "tuning.warmup_repeats", 0)
         if not isinstance(self.benchmark_candidate_arm_first, bool):
             raise ConfigError(
                 "tuning.benchmark_candidate_arm_first must be a bool, "
@@ -941,6 +971,7 @@ class SpeedLMConfig:
             ),
             "held_out_fraction": self.tuning.held_out_fraction,
             "benchmark_repeats": self.tuning.benchmark_repeats,
+            "warmup_repeats": self.tuning.warmup_repeats,
             "benchmark_candidate_arm_first": (
                 self.tuning.benchmark_candidate_arm_first
             ),
@@ -1053,6 +1084,7 @@ class SpeedLMConfig:
                 "serving_recovery_interval_seconds",
                 "held_out_fraction",
                 "benchmark_repeats",
+                "warmup_repeats",
                 "benchmark_candidate_arm_first",
                 "benchmark_concurrency",
                 "correctness_max_tokens",

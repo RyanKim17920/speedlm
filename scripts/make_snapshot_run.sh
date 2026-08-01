@@ -88,6 +88,17 @@ Optional:
   --verifier ID         SPEEDLM_E2E_VERIFIER_MODEL        (capture/hot-swap)
   --drafter ID          SPEEDLM_E2E_DRAFTER_MODEL         (capture/hot-swap)
   --drafter-dir PATH    SPEEDLM_E2E_DRAFTER_DIR           (hot-swap, optional)
+  --runner R            auto | v1 | v2                    (default: auto)
+                        v1/v2 force VLLM_USE_V2_MODEL_RUNNER=0/1; auto lets
+                        vLLM decide.  A non-auto runner is also folded into the
+                        default run name so cells do not collide.
+  --prompt-set NAME     SPEEDLM_E2E_PROMPT_SET            (capture, optional)
+  --target-layer-ids C  SPEEDLM_E2E_TARGET_LAYER_IDS      (capture, optional, csv)
+  --hf-reference 0|1    SPEEDLM_E2E_HF_REFERENCE          (capture, optional)
+  --strict-verdict 0|1  SPEEDLM_E2E_STRICT_VERDICT        (capture, optional)
+  --pytest-k EXPR       pytest -k EXPR                    (optional; without it
+                        the whole test file runs, i.e. Stage 0 AND the
+                        prefix-cache test together)
   --corpus PATH         SPEEDLM_E2E_PROMPT_CORPUS         (idle-tuning)
   --no-corpus           omit the corpus; test falls back to synthetic prompts
   --model ID            served model                      (default: per flavor)
@@ -102,6 +113,38 @@ Optional:
 The snapshot lands in /data/ryan.kim/speedlm-snapshots/<full-sha>/ and is made
 read-only.  Re-running for the same commit reuses it (content is identical by
 construction), so snapshots are cheap: the tree is ~2.5 MB.
+
+STAGE 0 RUNNER x MODEL MATRIX
+----------------------------
+Both gpt-oss models are already in the default HF_HOME=/data/ryan.kim/hf-cache
+(openai/gpt-oss-20b has 24 hidden layers), so the four cells below need no
+extra plumbing beyond --verifier/--drafter/--runner:
+
+  # qwen3-8b x v1
+  scripts/make_snapshot_run.sh --flavor activation-capture --runner v1 \
+      --pytest-k test_stage0_activation_capture
+
+  # qwen3-8b x v2
+  scripts/make_snapshot_run.sh --flavor activation-capture --runner v2 \
+      --pytest-k test_stage0_activation_capture
+
+  # gpt-oss-20b x v1
+  scripts/make_snapshot_run.sh --flavor activation-capture --runner v1 \
+      --verifier openai/gpt-oss-20b \
+      --drafter RedHatAI/gpt-oss-20b-speculator.eagle3 \
+      --run-name capture-gptoss20b-v1 \
+      --pytest-k test_stage0_activation_capture
+
+  # gpt-oss-20b x v2
+  scripts/make_snapshot_run.sh --flavor activation-capture --runner v2 \
+      --verifier openai/gpt-oss-20b \
+      --drafter RedHatAI/gpt-oss-20b-speculator.eagle3 \
+      --run-name capture-gptoss20b-v2 \
+      --pytest-k test_stage0_activation_capture
+
+The two qwen cells need no --run-name: --runner is folded into the default,
+giving activation-capture-v1-snap-<UTC> and activation-capture-v2-snap-<UTC>.
+The gpt-oss cells share that default with the qwen ones, so name them.
 
 Nothing is submitted.  The script prints the sbatch to run.
 EOF
@@ -121,6 +164,12 @@ tuning_profile=""
 verifier=""
 drafter=""
 drafter_dir=""
+runner="auto"
+prompt_set=""
+target_layer_ids=""
+hf_reference=""
+strict_verdict=""
+pytest_k=""
 corpus="$CORPUS"
 model=""
 matrix_cell=""
@@ -142,6 +191,12 @@ while [[ $# -gt 0 ]]; do
         --verifier)       verifier="$2"; shift 2 ;;
         --drafter)        drafter="$2"; shift 2 ;;
         --drafter-dir)    drafter_dir="$2"; shift 2 ;;
+        --runner)         runner="$2"; shift 2 ;;
+        --prompt-set)     prompt_set="$2"; shift 2 ;;
+        --target-layer-ids) target_layer_ids="$2"; shift 2 ;;
+        --hf-reference)   hf_reference="$2"; shift 2 ;;
+        --strict-verdict) strict_verdict="$2"; shift 2 ;;
+        --pytest-k)       pytest_k="$2"; shift 2 ;;
         --corpus)         corpus="$2"; shift 2 ;;
         --no-corpus)      corpus=""; shift ;;
         --model)          model="$2"; shift 2 ;;
@@ -155,6 +210,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "$flavor" ]] || { echo "error: --flavor is required" >&2; usage >&2; exit 2; }
+
+case "$runner" in
+    auto|v1|v2) ;;
+    *) echo "error: invalid --runner '$runner' (want auto|v1|v2)" >&2; exit 2 ;;
+esac
 
 # --------------------------------------------------------------------------
 # Per-flavor wiring.
@@ -333,7 +393,13 @@ sha="$(git rev-parse --verify "${commit_ref}^{commit}")"
 short_sha="${sha:0:12}"
 snapshot="$SNAPSHOT_ROOT/$sha"
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
-run_name="${run_name:-${flavor}-snap-${stamp}}"
+# A runner sweep generates cells that differ ONLY by --runner, and two of them
+# started in the same second would collide on the "run directory already exists"
+# refusal below.  Fold a non-auto runner into the default name; an explicit
+# --run-name is left exactly as given.
+runner_tag=""
+[[ "$runner" == "auto" ]] || runner_tag="-$runner"
+run_name="${run_name:-${flavor}${runner_tag}-snap-${stamp}}"
 run_dir="$RUN_ROOT/$run_name"
 
 if [[ -e "$run_dir" ]]; then
@@ -457,6 +523,25 @@ export SPEEDLM_E2E_DRAFTER_MODEL=$drafter
 EOF
         [[ -n "$drafter_dir" ]] && echo "export SPEEDLM_E2E_DRAFTER_DIR=$drafter_dir"
         echo "export SPEEDLM_E2E_READY_TIMEOUT=1800"
+        # Stage 0 matrix knobs.  Each is emitted ONLY when the operator set it,
+        # so the unset case keeps the test's own defaults.
+        [[ -n "$prompt_set" ]] && echo "export SPEEDLM_E2E_PROMPT_SET=$prompt_set"
+        [[ -n "$target_layer_ids" ]] && echo "export SPEEDLM_E2E_TARGET_LAYER_IDS=$target_layer_ids"
+        [[ -n "$hf_reference" ]] && echo "export SPEEDLM_E2E_HF_REFERENCE=$hf_reference"
+        [[ -n "$strict_verdict" ]] && echo "export SPEEDLM_E2E_STRICT_VERDICT=$strict_verdict"
+        # The GPU model runner generation is forceable from the environment.
+        # VllmConfig.use_v2_model_runner (vllm/config/vllm.py:519-522) reads
+        # envs.VLLM_USE_V2_MODEL_RUNNER FIRST and returns it verbatim when it is
+        # not None, short-circuiting every auto-detection heuristic.  The var is
+        # declared at vllm/envs.py:264 and parsed at vllm/envs.py:1867-1868 with
+        # maybe_convert_bool(os.getenv(...)), so 0 and 1 both work and leaving it
+        # unset means "auto".  EXPECTED_RUNNER is emitted unconditionally so the
+        # test can assert at runtime that it got the runner that was requested.
+        case "$runner" in
+            v1) echo "export VLLM_USE_V2_MODEL_RUNNER=0" ;;
+            v2) echo "export VLLM_USE_V2_MODEL_RUNNER=1" ;;
+        esac
+        echo "export SPEEDLM_E2E_EXPECTED_RUNNER=\"$runner\""
         ;;
     live-vllm)
         echo "export SPEEDLM_E2E_MODEL=$model"
@@ -505,6 +590,11 @@ if [[ -n "$vllm_args" ]]; then
     echo "export $vllm_args_var='$vllm_args'"
 fi
 
+# Without -k the whole test file runs, i.e. Stage 0 and the prefix-cache test
+# together.  -k is what lets one runner/model cell be run on its own.
+pytest_k_arg=""
+[[ -n "$pytest_k" ]] && pytest_k_arg=" -k '$pytest_k'"
+
 cat <<EOF
 
 echo "started_at=\$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -539,7 +629,7 @@ print("provenance OK: imports resolve to the snapshot")
 PYEOF
 
 "\$interpreter" -m pytest -o addopts='' -p no:cacheprovider -q -s \\
-    "\$snapshot/$test_path"
+    "\$snapshot/$test_path"$pytest_k_arg
 
 echo "finished_at=\$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 EOF

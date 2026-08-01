@@ -201,6 +201,13 @@ class TestPromotion:
             assert decision.throughput_dispersion is DispersionBasis.MEASURED
             assert decision.throughput_delta_standard_error_pct is not None
             assert decision.candidate_throughput_trend_pct_per_repeat is not None
+            # The warming diagnostic has to reach ``decision.json`` on every
+            # run, not only when it happens to find a plateau -- accumulating
+            # the answer across runs is the entire mechanism.  Its *value* is
+            # not asserted: three repeats of a simulated engine is not a
+            # warming curve, and pinning one here would be pinning noise.
+            assert "candidate_throughput_flat_from_repeat" in record
+            assert "stock_throughput_flat_from_repeat" in record
 
     def test_every_scrape_is_kept_verbatim_as_evidence(self, tmp_path: Path) -> None:
         stock, candidate = _profiles()
@@ -301,6 +308,53 @@ class TestMeasuredRejections:
             assert decision.output_early_divergences == SUITE_SIZE
             assert all(d.early for d in decision.output_divergences)
             assert all(d.first_divergence_index == 2 for d in decision.output_divergences)
+
+    def test_raising_the_threshold_reclassifies_a_real_divergence_as_early(
+        self, tmp_path: Path
+    ) -> None:
+        """The rehearsal for the GPU experiment that has never run.
+
+        Every divergence recorded on live hardware has classified LATE: job
+        369161 measured first-divergence offsets of 36/67/78/91/127 and job
+        369162 measured 58 of them spanning 20..125, against a threshold of 16.
+        So the EARLY branch -- the one that actually rejects -- has only ever
+        executed against synthetic unit-test data.
+
+        The cheapest decisive experiment is not a deliberately broken drafter;
+        it is the *same* benign divergences judged against a threshold above
+        them.  That is what this pins in simulation, over the real gate and a
+        real replay, and it is exactly the shape of the sbatch that runs it:
+        one config key, no code path that exists only for the experiment.
+
+        What it establishes: the classification boundary and the reject path
+        work on divergences the engine genuinely produced.  What it does not:
+        that a genuinely broken drafter parts early.  Those are different
+        claims and only the first one is testable this cheaply.
+        """
+        # The default (16) promotes this exact candidate -- see
+        # ``test_a_divergence_deep_into_the_answer_does_not_block_promotion``.
+        stock, candidate = _profiles(candidate_divergence_at=40)
+        promotion = replace(ACCEPTANCE_ONLY, min_divergence_token_index=128)
+        with _fixture(tmp_path, stock, candidate) as fixture:
+            result = fixture.gate(promotion=promotion).benchmark(
+                fixture.candidate, timeout_seconds=600.0, should_abort=lambda: False
+            )
+
+            decision = result.decision
+            assert decision is not None
+            assert result.passed is False
+            assert result.failure is None, "a measured rejection is not a gate failure"
+            assert decision.verdict is Verdict.REJECT
+            assert decision.reason is Reason.OUTPUT_MISMATCH
+            # The divergences are the same ones; only the criterion moved.
+            assert all(d.first_divergence_index == 40 for d in decision.output_divergences)
+            assert all(d.early for d in decision.output_divergences)
+            assert decision.output_early_divergences == SUITE_SIZE
+            assert decision.output_total_divergences == SUITE_SIZE
+            # The archived record has to say which criterion produced this, or
+            # a reader cannot tell the experiment from a production rejection.
+            assert decision.min_divergence_token_index == 128
+            assert decision.to_dict()["min_divergence_token_index"] == 128
 
     def test_counter_reset_under_the_gate(self, tmp_path: Path) -> None:
         # An engine that restarts mid-arm.  Per arm the schedule is: 5 warmup
