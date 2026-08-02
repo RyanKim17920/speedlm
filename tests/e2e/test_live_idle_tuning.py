@@ -139,18 +139,31 @@ FAILED_OUTCOMES = frozenset(
     }
 )
 
-# Verdicts reached by actually comparing the two arms.  Anything else means the
-# gate rejected for want of data, which is a legitimate runtime outcome but not
-# a passing end-to-end run: it proves the lifecycle turned over without proving
-# the gate can measure.
-MEASURED_REASONS = frozenset(
+# Verdicts reached after computing both deltas, i.e. the gate ran the whole
+# comparison and judged it against the thresholds.  These are the only reasons
+# for which `acceptance_delta_pp` and `throughput_delta_pct` are populated.
+DELTA_REASONS = frozenset(
     {
         "both_thresholds_met",
         "acceptance_below_threshold",
         "throughput_below_threshold",
-        "output_mismatch",
     }
 )
+
+# Verdicts reached by measuring the arms and then short-circuiting *before* the
+# deltas are computed.  `output_mismatch` is one: `decide_promotion` returns at
+# the divergence check, which sits above the `acceptance_delta_pp` assignment,
+# so both delta fields are null by design on this path.  That is not missing
+# data -- the gate has evidence, it is just evidence of a different kind -- so
+# these reasons are measured, and the evidence they *do* carry is asserted
+# below instead of the deltas.
+SHORT_CIRCUIT_MEASURED_REASONS = frozenset({"output_mismatch"})
+
+# Verdicts reached by actually comparing the two arms.  Anything else means the
+# gate rejected for want of data, which is a legitimate runtime outcome but not
+# a passing end-to-end run: it proves the lifecycle turned over without proving
+# the gate can measure.
+MEASURED_REASONS = DELTA_REASONS | SHORT_CIRCUIT_MEASURED_REASONS
 # Escape hatch for deliberately exercising an unmeasurable gate (e.g. a build
 # with speculative decoding switched off).  Off by default so the silent
 # zero-sample rejection that shipped cannot pass again.
@@ -439,8 +452,33 @@ def _assert_gate_measured_something(decision: JsonObject) -> None:
         )
 
     assert num_repeats > 0, decision
-    assert decision.get("acceptance_delta_pp") is not None, decision
-    assert decision.get("throughput_delta_pct") is not None, decision
+    if reason in DELTA_REASONS:
+        assert decision.get("acceptance_delta_pp") is not None, decision
+        assert decision.get("throughput_delta_pct") is not None, decision
+    else:
+        # Short-circuited above the delta computation.  Requiring the deltas
+        # here would be unsatisfiable, so require the evidence that actually
+        # justified the short circuit -- otherwise this branch would let a gate
+        # that measured nothing through under a measured-looking reason.
+        assert decision.get("output_early_divergences", 0) > 0, decision
+        divergences = decision.get("output_divergences")
+        assert isinstance(divergences, list) and divergences, decision
+        assert any(d.get("early") for d in divergences), decision
+        # The correctness pass is a different replay from the scored repeats.
+        # Pin that the record says how many passes it made, so a reader cannot
+        # mistake the zeros in the `per_repeat` `output_mismatches` column for
+        # clean correctness passes that never ran.
+        correctness_repeats = decision.get("correctness_repeats")
+        assert (
+            isinstance(correctness_repeats, int)
+            and not isinstance(correctness_repeats, bool)
+            and correctness_repeats > 0
+        ), decision
+        assert all(
+            row.get("output_mismatches", 0) == 0
+            for row in per_repeat[correctness_repeats:]
+            if isinstance(row, dict)
+        ), decision
     # Throughput is measured whenever the arms ran at all, so require it on
     # both.  Acceptance may legitimately be a measured zero for one arm (a head
     # whose every draft is rejected), but not for both -- that is the all-zero

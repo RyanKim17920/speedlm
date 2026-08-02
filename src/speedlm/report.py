@@ -1062,6 +1062,7 @@ def parse_decision(record: Mapping[str, Any], *, source: Path) -> Decision:
         benchmark_max_tokens=_optional_int(record.get("benchmark_max_tokens")),
         replay_concurrency=_optional_int(record.get("replay_concurrency")),
         correctness_max_tokens=_optional_int(record.get("correctness_max_tokens")),
+        correctness_repeats=_optional_int(record.get("correctness_repeats")),
         suite_hash=_optional_str(record.get("suite_hash")),
         num_contexts=_optional_int(record.get("num_contexts")),
         stock_draft=_optional_str(record.get("stock_draft")),
@@ -1334,6 +1335,10 @@ class GainReport:
             "benchmark_max_tokens": decision.benchmark_max_tokens,
             "replay_concurrency": decision.replay_concurrency,
             "correctness_max_tokens": decision.correctness_max_tokens,
+            # Passes the correctness replay made.  Without it the
+            # ``output_mismatches`` column in ``per_repeat`` cannot be read:
+            # rows at or beyond this index were never checked.
+            "correctness_repeats": decision.correctness_repeats,
         }
         if self.deltas_measured:
             result["measurement"] = {

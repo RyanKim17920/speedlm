@@ -1132,10 +1132,11 @@ def test_gain_omits_context_lines_a_legacy_decision_never_recorded(
 # gain — archived artifacts
 # ---------------------------------------------------------------------------
 
-#: Real gate decisions from completed GPU runs.  They predate every field added
-#: above, which is exactly why they are the test: the dispersion figures are
-#: *derived* from ``per_repeat``, so an archived record must report the same
-#: basis the gate would have, without carrying any of the new keys.
+#: Real gate decisions from completed GPU runs.  The older ones predate every
+#: field added above, which is exactly why they are the test: the dispersion
+#: figures are *derived* from ``per_repeat``, so an archived record must report
+#: the same basis the gate would have, without carrying any of the new keys.
+#: Newer runs land in the same tree and do carry them; both are replayed.
 _ARCHIVE_ROOT = Path("/data/ryan.kim/speedlm-runs")
 _ARCHIVED_DECISIONS = sorted(
     _ARCHIVE_ROOT.glob(
@@ -1152,15 +1153,23 @@ _ARCHIVED_DECISIONS = sorted(
 )
 def test_archived_decisions_round_trip_without_the_new_keys(path: Path) -> None:
     record = json.loads(path.read_text(encoding="utf-8"))
-    assert "acceptance_dispersion" not in record, (
-        "this fixture is only meaningful while it predates the field"
-    )
+    # The archive now holds records from both sides of the field's
+    # introduction, so this branches on the record instead of asserting the
+    # tree stays legacy -- which it does not.  Job 369373 wrote a modern
+    # decision.json into the same glob and turned this into a red suite about
+    # the fixture rather than about the code.  Both sides are worth replaying:
+    # a legacy record proves the dispersion figures are *derived*, a modern one
+    # proves the stored basis survives the round trip unchanged.
+    legacy = "acceptance_dispersion" not in record
 
     decision = load_decision(path)
 
-    # Derived, so they exist even though the file never stored them.
+    # Derived, so they exist even though a legacy file never stored them.
     assert decision.acceptance_dispersion in set(DispersionBasis)
     assert decision.throughput_dispersion in set(DispersionBasis)
+    if not legacy:
+        assert decision.acceptance_dispersion.value == record["acceptance_dispersion"]
+        assert decision.throughput_dispersion.value == record["throughput_dispersion"]
     # And the invariant that motivated the enum: no zero standard errors.
     for basis, error in (
         (decision.acceptance_dispersion, decision.acceptance_delta_standard_error_pp),

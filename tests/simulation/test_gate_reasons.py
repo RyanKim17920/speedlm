@@ -356,6 +356,108 @@ class TestMeasuredRejections:
             assert decision.min_divergence_token_index == 128
             assert decision.to_dict()["min_divergence_token_index"] == 128
 
+    def test_an_early_divergence_rejection_carries_no_deltas_but_is_measured(
+        self, tmp_path: Path
+    ) -> None:
+        """The exact record shape job 369373 produced, pinned without a GPU.
+
+        That job rejected 48 early divergences and reported
+        ``acceptance_delta_pp: null`` -- correctly, because
+        :func:`~speedlm.gate.decide.decide_promotion` returns at the divergence
+        check, which sits *above* the line that computes the deltas.  The e2e
+        harness nevertheless asserted the delta was non-null for every reason
+        it called "measured", ``output_mismatch`` among them, so the assertion
+        could never hold and the job reported FAILED on a pipeline that worked.
+
+        Two claims are pinned here.  First, the gate's own contract: a
+        short-circuited rejection publishes no deltas and instead publishes the
+        divergence evidence that caused it.  Second, the harness contract: the
+        shipped e2e assertion accepts this record while still refusing one from
+        a gate that measured nothing.
+        """
+        from e2e.test_live_idle_tuning import (  # noqa: PLC0415
+            DELTA_REASONS,
+            MEASURED_REASONS,
+            SHORT_CIRCUIT_MEASURED_REASONS,
+            _assert_gate_measured_something,
+        )
+
+        stock, candidate = _profiles(candidate_divergence_at=2)
+        with _fixture(tmp_path, stock, candidate) as fixture:
+            result = fixture.gate().benchmark(
+                fixture.candidate, timeout_seconds=600.0, should_abort=lambda: False
+            )
+
+            decision = result.decision
+            assert decision is not None
+            assert decision.verdict is Verdict.REJECT
+            assert decision.reason is Reason.OUTPUT_MISMATCH
+            # Null by design: the short circuit is above the delta computation.
+            assert decision.acceptance_delta_pp is None
+            assert decision.throughput_delta_pct is None
+            # But the arms did run, and the evidence is on the record.
+            assert decision.num_repeats > 0
+            assert decision.output_early_divergences > 0
+
+            record = decision.to_dict()
+            # The correctness pass is its own replay: it made ONE pass, so only
+            # ``per_repeat`` row 0 can carry a non-zero ``output_mismatches``
+            # and the later rows are unmeasured, not clean.  Without this field
+            # a reader cannot tell those two apart.
+            assert record["correctness_repeats"] == 1
+            assert record["per_repeat"][0]["output_mismatches"] > 0
+            assert all(
+                row["output_mismatches"] == 0 for row in record["per_repeat"][1:]
+            )
+
+            # The harness contract, checked against the shipped assertion.
+            assert decision.reason.value in SHORT_CIRCUIT_MEASURED_REASONS
+            assert decision.reason.value not in DELTA_REASONS
+            assert decision.reason.value in MEASURED_REASONS
+            _assert_gate_measured_something(record)
+
+    def test_the_harness_still_rejects_a_gate_that_measured_nothing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The coverage the ``output_mismatch`` split must not have cost.
+
+        Dropping ``output_mismatch`` from the measured set would have made the
+        e2e assertion pass, at the price of no longer distinguishing a gate
+        that measured and declined from one that collected zero samples.  This
+        pins that the zero-sample record still fails, and that a short-circuit
+        reason with no divergence evidence behind it fails too -- the loophole
+        the split would otherwise open.
+        """
+        from e2e import test_live_idle_tuning as harness  # noqa: PLC0415
+
+        _assert_gate_measured_something = harness._assert_gate_measured_something
+        # The escape hatch is an operator override, not part of the contract
+        # under test; pin it off so this passes regardless of the environment.
+        monkeypatch.setattr(harness, "ALLOW_UNMEASURED_GATE", False)
+
+        # The record that actually shipped: rejected having measured nothing.
+        with pytest.raises(AssertionError, match="without comparing the two arms"):
+            _assert_gate_measured_something(
+                {
+                    "reason": "acceptance_unavailable",
+                    "num_repeats": 0,
+                    "per_repeat": [],
+                }
+            )
+
+        # An ``output_mismatch`` claimed with no divergence behind it.
+        with pytest.raises(AssertionError):
+            _assert_gate_measured_something(
+                {
+                    "reason": "output_mismatch",
+                    "num_repeats": 1,
+                    "per_repeat": [{"output_mismatches": 0}],
+                    "output_early_divergences": 0,
+                    "output_divergences": [],
+                    "correctness_repeats": 1,
+                }
+            )
+
     def test_counter_reset_under_the_gate(self, tmp_path: Path) -> None:
         # An engine that restarts mid-arm.  Per arm the schedule is: 5 warmup
         # generations, then three scored repeats of 5.  A reset on generation 12

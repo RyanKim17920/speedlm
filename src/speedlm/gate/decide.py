@@ -204,8 +204,13 @@ class RepeatSummary:
     #: Early divergences attributed to the correctness-pass repeat with this
     #: index.  The correctness pass is a separate, bounded, single-stream
     #: replay that runs once by default, so with the default configuration only
-    #: row 0 is ever non-zero.  ``Decision.output_early_divergences`` is the
-    #: total the gate actually compares against ``max_output_mismatches``.
+    #: row 0 is ever non-zero -- and rows at or beyond
+    #: ``Decision.correctness_repeats`` report zero because *no correctness
+    #: pass ran at that index*, not because one ran and found nothing.  Read
+    #: this column against ``Decision.correctness_repeats``, never against
+    #: ``num_repeats``: they index different passes that merely share a
+    #: counter.  ``Decision.output_early_divergences`` is the total the gate
+    #: actually compares against ``max_output_mismatches``.
     output_mismatches: int
 
 
@@ -287,6 +292,14 @@ class Decision:
     #: Output cap of the separate, single-stream correctness pass -- the one
     #: that produces ``output_divergences``.
     correctness_max_tokens: int | None = None
+    #: Suite passes that correctness pass made, per arm.  Recorded because
+    #: ``per_repeat`` is indexed by the *throughput* pass's repeat and carries
+    #: an ``output_mismatches`` column anyway: without this field a record
+    #: reading ``num_repeats: 5`` and ``output_mismatches: [48, 0, 0, 0, 0]``
+    #: is indistinguishable from five correctness passes of which four were
+    #: clean, when in fact one pass ran and rows 1..4 were never measured.
+    #: Job 369373 produced exactly that record.
+    correctness_repeats: int | None = None
     #: Identity of the frozen held-out suite both arms replayed.  Two deltas
     #: measured over different suites are different measurements.
     suite_hash: str | None = None
@@ -512,6 +525,7 @@ class Decision:
             "benchmark_max_tokens": self.benchmark_max_tokens,
             "replay_concurrency": self.replay_concurrency,
             "correctness_max_tokens": self.correctness_max_tokens,
+            "correctness_repeats": self.correctness_repeats,
             "suite_hash": self.suite_hash,
             "num_contexts": self.num_contexts,
             "stock_draft": self.stock_draft,
@@ -874,11 +888,20 @@ def decide_promotion(
     # single-stream, bounded generation rather than of the batched throughput
     # pass, whose whole purpose is to vary batch composition.
     min_divergence_index = promotion_config.min_divergence_token_index
+    stock_corr = stock_correctness if stock_correctness is not None else stock_replay
+    candidate_corr = (
+        candidate_correctness if candidate_correctness is not None else candidate_replay
+    )
     divergences = _collect_divergences(
-        stock_correctness if stock_correctness is not None else stock_replay,
-        candidate_correctness if candidate_correctness is not None else candidate_replay,
+        stock_corr,
+        candidate_corr,
         min_divergence_index=min_divergence_index,
     )
+    # The number of passes the divergence evidence above actually rests on.
+    # ``_collect_divergences`` compares ``min(num_runs)`` pairs, so that is the
+    # count -- and it is what bounds which ``per_repeat`` rows can carry a
+    # non-zero ``output_mismatches``.
+    correctness_repeats = min(stock_corr.num_runs, candidate_corr.num_runs)
     early_by_repeat: dict[int, int] = {}
     for d in divergences:
         if d.early:
@@ -966,6 +989,7 @@ def decide_promotion(
             benchmark_max_tokens=benchmark_max_tokens,
             replay_concurrency=replay_concurrency,
             correctness_max_tokens=correctness_max_tokens,
+            correctness_repeats=correctness_repeats,
             suite_hash=stock_replay.suite_hash or None,
             num_contexts=num_contexts,
             stock_draft=stock_draft,
