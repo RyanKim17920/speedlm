@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -16,8 +16,19 @@ from speedlm.gateway.activity import ActivityTracker
 from speedlm.report import load_decision
 from speedlm.traces.store import TraceRecord, TraceStats, TraceStore
 from speedlm.training.base import BackendInfo
+from speedlm.training.masking import MaskPolicy
 from speedlm.tuner.artifacts import ArtifactRegistry, ArtifactSpec
-from speedlm.tuner.composition import active_draft_reference
+from speedlm.tuner.composition import (
+    active_draft_reference,
+    promotion_chain_depth,
+    warm_start_reference,
+)
+from speedlm.tuner.eagle3 import (
+    Eagle3Adapter,
+    Eagle3Config,
+    TraceSnapshot,
+    TrainingResult,
+)
 from speedlm.tuner.idle import IdleDetector
 from speedlm.tuner.orchestrator import (
     CycleOutcome,
@@ -617,3 +628,262 @@ def test_second_cycle_benchmarks_against_the_promoted_draft_not_the_original(
     # or the two cycles' deltas are indistinguishable after the fact.
     assert second.decision_path is not None
     assert load_decision(second.decision_path).stock_draft == str(promoted.path)
+
+
+# ---------------------------------------------------------------------------
+# Compounding warm start
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _RecordingTrainer:
+    """Records the ``--from-pretrained`` base each cycle actually trained on."""
+
+    bases: list[str] = field(default_factory=list)
+
+    def train(
+        self,
+        hidden_states_path: Path,
+        destination: Path,
+        *,
+        from_pretrained: str,
+        training_params: Mapping[str, object],
+        timeout_seconds: float,
+        should_abort: Callable[[], bool],
+    ) -> TrainingResult:
+        del hidden_states_path, training_params
+        assert timeout_seconds > 0 and not should_abort()
+        self.bases.append(from_pretrained)
+        checkpoint = destination / "checkpoint_best"
+        checkpoint.mkdir(parents=True)
+        return TrainingResult(checkpoint_best=checkpoint, returncode=0)
+
+
+@dataclass
+class _StubStages:
+    """Every EAGLE-3 effect except training, which is what the test watches."""
+
+    payload: bytes
+
+    def lease_snapshot(
+        self,
+        destination: Path,
+        *,
+        timeout_seconds: float,
+        should_abort: Callable[[], bool],
+    ) -> TraceSnapshot:
+        assert timeout_seconds > 0 and not should_abort()
+        destination.mkdir(parents=True, exist_ok=True)
+        return TraceSnapshot(path=destination, content_hash=self.payload.hex())
+
+    def render_rows(
+        self,
+        snapshot: TraceSnapshot,
+        destination: Path,
+        *,
+        timeout_seconds: float,
+        should_abort: Callable[[], bool],
+    ) -> Path:
+        del snapshot
+        assert timeout_seconds > 0 and not should_abort()
+        destination.mkdir(parents=True, exist_ok=True)
+        return destination
+
+    def extract_hidden_states(
+        self,
+        rows_path: Path,
+        destination: Path,
+        *,
+        verifier_model: str,
+        timeout_seconds: float,
+        should_abort: Callable[[], bool],
+    ) -> Path:
+        del rows_path, verifier_model
+        assert timeout_seconds > 0 and not should_abort()
+        destination.mkdir(parents=True, exist_ok=True)
+        return destination
+
+    def materialize(
+        self,
+        checkpoint_best: Path,
+        destination: Path,
+        *,
+        timeout_seconds: float,
+        should_abort: Callable[[], bool],
+    ) -> Path:
+        del checkpoint_best
+        assert timeout_seconds > 0 and not should_abort()
+        destination.mkdir(parents=True, exist_ok=True)
+        (destination / "weights.bin").write_bytes(self.payload)
+        return destination
+
+    def validate(
+        self,
+        draft_directory: Path,
+        *,
+        verifier_model: str,
+        timeout_seconds: float,
+        should_abort: Callable[[], bool],
+    ) -> None:
+        del verifier_model
+        assert draft_directory.is_dir()
+        assert timeout_seconds > 0 and not should_abort()
+
+
+STOCK_DRAFT = "acme/stock-speculator"
+
+
+def _adapter(
+    payload: bytes,
+    trainer: _RecordingTrainer,
+    resolver: Callable[[], str] | None,
+) -> Eagle3Adapter:
+    stages = _StubStages(payload)
+    return Eagle3Adapter(
+        Eagle3Config(
+            verifier_model="acme/verifier",
+            draft_model=STOCK_DRAFT,
+            from_pretrained=STOCK_DRAFT,
+            mask_policy=MaskPolicy.ALL_ASSISTANT_TURNS,
+        ),
+        leaser=stages,
+        renderer=stages,
+        extractor=stages,
+        trainer=trainer,
+        materializer=stages,
+        validator=stages,
+        warm_start_resolver=resolver,
+    )
+
+
+def _compounding_cycles(
+    tmp_path: Path,
+    verdicts: Sequence[bool],
+    *,
+    max_chain_depth: int | None = None,
+    compounding: bool = True,
+) -> tuple[_RecordingTrainer, ArtifactRegistry, list[Any]]:
+    """Drive consecutive real cycles through the real EAGLE-3 adapter."""
+    runs = tmp_path / "runs"
+    artifacts = ArtifactRegistry(runs)
+    trainer = _RecordingTrainer()
+    now, activity, idle = _idle_pair()
+    runtime = _Runtime(activity, now)
+    resolver = (
+        (
+            lambda: warm_start_reference(
+                artifacts,
+                STOCK_DRAFT,
+                max_chain_depth=max_chain_depth,
+            )
+        )
+        if compounding
+        else None
+    )
+    results: list[Any] = []
+    for index, passed in enumerate(verdicts):
+        results.append(
+            TunerOrchestrator(
+                state=TunerStateMachine(runs / "state"),
+                idle=idle,
+                backend=_adapter(f"weights-{index}".encode(), trainer, resolver),
+                artifacts=artifacts,
+                runtime=runtime,
+                gate=_Gate(passed),
+                work_root=runs,
+                run_id_factory=lambda index=index: f"cycle-{index}",
+            ).run_once()
+        )
+    return trainer, artifacts, results
+
+
+def test_each_cycle_warm_starts_from_the_artifact_that_is_currently_serving(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Learning has to accumulate, which means cycle N+1 builds on cycle N.
+
+    Regression for a warm start captured once, at composition time, from the
+    profile's stock speculator.  Frozen, every cycle re-ran the same one-shot
+    fine-tune of the original head and threw the previous cycle's promoted
+    artifact away, so the compounding that is the whole premise of idle tuning
+    could never happen -- and never had.
+
+    Three cycles is the minimum that separates the two things a warm start must
+    track: promotion (cycle two must move to cycle one's artifact) and the
+    *absence* of one (cycle three must stay on it after a rejection, not fall
+    back to stock and not follow the rejected candidate).
+    """
+    monkeypatch.setenv("SPEEDLM_HOME", str(tmp_path))
+    trainer, artifacts, results = _compounding_cycles(tmp_path, (True, False, True))
+
+    assert [result.outcome for result in results] == [
+        CycleOutcome.PROMOTED,
+        CycleOutcome.REJECTED,
+        CycleOutcome.PROMOTED,
+    ]
+    first, rejected, third = (result.artifact_id for result in results)
+    first_path = artifacts.get(first).path
+
+    # Cycle one has nothing promoted, so it legitimately starts from stock.
+    # Cycle two must start from cycle one's promotion, and cycle three -- whose
+    # predecessor was rejected -- must still start from the incumbent, which is
+    # cycle one's artifact and not the rejected candidate.
+    assert trainer.bases == [STOCK_DRAFT, str(first_path), str(first_path)]
+    assert str(artifacts.get(rejected).path) not in trainer.bases
+
+    # ...and the chain has to be reconstructable from the artifacts alone, or a
+    # promotion's ancestry is unknowable after the fact.  The manifest must
+    # carry the *resolved* base, not the configured one.
+    assert artifacts.get(first).manifest.base_draft == STOCK_DRAFT
+    assert artifacts.get(third).manifest.base_draft == str(first_path)
+    assert promotion_chain_depth(first_path) == 1
+    assert promotion_chain_depth(artifacts.get(third).path) == 2
+    assert promotion_chain_depth(STOCK_DRAFT) == 0
+
+
+def test_compounding_can_be_switched_off_and_every_cycle_returns_to_stock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``tuning.compounding_warm_start = false`` is the archived-run behaviour."""
+    monkeypatch.setenv("SPEEDLM_HOME", str(tmp_path))
+    trainer, _artifacts, results = _compounding_cycles(
+        tmp_path,
+        (True, True),
+        compounding=False,
+    )
+
+    assert [result.outcome for result in results] == [
+        CycleOutcome.PROMOTED,
+        CycleOutcome.PROMOTED,
+    ]
+    assert trainer.bases == [STOCK_DRAFT, STOCK_DRAFT]
+
+
+def test_a_chain_bound_re_baselines_to_stock_instead_of_compounding_forever(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The only lever against drift, since the gate cannot measure it.
+
+    ``warm_start_max_chain_depth=1`` means "an incumbent that is itself trained
+    is already at the bound", so the second cycle re-baselines.  It promotes
+    anyway -- the bound moves where training *starts*, never what the gate
+    decides -- and the third cycle's incumbent is still one deep, so it
+    re-baselines too.
+    """
+    monkeypatch.setenv("SPEEDLM_HOME", str(tmp_path))
+    trainer, artifacts, results = _compounding_cycles(
+        tmp_path,
+        (True, True, True),
+        max_chain_depth=1,
+    )
+
+    assert [result.outcome for result in results] == [CycleOutcome.PROMOTED] * 3
+    assert trainer.bases == [STOCK_DRAFT, STOCK_DRAFT, STOCK_DRAFT]
+    # Every artifact is one link deep, which is exactly what the bound buys:
+    # the chain never grows, so a promotion cannot inherit an ancestor's drift.
+    for result in results:
+        assert result.artifact_id is not None
+        assert promotion_chain_depth(artifacts.get(result.artifact_id).path) == 1

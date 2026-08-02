@@ -104,6 +104,14 @@ def derive_scratch_quota_bytes(training_window_records: int) -> int:
 
 AbortCheck = Callable[[], bool]
 
+#: Names the checkpoint one cycle warm-starts from, resolved when it trains.
+#:
+#: The same shape as :data:`speedlm.gate.runner.StockDraft`, and for the same
+#: reason: what counts as "the head we are improving on" is a *durable pointer
+#: that moves*, so anything naming it has to ask at the moment it needs the
+#: answer rather than capture a value at composition time.
+WarmStartResolver = Callable[[], str]
+
 
 class Eagle3Error(RuntimeError):
     """Base class for EAGLE-3 adapter failures."""
@@ -393,6 +401,26 @@ class DraftValidator(Protocol):
 class Eagle3Adapter:
     """Coordinate injected EAGLE-3 effects with hard safety contracts."""
 
+    #: Held unresolved on purpose; see :meth:`_warm_start`.  ``None`` keeps the
+    #: historical behaviour exactly: every cycle trains from
+    #: ``config.from_pretrained``.
+    _warm_start_resolver: WarmStartResolver | None = None
+
+    #: What the most recent :meth:`train` actually trained from.
+    #:
+    #: :meth:`describe` reports this rather than the configured value, because
+    #: the configured value stopped being the answer the moment a resolver could
+    #: return something else -- and the artifact manifest's ``base_draft`` is
+    #: the *only* record of which head a cycle built on.  Recording a
+    #: configured-but-unused value there is the same class of defect as a
+    #: manifest asserting a verifier revision the cycle could not satisfy (see
+    #: :meth:`~speedlm.training.backends.eagle3.Eagle3Backend.describe`).
+    #:
+    #: Both are class-level defaults so that an adapter assembled without
+    #: ``__init__`` -- which tests do to exercise ``describe`` in isolation --
+    #: still answers, exactly as ``Eagle3Backend._state`` does.
+    _resolved_warm_start: str | None = None
+
     def __init__(
         self,
         config: Eagle3Config,
@@ -404,6 +432,7 @@ class Eagle3Adapter:
         materializer: DraftMaterializer,
         validator: DraftValidator,
         clock: Callable[[], float] = time.monotonic,
+        warm_start_resolver: WarmStartResolver | None = None,
     ) -> None:
         self.config = config
         self._leaser = leaser
@@ -413,6 +442,7 @@ class Eagle3Adapter:
         self._materializer = materializer
         self._validator = validator
         self._clock = clock
+        self._warm_start_resolver = warm_start_resolver
 
     def describe(self) -> BackendInfo:
         """Return backend-neutral metadata for orchestration and provenance.
@@ -427,15 +457,45 @@ class Eagle3Adapter:
         effort, so an absent key would be ambiguous between "this build does
         not record revisions" and "this cycle could not be pinned"; an
         explicit null says the cycle ran unpinned and says it in the artifact.
+
+        ``from_pretrained`` is the *resolved* warm start once a cycle has
+        trained, so the chain is reconstructable: each artifact's manifest
+        ``base_draft`` names the artifact directory it was trained from, and
+        following that field back terminates at the profile's stock drafter.
+
+        Before any training it is the configured stock drafter, which is also
+        what :meth:`speedlm.tuner.orchestrator.TunerOrchestrator._active_draft`
+        needs from it: that caller reads this field only when the registry has
+        no active artifact, and a resolved value can only ever *be* an artifact
+        directory when the registry had one.  So the fallback branch is
+        unreachable with a stale directory by construction.
         """
         params = dict(self.config.training_params)
         params["verifier_revision"] = self.config.verifier_revision
         return BackendInfo(
             verifier_model=self.config.verifier_model,
             draft_model=self.config.draft_model,
-            from_pretrained=self.config.from_pretrained,
+            from_pretrained=self._resolved_warm_start or self.config.from_pretrained,
             training_params=params,
         )
+
+    def _warm_start(self) -> str:
+        """The checkpoint this cycle trains from, resolved when it trains.
+
+        Fails closed.  A resolver that returns nothing is a broken pointer, and
+        quietly substituting the stock drafter would silently restart the chain
+        -- which is indistinguishable, in the artifacts, from a chain that was
+        never compounding at all.
+        """
+        if self._warm_start_resolver is None:
+            return self.config.from_pretrained
+        resolved = self._warm_start_resolver()
+        if not isinstance(resolved, str) or not resolved:
+            raise Eagle3Error(
+                "warm-start resolver named no checkpoint; refusing to guess a "
+                "base for EAGLE-3 training"
+            )
+        return resolved
 
     def prepare(self, work_dir: Path, *, should_abort: AbortCheck) -> PreparedData:
         """Lease traces and render training rows without touching a GPU."""
@@ -559,11 +619,16 @@ class Eagle3Adapter:
         self._check(work_dir, should_abort)
         if not self.config.from_pretrained:
             raise Eagle3Error("refusing to train EAGLE-3 from scratch")
+        from_pretrained = self._warm_start()
+        # Recorded before the run, not after it: ``describe`` must be able to
+        # say what a *failed* cycle attempted to build on, and a value written
+        # only on success cannot.
+        self._resolved_warm_start = from_pretrained
         started = self._clock()
         result = self._trainer.train(
             hidden_states,
             work_dir / "speculators-training",
-            from_pretrained=self.config.from_pretrained,
+            from_pretrained=from_pretrained,
             training_params=self.config.effective_training_params,
             timeout_seconds=self.config.timeouts.train,
             should_abort=should_abort,

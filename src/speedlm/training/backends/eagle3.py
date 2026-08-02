@@ -48,6 +48,7 @@ from speedlm.tuner.eagle3 import (
     TrainingError,
     TrainingResult,
     TrainingRowRenderer,
+    WarmStartResolver,
     derive_scratch_quota_bytes,
     scratch_usage,
 )
@@ -461,6 +462,16 @@ class _State:
     row_count: int | None = None
     verifier: str | None = None
     warm_start: str | None = None
+    #: Which model string :attr:`warm_start` was resolved *from*.
+    #:
+    #: The state object lives for the whole process, not for one cycle, so a
+    #: memo keyed on nothing returns the first cycle's resolution forever.  That
+    #: was harmless only while the warm start was a process-wide constant; once
+    #: each cycle can warm-start from the current incumbent, an unkeyed memo
+    #: silently trains every later cycle from the first cycle's base -- exactly
+    #: the defect the per-cycle resolver exists to remove, reintroduced one
+    #: layer down.
+    warm_start_source: str | None = None
     #: Whether the configured verifier revision was actually satisfied.
     #:
     #: ``None`` until the verifier is resolved, or when no revision was pinned
@@ -500,7 +511,16 @@ class _Resolver:
         return self.state.verifier
 
     def warm_start(self, model: str, guard: AbortCheck, scratch: Path) -> str:
-        if self.state.warm_start is None:
+        """Resolve *model*, re-resolving whenever the requested base changes.
+
+        Two guards keep a promoted artifact -- a local directory of
+        materialized weights -- off the Hub path, and they are independent:
+        ``warm_start_revision`` is applied only to the *configured* stock repo
+        id, so a directory is never pinned to the stock drafter's commit; and
+        :meth:`_resolve` short-circuits any ``model`` that exists on disk, so no
+        directory is ever handed to snapshot resolution in the first place.
+        """
+        if self.state.warm_start is None or self.state.warm_start_source != model:
             revision = (
                 self.config.warm_start_revision
                 if model == self.config.warm_start_model
@@ -509,6 +529,7 @@ class _Resolver:
             self.state.warm_start, _ = self._resolve(
                 model, revision, "warm-start model resolution", guard, scratch
             )
+            self.state.warm_start_source = model
         return self.state.warm_start
 
     def _resolve(
@@ -1205,6 +1226,7 @@ class Eagle3Backend(Eagle3Adapter):
         health_check: Callable[[str, float], bool] | None = None,
         sleeper: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic,
+        warm_start_resolver: WarmStartResolver | None = None,
     ) -> Eagle3Backend:
         if (trace_source is None) == (trace_leaser is None):
             raise ValueError("provide exactly one of trace_source or trace_leaser")
@@ -1258,6 +1280,7 @@ class Eagle3Backend(Eagle3Adapter):
             ),
             validator=SpeculatorsDraftValidator(pipeline, process_runner, resolver),
             clock=clock,
+            warm_start_resolver=warm_start_resolver,
         )
         backend._state = state
         return backend
@@ -2025,5 +2048,6 @@ __all__ = [
     "TrainingError",
     "TrainingResult",
     "TrainingRowRenderer",
+    "WarmStartResolver",
     "scratch_usage",
 ]

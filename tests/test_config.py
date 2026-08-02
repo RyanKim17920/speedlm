@@ -714,3 +714,49 @@ def test_benchmark_repeats_is_unbounded_above_for_characterisation_runs() -> Non
     """
     assert IdleTuningConfig(benchmark_repeats=20).benchmark_repeats == 20
     assert SpeedLMConfig(model="m").tuning.benchmark_repeats == 5
+
+
+# ---------------------------------------------------------------------------
+# Compounding warm start
+# ---------------------------------------------------------------------------
+
+
+def test_compounding_warm_start_is_on_by_default_and_unbounded() -> None:
+    """The default is the argued one, so a change to it is a visible diff.
+
+    Every archived realistic-data run trained a professionally built speculator
+    from a standing start over ~409 records and lost to it -- so re-running that
+    from-stock fine-tune every cycle is the configuration with the measured
+    negative record, and compounding is the only one in which the product's
+    premise is testable at all.  The bound is null because no compounding cycle
+    has ever run and any N would be invented; see the field docstrings.
+    """
+    tuning = SpeedLMConfig(model="m").tuning
+    assert tuning.compounding_warm_start is True
+    assert tuning.warm_start_max_chain_depth is None
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("compounding_warm_start", False),
+        ("warm_start_max_chain_depth", 5),
+    ],
+)
+def test_warm_start_knobs_round_trip(key: str, value: object) -> None:
+    configured = SpeedLMConfig.from_dict({"model": "org/model", "tuning": {key: value}})
+    assert getattr(configured.tuning, key) == value
+    assert configured.to_dict()["tuning"][key] == value
+    assert getattr(SpeedLMConfig.from_dict(configured.to_dict()).tuning, key) == value
+
+
+@pytest.mark.parametrize("value", ["yes", 1, None])
+def test_invalid_compounding_warm_start_is_rejected(value: object) -> None:
+    with pytest.raises(ConfigError, match="compounding_warm_start"):
+        IdleTuningConfig(compounding_warm_start=value)
+
+
+@pytest.mark.parametrize("value", [0, -1, "x", 1.5, True])
+def test_invalid_warm_start_chain_bound_is_rejected(value: object) -> None:
+    with pytest.raises(ConfigError, match="warm_start_max_chain_depth"):
+        IdleTuningConfig(warm_start_max_chain_depth=value)

@@ -16,8 +16,10 @@ import pytest
 from speedlm.training.backends.eagle3 import (
     _RESOLVE_MODEL,
     _VALIDATE_DRAFT,
+    Eagle3Adapter,
     Eagle3Backend,
     Eagle3Config,
+    Eagle3Error,
     SpeculatorsPipelineConfig,
     _Resolver,
     _State,
@@ -542,3 +544,106 @@ def test_pinned_layer_ids_that_disagree_with_the_contract_fail(
 
     with pytest.raises(SystemExit, match="draft target layer ids"):
         _run_validate_script(draft, _QWEN_SNAPSHOT, (2, 18, 33))
+
+
+# ---------------------------------------------------------------------------
+# Per-cycle warm start
+# ---------------------------------------------------------------------------
+
+
+class _TrackingRunner:
+    """Records every resolution the resolver actually delegated."""
+
+    def __init__(self) -> None:
+        self.models: list[tuple[str, str]] = []
+
+    def run(self, argv: Sequence[str], **_kwargs: object) -> ProcessResult:
+        self.models.append((argv[3], argv[4]))
+        return ProcessResult(
+            argv=tuple(argv),
+            returncode=0,
+            stdout=f"/snapshots/{argv[3].replace('/', '--')}\n",
+            stderr="",
+        )
+
+
+def test_the_warm_start_memo_re_resolves_when_the_requested_base_moves(
+    tmp_path: Path,
+) -> None:
+    """The memo outlives a cycle, so it has to be keyed on what it memoized.
+
+    ``_State`` is built once per process, not once per cycle.  An unkeyed memo
+    returns the first cycle's resolution forever, which would reintroduce the
+    frozen warm start one layer below the resolver that exists to remove it.
+    """
+    pipeline = replace(_pipeline(tmp_path), warm_start_revision="draft-sha")
+    runner = _TrackingRunner()
+    resolver = _Resolver(pipeline, runner, _State())
+
+    first = resolver.warm_start(pipeline.warm_start_model, lambda: False, tmp_path)
+    again = resolver.warm_start(pipeline.warm_start_model, lambda: False, tmp_path)
+    assert first == again == "/snapshots/RedHatAI--gpt-oss-20b-speculator.eagle3"
+    # Memoized: the same base resolves once, not once per call.
+    assert runner.models == [(pipeline.warm_start_model, "draft-sha")]
+
+    promoted = tmp_path / "artifacts" / "promoted"
+    promoted.mkdir(parents=True)
+    assert resolver.warm_start(str(promoted), lambda: False, tmp_path) == str(promoted)
+    # A promoted artifact is a directory of materialized weights.  It must not
+    # be handed to Hub snapshot resolution at all, and the stock drafter's
+    # revision pin must not follow it: two independent guards, both required.
+    assert runner.models == [(pipeline.warm_start_model, "draft-sha")]
+
+    # And moving back is a re-resolution, not a stale hit on the directory.
+    assert resolver.warm_start(pipeline.warm_start_model, lambda: False, tmp_path) == (
+        "/snapshots/RedHatAI--gpt-oss-20b-speculator.eagle3"
+    )
+    assert runner.models == [(pipeline.warm_start_model, "draft-sha")] * 2
+
+
+def _bare_adapter(resolver: object) -> Eagle3Adapter:
+    """An adapter whose only reachable stage is the warm-start resolution."""
+    return Eagle3Adapter(
+        Eagle3Config(
+            verifier_model="acme/verifier",
+            draft_model="acme/stock",
+            from_pretrained="acme/stock",
+            mask_policy=MaskPolicy.FINAL_TURN_ALL_CHANNELS,
+        ),
+        leaser=object(),  # type: ignore[arg-type]
+        renderer=object(),  # type: ignore[arg-type]
+        extractor=object(),  # type: ignore[arg-type]
+        trainer=object(),  # type: ignore[arg-type]
+        materializer=object(),  # type: ignore[arg-type]
+        validator=object(),  # type: ignore[arg-type]
+        warm_start_resolver=resolver,  # type: ignore[arg-type]
+    )
+
+
+def test_describe_reports_the_configured_base_until_a_cycle_resolves_one(
+    tmp_path: Path,
+) -> None:
+    """Which is what ``TunerOrchestrator._active_draft`` needs from it.
+
+    That caller reads ``from_pretrained`` only when the registry holds no
+    active artifact, so it must never be handed an artifact directory that the
+    registry no longer names.  Before any training there is nothing resolved to
+    hand it, and a resolved value can only ever *be* an artifact directory
+    because the registry had one.
+    """
+    adapter = _bare_adapter(lambda: str(tmp_path / "promoted"))
+    assert adapter.describe().from_pretrained == "acme/stock"
+
+
+def test_a_warm_start_resolver_that_names_nothing_fails_closed(
+    tmp_path: Path,
+) -> None:
+    """Silently substituting stock would restart the chain invisibly.
+
+    The artifacts would then be indistinguishable from a chain that had never
+    been compounding at all, which is exactly the ambiguity the resolved
+    ``base_draft`` exists to remove.
+    """
+    adapter = _bare_adapter(lambda: "")
+    with pytest.raises(Eagle3Error, match="named no checkpoint"):
+        adapter.train(tmp_path / "hidden", tmp_path / "work", should_abort=lambda: False)

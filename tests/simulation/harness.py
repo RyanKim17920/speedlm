@@ -28,6 +28,7 @@ from speedlm.gateway.activity import ActivityTracker
 from speedlm.traces.store import TraceRecord, TraceStats
 from speedlm.training.base import BackendInfo
 from speedlm.tuner.artifacts import ArtifactRegistry
+from speedlm.tuner.composition import warm_start_reference
 from speedlm.tuner.idle import IdleDetector
 from speedlm.tuner.orchestrator import (
     CycleResult,
@@ -162,6 +163,13 @@ class SimulatedBackend:
     verifier_model: str = "sim/verifier-8b"
     draft_model: str = "sim/draft-eagle3"
     base_draft: str = "sim/stock-draft"
+    #: Resolves the checkpoint each cycle warm-starts from, exactly as
+    #: ``create_production_tuner`` wires it.  ``None`` is the historical
+    #: behaviour: every cycle trains from ``base_draft``.
+    warm_start_resolver: Callable[[], str] | None = None
+    #: One entry per :meth:`train`, in cycle order -- the assertion surface for
+    #: "did learning actually accumulate across cycles".
+    trained_from: list[str] = field(default_factory=list)
     fail_in: str | None = None
     failure: Exception | None = None
     prepared_calls: int = 0
@@ -171,10 +179,14 @@ class SimulatedBackend:
     aborts_seen: list[tuple[str, bool]] = field(default_factory=list)
 
     def describe(self) -> BackendInfo:
+        # The *resolved* base once a cycle has trained, so the manifest's
+        # ``base_draft`` names the head this artifact was actually built on.
         return BackendInfo(
             verifier_model=self.verifier_model,
             draft_model=self.draft_model,
-            from_pretrained=self.base_draft,
+            from_pretrained=(
+                self.trained_from[-1] if self.trained_from else self.base_draft
+            ),
             training_params={"steps": 4, "lr": 1e-4},
         )
 
@@ -211,6 +223,11 @@ class SimulatedBackend:
         del extracted, work_dir
         self.hooks.fire("train")
         self._maybe_fail("train")
+        self.trained_from.append(
+            self.base_draft
+            if self.warm_start_resolver is None
+            else self.warm_start_resolver()
+        )
         self.aborts_seen.append(("train", should_abort()))
         return _Trained(val_loss=self.val_loss)
 
@@ -584,19 +601,28 @@ def build_simulation(
     timeouts: OrchestratorTimeouts | None = None,
     val_loss_prefilter: ValLossPreFilterConfig | None = None,
     base_draft: str = "sim/stock-draft",
+    compounding_warm_start: bool = False,
+    warm_start_max_chain_depth: int | None = None,
 ) -> Simulation:
-    """Wire production orchestration around the simulated engine."""
+    """Wire production orchestration around the simulated engine.
+
+    ``compounding_warm_start`` defaults to *off* here, unlike production: the
+    existing simulations assert cycle sequencing and pointer movement, and none
+    of them should change behaviour because a warm start started following the
+    registry.  The compounding simulation opts in explicitly.
+    """
     shared_hooks = hooks or StageHooks()
     clock = MutableClock(start=100.0)
     activity = ActivityTracker(clock=clock)
     runs = root / "runs"
     runs.mkdir(parents=True, exist_ok=True)
+    artifacts = ArtifactRegistry(root / "registry", clock=lambda: clock.now)
     return Simulation(
         root=root,
         clock=clock,
         activity=activity,
         state=TunerStateMachine(root / "state", clock=lambda: clock.now),
-        artifacts=ArtifactRegistry(root / "registry", clock=lambda: clock.now),
+        artifacts=artifacts,
         runtime=SimulatedRuntime(
             engine=engine,
             hooks=shared_hooks,
@@ -607,6 +633,17 @@ def build_simulation(
             hooks=shared_hooks,
             val_loss=val_loss,
             base_draft=base_draft,
+            warm_start_resolver=(
+                (
+                    lambda: warm_start_reference(
+                        artifacts,
+                        base_draft,
+                        max_chain_depth=warm_start_max_chain_depth,
+                    )
+                )
+                if compounding_warm_start
+                else None
+            ),
         ),
         gate=gate,
         hooks=shared_hooks,

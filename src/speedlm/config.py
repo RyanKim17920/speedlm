@@ -755,6 +755,61 @@ class IdleTuningConfig:
     #: the stage the window actually pays for -- to a fixed ceiling.  Set to
     #: null to restore the unbounded full-corpus scan.
     training_window_records: int | None = 256
+    #: Whether each cycle warm-starts from the artifact currently serving.
+    #:
+    #: Off, every cycle re-runs the same one-shot fine-tune of the profile's
+    #: stock speculator and discards the previous cycle's promoted head, so
+    #: learning cannot accumulate across cycles at all.  That was the behaviour
+    #: before this knob existed, and it was not a decision -- the warm start was
+    #: simply captured at composition time and never consulted the registry
+    #: again, the same defect ``benchmark_candidate_arm_first``'s neighbour
+    #: ``stock_draft`` carried on the gate side.
+    #:
+    #: **On by default**, and the argument is the measured record rather than
+    #: the premise.  Four realistic-data runs across two models produced a
+    #: candidate *worse* than stock every time -- acceptance deltas of -0.189,
+    #: -0.554, -0.567 and -1.27 pp -- and each was a single ~409-record
+    #: fine-tune of a professionally trained speculator from a standing start.
+    #: A one-shot pass over a few hundred records is not enough signal to beat
+    #: that starting point, and re-taking it every cycle cannot become enough,
+    #: because the cycles do not add up.  Compounding is the only configuration
+    #: in which the product's stated premise is even testable, and it has never
+    #: been exercised.
+    #:
+    #: The safety argument for defaulting it on is that the gate is unaffected.
+    #: Promotion still requires beating the *current incumbent* on a held-out
+    #: suite, so a worse head is rejected whether it was trained from stock or
+    #: from the incumbent; what changes is only where training starts.  What the
+    #: gate does *not* cover is drift -- see ``warm_start_max_chain_depth``.
+    #:
+    #: Set to false to restore the historical from-stock-every-cycle behaviour,
+    #: which is also the configuration to reproduce an archived run in.
+    compounding_warm_start: bool = True
+    #: Promotions deep the warm-start chain may get before a forced re-baseline.
+    #:
+    #: There is no post-promotion rollback in this system: the gate is the only
+    #: safeguard, and it is a *marginal* test -- each candidate beats the head
+    #: before it, on a suite split from the same captured traffic.  Marginal
+    #: gains can therefore accumulate into a head that is excellent on this
+    #: deployment's recent traffic and quietly worse in general, and no arm of
+    #: the gate can see that, because both arms are scored on traffic drawn
+    #: from the same distribution the drift is toward.  Speculative decoding is
+    #: lossless, so the exposure is throughput on unlike traffic, never wrong
+    #: answers -- but it is unmeasured and it compounds.
+    #:
+    #: Setting this to *N* makes a cycle whose incumbent is already *N*
+    #: artifacts deep train from the stock speculator instead.  That costs one
+    #: cycle, and it buys the only drift signal available: if a from-stock head
+    #: *beats* an N-deep incumbent on the gate's own suite, the chain has
+    #: regressed on the very traffic it was specialising for.
+    #:
+    #: **Null (unbounded) by default, deliberately.**  No compounding cycle has
+    #: ever run, so any *N* would be invented rather than measured, and a bound
+    #: pointed at a hazard nobody has yet observed would spend a cycle in
+    #: ``max_chain_depth`` to buy nothing.  Operators running long unattended
+    #: chains should set it -- 5 to 10 is a reasonable place to start -- and the
+    #: honest way to pick it is to watch what the re-baseline cycle reports.
+    warm_start_max_chain_depth: int | None = None
     #: Immutable commit SHA of the verifier the cycle trains and benchmarks
     #: against.  Left null it is resolved from the Hub once per composition and
     #: pinned for the process; set it explicitly to reproduce an archived run.
@@ -849,6 +904,21 @@ class IdleTuningConfig:
         # Zero is legal: it restores the pre-warmup behaviour, which is a
         # measurement an operator may legitimately want back for comparison.
         _validate_int_gte(self.warmup_repeats, "tuning.warmup_repeats", 0)
+        if not isinstance(self.compounding_warm_start, bool):
+            raise ConfigError(
+                "tuning.compounding_warm_start must be a bool, "
+                f"got {type(self.compounding_warm_start).__name__!r}"
+            )
+        if self.warm_start_max_chain_depth is not None:
+            # One is the smallest bound that means anything: it re-baselines
+            # every cycle whose incumbent is itself trained, i.e. it is exactly
+            # ``compounding_warm_start = false`` expressed the long way.  Zero
+            # or negative would be a bound on a depth no artifact can have.
+            _validate_int_gte(
+                self.warm_start_max_chain_depth,
+                "tuning.warm_start_max_chain_depth",
+                1,
+            )
         if not isinstance(self.benchmark_candidate_arm_first, bool):
             raise ConfigError(
                 "tuning.benchmark_candidate_arm_first must be a bool, "
@@ -1095,6 +1165,8 @@ class SpeedLMConfig:
             "correctness_max_tokens": self.tuning.correctness_max_tokens,
             "benchmark_max_tokens": self.tuning.benchmark_max_tokens,
             "training_window_records": self.tuning.training_window_records,
+            "compounding_warm_start": self.tuning.compounding_warm_start,
+            "warm_start_max_chain_depth": self.tuning.warm_start_max_chain_depth,
             "verifier_revision": self.tuning.verifier_revision,
             "speculators_repo": self.tuning.speculators_repo,
             "training_python": self.tuning.training_python,
@@ -1206,6 +1278,8 @@ class SpeedLMConfig:
                 "correctness_max_tokens",
                 "benchmark_max_tokens",
                 "training_window_records",
+                "compounding_warm_start",
+                "warm_start_max_chain_depth",
                 "verifier_revision",
                 "speculators_repo",
                 "training_python",

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import contextlib
 import hashlib
 import json
@@ -41,6 +42,12 @@ class ExchangeLedger:
         if writer_threads <= 0:
             raise ValueError("writer_threads must be positive")
         self.root = root
+        #: Created once here rather than per exchange. On a distributed
+        #: filesystem each metadata call is a network round trip, and these two
+        #: were previously repeated on every proxied request.
+        root.mkdir(parents=True, exist_ok=True, mode=0o700)
+        with contextlib.suppress(OSError):
+            root.chmod(0o700)
         self._executor = ThreadPoolExecutor(
             max_workers=writer_threads,
             thread_name_prefix="speedlm-exchange-writer",
@@ -171,9 +178,6 @@ class ExchangeRecorder:
         request_headers: Sequence[tuple[bytes, bytes]],
         started_at: float,
     ) -> None:
-        root.mkdir(parents=True, exist_ok=True, mode=0o700)
-        with contextlib.suppress(OSError):
-            root.chmod(0o700)
         self.id = uuid.uuid4().hex
         self.directory = root / self.id
         self.directory.mkdir(mode=0o700)
@@ -181,6 +185,7 @@ class ExchangeRecorder:
         self._lock = threading.RLock()
         self._method = method
         self._path = path
+        self._query = bytes(query)
         self._started_at = started_at
         self._request_headers = _safe_headers(request_headers)
         self._response_headers: list[list[str]] = []
@@ -195,7 +200,6 @@ class ExchangeRecorder:
         self._storage_errors: list[str] = []
         self._request_file = _private_binary_file(self.directory / "request.body")
         self._response_file = _private_binary_file(self.directory / "response.body")
-        _write_private_bytes(self.directory / "query.bin", query)
         self._write_manifest(state="recording", failure_reason=None)
         _fsync_directory(root)
 
@@ -345,12 +349,15 @@ class ExchangeRecorder:
 
     def _write_manifest(self, *, state: str, failure_reason: str | None) -> None:
         manifest = {
-            "schema_version": 1,
+            "schema_version": 2,
             "exchange_id": self.id,
             "state": state,
             "method": self._method,
             "path": self._path,
-            "query_file": "query.bin",
+            #: Inlined rather than written as its own ``query.bin``. The query
+            #: is tiny, and a separate private file cost one create plus one
+            #: fsync on the request path before proxying could start.
+            "query_b64": base64.b64encode(self._query).decode("ascii"),
             "started_at": self._started_at,
             "completed_at": (
                 time.time() if state != "recording" else None
@@ -398,18 +405,6 @@ def _private_binary_file(path: Path) -> BinaryIO:
         0o600,
     )
     return os.fdopen(descriptor, "wb", buffering=0)
-
-
-def _write_private_bytes(path: Path, value: bytes) -> None:
-    descriptor = os.open(
-        path,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-        0o600,
-    )
-    with os.fdopen(descriptor, "wb", buffering=0) as file:
-        file.write(value)
-        file.flush()
-        os.fsync(file.fileno())
 
 
 def _atomic_private_json(path: Path, value: object) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 import stat
@@ -56,10 +57,12 @@ def test_complete_exchange_preserves_exact_bytes_and_hashes(tmp_path: Path) -> N
         ["content-type", "application/json"],
         ["authorization", "<redacted>"],
     ]
-    assert (directory / "query.bin").read_bytes() == b"mode=raw"
+    assert manifest["schema_version"] == 2
+    assert base64.b64decode(manifest["query_b64"]) == b"mode=raw"
+    assert not (directory / "query.bin").exists()
     assert (directory / "request.body").read_bytes() == request_body
     assert (directory / "response.body").read_bytes() == response_body
-    for filename in ("manifest.json", "query.bin", "request.body", "response.body"):
+    for filename in ("manifest.json", "request.body", "response.body"):
         mode = stat.S_IMODE((directory / filename).stat().st_mode)
         assert mode == 0o600
 
@@ -188,3 +191,58 @@ def test_blocked_writer_does_not_block_event_loop(
         await ledger.aclose()
 
     asyncio.run(scenario())
+
+
+def test_ledger_creates_its_private_root_once(tmp_path: Path) -> None:
+    """Per-exchange starts must not repeat root directory metadata calls."""
+    root = tmp_path / "exchanges"
+    ledger = ExchangeLedger(root)
+    assert root.is_dir()
+    assert stat.S_IMODE(root.stat().st_mode) == 0o700
+
+    observed: list[Path] = []
+    original_mkdir = Path.mkdir
+
+    def counting_mkdir(self: Path, *args: object, **kwargs: object) -> None:
+        observed.append(self)
+        original_mkdir(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    Path.mkdir = counting_mkdir  # type: ignore[method-assign]
+    try:
+        recorders = [
+            ledger.start(
+                method="POST",
+                path="/v1/chat/completions",
+                query=b"",
+                request_headers=[],
+                started_at=0.0,
+            )
+            for _ in range(3)
+        ]
+    finally:
+        Path.mkdir = original_mkdir  # type: ignore[method-assign]
+
+    assert observed == [recorder.directory for recorder in recorders]
+    for recorder in recorders:
+        recorder.abort("test_cleanup")
+
+
+def test_query_bytes_are_stored_in_the_manifest_without_an_extra_file(
+    tmp_path: Path,
+) -> None:
+    ledger = ExchangeLedger(tmp_path / "exchanges")
+    recorder = ledger.start(
+        method="POST",
+        path="/v1/completions",
+        query=b"raw=\xff\x00&mode=x",
+        request_headers=[],
+        started_at=1.0,
+    )
+    recorder.finish_request()
+    recorder.set_response(status=200, headers=[])
+    recorder.complete()
+
+    manifest = next(ledger.iter_manifests())
+    assert base64.b64decode(manifest["query_b64"]) == b"raw=\xff\x00&mode=x"
+    assert "query_file" not in manifest
+    assert not (recorder.directory / "query.bin").exists()

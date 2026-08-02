@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import json
 from pathlib import Path
@@ -29,8 +30,8 @@ def _query_for(
     ledger: ExchangeLedger,
     manifest: dict[str, Any],
 ) -> bytes:
-    directory = ledger.root / manifest["exchange_id"]
-    return (directory / manifest["query_file"]).read_bytes()
+    del ledger
+    return base64.b64decode(manifest["query_b64"])
 
 
 def _assert_complete_raw_pair(

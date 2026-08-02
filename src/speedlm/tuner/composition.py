@@ -195,6 +195,118 @@ def active_draft_reference(
     return fallback
 
 
+#: Hard stop on a ``base_draft`` walk, so a corrupted or hand-edited manifest
+#: chain cannot spin.  Any real chain is bounded by the number of promotions
+#: this installation has ever made.
+_MAX_CHAIN_WALK: Final = 1_000
+
+
+def promotion_chain_depth(reference: DraftReference) -> int:
+    """How many trained artifacts deep *reference* sits above the stock drafter.
+
+    ``0`` for the profile's stock drafter (a Hub repo id, or any directory that
+    is not a published artifact), ``1`` for a head trained from it, and so on.
+
+    The chain is read from the artifacts themselves rather than from the active
+    pointer's ``history``.  ``history`` records every promotion, including ones
+    made while compounding was switched off, so it counts *promotions* and not
+    *ancestry*; ``base_draft`` records what a cycle actually trained from and is
+    therefore the only field that answers this question.
+
+    The manifest is read directly, without
+    :meth:`~speedlm.tuner.artifacts.ArtifactRegistry.get`'s content
+    verification: this feeds a policy decision about where to warm-start, not a
+    trust decision about what to load, and re-hashing every ancestor would cost
+    gigabytes of reads per cycle.  An unreadable link ends the walk, which
+    biases the depth *down* -- toward compounding rather than toward an
+    unrequested re-baseline.
+    """
+    depth = 0
+    seen: set[str] = set()
+    current = str(reference)
+    while depth < _MAX_CHAIN_WALK:
+        if current in seen:
+            # A manifest chain that revisits a node is corrupt, not infinite.
+            return depth
+        seen.add(current)
+        try:
+            raw = json.loads(
+                (Path(current) / "manifest.json").read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError):
+            return depth
+        if not isinstance(raw, dict):
+            return depth
+        base = raw.get("base_draft")
+        if not isinstance(base, str) or not base:
+            # A readable artifact whose ancestry is unusable still counts
+            # itself; only its ancestors are lost.
+            return depth + 1
+        depth += 1
+        current = base
+    logger.warning(
+        "stopped walking the warm-start chain at %d links; treating it as "
+        "unbounded",
+        _MAX_CHAIN_WALK,
+    )
+    return depth
+
+
+def warm_start_reference(
+    artifacts: ArtifactRegistry,
+    stock: str,
+    *,
+    max_chain_depth: int | None = None,
+) -> str:
+    """The checkpoint the *next* cycle should train from.
+
+    This is the training-side twin of :func:`active_draft_reference`, and it
+    exists for the same reason: the incumbent is a durable pointer that moves,
+    so a value captured at composition time is wrong from the second cycle on.
+    Frozen, every cycle re-ran the same one-shot fine-tune of the *stock*
+    speculator and threw the previous cycle's promoted head away -- so learning
+    could not accumulate, which is the entire premise of idle tuning.
+
+    Falls back to *stock* when the registry has no active artifact: the first
+    cycle of a fresh installation, and any state a rollback leaves with nothing
+    promoted.
+
+    ``max_chain_depth`` bounds compounding.  There is no post-promotion
+    rollback anywhere in this system, so a chain accumulates its own mistakes
+    as readily as its own gains; past the bound a cycle deliberately
+    re-baselines to *stock* and lets the gate compare that head against the
+    deep incumbent.  ``None``, the default, does not bound it -- see
+    :attr:`speedlm.config.IdleTuningConfig.warm_start_max_chain_depth` for why
+    an invented bound would be worse than none.
+
+    **What this cannot protect against.**  Warm-starting repeatedly from a head
+    fine-tuned on one traffic slice walks the drafter toward that slice.  The
+    gate does not see it: its held-out suite is split from the *same* captured
+    traffic (:class:`~speedlm.training.split.HeldOutTraceSnapshotLeaser`), so a
+    head that has become excellent on this deployment's traffic and worse in
+    general passes every arm of it.  Speculative decoding is lossless, so the
+    cost is throughput on unlike traffic and never wrong answers -- but it is a
+    real cost, it compounds, and nothing in this process measures it.
+    """
+    active = artifacts.active()
+    if active is None:
+        return stock
+    if max_chain_depth is not None:
+        depth = promotion_chain_depth(active.path)
+        if depth >= max_chain_depth:
+            logger.info(
+                "warm-start chain for artifact %s is %d deep, at or past the "
+                "configured bound of %d; re-baselining this cycle to the stock "
+                "drafter %s",
+                active.artifact_id,
+                depth,
+                max_chain_depth,
+                stock,
+            )
+            return stock
+    return str(active.path)
+
+
 @dataclass(frozen=True, slots=True)
 class TuningLaunchPlan:
     profile: ModelProfile
@@ -330,6 +442,9 @@ def create_production_tuner(
         raise ProductionTuningError(
             f"profile {profile.name!r} is not supported by the EAGLE-3 backend"
         )
+    #: The profile's stock speculator, bound once here so the warm-start
+    #: resolver below closes over a narrowed ``str`` rather than re-deriving it.
+    stock_draft_model = profile.draft_model
     tuning = config.tuning
     layout = ensure_layout(home)
     state = TunerStateMachine(layout.runs_dir)
@@ -352,7 +467,7 @@ def create_production_tuner(
         verifier_revision=resolve_verifier_revision(
             profile.verifier_model, tuning.verifier_revision
         ),
-        warm_start_model=profile.draft_model,
+        warm_start_model=stock_draft_model,
         target_layer_ids=profile.target_layer_ids or (
             resolve_target_layer_ids(
                 explicit=None,
@@ -383,6 +498,23 @@ def create_production_tuner(
     backend = Eagle3Backend.from_speculators(
         pipeline,
         trace_leaser=split,
+        # Resolved per cycle, not captured here.  The profile's stock speculator
+        # -- the same string ``pipeline.warm_start_model`` carries -- stays the
+        # fallback; this is what lets cycle N+1 build on cycle N's promotion
+        # instead of re-running the same from-stock fine-tune forever.  See
+        # ``warm_start_reference`` for the bound and for the drift it explicitly
+        # does not cover.
+        warm_start_resolver=(
+            (
+                lambda: warm_start_reference(
+                    artifacts,
+                    stock_draft_model,
+                    max_chain_depth=tuning.warm_start_max_chain_depth,
+                )
+            )
+            if tuning.compounding_warm_start
+            else None
+        ),
     )
     runtime = RuntimeController(
         activity=activity,
@@ -618,5 +750,7 @@ __all__ = [
     "build_tuning_launch_plan",
     "cached_hub_revision",
     "create_production_tuner",
+    "promotion_chain_depth",
     "resolve_verifier_revision",
+    "warm_start_reference",
 ]

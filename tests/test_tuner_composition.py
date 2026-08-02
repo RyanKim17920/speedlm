@@ -406,7 +406,15 @@ def test_create_production_tuner_assembles_profile_bound_collaborators(
     assert pipeline["target_layer_ids"] == profile.target_layer_ids
     assert pipeline["sequence_length"] == profile.max_seq_len
     assert pipeline["learning_rate"] == config.tuning.learning_rate
-    assert captured["backend"] == {"trace_leaser": split}
+    assert captured["backend"]["trace_leaser"] is split
+    # The training-side twin of ``stock_draft`` below, and resolved for the same
+    # reason: frozen at composition time it names the profile's stock speculator
+    # forever, so every cycle re-runs the same one-shot fine-tune of the
+    # original head and discards the previous cycle's promotion.
+    warm_start_resolver = captured["backend"]["warm_start_resolver"]
+    assert callable(warm_start_resolver)
+    assert warm_start_resolver() == profile.draft_model
+    assert set(captured["backend"]) == {"trace_leaser", "warm_start_resolver"}
     assert captured["runtime"]["active_draft"] == "acme/active-draft"
     # The post-sleep memory precondition must demand exactly what the
     # hidden-state engine will be launched with, or it is decorative.
@@ -972,3 +980,110 @@ def test_an_aborted_activation_never_touches_the_engine() -> None:
 
     assert process.restarts == []
     assert http.ready_calls == 0
+
+
+# ---------------------------------------------------------------------------
+# Warm-start resolution
+# ---------------------------------------------------------------------------
+
+
+def _publish(
+    artifacts: ArtifactRegistry,
+    source: Path,
+    payload: bytes,
+    base_draft: str,
+) -> Any:
+    source.mkdir(parents=True)
+    (source / "weights.bin").write_bytes(payload)
+    return artifacts.publish(
+        source,
+        ArtifactSpec(
+            verifier_model="acme/verifier",
+            draft_model="acme/stock",
+            base_draft=base_draft,
+            trace_hash=payload.hex(),
+            training_params={},
+        ),
+    )
+
+
+def test_warm_start_falls_back_to_stock_while_nothing_has_been_promoted(
+    tmp_path: Path,
+) -> None:
+    """The first cycle of a fresh install, and any state with no incumbent."""
+    artifacts = ArtifactRegistry(tmp_path / "runs")
+    assert composition.warm_start_reference(artifacts, "acme/stock") == "acme/stock"
+
+
+def test_warm_start_follows_the_registry_once_something_is_promoted(
+    tmp_path: Path,
+) -> None:
+    artifacts = ArtifactRegistry(tmp_path / "runs")
+    first = _publish(artifacts, tmp_path / "one", b"one", "acme/stock")
+    assert composition.warm_start_reference(artifacts, "acme/stock") == "acme/stock"
+    artifacts.promote(first.artifact_id, gate_passed=True)
+    assert composition.warm_start_reference(artifacts, "acme/stock") == str(first.path)
+
+
+def test_the_chain_depth_is_read_from_ancestry_not_from_promotion_count(
+    tmp_path: Path,
+) -> None:
+    """``base_draft``, not the pointer's ``history``.
+
+    ``history`` counts promotions, including ones made with compounding off,
+    so it says nothing about what a head was actually built on.
+    """
+    artifacts = ArtifactRegistry(tmp_path / "runs")
+    first = _publish(artifacts, tmp_path / "one", b"one", "acme/stock")
+    second = _publish(artifacts, tmp_path / "two", b"two", str(first.path))
+    # Promoted, but trained from stock rather than from its predecessor: a
+    # promotion that is not a link in the chain.
+    third = _publish(artifacts, tmp_path / "three", b"three", "acme/stock")
+    for artifact in (first, second, third):
+        artifacts.promote(artifact.artifact_id, gate_passed=True)
+
+    assert composition.promotion_chain_depth("acme/stock") == 0
+    assert composition.promotion_chain_depth(first.path) == 1
+    assert composition.promotion_chain_depth(second.path) == 2
+    assert composition.promotion_chain_depth(third.path) == 1
+
+
+def test_a_chain_at_its_bound_re_baselines_to_the_stock_drafter(
+    tmp_path: Path,
+) -> None:
+    artifacts = ArtifactRegistry(tmp_path / "runs")
+    first = _publish(artifacts, tmp_path / "one", b"one", "acme/stock")
+    artifacts.promote(first.artifact_id, gate_passed=True)
+
+    # One deep: still inside a bound of two, already at a bound of one.
+    assert (
+        composition.warm_start_reference(artifacts, "acme/stock", max_chain_depth=2)
+        == str(first.path)
+    )
+    assert (
+        composition.warm_start_reference(artifacts, "acme/stock", max_chain_depth=1)
+        == "acme/stock"
+    )
+
+
+def test_an_unreadable_ancestor_ends_the_walk_rather_than_spinning(
+    tmp_path: Path,
+) -> None:
+    """A broken link biases the depth *down*, toward compounding.
+
+    Failing the other way would silently re-baseline a healthy chain because a
+    manifest could not be read, which is a worse outcome than under-counting:
+    the bound is a precaution, the chain is the product.
+    """
+    artifacts = ArtifactRegistry(tmp_path / "runs")
+    first = _publish(artifacts, tmp_path / "one", b"one", str(tmp_path / "vanished"))
+    assert composition.promotion_chain_depth(first.path) == 1
+
+    # A manifest naming itself is the degenerate cycle; it must terminate.
+    self_referential = tmp_path / "loop"
+    self_referential.mkdir()
+    (self_referential / "manifest.json").write_text(
+        json.dumps({"base_draft": str(self_referential)}),
+        encoding="utf-8",
+    )
+    assert composition.promotion_chain_depth(self_referential) == 1
