@@ -155,12 +155,20 @@ _ROW_ID = re.compile(
 #: IncompleteSnapshotError (job 368710).
 #:
 #: ``allow_patterns`` narrows completeness to the files training actually
-#: reads.  It is a real narrowing but not a guarantee: huggingface_hub matches
-#: patterns with ``fnmatch``, whose ``*`` crosses ``/``, so ``*.json`` also
-#: claims ``original/config.json`` in an auxiliary directory a minimal cache
-#: never pulled (job 368719).
+#: reads, but on its own it does not narrow far enough, and the claim that it
+#: did was the bug.  huggingface_hub filters with ``fnmatch``, whose ``*``
+#: crosses ``/``, so ``*.json`` also claims ``original/config.json`` and
+#: ``*.safetensors`` claims the 13.7 GB ``original/model.safetensors`` --
+#: auxiliary paths a deliberately minimal cache never pulled.  There is no
+#: character class that repairs this (``[!/]*.json`` still matches, because the
+#: trailing ``*`` crosses the separator all the same), so the anchoring is done
+#: with ``ignore_patterns`` instead: ``*/*`` matches exactly the paths that
+#: contain a separator, which leaves the top level and nothing else.  Verified
+#: against the cached tree listing for ``openai/gpt-oss-20b``, where the
+#: unanchored patterns expected three files the cache does not hold and the
+#: anchored ones expect ten, all present (job 369373).
 #:
-#: The guarantee is the fallback, and it is *not* another download.  The
+#: The guarantee is still the fallback, and it is *not* another download.  The
 #: unpinned path never called ``snapshot_download`` at all -- it handed the
 #: bare repo id downstream and let the loader resolve it -- so an unpinned
 #: call cannot be reproduced by passing ``revision=None``, which still runs
@@ -168,15 +176,27 @@ _ROW_ID = re.compile(
 #: pin, resolution reports that and the caller falls back to exactly what an
 #: unpinned cycle did.
 _UNRESOLVED_SNAPSHOT = "SPEEDLM_UNRESOLVED"
+#: argv markers separating the two pattern lists.  Positional lists cannot be
+#: split by count -- both are operator-configurable and either may be empty.
+_ALLOW_FLAG = "--allow"
+_IGNORE_FLAG = "--ignore"
 _RESOLVE_MODEL = f"""
 import sys
 from huggingface_hub import snapshot_download
 from huggingface_hub.errors import IncompleteSnapshotError
 repo = sys.argv[1]
 revision = sys.argv[2]
-patterns = sys.argv[3:] or None
+rest = sys.argv[3:]
+split = rest.index("{_IGNORE_FLAG}")
+allow = rest[1:split] or None
+ignore = rest[split + 1:] or None
 try:
-    path = snapshot_download(repo_id=repo, revision=revision, allow_patterns=patterns)
+    path = snapshot_download(
+        repo_id=repo,
+        revision=revision,
+        allow_patterns=allow,
+        ignore_patterns=ignore,
+    )
 except IncompleteSnapshotError as error:
     print(f"SPEEDLM_INCOMPLETE_SNAPSHOT={{error}}", file=sys.stderr)
     path = "{_UNRESOLVED_SNAPSHOT}"
@@ -318,6 +338,14 @@ class SpeculatorsPipelineConfig:
         "*.safetensors",
         "*.jinja",
     )
+    #: What the patterns above must *not* be allowed to reach.  They are matched
+    #: with ``fnmatch``, whose ``*`` crosses ``/``, so without this they claim
+    #: nested auxiliary paths -- ``original/config.json``,
+    #: ``original/model.safetensors`` (13.7 GB on ``openai/gpt-oss-20b``) --
+    #: that a minimal cache never downloaded, and the pin is then recorded as
+    #: unsatisfied on a cache that holds everything training reads.  ``*/*``
+    #: matches exactly the paths containing a separator; see ``_RESOLVE_MODEL``.
+    model_resolve_ignore_patterns: tuple[str, ...] = ("*/*",)
     model_resolve_timeout_seconds: float = 600.0
     server_shutdown_timeout_seconds: float = 10.0
     health_poll_interval_seconds: float = 0.25
@@ -392,6 +420,23 @@ class SpeculatorsPipelineConfig:
                 "scratch_quota_bytes must be in 1..20 GiB "
                 "(field: tuning.scratch_quota_bytes)"
             )
+        for name, patterns in (
+            ("model_resolve_allow_patterns", self.model_resolve_allow_patterns),
+            ("model_resolve_ignore_patterns", self.model_resolve_ignore_patterns),
+        ):
+            # The two lists travel to the resolver subprocess as one argv split
+            # on the marker tokens, so a pattern equal to a marker would silently
+            # move files from one list to the other.
+            if any(
+                not isinstance(pattern, str)
+                or not pattern
+                or pattern in (_ALLOW_FLAG, _IGNORE_FLAG)
+                for pattern in patterns
+            ):
+                raise ValueError(
+                    f"{name} must be non-empty strings other than "
+                    f"{_ALLOW_FLAG!r} and {_IGNORE_FLAG!r}"
+                )
         for name, timeout_value in (
             ("model_resolve_timeout_seconds", self.model_resolve_timeout_seconds),
             ("server_shutdown_timeout_seconds", self.server_shutdown_timeout_seconds),
@@ -489,7 +534,10 @@ class _Resolver:
                 _RESOLVE_MODEL,
                 model,
                 revision,
+                _ALLOW_FLAG,
                 *self.config.model_resolve_allow_patterns,
+                _IGNORE_FLAG,
+                *self.config.model_resolve_ignore_patterns,
             ],
             cwd=self.config.speculators_repo,
             env=_environment(self.config),
@@ -1116,14 +1164,29 @@ class Eagle3Backend(Eagle3Adapter):
         met is preserved beside it so the drop is visible rather than merely
         absent.  ``describe`` is read after training, so the resolution this
         consults is the one the cycle actually used.
+
+        ``verifier_revision_satisfied`` is written on *both* outcomes.  Written
+        only on failure it is unfalsifiable: a manifest without it could mean
+        the pin held, or that the cycle predates the field, or that the state
+        was never consulted, and a provenance record that cannot say "yes"
+        cannot be compared against one that says "no".  It stays absent only
+        when no pin applied at all -- nothing was asked, so nothing was
+        satisfied or missed.
         """
         info = super().describe()
-        if self._state is None or self._state.verifier_pinned is not False:
+        if self._state is None or self._state.verifier_pinned is None:
             return info
         params = dict(info.training_params)
+        params["verifier_revision_satisfied"] = self._state.verifier_pinned
+        if self._state.verifier_pinned:
+            return BackendInfo(
+                verifier_model=info.verifier_model,
+                draft_model=info.draft_model,
+                from_pretrained=info.from_pretrained,
+                training_params=params,
+            )
         params["verifier_revision"] = None
         params["verifier_revision_requested"] = self.config.verifier_revision
-        params["verifier_revision_satisfied"] = False
         return BackendInfo(
             verifier_model=info.verifier_model,
             draft_model=info.draft_model,

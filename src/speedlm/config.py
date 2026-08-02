@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any, cast
 
@@ -16,6 +18,8 @@ from speedlm.storage import atomic_write_json
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_HOME_NAME = ".speedlm"
 HOME_ENV_VAR = "SPEEDLM_HOME"
@@ -216,6 +220,62 @@ class RedactionConfig:
             raise ConfigError(
                 f"redaction.enabled must be a bool, got {type(self.enabled).__name__!r}"
             )
+
+
+class DivergenceCriterion(Enum):
+    """Whether the position criterion can discriminate at all.
+
+    ``promotion.min_divergence_token_index`` only means something *relative to*
+    ``tuning.correctness_max_tokens``: the threshold divides an observable
+    range that the correctness pass itself bounds.  Push the threshold to
+    either end of that range and the criterion stops discriminating, without
+    any single field looking wrong on its own -- which is exactly how job
+    369373 was read as an ordinary rejection.
+
+    * ``CALIBRATED`` -- ``0 < threshold < cap``.  Some offsets classify early
+      and some late, which is the regime the threshold was calibrated for.
+    * ``SATURATED`` -- ``threshold >= cap``.  Every divergence at every
+      observable offset classifies *early* by construction, so with the
+      default ``max_output_mismatches = 0`` the gate demands a bitwise
+      identical generation over the whole correctness pass.  On hardware that
+      is not bitwise reproducible that is a near-certain reject, and the
+      rejection says nothing about the drafter.  Job 369373 set both to 128
+      and rejected on 48 divergences at offsets 24-127 -- the same benign
+      distribution earlier jobs recorded as *late* against a threshold of 16.
+    * ``DISABLED`` -- ``threshold == 0``.  No divergence can ever be early, so
+      the position criterion is off and any divergence is accepted.  Recorded
+      because this is the failure mode in the *other* direction: the gate is
+      the only safeguard and there is no post-promotion rollback.
+
+    The two degenerate states are legitimate to configure -- 369373 ran
+    ``SATURATED`` deliberately, to exercise the early branch -- so they warn
+    rather than raise.  What must not happen is a reader of ``decision.json``
+    mistaking a constructed rejection for a drafter-quality one, which is why
+    the state is carried into the decision record as well.
+    """
+
+    CALIBRATED = "calibrated"
+    SATURATED = "saturated"
+    DISABLED = "disabled"
+
+
+def classify_divergence_criterion(
+    min_divergence_token_index: int,
+    correctness_max_tokens: int | None,
+) -> DivergenceCriterion:
+    """Classify the promotion/tuning threshold relationship.
+
+    *correctness_max_tokens* is optional because an archived decision written
+    before the field existed reads back as ``None``; without the cap there is
+    no range to saturate, so only the ``DISABLED`` end is decidable.
+    """
+    if min_divergence_token_index <= 0:
+        return DivergenceCriterion.DISABLED
+    if correctness_max_tokens is not None and (
+        min_divergence_token_index >= correctness_max_tokens
+    ):
+        return DivergenceCriterion.SATURATED
+    return DivergenceCriterion.CALIBRATED
 
 
 @dataclass(frozen=True, slots=True)
@@ -944,6 +1004,42 @@ class SpeedLMConfig:
         if not isinstance(self.tuning_enabled, bool):
             raise ConfigError(
                 f"tuning_enabled must be a bool, got {type(self.tuning_enabled).__name__!r}"
+            )
+        self._warn_on_degenerate_divergence_criterion()
+
+    def _warn_on_degenerate_divergence_criterion(self) -> None:
+        """Say so at load when the position criterion cannot discriminate.
+
+        ``promotion.min_divergence_token_index`` and
+        ``tuning.correctness_max_tokens`` are validated independently and each
+        looks fine on its own; it is their *relationship* that decides whether
+        the criterion has a range to work in -- see
+        :class:`DivergenceCriterion`.  Both degenerate ends are deliberately
+        configurable, so this warns rather than raising: the point is that an
+        operator who set one accidentally finds out here, before a GPU cycle,
+        rather than from a rejection that reads like drafter quality.
+        """
+        criterion = classify_divergence_criterion(
+            self.promotion.min_divergence_token_index,
+            self.tuning.correctness_max_tokens,
+        )
+        if criterion is DivergenceCriterion.SATURATED:
+            logger.warning(
+                "promotion.min_divergence_token_index (%d) is at or above "
+                "tuning.correctness_max_tokens (%d): every divergence at every "
+                "observable offset will classify as early, so the gate demands a "
+                "bitwise identical generation and will reject almost any "
+                "candidate. Set the threshold below the correctness cap unless "
+                "this is deliberate.",
+                self.promotion.min_divergence_token_index,
+                self.tuning.correctness_max_tokens,
+            )
+        elif criterion is DivergenceCriterion.DISABLED:
+            logger.warning(
+                "promotion.min_divergence_token_index is 0: the divergence "
+                "position criterion is disabled and any divergence, however "
+                "early, will be accepted. The gate is the only safeguard and "
+                "promotion cannot be rolled back."
             )
 
     @property

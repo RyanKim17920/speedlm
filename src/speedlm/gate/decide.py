@@ -9,7 +9,11 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Final
 
-from speedlm.config import PromotionConfig
+from speedlm.config import (
+    DivergenceCriterion,
+    PromotionConfig,
+    classify_divergence_criterion,
+)
 from speedlm.gate.metrics import MetricsDelta
 from speedlm.gate.replay import ReplayResult, RequestResult
 
@@ -437,6 +441,21 @@ class Decision:
         return len(self.output_divergences)
 
     @property
+    def divergence_criterion(self) -> DivergenceCriterion:
+        """Whether the recorded position criterion could discriminate.
+
+        Derived from the two fields already on the record -- the threshold the
+        run was judged under and the cap the correctness pass ran with -- so it
+        is a reading of this decision, not of the config that is live now.  It
+        is what stops ``OUTPUT_MISMATCH`` on a saturated threshold from being
+        read as evidence about the drafter; see
+        :class:`speedlm.config.DivergenceCriterion`.
+        """
+        return classify_divergence_criterion(
+            self.min_divergence_token_index, self.correctness_max_tokens
+        )
+
+    @property
     def throughput_statistic_gap_pp(self) -> float | None:
         """How far the diagnostic statistic sits from the gating one.
 
@@ -489,6 +508,11 @@ class Decision:
                 self.acceptance_delta_standard_error_pp
             ),
             "min_divergence_token_index": self.min_divergence_token_index,
+            # Whether that threshold had a range to discriminate in, given the
+            # correctness cap below.  ``saturated`` means every divergence was
+            # early by construction and the verdict is a property of the
+            # configuration, not of the drafter.
+            "divergence_criterion": self.divergence_criterion.value,
             "output_early_divergences": self.output_early_divergences,
             "output_total_divergences": self.output_total_divergences,
             "output_divergences": [d.to_dict() for d in self.output_divergences],

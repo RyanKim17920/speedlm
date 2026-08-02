@@ -1178,8 +1178,25 @@ def test_a_satisfied_verifier_pin_still_reaches_the_manifest(
 
     params = backend.describe().training_params
     assert params["verifier_revision"] == pinned.verifier_revision
+    # Written on success too: a flag that only ever appears as ``false`` cannot
+    # be compared against anything, because its absence has three meanings.
+    assert params["verifier_revision_satisfied"] is True
     assert "verifier_revision_requested" not in params
     assert not (work / STAGE_LOG_DIR_NAME / "provenance").exists()
+
+
+def test_an_unpinned_cycle_records_no_satisfaction_claim(
+    tmp_path: Path,
+    pipeline: SpeculatorsPipelineConfig,
+) -> None:
+    """Nothing was asked, so nothing was satisfied or missed."""
+    runner = _FakeRunner()
+    backend, work = _backend(tmp_path, pipeline, runner)
+
+    backend.prepare(work, should_abort=lambda: False)
+
+    params = backend.describe().training_params
+    assert "verifier_revision_satisfied" not in params
 
 
 # ---------------------------------------------------------------------------

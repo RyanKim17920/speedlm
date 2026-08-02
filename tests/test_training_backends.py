@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import contextlib
+import fnmatch
 import io
 import json
 import sys
 import types
 from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -172,9 +174,15 @@ def test_a_pinned_revision_narrows_completeness_to_the_files_training_reads(
     resolver.verifier(lambda: False, tmp_path)
 
     assert pipeline.model_resolve_allow_patterns == ("*.json", "*.safetensors", "*.jinja")
-    assert runner.argv[-3:] == pipeline.model_resolve_allow_patterns
+    assert pipeline.model_resolve_ignore_patterns == ("*/*",)
     assert runner.argv[3] == "openai/gpt-oss-20b"
     assert runner.argv[4] == "6cee5e81ee83917806bbde320786a8fb61efebee"
+    assert runner.argv[5:] == (
+        "--allow",
+        *pipeline.model_resolve_allow_patterns,
+        "--ignore",
+        *pipeline.model_resolve_ignore_patterns,
+    )
 
 
 def _run_resolve_script(
@@ -193,12 +201,14 @@ def _run_resolve_script(
         repo_id: str,
         revision: str | None = None,
         allow_patterns: object = None,
+        ignore_patterns: object = None,
     ) -> str:
         calls.append(
             {
                 "repo_id": repo_id,
                 "revision": revision,
                 "allow_patterns": allow_patterns,
+                "ignore_patterns": ignore_patterns,
             }
         )
         if revision is not None and incomplete_for_revision:
@@ -227,7 +237,16 @@ def _run_resolve_script(
 def test_a_pinned_revision_resolves_the_partial_offline_cache(tmp_path: Path) -> None:
     """A complete-enough minimal cache resolves under the pin, no fallback."""
     path, calls = _run_resolve_script(
-        ["-", "openai/gpt-oss-20b", "6cee5e81", "*.json", "*.safetensors"],
+        [
+            "-",
+            "openai/gpt-oss-20b",
+            "6cee5e81",
+            "--allow",
+            "*.json",
+            "*.safetensors",
+            "--ignore",
+            "*/*",
+        ],
         incomplete_for_revision=False,
     )
 
@@ -237,6 +256,7 @@ def test_a_pinned_revision_resolves_the_partial_offline_cache(tmp_path: Path) ->
             "repo_id": "openai/gpt-oss-20b",
             "revision": "6cee5e81",
             "allow_patterns": ["*.json", "*.safetensors"],
+            "ignore_patterns": ["*/*"],
         }
     ]
 
@@ -249,12 +269,156 @@ def test_an_unsatisfiable_pin_reports_unresolved_rather_than_redownloading() -> 
     against main.  Resolution must instead say it could not satisfy the pin.
     """
     path, calls = _run_resolve_script(
-        ["-", "openai/gpt-oss-20b", "6cee5e81", "*.json"],
+        ["-", "openai/gpt-oss-20b", "6cee5e81", "--allow", "*.json", "--ignore", "*/*"],
         incomplete_for_revision=True,
     )
 
     assert path == "SPEEDLM_UNRESOLVED"
     assert [call["revision"] for call in calls] == ["6cee5e81"]
+
+
+#: The file listing of ``openai/gpt-oss-20b`` at the pinned revision, taken
+#: from the cached tree listing this host resolves against.  ``original/`` and
+#: ``metal/`` are auxiliary formats a minimal cache deliberately never pulls.
+_GPT_OSS_REPO_FILES = (
+    ".gitattributes",
+    "LICENSE",
+    "README.md",
+    "USAGE_POLICY",
+    "chat_template.jinja",
+    "config.json",
+    "generation_config.json",
+    "metal/model.bin",
+    "model-00000-of-00002.safetensors",
+    "model-00001-of-00002.safetensors",
+    "model-00002-of-00002.safetensors",
+    "model.safetensors.index.json",
+    "original/config.json",
+    "original/dtypes.json",
+    "original/model.safetensors",
+    "special_tokens_map.json",
+    "tokenizer.json",
+    "tokenizer_config.json",
+)
+#: What a minimal cache of that repo holds on disk: the top level only.
+_GPT_OSS_MINIMAL_CACHE = tuple(
+    name for name in _GPT_OSS_REPO_FILES if "/" not in name
+)
+
+
+def _expected_files(
+    repo_files: Sequence[str],
+    allow_patterns: Sequence[str],
+    ignore_patterns: Sequence[str] = (),
+) -> list[str]:
+    """Mirror ``huggingface_hub.utils.filter_repo_objects``.
+
+    That helper is what ``_raise_if_incomplete_snapshot`` runs the repo's tree
+    listing through before demanding every survivor exist on disk: ``fnmatch``
+    against the *full path*, allow first, then ignore.  It is reproduced here
+    rather than imported because huggingface_hub is a dependency of the
+    training venv, not of this repo, and the point of the test is the pattern
+    semantics, which are ``fnmatch``'s.
+    """
+    return [
+        name
+        for name in repo_files
+        if any(fnmatch.fnmatch(name, pattern) for pattern in allow_patterns)
+        and not any(fnmatch.fnmatch(name, pattern) for pattern in ignore_patterns)
+    ]
+
+
+def test_unanchored_allow_patterns_demand_files_a_minimal_cache_never_pulled(
+    tmp_path: Path,
+) -> None:
+    """Pins the defect: ``*`` crosses ``/``, so ``*.json`` claims ``original/``.
+
+    This is what made job 369373 record ``verifier_revision_satisfied: false``
+    on a cache that held every file training reads.
+    """
+    pipeline = _pipeline(tmp_path)
+
+    unanchored = _expected_files(
+        _GPT_OSS_REPO_FILES, pipeline.model_resolve_allow_patterns
+    )
+
+    assert [name for name in unanchored if "/" in name] == [
+        "original/config.json",
+        "original/dtypes.json",
+        "original/model.safetensors",
+    ]
+    assert [name for name in unanchored if name not in _GPT_OSS_MINIMAL_CACHE]
+
+
+def test_the_shipped_patterns_match_the_top_level_files_and_nothing_else(
+    tmp_path: Path,
+) -> None:
+    """The anchored pair expects exactly what a minimal cache holds."""
+    pipeline = _pipeline(tmp_path)
+
+    expected = _expected_files(
+        _GPT_OSS_REPO_FILES,
+        pipeline.model_resolve_allow_patterns,
+        pipeline.model_resolve_ignore_patterns,
+    )
+
+    assert expected == [
+        "chat_template.jinja",
+        "config.json",
+        "generation_config.json",
+        "model-00000-of-00002.safetensors",
+        "model-00001-of-00002.safetensors",
+        "model-00002-of-00002.safetensors",
+        "model.safetensors.index.json",
+        "special_tokens_map.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+    ]
+    assert not [name for name in expected if name not in _GPT_OSS_MINIMAL_CACHE]
+
+
+def test_the_anchored_patterns_leave_a_flat_repo_untouched(tmp_path: Path) -> None:
+    """Qwen3-8B publishes no nested paths, so anchoring must change nothing."""
+    pipeline = _pipeline(tmp_path)
+    qwen_files = (
+        ".gitattributes",
+        "LICENSE",
+        "README.md",
+        "config.json",
+        "generation_config.json",
+        "merges.txt",
+        "model-00001-of-00005.safetensors",
+        "model-00002-of-00005.safetensors",
+        "model-00003-of-00005.safetensors",
+        "model-00004-of-00005.safetensors",
+        "model-00005-of-00005.safetensors",
+        "model.safetensors.index.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.json",
+    )
+
+    anchored = _expected_files(
+        qwen_files,
+        pipeline.model_resolve_allow_patterns,
+        pipeline.model_resolve_ignore_patterns,
+    )
+
+    assert anchored == _expected_files(
+        qwen_files, pipeline.model_resolve_allow_patterns
+    )
+    assert "config.json" in anchored
+    assert "model-00005-of-00005.safetensors" in anchored
+    assert "vocab.json" in anchored
+    assert "README.md" not in anchored
+
+
+def test_a_pattern_colliding_with_an_argv_marker_is_rejected(tmp_path: Path) -> None:
+    """The two lists are split on markers, so a pattern may not be one."""
+    with pytest.raises(ValueError, match="model_resolve_allow_patterns"):
+        replace(_pipeline(tmp_path), model_resolve_allow_patterns=("--ignore",))
+    with pytest.raises(ValueError, match="model_resolve_ignore_patterns"):
+        replace(_pipeline(tmp_path), model_resolve_ignore_patterns=("",))
 
 
 def test_an_unsatisfiable_pin_falls_back_to_the_bare_repo_id(tmp_path: Path) -> None:

@@ -6,6 +6,7 @@ import pytest
 
 from speedlm.config import (
     ConfigError,
+    DivergenceCriterion,
     IdleTuningConfig,
     PromotionConfig,
     RedactionConfig,
@@ -14,6 +15,7 @@ from speedlm.config import (
     TargetConfig,
     TraceBufferConfig,
     WrapperConfig,
+    classify_divergence_criterion,
     load_config,
     save_config,
     speedlm_home,
@@ -439,6 +441,91 @@ def test_invalid_divergence_threshold_is_rejected(value: object) -> None:
 def test_invalid_correctness_max_tokens_is_rejected(value: object) -> None:
     with pytest.raises(ConfigError, match="correctness_max_tokens"):
         IdleTuningConfig(correctness_max_tokens=value)
+
+
+# --- the promotion/tuning threshold relationship ---------------------------
+# Neither field is wrong on its own; it is the pair that decides whether the
+# position criterion has a range to discriminate in.  Both degenerate ends are
+# legitimate to configure, so they warn at load rather than raising -- job
+# 369373 set them equal deliberately -- but they must not be silent.
+
+
+@pytest.mark.parametrize(
+    ("threshold", "cap", "expected"),
+    [
+        (16, 128, DivergenceCriterion.CALIBRATED),
+        (127, 128, DivergenceCriterion.CALIBRATED),
+        (128, 128, DivergenceCriterion.SATURATED),
+        (256, 128, DivergenceCriterion.SATURATED),
+        (0, 128, DivergenceCriterion.DISABLED),
+        # An archived decision predating the cap field: only the disabled end
+        # is decidable without a range.
+        (16, None, DivergenceCriterion.CALIBRATED),
+        (0, None, DivergenceCriterion.DISABLED),
+    ],
+)
+def test_the_divergence_criterion_is_classified_at_both_ends(
+    threshold: int,
+    cap: int | None,
+    expected: DivergenceCriterion,
+) -> None:
+    assert classify_divergence_criterion(threshold, cap) is expected
+
+
+def test_a_saturated_divergence_threshold_warns_at_config_load(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Job 369373: threshold 128 against a cap of 128 rejects everything.
+
+    Every divergence at every observable offset classifies early, so with
+    ``max_output_mismatches = 0`` the gate demands a bitwise identical
+    generation -- which non-reproducible hardware will not produce.
+    """
+    with caplog.at_level("WARNING", logger="speedlm.config"):
+        SpeedLMConfig.from_dict(
+            {
+                "model": "m",
+                "promotion": {"min_divergence_token_index": 128},
+                "tuning": {"correctness_max_tokens": 128},
+            }
+        )
+
+    assert "every divergence" in caplog.text
+    assert "min_divergence_token_index" in caplog.text
+
+
+def test_a_disabled_divergence_threshold_warns_at_config_load(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The other end matters too: the gate is the only safeguard."""
+    with caplog.at_level("WARNING", logger="speedlm.config"):
+        SpeedLMConfig.from_dict(
+            {"model": "m", "promotion": {"min_divergence_token_index": 0}}
+        )
+
+    assert "disabled" in caplog.text
+
+
+def test_a_calibrated_divergence_threshold_is_silent(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    with caplog.at_level("WARNING", logger="speedlm.config"):
+        SpeedLMConfig(model="m")
+
+    assert caplog.text == ""
+
+
+def test_a_degenerate_threshold_relationship_is_not_fatal() -> None:
+    """The 369373 experiment must stay runnable; the warning is the safeguard."""
+    config = SpeedLMConfig.from_dict(
+        {
+            "model": "m",
+            "promotion": {"min_divergence_token_index": 128},
+            "tuning": {"correctness_max_tokens": 128},
+        }
+    )
+
+    assert config.promotion.min_divergence_token_index == 128
 
 
 def test_benchmark_max_tokens_round_trips_and_defaults_to_the_served_cap() -> None:

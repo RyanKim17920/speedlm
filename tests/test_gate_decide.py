@@ -4,7 +4,7 @@ import math
 
 import pytest
 
-from speedlm.config import PromotionConfig
+from speedlm.config import DivergenceCriterion, PromotionConfig
 from speedlm.gate.decide import (
     GATING_ACCEPTANCE_STATISTIC,
     GATING_THROUGHPUT_STATISTIC,
@@ -890,6 +890,7 @@ def _decide_with_correctness(
     diverge_at: int | None,
     min_divergence_token_index: int = 16,
     contexts: int = 1,
+    correctness_max_tokens: int | None = None,
 ) -> Decision:
     stock_correctness, cand_correctness = _correctness_pair(
         diverge_at=diverge_at, contexts=contexts
@@ -906,6 +907,7 @@ def _decide_with_correctness(
         ),
         stock_correctness=stock_correctness,
         candidate_correctness=cand_correctness,
+        correctness_max_tokens=correctness_max_tokens,
     )
 
 
@@ -999,6 +1001,43 @@ def test_divergence_threshold_is_configurable() -> None:
     assert _decide_with_correctness(
         diverge_at=20, min_divergence_token_index=64
     ).reason is Reason.OUTPUT_MISMATCH
+
+
+def test_a_saturated_threshold_is_named_in_the_decision_record() -> None:
+    """Job 369373: the rejection was constructed by the config, not measured.
+
+    Threshold 128 against a correctness cap of 128 makes every divergence at
+    every observable offset early, so ``OUTPUT_MISMATCH`` here says nothing
+    about the drafter -- and a reader of ``decision.json`` must be able to see
+    that without re-deriving it from two numbers.
+    """
+    dec = _decide_with_correctness(
+        diverge_at=24, min_divergence_token_index=128, correctness_max_tokens=128
+    )
+
+    assert dec.reason is Reason.OUTPUT_MISMATCH
+    assert dec.divergence_criterion is DivergenceCriterion.SATURATED
+    assert dec.to_dict()["divergence_criterion"] == "saturated"
+
+
+def test_a_disabled_threshold_is_named_in_the_decision_record() -> None:
+    """The other end: no divergence can ever be early, so none can gate."""
+    dec = _decide_with_correctness(
+        diverge_at=1, min_divergence_token_index=0, correctness_max_tokens=128
+    )
+
+    assert dec.output_early_divergences == 0
+    assert dec.divergence_criterion is DivergenceCriterion.DISABLED
+    assert dec.to_dict()["divergence_criterion"] == "disabled"
+
+
+def test_the_calibrated_default_relationship_is_recorded_as_such() -> None:
+    dec = _decide_with_correctness(
+        diverge_at=24, min_divergence_token_index=16, correctness_max_tokens=128
+    )
+
+    assert dec.divergence_criterion is DivergenceCriterion.CALIBRATED
+    assert dec.to_dict()["divergence_criterion"] == "calibrated"
 
 
 def test_correctness_pass_is_compared_instead_of_the_throughput_pass() -> None:
