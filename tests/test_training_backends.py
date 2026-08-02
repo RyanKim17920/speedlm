@@ -13,9 +13,15 @@ from unittest import mock
 
 import pytest
 
+from speedlm.profiles import (
+    GPT_OSS_EAGLE3_PROFILE,
+    MAX_SPECULATIVE_TOKENS,
+    QWEN_3_8B_EAGLE3_PROFILE,
+)
 from speedlm.training.backends.eagle3 import (
     _RESOLVE_MODEL,
     _VALIDATE_DRAFT,
+    REQUIRED_DRAFT_TENSORS,
     Eagle3Adapter,
     Eagle3Backend,
     Eagle3Config,
@@ -468,13 +474,20 @@ def _write_draft(
     return draft
 
 
-def _run_validate_script(draft: Path, verifier: str, layers: Sequence[int]) -> None:
+def _run_validate_script(
+    draft: Path,
+    verifier: str,
+    layers: Sequence[int],
+    *,
+    tensor_keys: frozenset[str] | None = None,
+) -> None:
     """Execute the real _VALIDATE_DRAFT source against a stub safetensors.
 
-    The repo venv carries no safetensors, and the weight check is not what is
-    under test here, so the reader is stubbed to report the vocab mappings a
-    healthy draft has.  Everything before it is the real snippet.
+    The repo venv carries no safetensors, and which tensors a *healthy* draft
+    has is not what these tests are about, so the reader reports the full
+    required set by default.  Everything before it is the real snippet.
     """
+    keys = REQUIRED_DRAFT_TENSORS if tensor_keys is None else tensor_keys
 
     class _Handle:
         def __enter__(self) -> _Handle:
@@ -484,7 +497,7 @@ def _run_validate_script(draft: Path, verifier: str, layers: Sequence[int]) -> N
             return None
 
         def keys(self) -> set[str]:
-            return {"d2t", "t2d"}
+            return set(keys)
 
     module = types.ModuleType("safetensors")
     module.safe_open = lambda *_a, **_k: _Handle()  # type: ignore[attr-defined]
@@ -647,3 +660,75 @@ def test_a_warm_start_resolver_that_names_nothing_fails_closed(
     adapter = _bare_adapter(lambda: "")
     with pytest.raises(Eagle3Error, match="named no checkpoint"):
         adapter.train(tmp_path / "hidden", tmp_path / "work", should_abort=lambda: False)
+
+
+# --- draft-chain depth: training must match serving ------------------------
+
+
+def test_eagle3_config_accepts_the_depth_the_profile_serves() -> None:
+    """The old ``!= 3`` pin is what made gpt-oss train 3 and serve 5."""
+    config = Eagle3Config(
+        verifier_model="openai/gpt-oss-20b",
+        draft_model="RedHatAI/gpt-oss-20b-speculator.eagle3",
+        from_pretrained="RedHatAI/gpt-oss-20b-speculator.eagle3",
+        mask_policy=MaskPolicy.FINAL_TURN_ALL_CHANNELS,
+        num_speculative_steps=GPT_OSS_EAGLE3_PROFILE.num_speculative_tokens,
+    )
+
+    assert config.num_speculative_steps == 5
+    assert config.effective_training_params["num_speculative_steps"] == 5
+
+
+@pytest.mark.parametrize("steps", [0, -1, MAX_SPECULATIVE_TOKENS + 1])
+def test_eagle3_config_still_bounds_the_depth(steps: int) -> None:
+    """Removing the hardcoded 3 must not remove the bound."""
+    with pytest.raises(ValueError, match="num_speculative_steps"):
+        Eagle3Config(
+            verifier_model="openai/gpt-oss-20b",
+            draft_model="acme/draft",
+            from_pretrained="acme/draft",
+            mask_policy=MaskPolicy.FINAL_TURN_ALL_CHANNELS,
+            num_speculative_steps=steps,
+        )
+
+
+def test_describe_records_the_trained_depth_in_the_manifest_params() -> None:
+    """Nothing downstream could previously compare training to serving depth."""
+    backend = object.__new__(Eagle3Backend)
+    backend.config = Eagle3Config(
+        verifier_model="openai/gpt-oss-20b",
+        draft_model="RedHatAI/gpt-oss-20b-speculator.eagle3",
+        from_pretrained="RedHatAI/gpt-oss-20b-speculator.eagle3",
+        mask_policy=MaskPolicy.FINAL_TURN_ALL_CHANNELS,
+        num_speculative_steps=5,
+    )
+
+    assert backend.describe().training_params["num_speculative_steps"] == 5
+
+
+def test_pipeline_config_rejects_an_out_of_range_depth(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="num_speculative_steps"):
+        SpeculatorsPipelineConfig(
+            prepared_validator_script=tmp_path / "validate.py",
+            verifier_model="openai/gpt-oss-20b",
+            warm_start_model="RedHatAI/gpt-oss-20b-speculator.eagle3",
+            num_speculative_steps=MAX_SPECULATIVE_TOKENS + 1,
+        )
+
+
+def test_the_qwen_profile_that_was_unaffected_still_trains_three() -> None:
+    """Qwen3-8B was 3/3 and must stay 3/3; the fix is not "always 5"."""
+    assert QWEN_3_8B_EAGLE3_PROFILE.num_speculative_tokens == 3
+
+
+def test_the_validator_requires_the_fusion_projection(tmp_path: Path) -> None:
+    """d2t/t2d alone cannot distinguish a trained head from a vocab map."""
+    draft = _write_draft(tmp_path, verifier="Qwen/Qwen3-8B", layer_ids=None)
+
+    with pytest.raises(SystemExit, match="fc.weight"):
+        _run_validate_script(
+            draft,
+            _QWEN_SNAPSHOT,
+            (2, 18, 33),
+            tensor_keys=frozenset({"d2t", "t2d"}),
+        )

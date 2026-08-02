@@ -7,13 +7,20 @@ the login-node test suite never imports CUDA, vLLM, or Speculators.
 
 from __future__ import annotations
 
+import hashlib
 import inspect
+import json
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Protocol
+from typing import Final, Protocol
 
+from speedlm.profiles import (
+    DEFAULT_SPECULATIVE_TOKENS,
+    MAX_SPECULATIVE_TOKENS,
+    cached_snapshot_dir,
+)
 from speedlm.traces.redact import Redactor
 from speedlm.training.base import BackendInfo
 from speedlm.training.masking import FinalAssistantMaskError, MaskPolicy
@@ -162,6 +169,225 @@ class StageTimeoutError(Eagle3Error):
     """An external stage exceeded its configured wall-clock timeout."""
 
 
+class DraftWeightsError(Eagle3Error):
+    """A materialized or published draft does not carry usable trained weights."""
+
+
+class StockIdenticalDraftError(DraftWeightsError):
+    """The candidate's weights are byte-identical to the head it trained from.
+
+    Training was a no-op: every tensor came out of the cycle exactly as it
+    went in.  Benchmarking such a candidate cannot do anything except spend a
+    gate cycle proving that a head is as good as itself, so the cycle fails
+    here instead.
+    """
+
+    def __init__(self, baseline: str, fingerprint: str) -> None:
+        self.baseline = baseline
+        self.fingerprint = fingerprint
+        super().__init__(
+            f"trained draft is byte-identical to its baseline {baseline!r} "
+            f"(weight fingerprint {fingerprint}); training was a no-op"
+        )
+
+
+#: Tensor keys every trained EAGLE-3 head must publish.
+#:
+#: Read off the two stock drafters in the local HF cache rather than assumed:
+#: ``RedHatAI/gpt-oss-20b-speculator.eagle3`` publishes 17 tensors and
+#: ``RedHatAI/Qwen3-8B-speculator.eagle3`` publishes 16.  This is their
+#: intersection.  gpt-oss additionally carries ``input_norm.weight`` because
+#: its config sets ``norm_before_fc``; Qwen3 does not, so requiring that key
+#: would reject a valid Qwen3 head, and it is deliberately excluded.
+#:
+#: ``fc.weight`` is what makes this a check on *training* rather than on
+#: packaging.  It is the fusion projection from the concatenated aux hidden
+#: states into the draft layer -- ``hidden x (aux_count * hidden)``, so
+#: ``(2880, 8640)`` for gpt-oss and ``(4096, 12288)`` for Qwen3 -- and it is
+#: the tensor EAGLE-3 training actually fits.  The previous validator required
+#: only ``d2t``/``t2d``, two vocabulary index maps that a directory holding no
+#: draft head at all would still satisfy.
+REQUIRED_DRAFT_TENSORS: Final[frozenset[str]] = frozenset(
+    {
+        "d2t",
+        "t2d",
+        "fc.weight",
+        "embed_tokens.weight",
+        "lm_head.weight",
+        "norm.weight",
+        "layers.0.hidden_norm.weight",
+        "layers.0.input_layernorm.weight",
+        "layers.0.post_attention_layernorm.weight",
+        "layers.0.mlp.down_proj.weight",
+        "layers.0.mlp.gate_proj.weight",
+        "layers.0.mlp.up_proj.weight",
+        "layers.0.self_attn.q_proj.weight",
+        "layers.0.self_attn.k_proj.weight",
+        "layers.0.self_attn.v_proj.weight",
+        "layers.0.self_attn.o_proj.weight",
+    }
+)
+
+#: Domain separator for :func:`weight_fingerprint`, versioned so a future
+#: change to what the digest covers can never be mistaken for a weight change.
+_FINGERPRINT_DOMAIN: Final = b"speedlm-eagle3-weights-v1"
+
+#: Ceiling on a safetensors JSON header, which is read whole into memory.
+#:
+#: The format is an 8-byte little-endian header length followed by that many
+#: bytes of JSON.  A corrupt or hostile file can claim an arbitrary length, so
+#: the claim is bounded before it is honoured.  Real headers here are a few
+#: kilobytes: the largest of the two stock drafters declares 17 tensors.
+_MAX_SAFETENSORS_HEADER_BYTES: Final = 100 * 1024 * 1024
+
+#: Read granularity when digesting tensor payloads.
+_FINGERPRINT_CHUNK_BYTES: Final = 1024 * 1024
+
+
+@dataclass(frozen=True, slots=True)
+class _TensorLocation:
+    """Where one named tensor's bytes live, and what shape they claim to be."""
+
+    path: Path
+    dtype: str
+    shape: tuple[int, ...]
+    start: int
+    end: int
+
+
+def _safetensors_tensors(path: Path) -> dict[str, _TensorLocation]:
+    """Parse *path*'s safetensors header without importing ``safetensors``.
+
+    The tuner process is deliberately free of the GPU stack -- it must stay
+    importable on the login node -- so the header is decoded from its
+    documented on-disk layout instead: ``u64`` header length, that many bytes
+    of JSON, then the tensor buffer.  ``data_offsets`` are relative to the
+    start of that buffer.
+    """
+    try:
+        with path.open("rb") as stream:
+            prefix = stream.read(8)
+            if len(prefix) != 8:
+                raise DraftWeightsError(f"truncated safetensors file: {path}")
+            header_bytes = int.from_bytes(prefix, "little")
+            if header_bytes <= 0 or header_bytes > _MAX_SAFETENSORS_HEADER_BYTES:
+                raise DraftWeightsError(
+                    f"safetensors header length {header_bytes} is not plausible: {path}"
+                )
+            raw = stream.read(header_bytes)
+            if len(raw) != header_bytes:
+                raise DraftWeightsError(f"truncated safetensors header: {path}")
+    except OSError as exc:
+        raise DraftWeightsError(f"cannot read safetensors file: {path}") from exc
+    try:
+        header = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise DraftWeightsError(f"unreadable safetensors header: {path}") from exc
+    if not isinstance(header, dict):
+        raise DraftWeightsError(f"safetensors header is not an object: {path}")
+    base = 8 + header_bytes
+    tensors: dict[str, _TensorLocation] = {}
+    for name, entry in header.items():
+        if name == "__metadata__":
+            continue
+        if not isinstance(entry, dict):
+            raise DraftWeightsError(f"safetensors entry {name!r} is not an object: {path}")
+        offsets = entry.get("data_offsets")
+        dtype = entry.get("dtype")
+        shape = entry.get("shape")
+        if (
+            not isinstance(offsets, list)
+            or len(offsets) != 2
+            or not all(isinstance(value, int) and not isinstance(value, bool) for value in offsets)
+            or offsets[0] < 0
+            or offsets[1] < offsets[0]
+            or not isinstance(dtype, str)
+            or not isinstance(shape, list)
+            or not all(isinstance(value, int) and not isinstance(value, bool) for value in shape)
+        ):
+            raise DraftWeightsError(
+                f"safetensors entry {name!r} has an unusable descriptor: {path}"
+            )
+        tensors[name] = _TensorLocation(
+            path=path,
+            dtype=dtype,
+            shape=tuple(shape),
+            start=base + offsets[0],
+            end=base + offsets[1],
+        )
+    return tensors
+
+
+def _collect_draft_tensors(directory: Path) -> dict[str, _TensorLocation]:
+    """Index every tensor across *directory*'s safetensors shards, by name."""
+    if not directory.is_dir():
+        raise DraftWeightsError(f"draft directory does not exist: {directory}")
+    collected: dict[str, _TensorLocation] = {}
+    for path in sorted(directory.glob("*.safetensors")):
+        for name, location in _safetensors_tensors(path).items():
+            previous = collected.get(name)
+            if previous is not None:
+                raise DraftWeightsError(
+                    f"tensor {name!r} appears in both {previous.path.name} and "
+                    f"{path.name}; the draft's shard layout is ambiguous"
+                )
+            collected[name] = location
+    return collected
+
+
+def draft_tensor_keys(directory: Path) -> frozenset[str]:
+    """Return every tensor name published by *directory*'s safetensors."""
+    return frozenset(_collect_draft_tensors(directory))
+
+
+def weight_fingerprint(directory: Path) -> str:
+    """Return a SHA-256 fingerprint of *directory*'s draft weights.
+
+    The digest covers each tensor's name, dtype, shape and raw bytes, walked
+    in sorted name order across all shards.  It deliberately does **not**
+    cover file names, shard boundaries, config or tokenizer files: two
+    directories with the same fingerprint hold the same weights however they
+    were packaged, which is what makes the comparison against the warm-start
+    head in :meth:`Eagle3Adapter.materialize` meaningful.
+
+    This is a *different* question from
+    :func:`speedlm.tuner.artifacts.hash_directory`, which hashes every byte of
+    every file and answers "is this the same publication".  A tuning cycle
+    can change the config and leave the weights untouched; only this digest
+    can tell that apart.
+    """
+    tensors = _collect_draft_tensors(directory)
+    if not tensors:
+        raise DraftWeightsError(f"draft directory has no safetensors weights: {directory}")
+    digest = hashlib.sha256()
+    digest.update(_FINGERPRINT_DOMAIN)
+    for name in sorted(tensors):
+        location = tensors[name]
+        digest.update(b"tensor\0")
+        digest.update(name.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(location.dtype.encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(",".join(str(value) for value in location.shape).encode("utf-8"))
+        digest.update(b"\0")
+        remaining = location.end - location.start
+        try:
+            with location.path.open("rb") as stream:
+                stream.seek(location.start)
+                while remaining > 0:
+                    chunk = stream.read(min(remaining, _FINGERPRINT_CHUNK_BYTES))
+                    if not chunk:
+                        raise DraftWeightsError(
+                            f"tensor {name!r} is truncated in {location.path}"
+                        )
+                    digest.update(chunk)
+                    remaining -= len(chunk)
+        except OSError as exc:
+            raise DraftWeightsError(f"cannot read tensor {name!r}: {location.path}") from exc
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
 class TrainingError(Eagle3Error):
     """Speculators training failed, retaining stderr for diagnosis."""
 
@@ -242,7 +468,11 @@ class Eagle3Config:
     draft_revision: str | None = None
     target_layer_ids: tuple[int, ...] | None = None
     sequence_length: int = 16_384
-    num_speculative_steps: int = 3
+    #: Depth of the draft chain this cycle trains, i.e. Speculators'
+    #: ``--ttt-steps``.  It must equal the profile's serving
+    #: ``num_speculative_tokens``; :func:`speedlm.profiles.validate_training_depth`
+    #: is what enforces that, at composition time, before a GPU cycle starts.
+    num_speculative_steps: int = DEFAULT_SPECULATIVE_TOKENS
     mask_policy: MaskPolicy = MaskPolicy.FINAL_TURN_ALL_CHANNELS
     training_params: Mapping[str, object] = field(default_factory=dict)
     timeouts: Eagle3Timeouts = field(default_factory=Eagle3Timeouts)
@@ -280,8 +510,23 @@ class Eagle3Config:
             or self.sequence_length < 1
         ):
             raise ValueError("sequence_length must be a positive integer")
-        if self.num_speculative_steps != 3:
-            raise ValueError("EAGLE-3 requires exactly 3 speculative/TTT steps")
+        # Formerly ``!= 3``, which was an assumption rather than a constraint.
+        # The Speculators EAGLE-3 head is one transformer layer rolled out
+        # autoregressively -- ``ttt_steps`` is the loop bound at
+        # ``src/speculators/models/eagle3/core.py:199``, its upstream suite
+        # drives 1, 3 and 5 steps against a single checkpoint, and the trainer
+        # merely *defaults* ``--ttt-steps`` to 3.  Pinning 3 here is what let
+        # gpt-oss-20b train a 3-deep head and serve it 5-deep.
+        if (
+            isinstance(self.num_speculative_steps, bool)
+            or not isinstance(self.num_speculative_steps, int)
+            or self.num_speculative_steps < 1
+            or self.num_speculative_steps > MAX_SPECULATIVE_TOKENS
+        ):
+            raise ValueError(
+                f"num_speculative_steps must be an integer in "
+                f"1..{MAX_SPECULATIVE_TOKENS}"
+            )
         if not isinstance(self.mask_policy, MaskPolicy):
             raise ValueError("mask_policy must be an explicit MaskPolicy")
         if (
@@ -421,6 +666,21 @@ class Eagle3Adapter:
     #: still answers, exactly as ``Eagle3Backend._state`` does.
     _resolved_warm_start: str | None = None
 
+    #: Weight fingerprint of the draft this cycle materialized, or ``None``
+    #: before :meth:`materialize` has run.  Class-level for the same reason as
+    #: the two attributes above: ``describe`` must answer on an adapter that a
+    #: test assembled without ``__init__``.
+    _draft_weight_fingerprint: str | None = None
+
+    #: What :meth:`materialize` compared that fingerprint against, and the
+    #: baseline's own fingerprint.  Both are ``None`` when no baseline could be
+    #: resolved to local weights.  They are recorded either way: an artifact
+    #: whose manifest cannot say *whether* the no-op check ran is
+    #: indistinguishable from one where it ran and passed, which is the exact
+    #: unfalsifiability ``verifier_revision_satisfied`` exists to avoid.
+    _draft_weight_baseline: str | None = None
+    _draft_weight_baseline_fingerprint: str | None = None
+
     def __init__(
         self,
         config: Eagle3Config,
@@ -472,6 +732,20 @@ class Eagle3Adapter:
         """
         params = dict(self.config.training_params)
         params["verifier_revision"] = self.config.verifier_revision
+        # The depth the cycle trained at, recorded beside the weights it
+        # produced.  Without it nothing downstream can compare training depth
+        # against the profile's serving ``num_speculative_tokens``, which is
+        # how a 3-deep head came to be served 5-deep unnoticed.
+        params["num_speculative_steps"] = self.config.num_speculative_steps
+        # Proof, not inference, that the trained weights are the published
+        # ones: the fingerprint is computed at the materialized draft and
+        # re-checked against the artifact tree by
+        # :meth:`assert_published_weights` before the publish commits.
+        params["draft_weight_fingerprint"] = self._draft_weight_fingerprint
+        params["draft_weight_baseline"] = self._draft_weight_baseline
+        params["draft_weight_baseline_fingerprint"] = (
+            self._draft_weight_baseline_fingerprint
+        )
         return BackendInfo(
             verifier_model=self.config.verifier_model,
             draft_model=self.config.draft_model,
@@ -695,7 +969,103 @@ class Eagle3Adapter:
             raise Eagle3Error(
                 f"materializer did not return a draft directory: {draft_directory}"
             )
+        self._record_draft_weights(draft_directory)
         return draft_directory
+
+    def _record_draft_weights(self, draft_directory: Path) -> None:
+        """Prove the materialized draft is a trained head, and fingerprint it.
+
+        Three separate claims, none of which the pipeline could previously
+        make:
+
+        1. **It is a draft head at all.**  Every key in
+           :data:`REQUIRED_DRAFT_TENSORS` must be present -- ``fc.weight``
+           above all.  The subprocess validator asked only for ``d2t``/``t2d``,
+           which a directory containing no head would still satisfy.
+
+        2. **Training changed something.**  The candidate is compared against
+           the head it warm-started from (the stock drafter on the first
+           cycle, the incumbent artifact afterwards).  Byte-identical means
+           the cycle was a no-op and the gate would be asked to distinguish a
+           head from itself, so it raises :class:`StockIdenticalDraftError`.
+
+        3. **These weights are the published ones.**  The fingerprint travels
+           into the artifact manifest via :meth:`describe` and is re-derived
+           from the artifact tree by :meth:`assert_published_weights`.
+
+        A baseline that cannot be resolved to local weights -- a Hub id absent
+        from the cache -- leaves claim 2 unmade rather than assumed, and the
+        manifest records nulls so the gap is visible in the artifact.
+        """
+        missing = REQUIRED_DRAFT_TENSORS - draft_tensor_keys(draft_directory)
+        if missing:
+            raise DraftWeightsError(
+                f"materialized draft is missing required tensors: {sorted(missing)} "
+                f"(directory: {draft_directory})"
+            )
+        fingerprint = weight_fingerprint(draft_directory)
+        baseline, baseline_fingerprint = self._baseline_weights()
+        if baseline_fingerprint is not None and baseline_fingerprint == fingerprint:
+            raise StockIdenticalDraftError(str(baseline), fingerprint)
+        self._draft_weight_fingerprint = fingerprint
+        self._draft_weight_baseline = baseline
+        self._draft_weight_baseline_fingerprint = baseline_fingerprint
+
+    def _baseline_weights(self) -> tuple[str | None, str | None]:
+        """Return the head this cycle built on, and its weight fingerprint.
+
+        Preference order is the resolved warm start -- what training was
+        actually handed -- then the configured stock drafter.  The second is
+        not merely a fallback for the first cycle: when compounding is off the
+        two are the same string, and when a resolver returned something the
+        cache cannot back, falling through to stock still catches the
+        no-op case that matters most.
+        """
+        candidates = [
+            reference
+            for reference in (self._resolved_warm_start, self.config.draft_model)
+            if reference
+        ]
+        for reference in candidates:
+            directory = cached_snapshot_dir(reference)
+            if directory is None:
+                continue
+            try:
+                return reference, weight_fingerprint(directory)
+            except DraftWeightsError:
+                # A baseline we cannot read is not evidence of anything; try
+                # the next one and, failing that, record the absence.
+                continue
+        return (candidates[0] if candidates else None), None
+
+    def assert_published_weights(self, published: Path) -> None:
+        """Fail the publish unless *published* holds the weights we trained.
+
+        Wired as the registry's ``before_publish`` hook, so it runs against
+        the staged artifact tree while the rename is still revocable.
+
+        This closes a gap rather than fixing a known bug: the
+        ``checkpoint_best -> materialize -> publish -> --speculative-config``
+        path traces correct, but nothing in it could *prove* the published
+        directory holds the trained tensors, so the hypothesis had only ever
+        been ruled out by reading code.  It now costs one pass over the
+        safetensors payload, which is deliberate: the redundant pass
+        :func:`speedlm.tuner.artifacts.hash_directory` dropped was a third
+        whole-tree digest that added no guarantee, whereas this is the only
+        step that ties the artifact back to the trained weights.
+        """
+        expected = self._draft_weight_fingerprint
+        if expected is None:
+            raise DraftWeightsError(
+                "no materialized draft fingerprint is on record; refusing to "
+                f"publish {published} as a trained draft"
+            )
+        actual = weight_fingerprint(published)
+        if actual != expected:
+            raise DraftWeightsError(
+                f"published draft weights do not match the trained draft: "
+                f"expected fingerprint {expected}, got {actual} (path: {published})"
+            )
 
     def validate(
         self,

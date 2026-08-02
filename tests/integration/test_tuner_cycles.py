@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from draft_weights import write_draft_weights
 
 from speedlm.config import IdleTuningConfig, SamplingConfig, SpeedLMConfig
 from speedlm.gate.replay import ReplayResult, RequestResult, RunResults
@@ -714,6 +715,10 @@ class _StubStages:
         del checkpoint_best
         assert timeout_seconds > 0 and not should_abort()
         destination.mkdir(parents=True, exist_ok=True)
+        # A real container seeded per cycle: the adapter now parses the
+        # safetensors header, requires the trained-head tensor set, and
+        # refuses a candidate whose weights match its baseline byte for byte.
+        write_draft_weights(destination, seed=self.payload[-1])
         (destination / "weights.bin").write_bytes(self.payload)
         return destination
 

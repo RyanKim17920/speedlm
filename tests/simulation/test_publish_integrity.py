@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from draft_weights import write_draft_weights
 
 from simulation.engine import DraftProfile, SimulatedEngine, running_engine
 from simulation.harness import (
@@ -29,7 +30,15 @@ from simulation.harness import (
     build_simulation,
     passing_gate_result,
 )
+from speedlm.training.masking import MaskPolicy
 from speedlm.tuner.artifacts import ArtifactError, ArtifactRegistry, ArtifactSpec
+from speedlm.tuner.composition import ProductionTuningError, _PublishedWeightGuard
+from speedlm.tuner.eagle3 import (
+    DraftWeightsError,
+    Eagle3Adapter,
+    Eagle3Config,
+    weight_fingerprint,
+)
 from speedlm.tuner.orchestrator import CycleOutcome
 from speedlm.tuner.state import TunerState
 
@@ -180,3 +189,90 @@ class TestInsideACycle:
         # neighbouring failure.
         assert simulation.artifacts.get(promoted.artifact_id).path.is_dir()
         assert Path(str(simulation.runtime.serving)).name == promoted.artifact_id
+
+
+class TestTheTrainedWeightsReachThePublication:
+    """``hash_directory`` proves the copy is faithful, not that it is *ours*.
+
+    The registry can only say "this tree is the tree I was handed".  Whether
+    the tree it was handed holds the weights the cycle trained is a separate
+    claim, and until the adapter fingerprinted them nothing in the pipeline
+    could make it -- the checkpoint_best -> materialize -> publish path was
+    believed correct because it reads correct, never because it was checked.
+    """
+
+    def _adapter(self, stock: Path) -> Eagle3Adapter:
+        adapter = object.__new__(Eagle3Adapter)
+        adapter.config = Eagle3Config(
+            verifier_model="sim/verifier-8b",
+            draft_model=str(stock),
+            from_pretrained=str(stock),
+            mask_policy=MaskPolicy.ALL_ASSISTANT_TURNS,
+        )
+        return adapter
+
+    def test_a_tree_that_is_not_the_trained_draft_is_refused(
+        self, tmp_path: Path
+    ) -> None:
+        stock = tmp_path / "stock"
+        write_draft_weights(stock, seed=1)
+        trained = tmp_path / "trained"
+        write_draft_weights(trained, seed=2)
+        someone_elses = tmp_path / "someone-elses"
+        write_draft_weights(someone_elses, seed=3)
+
+        adapter = self._adapter(stock)
+        adapter._record_draft_weights(trained)
+        guard = _PublishedWeightGuard()
+        guard.bind(adapter)
+        registry = ArtifactRegistry(tmp_path / "registry", before_publish=guard)
+
+        with pytest.raises(DraftWeightsError, match="do not match"):
+            registry.publish(someone_elses, SPEC)
+
+        assert list((tmp_path / "registry" / "artifacts").iterdir()) == []
+        assert registry.active_pointer() is None
+
+    def test_the_trained_draft_publishes_and_carries_its_fingerprint(
+        self, tmp_path: Path
+    ) -> None:
+        stock = tmp_path / "stock"
+        write_draft_weights(stock, seed=1)
+        trained = tmp_path / "trained"
+        write_draft_weights(trained, seed=2)
+
+        adapter = self._adapter(stock)
+        adapter._record_draft_weights(trained)
+        guard = _PublishedWeightGuard()
+        guard.bind(adapter)
+        registry = ArtifactRegistry(tmp_path / "registry", before_publish=guard)
+
+        artifact = registry.publish(
+            trained,
+            ArtifactSpec(
+                verifier_model="sim/verifier-8b",
+                draft_model="sim/draft-eagle3",
+                base_draft=str(stock),
+                trace_hash="sim-trace-hash",
+                training_params=adapter.describe().training_params,
+            ),
+        )
+
+        recorded = artifact.manifest.training_params["draft_weight_fingerprint"]
+        assert recorded == weight_fingerprint(artifact.path)
+        assert (
+            artifact.manifest.training_params["draft_weight_baseline_fingerprint"]
+            == weight_fingerprint(stock)
+        )
+
+    def test_an_unbound_guard_is_an_error_not_a_skipped_check(
+        self, tmp_path: Path
+    ) -> None:
+        trained = tmp_path / "trained"
+        write_draft_weights(trained, seed=2)
+        registry = ArtifactRegistry(
+            tmp_path / "registry", before_publish=_PublishedWeightGuard()
+        )
+
+        with pytest.raises(ProductionTuningError, match="never bound"):
+            registry.publish(trained, SPEC)

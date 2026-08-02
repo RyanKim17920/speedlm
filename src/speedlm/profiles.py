@@ -37,9 +37,38 @@ SPECULATIVE_METHODS: Final = frozenset(
 CHAT_TEMPLATE_KINDS: Final = frozenset({"harmony", "chatml", "auto"})
 NON_TRAINABLE_METHODS: Final = frozenset({"ngram"})
 
+#: Draft-chain depth assumed when nothing else names one.
+#:
+#: This is the Speculators trainer's own ``--ttt-steps`` default
+#: (``scripts/train.py:660``) and the depth both stock RedHatAI EAGLE-3
+#: drafters declare in ``speculators_config.proposal_methods[0]``.  It is a
+#: fallback, never a contract: the serving depth is
+#: :attr:`ModelProfile.num_speculative_tokens`.
+DEFAULT_SPECULATIVE_TOKENS: Final = 3
+
+#: Deepest draft chain SpeedLM will train or serve.
+#:
+#: Not an architectural bound.  The Speculators EAGLE-3 head is a *single*
+#: transformer layer rolled out autoregressively, so ``ttt_steps`` is a loop
+#: bound (``src/speculators/models/eagle3/core.py:199``) rather than a shape,
+#: and the upstream suite drives one checkpoint at 1, 3 and 5 steps
+#: (``tests/integration/models/test_model_forward.py:264``).  Nothing in the
+#: drafter forbids a deeper chain -- gpt-oss-20b's measured *conditional*
+#: acceptance is flat-to-rising through position 5 (0.689, 0.665, 0.677,
+#: 0.690, 0.715), which is an argument for going deeper, not shallower.
+#:
+#: The ceiling exists only so a typo in a user profile cannot request a chain
+#: whose per-step training and verification cost grows without bound.  Raise
+#: it deliberately when a measurement asks for more.
+MAX_SPECULATIVE_TOKENS: Final = 16
+
 
 class ProfileError(ValueError):
     """Raised when a model profile cannot be loaded or resolved safely."""
+
+
+class SpeculativeDepthError(ProfileError):
+    """Raised when training depth and serving depth cannot be reconciled."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -116,6 +145,11 @@ class ModelProfile:
                 f"got {self.speculative_method!r}"
             )
         _positive_int(self.num_speculative_tokens, "num_speculative_tokens")
+        if self.num_speculative_tokens > MAX_SPECULATIVE_TOKENS:
+            raise SpeculativeDepthError(
+                f"num_speculative_tokens must be at most "
+                f"{MAX_SPECULATIVE_TOKENS}; got {self.num_speculative_tokens}"
+            )
         _positive_int(self.max_seq_len, "max_seq_len")
         if self.num_hidden_layers is not None:
             _positive_int(self.num_hidden_layers, "num_hidden_layers")
@@ -490,6 +524,142 @@ def _validate_layer_ids(
             f"target_layer_ids has {len(indices)} entries but the drafter "
             f"expects {expected_count} aux layers"
         )
+
+
+def resolve_speculative_tokens(
+    *,
+    explicit: int | None = None,
+    drafter_declared: int | None = None,
+) -> int:
+    """Resolve the EAGLE-3 draft-chain depth with a documented precedence.
+
+    This is the single answer to "how deep is the chain", used for *both* the
+    trainer's ``--ttt-steps`` and vLLM's ``num_speculative_tokens``.  Before it
+    existed the two were independent constants -- the profile served
+    ``num_speculative_tokens`` while
+    :class:`speedlm.tuner.eagle3.Eagle3Config` hard-required 3 TTT steps and
+    the backend never passed ``--ttt-steps`` at all, so gpt-oss-20b trained a
+    3-deep head and served it 5-deep and positions 4-5 were pure
+    extrapolation.
+
+    Resolution order, deliberately the same shape as
+    :func:`resolve_target_layer_ids`:
+
+    1. **Explicit profile override** -- ``explicit``, if set, wins.  The
+       profile's ``num_speculative_tokens`` is what vLLM is actually told to
+       serve, so it is the truth training has to match, not the other way
+       round.
+
+    2. **Drafter-declared arity** -- otherwise the checkpoint's own
+       ``speculators_config.proposal_methods[*].speculative_tokens``, read via
+       :func:`drafter_declared_speculative_tokens`.  A checkpoint that names
+       the chain it was fitted for is better evidence than any default.
+
+    3. **Fallback** -- :data:`DEFAULT_SPECULATIVE_TOKENS`.
+
+    A declared value that disagrees with an explicit profile pin is *not* an
+    error, and that asymmetry against ``expected_count`` in
+    :func:`_validate_layer_ids` is deliberate.  Aux-layer count is a shape:
+    ``fc.weight`` is ``hidden x (aux_count * hidden)`` and the wrong count
+    cannot even load.  Chain depth is a rollout length; the stock drafters
+    declare 3 because 3 is what they were trained at, and deepening that is
+    exactly what a tuning cycle is for.  Treating the declaration as a veto
+    would forbid the fix.
+
+    Raises:
+        SpeculativeDepthError: if the resolved depth is not an integer in
+            ``1..MAX_SPECULATIVE_TOKENS``.
+    """
+    for name, value in (("explicit", explicit), ("drafter_declared", drafter_declared)):
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise SpeculativeDepthError(f"{name} speculative tokens must be an integer")
+        if value < 1 or value > MAX_SPECULATIVE_TOKENS:
+            raise SpeculativeDepthError(
+                f"{name} speculative tokens must be in "
+                f"1..{MAX_SPECULATIVE_TOKENS}; got {value}"
+            )
+    if explicit is not None:
+        return explicit
+    if drafter_declared is not None:
+        return drafter_declared
+    return DEFAULT_SPECULATIVE_TOKENS
+
+
+def drafter_declared_speculative_tokens(config: Mapping[str, Any]) -> int | None:
+    """Return the chain depth a Speculators draft *config* declares, if any.
+
+    Reads ``speculators_config.proposal_methods[*].speculative_tokens``, which
+    is what ``Eagle3DraftModel.from_training_args`` writes from ``ttt_steps``
+    (``src/speculators/models/eagle3/core.py:317``) and what
+    ``Eagle3SpeculatorConfig`` exposes to vLLM.  Both stock RedHatAI EAGLE-3
+    drafters in the local cache declare 3.
+
+    Returns ``None`` when the config carries no usable declaration, and when
+    the declared depths disagree with each other -- an ambiguous checkpoint is
+    no evidence at all, and guessing which proposal method "counts" would be
+    the same class of silent assumption this module exists to remove.
+    """
+    speculators = config.get("speculators_config")
+    if not isinstance(speculators, Mapping):
+        return None
+    methods = speculators.get("proposal_methods")
+    if not isinstance(methods, Sequence) or isinstance(methods, (str, bytes)):
+        return None
+    declared: set[int] = set()
+    for method in methods:
+        if not isinstance(method, Mapping):
+            continue
+        value = method.get("speculative_tokens")
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            continue
+        declared.add(value)
+    if len(declared) != 1:
+        return None
+    return declared.pop()
+
+
+def validate_training_depth(
+    *,
+    profile_name: str,
+    serving_tokens: int,
+    training_steps: int,
+) -> None:
+    """Fail before a GPU cycle when the two depths disagree.
+
+    Composition derives ``training_steps`` from ``serving_tokens``, so this
+    can only fire after someone reintroduces an independent source for one of
+    them.  That is precisely the regression it exists to catch: the original
+    defect was silent for a whole tuning cycle and only showed up as a
+    -0.567 pp gate delta on gpt-oss against -0.189 pp on the 3/3 Qwen3
+    profile.
+    """
+    if training_steps != serving_tokens:
+        raise SpeculativeDepthError(
+            f"profile {profile_name!r} would train a {training_steps}-deep "
+            f"draft chain and serve a {serving_tokens}-deep one; positions "
+            f"{training_steps + 1}..{serving_tokens} would be extrapolation. "
+            "Training depth must equal num_speculative_tokens."
+        )
+
+
+def cached_snapshot_dir(model: str) -> Path | None:
+    """Return a local directory holding *model*'s weights, or ``None``.
+
+    Accepts either an on-disk path (a promoted artifact, returned as-is) or a
+    Hub repo id, whose snapshot is located by reading the cache layout
+    directly -- the same stdlib-only approach as
+    :func:`speedlm.tuner.composition.cached_hub_revision`, so this stays
+    importable on hosts without ``huggingface_hub``.
+    """
+    candidate = Path(model)
+    if candidate.is_dir():
+        return candidate
+    config = _cached_model_config(model)
+    if config is None:
+        return None
+    return config.parent
 
 
 GPT_OSS_EAGLE3_PROFILE: Final = ModelProfile(

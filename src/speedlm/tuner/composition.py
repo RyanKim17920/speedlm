@@ -28,9 +28,13 @@ from speedlm.gateway.supervisor import ThreadsafeProcessControl
 from speedlm.gateway.vllm_http import VLLMControlClient, VLLMDraftSwapClient
 from speedlm.profiles import (
     ModelProfile,
+    cached_snapshot_dir,
     canonical_verifier_reference,
+    drafter_declared_speculative_tokens,
     resolve_profile,
+    resolve_speculative_tokens,
     resolve_target_layer_ids,
+    validate_training_depth,
 )
 from speedlm.storage import ensure_layout
 from speedlm.traces.store import TraceStore
@@ -41,6 +45,7 @@ from speedlm.training.backends.eagle3 import (
 )
 from speedlm.training.split import HeldOutTraceSnapshotLeaser
 from speedlm.tuner.artifacts import ArtifactRegistry
+from speedlm.tuner.eagle3 import Eagle3Adapter
 from speedlm.tuner.service import TunerService, create_tuner_service
 from speedlm.tuner.state import TunerStateMachine
 
@@ -60,6 +65,54 @@ DRAFT_SWAP_WORKER_EXTENSION_CLS: Final = (
 
 class ProductionTuningError(RuntimeError):
     """Raised before serving when an opt-in production contract is incomplete."""
+
+
+@dataclass(slots=True)
+class _PublishedWeightGuard:
+    """Deferred binding of the publish-time weight assertion.
+
+    :class:`~speedlm.tuner.artifacts.ArtifactRegistry` needs its
+    ``before_publish`` hook at construction, but the adapter that knows which
+    weights were trained is built from a pipeline config that the registry
+    itself feeds (the warm-start resolver reads the registry).  Rather than
+    reorder the two and rely on a closure over a not-yet-assigned local, the
+    hook is this object and the adapter is bound into it a few lines later.
+
+    Unbound is a programming error, not a permission to skip the check: a
+    guard that silently passed when nothing was wired would reproduce exactly
+    the "ruled out by inference" gap it exists to close.
+    """
+
+    _adapter: Eagle3Adapter | None = None
+
+    def bind(self, adapter: Eagle3Adapter) -> None:
+        self._adapter = adapter
+
+    def __call__(self, published: Path) -> None:
+        if self._adapter is None:
+            raise ProductionTuningError(
+                "publish-time weight guard was never bound to an adapter"
+            )
+        self._adapter.assert_published_weights(published)
+
+
+def declared_draft_depth(draft_model: str) -> int | None:
+    """Return the chain depth *draft_model*'s cached config declares, if any.
+
+    Best effort, and deliberately so: this is provenance, not a precondition.
+    A drafter absent from the local cache, or one whose config cannot be read,
+    yields ``None`` and the profile's serving depth stands on its own.
+    """
+    directory = cached_snapshot_dir(draft_model)
+    if directory is None:
+        return None
+    try:
+        raw = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    return drafter_declared_speculative_tokens(raw)
 
 
 def resolve_verifier_revision(
@@ -446,9 +499,39 @@ def create_production_tuner(
     #: resolver below closes over a narrowed ``str`` rather than re-deriving it.
     stock_draft_model = profile.draft_model
     tuning = config.tuning
+    #: The one depth this profile trains *and* serves.
+    #:
+    #: The profile's ``num_speculative_tokens`` is what vLLM is told to
+    #: speculate, so it is the truth; ``resolve_speculative_tokens`` states
+    #: that precedence in one place rather than leaving the trainer to fall
+    #: through to a default of 3.  gpt-oss-20b serves 5 and used to train 3.
+    stock_declared_depth = declared_draft_depth(stock_draft_model)
+    training_depth = resolve_speculative_tokens(
+        explicit=profile.num_speculative_tokens,
+        drafter_declared=stock_declared_depth,
+    )
+    if stock_declared_depth is not None and stock_declared_depth != training_depth:
+        # Not a fault: both stock RedHatAI EAGLE-3 drafters declare 3, and
+        # deepening that head is what a tuning cycle is *for*.  It is logged
+        # because the cycle is then genuinely training past the depth its warm
+        # start was fitted at, and that should be visible rather than inferred.
+        logger.info(
+            "profile %r serves %d speculative tokens while its stock drafter %r "
+            "declares %d; this cycle trains the deeper chain",
+            profile.name,
+            training_depth,
+            stock_draft_model,
+            stock_declared_depth,
+        )
+    validate_training_depth(
+        profile_name=profile.name,
+        serving_tokens=profile.num_speculative_tokens,
+        training_steps=training_depth,
+    )
     layout = ensure_layout(home)
     state = TunerStateMachine(layout.runs_dir)
-    artifacts = ArtifactRegistry(layout.runs_dir)
+    publish_guard = _PublishedWeightGuard()
+    artifacts = ArtifactRegistry(layout.runs_dir, before_publish=publish_guard)
     split = HeldOutTraceSnapshotLeaser(
         traces,
         held_out_fraction=tuning.held_out_fraction,
@@ -478,6 +561,7 @@ def create_production_tuner(
             else ()
         ),
         sequence_length=min(tuning.sequence_length, profile.max_seq_len),
+        num_speculative_steps=training_depth,
         learning_rate=tuning.learning_rate,
         epochs=tuning.epochs,
         port=tuning.training_port,
@@ -516,6 +600,7 @@ def create_production_tuner(
             else None
         ),
     )
+    publish_guard.bind(backend)
     runtime = RuntimeController(
         activity=activity,
         admission=admission,

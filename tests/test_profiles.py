@@ -10,21 +10,27 @@ import speedlm.profiles as profiles_module
 from speedlm.config import SpeedLMConfig
 from speedlm.profiles import (
     BUILTIN_PROFILES,
+    DEFAULT_SPECULATIVE_TOKENS,
     GPT_OSS_EAGLE3_PROFILE,
     LLAMA_31_8B_EAGLE3_PROFILE,
+    MAX_SPECULATIVE_TOKENS,
     QWEN_3_8B_EAGLE3_PROFILE,
     QWEN_35_9B_MTP_PROFILE,
     AuxLayerError,
     ModelProfile,
     ParserRegistry,
     ProfileError,
+    SpeculativeDepthError,
     default_aux_layers,
     discover_vllm_parser_registry,
+    drafter_declared_speculative_tokens,
     load_profiles,
     resolve_model_parsers,
     resolve_profile,
+    resolve_speculative_tokens,
     resolve_target_layer_ids,
     spread_aux_layers,
+    validate_training_depth,
 )
 
 
@@ -785,3 +791,115 @@ def test_e2e_verifier_depth_reader_handles_text_config() -> None:
     assert _verifier_num_hidden_layers({"text_config": {"num_hidden_layers": 28}}) == 28
     assert _verifier_num_hidden_layers({"num_hidden_layers": 0}) is None
     assert _verifier_num_hidden_layers({}) is None
+
+
+# ---------------------------------------------------------------------------
+# Draft-chain depth: what is trained must be what is served
+# ---------------------------------------------------------------------------
+
+
+def test_the_profile_pin_is_the_serving_truth_and_wins() -> None:
+    """gpt-oss serves 5; the trainer's default of 3 must not override it."""
+    assert (
+        resolve_speculative_tokens(explicit=5, drafter_declared=3) == 5
+    )
+
+
+def test_a_drafter_declaration_is_used_when_the_profile_pins_nothing() -> None:
+    assert resolve_speculative_tokens(drafter_declared=4) == 4
+
+
+def test_nothing_named_falls_back_to_the_trainer_default() -> None:
+    assert resolve_speculative_tokens() == DEFAULT_SPECULATIVE_TOKENS == 3
+
+
+@pytest.mark.parametrize("depth", [0, -1, MAX_SPECULATIVE_TOKENS + 1])
+def test_an_out_of_range_depth_is_rejected(depth: int) -> None:
+    with pytest.raises(SpeculativeDepthError):
+        resolve_speculative_tokens(explicit=depth)
+
+
+def test_the_ceiling_is_not_a_hardcoded_five() -> None:
+    """gpt-oss's conditional acceptance still rises at position 5.
+
+    Whatever replaced the hardcoded 3 must leave going deeper reachable, so a
+    depth above the current serving value has to resolve cleanly.
+    """
+    assert resolve_speculative_tokens(explicit=8) == 8
+    assert MAX_SPECULATIVE_TOKENS > 5
+
+
+def test_the_stock_drafters_declaration_is_read_not_guessed() -> None:
+    """Both cached RedHatAI EAGLE-3 drafters declare 3 here."""
+    config = {
+        "speculators_config": {
+            "algorithm": "eagle3",
+            "proposal_methods": [
+                {"proposal_type": "greedy", "speculative_tokens": 3},
+            ],
+        }
+    }
+
+    assert drafter_declared_speculative_tokens(config) == 3
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {},
+        {"speculators_config": {}},
+        {"speculators_config": {"proposal_methods": []}},
+        {"speculators_config": {"proposal_methods": [{"speculative_tokens": 0}]}},
+        {
+            "speculators_config": {
+                "proposal_methods": [
+                    {"speculative_tokens": 3},
+                    {"speculative_tokens": 5},
+                ]
+            }
+        },
+    ],
+)
+def test_an_unusable_declaration_is_no_evidence(config: dict[str, object]) -> None:
+    assert drafter_declared_speculative_tokens(config) is None
+
+
+def test_a_training_serving_mismatch_fails_before_the_gpu_cycle() -> None:
+    with pytest.raises(SpeculativeDepthError, match="extrapolation"):
+        validate_training_depth(
+            profile_name="gpt-oss-20b-eagle3",
+            serving_tokens=5,
+            training_steps=3,
+        )
+
+
+def test_matching_depths_pass() -> None:
+    validate_training_depth(
+        profile_name="qwen3-8b-eagle3",
+        serving_tokens=3,
+        training_steps=3,
+    )
+
+
+def test_every_builtin_profile_can_be_trained_at_the_depth_it_serves() -> None:
+    for profile in BUILTIN_PROFILES.values():
+        depth = resolve_speculative_tokens(explicit=profile.num_speculative_tokens)
+        validate_training_depth(
+            profile_name=profile.name,
+            serving_tokens=profile.num_speculative_tokens,
+            training_steps=depth,
+        )
+
+
+def test_a_profile_cannot_request_an_unbounded_chain() -> None:
+    with pytest.raises(SpeculativeDepthError):
+        ModelProfile(
+            name="too-deep",
+            verifier_model="acme/verifier",
+            draft_model="acme/draft",
+            speculative_method="eagle3",
+            num_speculative_tokens=MAX_SPECULATIVE_TOKENS + 1,
+            target_layer_ids=None,
+            chat_template_kind="auto",
+            max_seq_len=4096,
+        )

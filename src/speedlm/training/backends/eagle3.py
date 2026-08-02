@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Final
 
+from speedlm.profiles import DEFAULT_SPECULATIVE_TOKENS, MAX_SPECULATIVE_TOKENS
 from speedlm.training.backends.speculators_runner import (
     ProcessResult,
     ProcessRunner,
@@ -28,6 +29,7 @@ from speedlm.training.backends.speculators_runner import (
 from speedlm.training.masking import FinalAssistantMaskError, MaskPolicy
 from speedlm.tuner.eagle3 import (
     MAX_SCRATCH_BYTES,
+    REQUIRED_DRAFT_TENSORS,
     SCRATCH_HEADROOM_BYTES,
     SHARD_BYTES_PER_ROW,
     AbortCheck,
@@ -236,7 +238,15 @@ for index, row in enumerate(load_from_disk(sys.argv[1])):
 #: fallback lookup under ``speculators_config`` costs nothing and only ever
 #: turns a silent pass into a loud failure, so it guards configs that nest the
 #: key where these two do not.
-_VALIDATE_DRAFT = """
+#:
+#: *Tensors.*  This asked only for ``d2t``/``t2d`` -- two vocabulary index maps
+#: that say nothing about whether a draft head is present, let alone a trained
+#: one.  It now requires all of
+#: :data:`speedlm.tuner.eagle3.REQUIRED_DRAFT_TENSORS`, ``fc.weight`` included.
+#: That is a *packaging* check; whether the weights actually moved is a
+#: different question, answered by the fingerprint comparison in
+#: :meth:`speedlm.tuner.eagle3.Eagle3Adapter._record_draft_weights`.
+_VALIDATE_DRAFT_BODY = """
 import json
 import sys
 from pathlib import Path
@@ -286,10 +296,20 @@ keys = set()
 for path in weights:
     with safe_open(str(path), framework="pt") as handle:
         keys.update(handle.keys())
-missing = {"d2t", "t2d"} - keys
+missing = set(REQUIRED_TENSORS) - keys
 if missing:
-    raise SystemExit(f"materialized draft is missing vocab mappings: {sorted(missing)}")
+    raise SystemExit(f"materialized draft is missing required tensors: {sorted(missing)}")
 """.strip()
+
+#: The validator script with its required-tensor set spliced in.
+#:
+#: Injected as a literal assignment rather than formatted into the body, so
+#: the body's own braces (f-strings, set literals) stay untouched, and so the
+#: subprocess and :func:`speedlm.tuner.eagle3.draft_tensor_keys` can never
+#: disagree about what a trained head must contain.
+_VALIDATE_DRAFT: Final = (
+    f"REQUIRED_TENSORS = {sorted(REQUIRED_DRAFT_TENSORS)!r}\n{_VALIDATE_DRAFT_BODY}"
+)
 
 
 class EmptySpeculatorsDatasetError(Eagle3Error):
@@ -316,6 +336,15 @@ class SpeculatorsPipelineConfig:
     verifier_revision: str | None = None
     warm_start_revision: str | None = None
     target_layer_ids: tuple[int, ...] = ()
+    #: Depth of the draft chain to train, passed through as ``--ttt-steps``.
+    #:
+    #: Previously absent, so the trainer ran at its own default of 3
+    #: (``scripts/train.py:660``) no matter what the profile served.  It is set
+    #: from the profile's ``num_speculative_tokens`` in
+    #: :func:`speedlm.tuner.composition.create_production_tuner`, which is the
+    #: serving truth, and checked against it by
+    #: :func:`speedlm.profiles.validate_training_depth`.
+    num_speculative_steps: int = DEFAULT_SPECULATIVE_TOKENS
     #: Sequence length for training. A value of 16384 collapsed a 512-record
     #: corpus into 1 batch; 4096 yielded 44 steps, making this a key lever
     #: for sampler throughput and gradient frequency.
@@ -385,6 +414,11 @@ class SpeculatorsPipelineConfig:
             ("max_num_seqs", self.max_num_seqs),
         ):
             _positive_int(name, integer_value)
+        _positive_int("num_speculative_steps", self.num_speculative_steps)
+        if self.num_speculative_steps > MAX_SPECULATIVE_TOKENS:
+            raise ValueError(
+                f"num_speculative_steps must be at most {MAX_SPECULATIVE_TOKENS}"
+            )
         if self.row_count is not None:
             _positive_int("row_count", self.row_count)
         if self.port > 65_535:
@@ -980,6 +1014,21 @@ class SpeculatorsTrainingProcess:
             "sequence_length",
             training_params.get("sequence_length", self.config.sequence_length),
         )
+        # The depth actually trained.  Taken from the training params -- which
+        # ``Eagle3Config.effective_training_params`` fills from the profile's
+        # serving ``num_speculative_tokens`` -- and passed explicitly, because
+        # omitting the flag silently accepted Speculators' own default of 3.
+        ttt_steps = _integer(
+            "num_speculative_steps",
+            training_params.get(
+                "num_speculative_steps", self.config.num_speculative_steps
+            ),
+        )
+        if ttt_steps < 1 or ttt_steps > MAX_SPECULATIVE_TOKENS:
+            raise Eagle3Error(
+                f"num_speculative_steps must be in 1..{MAX_SPECULATIVE_TOKENS}, "
+                f"got {ttt_steps}"
+            )
         scratch = destination.parent
         guard = _guard(
             scratch, self.config.scratch_quota_bytes, should_abort, (destination,)
@@ -1024,6 +1073,8 @@ class SpeculatorsTrainingProcess:
                     str(self.config.learning_rate),
                     "--total-seq-len",
                     str(seq_len),
+                    "--ttt-steps",
+                    str(ttt_steps),
                     "--no-resume-from-checkpoint",
                     "--save-best",
                 ],
@@ -1241,6 +1292,7 @@ class Eagle3Backend(Eagle3Adapter):
             from_pretrained=pipeline.warm_start_model,
             target_layer_ids=pipeline.target_layer_ids,
             sequence_length=pipeline.sequence_length,
+            num_speculative_steps=pipeline.num_speculative_steps,
             mask_policy=pipeline.mask_policy,
             training_params={
                 "learning_rate": pipeline.learning_rate,

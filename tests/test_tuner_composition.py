@@ -330,7 +330,9 @@ def test_create_production_tuner_assembles_profile_bound_collaborators(
         lambda _home: SimpleNamespace(runs_dir=tmp_path / "runs"),
     )
     monkeypatch.setattr(composition, "TunerStateMachine", lambda _path: state)
-    monkeypatch.setattr(composition, "ArtifactRegistry", lambda _path: artifacts)
+    monkeypatch.setattr(
+        composition, "ArtifactRegistry", lambda _path, **_kwargs: artifacts
+    )
 
     def build_split(_traces: object, **kwargs: object) -> object:
         captured["split"] = kwargs
@@ -405,6 +407,10 @@ def test_create_production_tuner_assembles_profile_bound_collaborators(
     assert pipeline["warm_start_model"] == profile.draft_model
     assert pipeline["target_layer_ids"] == profile.target_layer_ids
     assert pipeline["sequence_length"] == profile.max_seq_len
+    # Training depth comes from the serving depth, not from Speculators'
+    # default of 3.  Threading this is what stops a profile serving a chain
+    # deeper than the one its head was fitted on.
+    assert pipeline["num_speculative_steps"] == profile.num_speculative_tokens
     assert pipeline["learning_rate"] == config.tuning.learning_rate
     assert captured["backend"]["trace_leaser"] is split
     # The training-side twin of ``stock_draft`` below, and resolved for the same
@@ -601,7 +607,9 @@ def test_min_corpus_records_reaches_the_service(
         lambda _home: SimpleNamespace(runs_dir=tmp_path / "runs"),
     )
     monkeypatch.setattr(composition, "TunerStateMachine", lambda _path: state)
-    monkeypatch.setattr(composition, "ArtifactRegistry", lambda _path: artifacts)
+    monkeypatch.setattr(
+        composition, "ArtifactRegistry", lambda _path, **_kwargs: artifacts
+    )
 
     def build_split(_traces: object, **kwargs: object) -> object:
         captured["split"] = kwargs
@@ -809,7 +817,9 @@ def test_the_swap_client_is_wired_only_when_the_flag_is_on(
         lambda _home: SimpleNamespace(runs_dir=tmp_path / "runs"),
     )
     monkeypatch.setattr(composition, "TunerStateMachine", lambda _path: object())
-    monkeypatch.setattr(composition, "ArtifactRegistry", lambda _path: object())
+    monkeypatch.setattr(
+        composition, "ArtifactRegistry", lambda _path, **_kwargs: object()
+    )
     monkeypatch.setattr(
         composition,
         "HeldOutTraceSnapshotLeaser",
@@ -1087,3 +1097,44 @@ def test_an_unreadable_ancestor_ends_the_walk_rather_than_spinning(
         encoding="utf-8",
     )
     assert composition.promotion_chain_depth(self_referential) == 1
+
+
+# ---------------------------------------------------------------------------
+# Draft-chain depth threading
+# ---------------------------------------------------------------------------
+
+
+def test_declared_draft_depth_reads_a_cached_drafter_config(tmp_path: Path) -> None:
+    drafter = tmp_path / "drafter"
+    drafter.mkdir()
+    (drafter / "config.json").write_text(
+        json.dumps(
+            {
+                "speculators_model_type": "eagle3",
+                "speculators_config": {
+                    "algorithm": "eagle3",
+                    "proposal_methods": [{"speculative_tokens": 3}],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert composition.declared_draft_depth(str(drafter)) == 3
+
+
+@pytest.mark.parametrize(
+    "contents",
+    [None, "not json", json.dumps([1, 2]), json.dumps({})],
+)
+def test_declared_draft_depth_is_best_effort(
+    tmp_path: Path, contents: str | None
+) -> None:
+    """Provenance, not a precondition: an unreadable drafter must not block."""
+    drafter = tmp_path / "drafter"
+    drafter.mkdir()
+    if contents is not None:
+        (drafter / "config.json").write_text(contents, encoding="utf-8")
+
+    assert composition.declared_draft_depth(str(drafter)) is None
+    assert composition.declared_draft_depth("acme/not-in-the-cache") is None

@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
+from draft_weights import write_draft_weights
 
 from speedlm.training.backends.eagle3 import (
     DRAFT_COPY_CHUNK_BYTES,
@@ -158,7 +159,9 @@ class _FakeRunner:
             output = Path(command[command.index("--save-path") + 1]) / "checkpoint_best"
             output.mkdir(parents=True)
             (output / "config.json").write_text("{}\n", encoding="utf-8")
-            (output / "model.safetensors").write_bytes(b"weights")
+            # A real container, not a placeholder: materialization now parses
+            # the safetensors header to fingerprint the trained weights.
+            write_draft_weights(output, seed=1)
             (output / "optimizer_state_dict.pt").write_bytes(b"transient")
 
 
@@ -294,6 +297,11 @@ def test_pipeline_uses_exact_stage_argv_and_separate_draft(
             "1e-05",
             "--total-seq-len",
             "4096",
+            # Explicit, not inherited: omitting the flag silently accepted
+            # Speculators' own default of 3 TTT steps regardless of the depth
+            # the profile served.
+            "--ttt-steps",
+            "3",
             "--no-resume-from-checkpoint",
             "--save-best",
         ),
