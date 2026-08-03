@@ -38,12 +38,18 @@ import sys
 import time
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Final
 
 import httpx
 import pytest
 
 from speedlm.config import SpeedLMConfig, load_config
+from speedlm.profiles import (
+    ModelProfile,
+    drafter_declared_speculative_tokens,
+    resolve_profile,
+)
+from speedlm.tuner.composition import declared_draft_depth
 
 # ── prompt corpus helpers ───────────────────────────────────────────────────
 
@@ -138,6 +144,44 @@ FAILED_OUTCOMES = frozenset(
         "benchmark_timed_out",
     }
 )
+
+# ── named failure diagnoses ─────────────────────────────────────────────────
+#
+# `CycleOutcome` has no member for a no-op training run: the orchestrator's
+# catch-all `except Exception` maps `StockIdenticalDraftError` onto the generic
+# `failed` outcome (src/speedlm/tuner/orchestrator.py:734-741), so the run
+# reports as an opaque harness failure indistinguishable from an OOM or a dead
+# subprocess. The distinguishing evidence *is* carried through, just not in the
+# outcome: `CycleResult.error` is `_combine_error(exc, ...)`, i.e. `str(exc)`
+# with the cleanup errors appended, and it reaches `scheduler.json` verbatim as
+# `last_result["error"]` (src/speedlm/tuner/service.py:856). So the test can
+# recover the distinct name from the message even though it may not edit src/.
+#
+# The marker is the tail of `StockIdenticalDraftError.__init__`'s message
+# (src/speedlm/tuner/eagle3.py:188-191) and is unique in the tree.
+STOCK_IDENTICAL_DRAFT_MARKER: Final = "training was a no-op"
+STOCK_IDENTICAL_DRAFT_DIAGNOSIS: Final = "stock_identical_draft"
+
+#: `(message marker, diagnosis name)` for failures the orchestrator can only
+#: report as `failed`. Ordered; first match wins.
+NAMED_FAILURE_DIAGNOSES: Final[tuple[tuple[str, str], ...]] = (
+    (STOCK_IDENTICAL_DRAFT_MARKER, STOCK_IDENTICAL_DRAFT_DIAGNOSIS),
+)
+
+
+def _failure_diagnosis(result: Mapping[str, object]) -> str:
+    """Name the failure behind a cycle result as precisely as the record allows.
+
+    Falls back to the bare outcome when no marker matches, so an unrecognised
+    failure is never silently renamed into a recognised one.
+    """
+    error = result.get("error")
+    if isinstance(error, str):
+        for marker, diagnosis in NAMED_FAILURE_DIAGNOSES:
+            if marker in error:
+                return diagnosis
+    outcome = result.get("outcome")
+    return outcome if isinstance(outcome, str) else repr(outcome)
 
 # Verdicts reached after computing both deltas, i.e. the gate ran the whole
 # comparison and judged it against the thresholds.  These are the only reasons
@@ -414,7 +458,17 @@ def _scheduler_result_after(
     assert isinstance(result, dict), scheduler
     outcome = result.get("outcome")
     if outcome in FAILED_OUTCOMES:
-        raise AssertionError(f"idle tuning cycle failed: {result}")
+        diagnosis = _failure_diagnosis(result)
+        if diagnosis == STOCK_IDENTICAL_DRAFT_DIAGNOSIS:
+            raise AssertionError(
+                f"idle tuning cycle failed [{diagnosis}]: training was a no-op -- "
+                "the materialized draft is byte-identical to the head it "
+                "warm-started from, so the cycle learned nothing and the gate "
+                "would only have been asked to distinguish a head from itself. "
+                "Check the trainer actually stepped (lr, epochs, data volume) "
+                f"before spending another GPU cycle. result={result}"
+            )
+        raise AssertionError(f"idle tuning cycle failed [{diagnosis}]: {result}")
     if (
         outcome in accepted
         and isinstance(result_at, (int, float))
@@ -492,6 +546,198 @@ def _assert_gate_measured_something(decision: JsonObject) -> None:
     ]
     assert all(isinstance(v, (int, float)) for v in acceptances), decision
     assert any(v > 0.0 for v in acceptances if isinstance(v, (int, float))), decision
+
+
+#: What `Eagle3Converter._build_eagle3_speculator_config` hardcodes into every
+#: converted stock EAGLE-3 drafter's
+#: `speculators_config.proposal_methods[0].speculative_tokens`
+#: (speculators `src/speculators/convert/eagle/eagle3_converter.py:118`,
+#: `speculative_tokens=3`). Used only as the fallback expectation when the
+#: warm-start drafter is not resolvable in the local Hub cache.
+CONVERTER_INHERITED_SPECULATIVE_TOKENS: Final = 3
+
+
+def _resolved_profile(config: SpeedLMConfig, home: Path) -> ModelProfile:
+    """Resolve the profile the run actually served, the way the launcher does.
+
+    Mirrors `build_tuning_launch_plan` (src/speedlm/tuner/composition.py:378)
+    exactly -- same argument shape, same `home` -- so a custom profile copied
+    into `<home>/profiles` by `_copy_profile` is resolved here too. Re-deriving
+    the depth from anything else (a hardcoded 5, the built-in registry) would
+    assert against a different profile than the one under test.
+    """
+    return resolve_profile(
+        {"model": config.model, "profile": config.profile},
+        served_model=config.model,
+        home=home,
+    )
+
+
+def _manifest_training_params(manifest_path: Path) -> JsonObject:
+    """Return the published manifest's `training_params`, or fail loudly."""
+    manifest = _read_object(manifest_path)
+    assert manifest is not None, f"artifact manifest is missing or unreadable: {manifest_path}"
+    params = manifest.get("training_params")
+    assert isinstance(params, dict), (
+        f"artifact manifest has no training_params object: {manifest_path} -> {manifest}"
+    )
+    return params
+
+
+def _assert_trained_at_serving_depth(
+    params: Mapping[str, object], *, serving_depth: int
+) -> int:
+    """Fail unless the cycle trained the chain depth the profile serves.
+
+    This is the assertion the depth-alignment commit exists to protect: before
+    it, the trainer hard-required 3 TTT steps while the profile served 5, so
+    positions 4-5 were pure extrapolation and nothing recorded the disagreement.
+    `Eagle3Adapter.describe` now stamps the trained depth into the manifest
+    (src/speedlm/tuner/eagle3.py:739), which is what makes the comparison
+    possible at all.
+    """
+    trained = params.get("num_speculative_steps")
+    assert isinstance(trained, int) and not isinstance(trained, bool), (
+        "the artifact manifest records no integer num_speculative_steps, so "
+        "nothing states the depth this cycle trained at; training_params="
+        f"{dict(params)}"
+    )
+    assert trained == serving_depth, (
+        f"training depth {trained} does not match the profile's serving depth "
+        f"{serving_depth}: the head was fitted for a {trained}-deep chain and "
+        f"will be rolled out {serving_depth} deep, so positions "
+        f"{trained + 1}..{serving_depth} are extrapolation. "
+        f"training_params={dict(params)}"
+    )
+    return trained
+
+
+def _assert_training_changed_the_weights(
+    params: Mapping[str, object],
+) -> tuple[str, str]:
+    """Fail unless the published head differs from its warm-start head.
+
+    Identical fingerprints mean the cycle was a no-op: every tensor came out
+    exactly as it went in, and the gate is being asked to distinguish a head
+    from itself. `Eagle3Adapter._record_draft_weights` raises
+    `StockIdenticalDraftError` on that case in production, but nothing read the
+    two fingerprints back out of the manifest, so a *null* baseline -- which
+    means the comparison was never made at all -- was indistinguishable from a
+    comparison that passed.
+    """
+    fingerprint = params.get("draft_weight_fingerprint")
+    baseline = params.get("draft_weight_baseline_fingerprint")
+    assert isinstance(fingerprint, str) and fingerprint, (
+        "the artifact manifest carries no draft_weight_fingerprint, so nothing "
+        "ties the published weights to the weights that were trained; "
+        f"training_params={dict(params)}"
+    )
+    assert isinstance(baseline, str) and baseline, (
+        "the artifact manifest carries a null draft_weight_baseline_fingerprint: "
+        "the warm-start head could not be resolved to local weights, so the "
+        "no-op check was never made. That is not a passing comparison, it is an "
+        f"absent one; training_params={dict(params)}"
+    )
+    assert fingerprint != baseline, (
+        "the published head is byte-identical to the head it warm-started from "
+        f"(fingerprint {fingerprint}): training was a no-op; "
+        f"training_params={dict(params)}"
+    )
+    return fingerprint, baseline
+
+
+def _artifact_declared_depth(published_dir: Path) -> tuple[JsonObject, int | None]:
+    """Read the chain depth the published artifact's own config.json declares.
+
+    `ArtifactRegistry.publish` copytrees the materialized draft directory into
+    `runs/artifacts/<id>/`, so the draft's `config.json` sits at that
+    directory's top level beside `manifest.json` (verified against the real
+    published artifacts under `log_artifacts/`).
+    """
+    config_path = published_dir / "config.json"
+    assert config_path.is_file(), (
+        f"the published artifact has no config.json: {config_path}"
+    )
+    raw = _read_object(config_path)
+    assert raw is not None, f"the published artifact's config.json is unreadable: {config_path}"
+    return raw, drafter_declared_speculative_tokens(raw)
+
+
+def _assert_artifact_declares_expected_depth(
+    declared: int | None,
+    *,
+    serving_depth: int,
+    stock_declared: int | None,
+) -> str:
+    """Check the depth read back out of the artifact the trainer produced.
+
+    KNOWN-STALE FIELD -- read this before changing the assertion.
+
+    Speculators does not rewrite `speculators_config.proposal_methods[*]
+    .speculative_tokens` on the `--from-pretrained` path. `scripts/train.py`
+    takes `model_class.from_pretrained(args.from_pretrained, ...)` (line 345-347)
+    which loads the warm-start checkpoint's config verbatim; only the
+    from-scratch branch, `Eagle3DraftModel.from_training_args`, writes
+    `speculative_tokens=kwargs["ttt_steps"]`
+    (`src/speculators/models/eagle3/core.py:317`). `save_pretrained` then writes
+    that inherited config back out, and SpeedLM never post-processes it. The
+    stock drafters were produced by `Eagle3Converter`, which hardcodes
+    `speculative_tokens=3` (`convert/eagle/eagle3_converter.py:118`).
+
+    Confirmed empirically on this host: the published artifact
+    `log_artifacts/live-idle-validate5-20260730T232443Z/.../runs/artifacts/
+    00c3fd3c.../config.json` declares `speculative_tokens: 3` under the
+    `gpt-oss-20b-eagle3` profile, whose `num_speculative_tokens` is 5.
+
+    So asserting `declared == serving_depth` would be an assertion that fails
+    for a *correct* pipeline, and asserting `declared == 3` would be an
+    assertion that passes for the wrong reason once Speculators is fixed.
+    Instead this pins the field to exactly one of two truthful readings, and
+    fails on any third:
+
+    * `declared == serving_depth` -- the field became truthful. Reported as
+      ``"truthful"``; nothing to do but delete the stale branch.
+    * `declared == stock_declared` -- the documented staleness: the field is
+      the warm start's inherited declaration, unchanged. Reported as
+      ``"known_stale"``.
+
+    Any other value means the depth in the artifact came from a third,
+    unaccounted-for place, which is exactly the silent drift this check exists
+    to catch. Depth *alignment* is still measured -- by
+    `_assert_trained_at_serving_depth` against the manifest, which SpeedLM does
+    write from the resolved depth.
+
+    NOT DISCRIMINATING when `serving_depth == stock_declared` (e.g. the
+    `qwen3-8b-eagle3` profile, which serves 3 and warm-starts from a drafter
+    declaring 3): both branches expect the same number, so a ``"truthful"``
+    verdict there is no evidence the field was rewritten. The recorded
+    observation carries a `discriminating` flag so a reader cannot mistake that
+    for proof. Only a profile whose serving depth differs from its warm start's
+    declaration -- `gpt-oss-20b-eagle3`, 5 against 3 -- tests this at all.
+    """
+    assert declared is not None, (
+        "the published artifact's config.json declares no usable "
+        "speculators_config.proposal_methods[*].speculative_tokens, so the "
+        "artifact states no chain depth at all (missing, non-integer, or "
+        "several proposal methods disagreeing)"
+    )
+    if declared == serving_depth:
+        return "truthful"
+    expected_stale = (
+        stock_declared
+        if stock_declared is not None
+        else CONVERTER_INHERITED_SPECULATIVE_TOKENS
+    )
+    assert declared == expected_stale, (
+        f"the published artifact declares speculative_tokens={declared}, which is "
+        f"neither the profile's serving depth ({serving_depth}) nor the depth "
+        f"inherited unchanged from the warm-start drafter ({expected_stale}). "
+        "A third value means the depth stamped into the artifact came from "
+        "somewhere unaccounted for -- neither the profile nor the warm start -- "
+        "and the served chain depth can no longer be reasoned about from the "
+        "artifact"
+    )
+    return "known_stale"
 
 
 def _collect_gate_metrics(run_dir: Path, artifact_dir: Path) -> None:
@@ -717,7 +963,60 @@ def test_live_idle_tuning_preempts_then_completes() -> None:
         decision_path = terminal.get("decision_path")
         assert isinstance(artifact_id, str) and artifact_id, terminal
         assert isinstance(decision_path, str) and Path(decision_path).is_file(), terminal
-        assert (home / "runs" / "artifacts" / artifact_id / "manifest.json").is_file()
+        published_dir = home / "runs" / "artifacts" / artifact_id
+        manifest_path = published_dir / "manifest.json"
+        assert manifest_path.is_file()
+
+        # ── depth alignment and weight provenance ───────────────────────────
+        # The profile the run actually used, resolved from the same config and
+        # the same SPEEDLM_HOME the gateway was launched with, so a custom
+        # SPEEDLM_E2E_TUNING_PROFILE is honoured here as well.
+        profile = _resolved_profile(config, home)
+        serving_depth = profile.num_speculative_tokens
+        training_params = _manifest_training_params(manifest_path)
+        _assert_trained_at_serving_depth(training_params, serving_depth=serving_depth)
+        _assert_training_changed_the_weights(training_params)
+
+        raw_draft_config, declared_depth = _artifact_declared_depth(published_dir)
+        stock_declared = declared_draft_depth(profile.draft_model)
+        # Recorded before the assertion so the observed value survives into the
+        # run artifacts even when the assertion below fails.
+        _write_json(
+            artifact_dir / "artifact-depth-observation.json",
+            {
+                "artifact_id": artifact_id,
+                "profile": profile.name,
+                "profile_num_speculative_tokens": serving_depth,
+                "manifest_num_speculative_steps": training_params.get(
+                    "num_speculative_steps"
+                ),
+                "artifact_declared_speculative_tokens": declared_depth,
+                "stock_drafter": profile.draft_model,
+                "stock_declared_speculative_tokens": stock_declared,
+                # False when the serving depth and the warm start's inherited
+                # declaration are the same number: the artifact-declared depth
+                # then cannot distinguish "Speculators rewrote the field" from
+                # "Speculators left it alone", so a truthful-looking reading
+                # proves nothing.
+                "discriminating": (
+                    stock_declared is not None and stock_declared != serving_depth
+                ),
+                "draft_weight_fingerprint": training_params.get(
+                    "draft_weight_fingerprint"
+                ),
+                "draft_weight_baseline": training_params.get("draft_weight_baseline"),
+                "draft_weight_baseline_fingerprint": training_params.get(
+                    "draft_weight_baseline_fingerprint"
+                ),
+                "speculators_config": raw_draft_config.get("speculators_config"),
+            },
+        )
+        _assert_artifact_declares_expected_depth(
+            declared_depth,
+            serving_depth=serving_depth,
+            stock_declared=stock_declared,
+        )
+
         decision = _read_object(Path(decision_path))
         assert decision is not None, decision_path
         _write_json(artifact_dir / "terminal-decision.json", decision)
