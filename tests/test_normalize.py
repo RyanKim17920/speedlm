@@ -8,6 +8,7 @@ import pytest
 
 from speedlm.config import SamplingConfig
 from speedlm.traces.normalize import (
+    SAMPLING_PROVENANCE_KEY,
     NormalizeError,
     Rejection,
     normalize_file,
@@ -33,6 +34,21 @@ def _default_data(**overrides: object) -> dict:
 
 def _defaults() -> SamplingConfig:
     return SamplingConfig(temperature=0.5, top_p=0.95, seed=17)
+
+
+_BOOKKEEPING_KEYS = {
+    SAMPLING_PROVENANCE_KEY,
+    "history_truncated",
+    "prefill_prefix_chars",
+}
+
+
+def _conversation(rec: object) -> tuple[dict, ...]:
+    """Messages with capture bookkeeping stripped, for content comparisons."""
+    return tuple(
+        {k: v for k, v in dict(m).items() if k not in _BOOKKEEPING_KEYS}
+        for m in rec.messages  # type: ignore[attr-defined]
+    )
 
 
 # ── Happy path ──────────────────────────────────────────────────────────────
@@ -279,7 +295,7 @@ class TestExternalShapes:
         rec = normalize_record(data, defaults=_defaults())
         assert rec.id == "chatcmpl-1"
         assert rec.timestamp == 1750000000.0
-        assert rec.messages == ({"role": "assistant", "content": "hi"},)
+        assert _conversation(rec) == ({"role": "assistant", "content": "hi"},)
         assert rec.prompt_tokens == 5
         assert rec.completion_tokens == 3
 
@@ -339,7 +355,7 @@ class TestExternalShapes:
         rec = normalize_record(data, defaults=_defaults())
         assert rec.id == "chatcmpl-pair"
         assert rec.model == "gpt-4-0613"
-        assert rec.messages == (
+        assert _conversation(rec) == (
             {"role": "user", "content": "hello"},
             {"role": "assistant", "content": "hi"},
         )
@@ -354,7 +370,7 @@ class TestExternalShapes:
             "completion": "hi",
         }
         rec = normalize_record(data, defaults=_defaults())
-        assert rec.messages[-1] == {"role": "assistant", "content": "hi"}
+        assert _conversation(rec)[-1] == {"role": "assistant", "content": "hi"}
         assert rec.prompt_tokens > 0
         assert rec.completion_tokens > 0
         assert rec.token_count_source == "estimated"
@@ -368,7 +384,7 @@ class TestExternalShapes:
             ],
         }
         rec = normalize_record(data, defaults=_defaults())
-        assert rec.messages == tuple(data["messages"])
+        assert _conversation(rec) == tuple(data["messages"])
         assert rec.prompt_tokens > 0
         assert rec.completion_tokens > 0
         assert rec.token_count_source == "estimated"
@@ -383,7 +399,7 @@ class TestExternalShapes:
             "usage": {"prompt_tokens": 5, "completion_tokens": 3},
         }
         rec = normalize_record(data, defaults=_defaults())
-        assert rec.messages == (
+        assert _conversation(rec) == (
             {"role": "user", "content": "hello"},
             {"role": "assistant", "content": "hi"},
         )
@@ -417,7 +433,7 @@ class TestExternalShapes:
         rec = normalize_record(data, defaults=_defaults())
         assert rec.id == "proxy-1"
         assert rec.model == "proxy-model"
-        assert rec.messages == (
+        assert _conversation(rec) == (
             {"role": "user", "content": "hello"},
             {"role": "assistant", "content": "hi"},
         )

@@ -6,7 +6,7 @@ import json
 import math
 import time
 from collections import Counter
-from collections.abc import Iterator, Mapping
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,6 +18,46 @@ from speedlm.traces.store import TraceRecord, estimate_message_tokens
 
 class NormalizeError(ValueError):
     """Raised when external input cannot be normalized (fail closed)."""
+
+
+# ── Sampling provenance ─────────────────────────────────────────────────────
+#
+# The gate scores the draft head on greedy (temperature 0) argmax agreement, so
+# whether a row was produced greedily or by sampling decides whether it is a
+# valid training target. A recorded ``temperature`` is therefore only usable
+# together with a statement of where that number came from.
+#
+# The provenance rides on the *generated* message rather than on the record
+# because ``TraceRecord`` has no field for it and ``TraceRecord.from_dict``
+# rejects unknown top-level keys (traces/store.py) — a new top-level key would
+# make every new trace unreadable by any reader that has not been upgraded in
+# lockstep. Messages are free-form dicts that already carry per-turn provenance
+# (``provenance_tag``), so this follows an established convention, round-trips
+# through ``to_dict``/``from_dict`` untouched, and is simply ignored by older
+# readers. Records written before this field existed carry no block at all;
+# consumers must read a missing block as "provenance unknown", never as greedy.
+SAMPLING_PROVENANCE_KEY = "sampling_provenance"
+
+#: The request carried the field explicitly (observed at the gateway).
+SAMPLING_SOURCE_CLIENT = "client_explicit"
+#: The request omitted the field; the recorded value is the default the serving
+#: engine applied. A default, not an observation.
+SAMPLING_SOURCE_SERVER_DEFAULT = "server_default"
+#: The value was present on an ingested external record. An observation, but
+#: whether the client or some intermediary set it is not knowable from the file.
+SAMPLING_SOURCE_RECORD = "record_explicit"
+#: No value anywhere. The number stored on the record is a configured
+#: placeholder and must not be read as a description of how the row was decoded.
+SAMPLING_SOURCE_UNKNOWN = "unknown"
+
+#: Message keys that describe the capture rather than the conversation. They are
+#: excluded from token estimation so provenance bookkeeping cannot inflate the
+#: token counts that the buffer and the trainer read.
+_NON_CONTENT_MESSAGE_KEYS = frozenset({
+    SAMPLING_PROVENANCE_KEY,
+    "history_truncated",
+    "prefill_prefix_chars",
+})
 
 
 # ── Data classes ────────────────────────────────────────────────────────────
@@ -184,11 +224,89 @@ def _openai_response_to_internal(
 
     normalized = dict(data)
     normalized.pop("choices", None)
+    # A bare OpenAI *response* object carries no request, so the prompt that
+    # produced this reply is not in the record and cannot be recovered. The
+    # single-message conversation below is therefore a fragment, not a
+    # conversation; flag it so a consumer does not read it as a complete turn
+    # and train on a reply whose context it never saw.
+    assistant = {**assistant, "history_truncated": True}
     normalized["messages"] = [assistant]
     tool_calls = assistant.get("tool_calls")
     if tool_calls is not None:
         normalized["tool_calls"] = tool_calls
     return normalized
+
+
+def is_prefill_continuation(
+    request: Mapping[str, Any],
+    messages: Sequence[Any],
+) -> bool:
+    """True when the generation continues the final assistant message.
+
+    A trailing assistant message in a request is only a *prefill* when the
+    server was told to continue it. With the OpenAI/vLLM default
+    (``add_generation_prompt=True``) a trailing assistant message renders as a
+    finished turn and a genuinely new assistant turn follows, so two
+    consecutive assistant messages are correct there and must be left alone.
+    """
+    if not messages:
+        return False
+    last = messages[-1]
+    if not isinstance(last, Mapping) or last.get("role") != "assistant":
+        return False
+    if request.get("continue_final_message"):
+        return True
+    return request.get("add_generation_prompt") is False
+
+
+def merge_assistant_prefill(
+    prefill: Mapping[str, Any],
+    generated: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Fold a client prefill and its continuation into one assistant turn.
+
+    Appending the generated reply after a prefill would inject a turn boundary
+    into what the engine rendered as one continuous generation, which is a
+    prompt the model was never shown. ``prefill_prefix_chars`` records how much
+    of the merged content was client-supplied so a consumer can avoid
+    supervising the prefix as if the model had produced it.
+    """
+    merged: dict[str, Any] = {
+        **prefill,
+        **{key: value for key, value in generated.items() if key != "content"},
+    }
+    head = prefill.get("content")
+    tail = generated.get("content")
+    if isinstance(head, str) and isinstance(tail, str):
+        merged["content"] = head + tail
+        merged["prefill_prefix_chars"] = len(head)
+    elif isinstance(head, list) and isinstance(tail, list):
+        merged["content"] = [*head, *tail]
+        merged["prefill_prefix_chars"] = None
+    elif head is None or head == "":
+        merged["content"] = tail
+        merged["prefill_prefix_chars"] = 0
+    elif tail is None or tail == "":
+        merged["content"] = head
+        merged["prefill_prefix_chars"] = len(head) if isinstance(head, str) else None
+    else:
+        # Mixed structured/plain content: keep both rather than silently
+        # dropping one half of a single turn.
+        merged["content"] = [head, tail]
+        merged["prefill_prefix_chars"] = None
+    return merged
+
+
+def _append_or_merge_assistant(
+    messages: list[Any],
+    assistant: Mapping[str, Any],
+    *,
+    request: Mapping[str, Any],
+) -> None:
+    if is_prefill_continuation(request, messages):
+        messages[-1] = merge_assistant_prefill(messages[-1], assistant)
+    else:
+        messages.append(dict(assistant))
 
 
 def _assistant_reply(value: Any, *, field: str, index: int) -> dict[str, Any]:
@@ -263,12 +381,12 @@ def _request_response_to_internal(
         if isinstance(reply_raw, dict):
             response_metadata = reply_raw
 
-    combined_messages = [
+    combined_messages: list[Any] = [
         dict(message) if isinstance(message, dict) else message
         for message in request_messages
     ]
     if assistant is not None:
-        combined_messages.append(assistant)
+        _append_or_merge_assistant(combined_messages, assistant, request=request)
     normalized: dict[str, Any] = {
         "messages": combined_messages,
     }
@@ -285,7 +403,9 @@ def _request_response_to_internal(
             normalized[key] = data[key]
         elif key in request:
             normalized[key] = request[key]
-    for key in ("temperature", "top_p", "seed"):
+    # ``tools`` belongs to the request and changes the rendered prompt, so
+    # dropping it here silently rewrote the prompt the row claims to describe.
+    for key in ("temperature", "top_p", "seed", "tools"):
         if key in request:
             normalized[key] = request[key]
         elif key in data and key not in {"request", reply_field}:
@@ -391,12 +511,16 @@ def _proxy_capture_to_internal(
             "or assistant content found"
         )
 
-    messages = [
+    messages: list[Any] = [
         dict(message) if isinstance(message, Mapping) else message
         for message in (request_messages or [])
     ]
     if assistant is not None:
-        messages.append(assistant)
+        _append_or_merge_assistant(
+            messages,
+            assistant,
+            request=request_metadata if request_metadata is not None else {},
+        )
     normalized: dict[str, Any] = {"messages": messages}
 
     mappings = list(_walk_mappings(data))
@@ -419,6 +543,15 @@ def _proxy_capture_to_internal(
         value = _first_nested(request_first, key)
         if value is not None:
             normalized[key] = value
+    # ``tools`` changes the rendered prompt, so it has to survive the proxy
+    # shape too. This shape is recovered by heuristic walk, so only take a
+    # value that is actually a tool-schema list; anything else would turn a
+    # previously accepted record into a rejection.
+    tools_value = _first_nested(request_first, "tools")
+    if isinstance(tools_value, list) and all(
+        isinstance(tool, Mapping) for tool in tools_value
+    ):
+        normalized["tools"] = tools_value
     if assistant is not None and "tool_calls" in assistant:
         normalized["tool_calls"] = assistant["tool_calls"]
     return normalized
@@ -524,6 +657,10 @@ def normalize_record(
                 f"record[{index}]: 'temperature' must be >= 0"
             )
     else:
+        # Deliberately still a number, because TraceRecord.temperature is a
+        # required float — but the provenance block below records that nothing
+        # observed it, so this value can never be mistaken for a genuine
+        # greedy request.
         temperature = defaults.temperature
 
     top_p = normalized.get("top_p")
@@ -551,6 +688,14 @@ def normalize_record(
             )
     else:
         seed = defaults.seed
+
+    messages_tuple = _attach_sampling_provenance(
+        messages_tuple,
+        observed={
+            key: normalized.get(key) is not None
+            for key in ("temperature", "top_p", "seed")
+        },
+    )
 
     # --- tool_calls ---
     tool_calls_raw = normalized.get("tool_calls")
@@ -607,6 +752,54 @@ def normalize_record(
     )
 
 
+def _attach_sampling_provenance(
+    messages: tuple[dict[str, Any], ...],
+    *,
+    observed: Mapping[str, bool],
+) -> tuple[dict[str, Any], ...]:
+    """Label where each stored sampling value came from.
+
+    A label written at capture time is authoritative and is never overwritten
+    here: the gateway saw the request, this function only sees the file. Keys
+    the gateway did not label get ``record_explicit`` when the record carried a
+    value and ``unknown`` when the value was substituted from configuration.
+    """
+    if not messages:
+        return messages
+    target = len(messages) - 1
+    for position in range(len(messages) - 1, -1, -1):
+        if messages[position].get("role") == "assistant":
+            target = position
+            break
+
+    existing = messages[target].get(SAMPLING_PROVENANCE_KEY)
+    block: dict[str, Any] = dict(existing) if isinstance(existing, Mapping) else {}
+    raw_sources = block.get("sources")
+    sources: dict[str, Any] = dict(raw_sources) if isinstance(raw_sources, Mapping) else {}
+    for key, was_observed in observed.items():
+        if key in sources:
+            continue
+        sources[key] = (
+            SAMPLING_SOURCE_RECORD if was_observed else SAMPLING_SOURCE_UNKNOWN
+        )
+    block["sources"] = sources
+
+    updated = list(messages)
+    updated[target] = {**messages[target], SAMPLING_PROVENANCE_KEY: block}
+    return tuple(updated)
+
+
+def _content_only(message: Mapping[str, Any]) -> dict[str, Any]:
+    """Drop capture bookkeeping so it cannot be counted as conversation text."""
+    if _NON_CONTENT_MESSAGE_KEYS.isdisjoint(message):
+        return dict(message)
+    return {
+        key: value
+        for key, value in message.items()
+        if key not in _NON_CONTENT_MESSAGE_KEYS
+    }
+
+
 def _extract_tokens(
     data: Mapping[str, Any],
     index: int,
@@ -614,7 +807,9 @@ def _extract_tokens(
 ) -> tuple[int, int, str]:
     """Use measured counts when complete; otherwise estimate without rejecting."""
     del index  # Token problems deliberately fall back to estimates.
-    estimated_prompt, estimated_completion = estimate_message_tokens(list(messages))
+    estimated_prompt, estimated_completion = estimate_message_tokens(
+        [_content_only(message) for message in messages]
+    )
     usage = data.get("usage")
     if isinstance(usage, dict):
         pt = usage.get("prompt_tokens")

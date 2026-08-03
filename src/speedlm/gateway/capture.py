@@ -26,12 +26,123 @@ from speedlm.gateway.sse import (
     parse_json_responses,
 )
 from speedlm.gateway.worker import await_worker
-from speedlm.traces.normalize import normalize_record
+from speedlm.traces.normalize import (
+    SAMPLING_PROVENANCE_KEY,
+    SAMPLING_SOURCE_CLIENT,
+    SAMPLING_SOURCE_SERVER_DEFAULT,
+    is_prefill_continuation,
+    merge_assistant_prefill,
+    normalize_record,
+)
 from speedlm.traces.store import TraceStore
 
 logger = logging.getLogger(__name__)
 
 _REASONING_FIELDS = {"reasoning_content", "reasoning", "thinking"}
+
+# ── Sampling capture ────────────────────────────────────────────────────────
+#
+# Every field below changes what the engine generated, so anything omitted from
+# the capture is a silent rewrite of the row's own decoding story. The previous
+# allowlist was {temperature, top_p, seed}, which dropped stop strings (a
+# stop-string truncation then looked like a natural turn ending), penalties,
+# top_k/min_p, length caps, and the chat-template switches that decide how the
+# prompt was rendered.
+_RECORDED_REQUEST_FIELDS: tuple[str, ...] = (
+    "temperature",
+    "top_p",
+    "top_k",
+    "min_p",
+    "seed",
+    "repetition_penalty",
+    "frequency_penalty",
+    "presence_penalty",
+    "stop",
+    "stop_token_ids",
+    "include_stop_str_in_output",
+    "ignore_eos",
+    "bad_words",
+    "allowed_token_ids",
+    "logit_bias",
+    "max_tokens",
+    "max_completion_tokens",
+    "max_output_tokens",
+    "min_tokens",
+    "truncate_prompt_tokens",
+    "n",
+    "best_of",
+    "response_format",
+    "structured_outputs",
+    "guided_json",
+    "guided_regex",
+    "guided_choice",
+    "guided_grammar",
+    "tool_choice",
+    "parallel_tool_calls",
+    "add_generation_prompt",
+    "continue_final_message",
+    "chat_template",
+    "chat_template_kwargs",
+    "echo",
+    "suffix",
+)
+
+#: Request keys that are transport/routing or are already captured elsewhere on
+#: the record (``messages``/``prompt`` become the conversation, ``tools`` becomes
+#: ``TraceRecord.tools``, ``model`` becomes ``TraceRecord.model``). Anything on a
+#: request that is in neither this set nor the recorded set is reported in
+#: ``unrecorded_request_fields`` so the allowlist's blind spots are stated on the
+#: row instead of being invisible.
+_STRUCTURAL_REQUEST_FIELDS: frozenset[str] = frozenset({
+    "messages",
+    "prompt",
+    "input",
+    "instructions",
+    "model",
+    "tools",
+    "stream",
+    "stream_options",
+    "user",
+    "metadata",
+    "store",
+    "request_id",
+    "priority",
+    "cache_salt",
+})
+
+# vLLM 0.25.1 (the pinned serving engine, see pyproject.toml) declares every
+# sampling field as ``Optional[...] = None`` on ChatCompletionRequest and only
+# substitutes a real value inside ``to_sampling_params``:
+#   vllm/entrypoints/openai/chat_completion/protocol.py
+#     :218   temperature: float | None = None
+#     :562   _DEFAULT_SAMPLING_PARAMS = {"repetition_penalty": 1.0,
+#            "temperature": 1.0, "top_p": 1.0, "top_k": 0, "min_p": 0.0}
+#     :599   temperature = default_sampling_params.get(
+#                "temperature", self._DEFAULT_SAMPLING_PARAMS["temperature"])
+# So an omitted temperature means the engine sampled at 1.0 — NOT greedy. That
+# is why an absent field must never be backfilled with 0.0.
+VLLM_ENGINE_SAMPLING_DEFAULTS: Mapping[str, float | int] = {
+    "temperature": 1.0,
+    "top_p": 1.0,
+    "top_k": 0,
+    "min_p": 0.0,
+    "repetition_penalty": 1.0,
+}
+
+#: Plain pydantic field defaults on the request model. Unlike the five above,
+#: these are not reachable by a model's ``generation_config.json``.
+VLLM_REQUEST_FIELD_DEFAULTS: Mapping[str, float | int] = {
+    "frequency_penalty": 0.0,
+    "presence_penalty": 0.0,
+    "n": 1,
+}
+
+_SERVER_DEFAULTS: Mapping[str, float | int] = {
+    **VLLM_ENGINE_SAMPLING_DEFAULTS,
+    **VLLM_REQUEST_FIELD_DEFAULTS,
+}
+
+SERVER_DEFAULTS_ORIGIN = "vllm-0.25.1-openai-chat-completions"
 
 
 @dataclass(frozen=True, slots=True)
@@ -301,6 +412,52 @@ def decode_request_body(body: bytes | bytearray) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
+def sampling_provenance(
+    request_data: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Return (effective sampling params, provenance block) for one request.
+
+    Params carry the client's value when the request had one and the serving
+    engine's documented default when it did not. The block says which, per key,
+    so a consumer can separate a request that asked for greedy decoding from one
+    that simply said nothing and was sampled at the engine default.
+    """
+    params: dict[str, Any] = {}
+    sources: dict[str, str] = {}
+    unspecified: list[str] = []
+    for key in _RECORDED_REQUEST_FIELDS:
+        if key in request_data:
+            params[key] = request_data[key]
+            sources[key] = SAMPLING_SOURCE_CLIENT
+        elif key in _SERVER_DEFAULTS:
+            params[key] = _SERVER_DEFAULTS[key]
+            sources[key] = SAMPLING_SOURCE_SERVER_DEFAULT
+        else:
+            # Absent from the request and with no engine default we can state
+            # (e.g. `seed`, whose absence means a fresh random seed we never
+            # observed). Listed rather than guessed.
+            unspecified.append(key)
+
+    block: dict[str, Any] = {
+        "sources": sources,
+        "params": params,
+        "unspecified": unspecified,
+        "server_defaults_origin": SERVER_DEFAULTS_ORIGIN,
+        # With `--generation-config auto` (vLLM's default) a served model's
+        # generation_config.json overrides these five, so a `server_default`
+        # label on them is an assumption about the deployment, not a reading.
+        "server_defaults_model_overridable": sorted(VLLM_ENGINE_SAMPLING_DEFAULTS),
+        "unrecorded_request_fields": sorted(
+            key
+            for key in request_data
+            if key not in sources
+            and key not in unspecified
+            and key not in _STRUCTURAL_REQUEST_FIELDS
+        ),
+    }
+    return params, block
+
+
 def _build_raw_record(
     request_data: Mapping[str, Any],
     response: AssembledResponse,
@@ -355,7 +512,16 @@ def _build_raw_record(
             and response.reasoning_field != "reasoning_content"
         ):
             assistant[response.reasoning_field] = response.reasoning_content
-    messages.append(assistant)
+
+    sampling_params, provenance = sampling_provenance(request_data)
+    assistant[SAMPLING_PROVENANCE_KEY] = provenance
+
+    if is_prefill_continuation(request_data, messages):
+        # The engine continued the client's final assistant message, so this is
+        # one turn. Appending would invent a turn boundary the model never saw.
+        messages[-1] = merge_assistant_prefill(messages[-1], assistant)
+    else:
+        messages.append(assistant)
 
     result: dict[str, Any] = {
         "timestamp": response.created if response.created is not None else timestamp,
@@ -383,9 +549,14 @@ def _build_raw_record(
     elif isinstance(request_model, str):
         result["model"] = request_model
 
+    # TraceRecord has fields for exactly these three; the rest of the recorded
+    # set survives on the generated message's provenance block. Values come from
+    # `sampling_params`, not from `request_data`, so an omitted temperature is
+    # stored as the 1.0 the engine actually applied rather than as a fabricated
+    # 0.0 that would be byte-identical to a genuine greedy row.
     for key in ("temperature", "top_p", "seed"):
-        if key in request_data:
-            result[key] = request_data[key]
+        if key in sampling_params:
+            result[key] = sampling_params[key]
     return result
 
 
