@@ -10,8 +10,11 @@ from __future__ import annotations
 import hashlib
 import inspect
 import json
+import math
+import operator
+import struct
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final, Protocol
@@ -188,6 +191,49 @@ class StockIdenticalDraftError(DraftWeightsError):
         super().__init__(
             f"trained draft is byte-identical to its baseline {baseline!r} "
             f"(weight fingerprint {fingerprint}); training was a no-op"
+        )
+
+
+class NoOpTrainingDeltaError(DraftWeightsError):
+    """The candidate differs from its baseline only by bf16 re-rounding.
+
+    :class:`StockIdenticalDraftError` catches the case where *no byte* moved.
+    This catches the case that actually happened: every byte-identity check
+    passed, the fingerprints differed, and the head was still statistically
+    the head it started from.  See :data:`MIN_TRAINED_RELATIVE_DELTA` for the
+    measurements and the derivation.
+
+    The per-tensor deltas travel on the exception *and* in its message,
+    because the alternative -- re-deriving them -- means re-running a whole
+    GPU cycle to find out why one failed.
+    """
+
+    def __init__(
+        self,
+        baseline: str,
+        deltas: Mapping[str, float],
+        *,
+        threshold: float,
+        norm_epsilon: float,
+    ) -> None:
+        self.baseline = baseline
+        #: Per-tensor relative Frobenius delta, plain floats for the manifest.
+        self.deltas = dict(deltas)
+        self.max_delta = max(self.deltas.values(), default=0.0)
+        self.threshold = threshold
+        self.norm_epsilon = norm_epsilon
+        listing = ", ".join(
+            f"{name}={value:.6f}"
+            for name, value in sorted(
+                self.deltas.items(), key=lambda item: (-item[1], item[0])
+            )
+        )
+        super().__init__(
+            f"trained draft is statistically identical to its baseline {baseline!r}: "
+            f"largest relative Frobenius delta {self.max_delta:.6f} is below the "
+            f"trained-head floor {threshold:.6f}, and every norm-type tensor moved "
+            f"at most {norm_epsilon:.6f}; training moved weights by at most one bf16 "
+            f"ULP, which is dither, not learning. Per-tensor deltas: {listing}"
         )
 
 
@@ -386,6 +432,295 @@ def weight_fingerprint(directory: Path) -> str:
             raise DraftWeightsError(f"cannot read tensor {name!r}: {location.path}") from exc
         digest.update(b"\0")
     return digest.hexdigest()
+
+
+def drafter_aux_count(directory: Path) -> int:
+    """Return how many aux hidden states *directory*'s drafter expects.
+
+    EAGLE-3 fuses the verifier's aux hidden states with ``fc.weight``, whose
+    shape is ``(hidden, aux_count * hidden)``.  The count is therefore
+    ``shape[1] // shape[0]`` and is a *property of the checkpoint*, not of
+    whatever the caller believes it configured.  Verified against both stock
+    drafters in the local HF cache: gpt-oss-20b's ``fc.weight`` is
+    ``(2880, 8640)`` and Qwen3-8B's is ``(4096, 12288)``; both give 3.
+
+    Only the safetensors header is read -- a few kilobytes -- so this answers
+    on the login node, before a GPU exists, which is the whole point: the
+    alternative is discovering the arity mismatch as a shape error several
+    hundred GPU-seconds into a forward pass.
+
+    Raises:
+        DraftWeightsError: if ``fc.weight`` is absent, is not 2-D, or has a
+            second dimension that is not a whole multiple of the first.  None
+            of those is a *count*; they are a malformed or non-EAGLE-3 head,
+            and reporting a floor-divided guess for them would launder a
+            structural problem into a plausible-looking integer.
+    """
+    tensors = _collect_draft_tensors(directory)
+    location = tensors.get("fc.weight")
+    if location is None:
+        raise DraftWeightsError(
+            f"draft directory publishes no fc.weight, so its aux-layer count is "
+            f"undefined: {directory}"
+        )
+    if len(location.shape) != 2:
+        raise DraftWeightsError(
+            f"fc.weight must be 2-D to imply an aux-layer count, got shape "
+            f"{list(location.shape)}: {directory}"
+        )
+    hidden, fused = location.shape
+    if hidden <= 0 or fused <= 0 or fused % hidden:
+        raise DraftWeightsError(
+            f"fc.weight shape {list(location.shape)} is not "
+            f"(hidden, aux_count * hidden); this is a malformed EAGLE-3 head, "
+            f"not an aux-layer count: {directory}"
+        )
+    return fused // hidden
+
+
+#: Relative spacing of the bf16 grid, i.e. one ULP as a fraction of the value.
+#:
+#: bf16 keeps 8 significand bits (7 stored).  For ``x`` in the binade
+#: ``[2^e, 2^(e+1))`` the ULP is ``2^(e-7)``, so the *relative* spacing lies in
+#: ``(2^-8, 2^-7] = (0.00391, 0.00781]``.  Re-rounding every element of a
+#: tensor by at most one ULP therefore cannot produce a relative Frobenius
+#: delta above ``2^-7``, whatever fraction of the elements moves.
+BF16_RELATIVE_ULP: Final = 2.0**-7
+
+#: Smallest relative Frobenius delta that counts as "this head trained".
+#:
+#: Not a taste call.  Three real candidates were measured against the stock
+#: warm-start snapshot they trained from, per tensor, as
+#: ``||cand - base||_F / ||base||_F`` in float64 after widening bf16::
+#:
+#:     run                 max delta   where
+#:     gptoss-pinned-2     0.005818    layers.0.self_attn.v_proj.weight
+#:     full-gptoss-head    0.005810    layers.0.self_attn.v_proj.weight
+#:     qwen-pinned-2       0.006090    layers.0.self_attn.k_proj.weight
+#:
+#: with the same signature in all three: only ~8 % of elements changed at all
+#: -- the ones sitting on a rounding boundary -- and every norm-type tensor was
+#: either exactly zero or ~1e-5.  For gptoss-pinned-2, ``fc.weight`` moved
+#: 1,994,546 of 24,883,200 elements for a delta of 0.003153, while
+#: ``embed_tokens.weight``, ``lm_head.weight``, ``norm.weight`` and both
+#: layer norms moved zero elements out of hundreds of millions.  Every one of
+#: those numbers sits inside the ``2^-7`` dither envelope above: the cycles
+#: had re-rounded the warm-start weights and changed nothing else, yet the
+#: byte-identity guard passed them because the bytes *did* differ.
+#:
+#: The floor is ``2 x 2^-7 = 0.015625``: 2.57x the largest observed dither.
+#: Be clear about what is *not* behind that factor of two -- no genuinely
+#: trained candidate was available to calibrate the upper side, so nothing
+#: here measures how far a head that actually learned something moves.  The
+#: constant is derived from the dither envelope plus an explicit margin, and
+#: it is a module-level name rather than an inline literal precisely so a run
+#: that finds real training landing under it can raise it without a patch.
+MIN_TRAINED_RELATIVE_DELTA: float = 2.0 * BF16_RELATIVE_ULP
+
+#: Relative delta below which a norm-type tensor counts as "did not move".
+#:
+#: The RMSNorm gains are the second signal, and they are the sharper one: a
+#: re-rounding pass leaves them alone (all three measured runs had every norm
+#: at 0.000000 except ``input_norm.weight`` at 0.000028/0.000030, from 37 of
+#: 8,640 elements, and qwen's ``layers.0.input_layernorm.weight`` at 0.000010
+#: from a *single* element of 4,096), whereas a head that actually fits data
+#: moves its gains materially.
+#:
+#: Note what that qwen number rules out: a strict "norms are EXACTLY zero"
+#: test would already have failed to fire on qwen-pinned-2, because one
+#: element moved.  Hence an epsilon and not an equality.  1e-4 is ~3.3x the
+#: largest observed non-zero norm delta (3.0e-5) and still far below anything
+#: a trained gain vector would show.
+NORM_MOVED_EPSILON: float = 1.0e-4
+
+#: Float dtypes the magnitude analysis understands, and their item sizes.
+#:
+#: Integer and boolean dtypes are deliberately absent rather than defaulted.
+#: The integer tensors an EAGLE-3 head publishes are ``d2t``/``t2d``, the
+#: reduced-vocabulary index maps -- a Frobenius norm over token *indices* is
+#: not a magnitude, it is arithmetic on labels, and its "relative delta" would
+#: be a meaningless number that still voted in the max.  They are excluded
+#: from the report and reported as skips instead.
+_DELTA_FLOAT_DTYPES: Final[dict[str, int]] = {"BF16": 2, "F16": 2, "F32": 4}
+
+#: Elements decoded per chunk when differencing a tensor pair.
+#:
+#: The whole pass is ~25 s over a 1.2 GB gpt-oss head and runs once per tuning
+#: cycle, against cycles measured in thousands of seconds.  A million elements
+#: is ~8 MB of CPython floats per side, which keeps the peak bounded while
+#: leaving the per-chunk work large enough that the C-speed primitives
+#: (:func:`struct.unpack`, :func:`map`, :func:`math.sumprod`) dominate.
+_DELTA_CHUNK_ELEMENTS: Final = 1 << 20
+
+
+def _bf16_to_floats(raw: bytes) -> tuple[float, ...]:
+    """Decode little-endian bf16 *raw* into floats, without numpy or torch.
+
+    A bf16 bit pattern is exactly the top 16 bits of the float32 with the same
+    value -- same sign, same 8-bit exponent, mantissa truncated from 23 bits to
+    7 -- so widening is a byte move, not arithmetic: drop each bf16 pair into
+    the *high* half of a little-endian float32 and zero the low half.  Slice
+    assignment on a ``bytearray`` does that at C speed, and
+    :func:`struct.unpack` then reads the result in one call.
+
+    This is why the tuner can do magnitude analysis at all while staying
+    importable on a login node with neither torch nor numpy installed.
+    """
+    if len(raw) % 2:
+        raise DraftWeightsError("bf16 payload is not a whole number of elements")
+    widened = bytearray(2 * len(raw))
+    widened[2::4] = raw[0::2]
+    widened[3::4] = raw[1::2]
+    return struct.unpack(f"<{len(raw) // 2}f", bytes(widened))
+
+
+def _decode_floats(dtype: str, raw: bytes) -> tuple[float, ...]:
+    """Decode *raw* according to *dtype*, which must be a float dtype."""
+    if dtype == "BF16":
+        return _bf16_to_floats(raw)
+    itemsize = _DELTA_FLOAT_DTYPES.get(dtype)
+    if itemsize is None:
+        raise DraftWeightsError(f"dtype {dtype!r} is not part of the magnitude analysis")
+    code = "f" if dtype == "F32" else "e"
+    return struct.unpack(f"<{len(raw) // itemsize}{code}", raw)
+
+
+def _tensor_chunks(location: _TensorLocation) -> Iterator[tuple[float, ...]]:
+    """Yield *location*'s values in fixed-size chunks, widened to float."""
+    itemsize = _DELTA_FLOAT_DTYPES[location.dtype]
+    count = math.prod(location.shape)
+    span = location.end - location.start
+    if count * itemsize != span:
+        raise DraftWeightsError(
+            f"tensor at {location.path} declares shape {list(location.shape)} of "
+            f"{location.dtype} ({count * itemsize} bytes) but occupies {span}"
+        )
+    try:
+        with location.path.open("rb") as stream:
+            stream.seek(location.start)
+            remaining = count
+            while remaining > 0:
+                wanted = min(remaining, _DELTA_CHUNK_ELEMENTS) * itemsize
+                buffer = bytearray()
+                while len(buffer) < wanted:
+                    piece = stream.read(wanted - len(buffer))
+                    if not piece:
+                        raise DraftWeightsError(f"tensor is truncated in {location.path}")
+                    buffer.extend(piece)
+                yield _decode_floats(location.dtype, bytes(buffer))
+                remaining -= wanted // itemsize
+    except OSError as exc:
+        raise DraftWeightsError(f"cannot read tensor bytes: {location.path}") from exc
+
+
+def _relative_delta(candidate: _TensorLocation, baseline: _TensorLocation) -> float:
+    """Return ``||cand - base||_F / ||base||_F`` for one tensor pair.
+
+    Accumulated in CPython floats (C doubles) across chunks, so widening bf16
+    to float64 costs nothing and the sum never rounds in the input precision.
+    ``sumprod`` is the whole reason this is affordable in pure Python: the
+    per-element work is one C subtraction and one fused multiply-add.
+    """
+    delta_square = 0.0
+    baseline_square = 0.0
+    for candidate_values, baseline_values in zip(
+        _tensor_chunks(candidate), _tensor_chunks(baseline), strict=True
+    ):
+        difference = list(map(operator.sub, candidate_values, baseline_values))
+        delta_square += math.sumprod(difference, difference)
+        baseline_square += math.sumprod(baseline_values, baseline_values)
+    if baseline_square == 0.0:
+        # An all-zero baseline has no scale to be relative to.  Saying "0"
+        # when the candidate is also all zeros is exact; saying "infinity"
+        # otherwise refuses to divide by nothing and still votes "moved".
+        return 0.0 if delta_square == 0.0 else math.inf
+    return math.sqrt(delta_square) / math.sqrt(baseline_square)
+
+
+@dataclass(frozen=True, slots=True)
+class WeightDeltaReport:
+    """Per-tensor magnitude comparison of a candidate head against a baseline."""
+
+    #: Tensor name -> relative Frobenius delta, over float tensors that both
+    #: directories publish with the same dtype and shape.
+    deltas: dict[str, float]
+    #: Tensor name -> why it was left out.  Skips are *recorded*, never
+    #: silent: a tensor that vanished, changed dtype or changed shape between
+    #: the two heads is the single most interesting thing a report can hold,
+    #: and dropping it on the floor is how a comparison ends up quietly
+    #: covering three tensors out of seventeen.
+    skipped: dict[str, str]
+
+    @property
+    def max_delta(self) -> float:
+        """Largest relative delta observed, or ``0.0`` if nothing compared."""
+        return max(self.deltas.values(), default=0.0)
+
+
+def weight_delta_report(candidate: Path, baseline: Path) -> WeightDeltaReport:
+    """Compare *candidate*'s weights against *baseline*'s, tensor by tensor.
+
+    Both members of :class:`WeightDeltaReport` are plain ``dict``s of ``str``
+    to JSON-native values, so the whole thing lands in the artifact manifest
+    unchanged -- a passing cycle is then as diagnosable as a failing one,
+    which matters because the interesting question after this guard ships is
+    "how far *does* a real cycle move", and only recorded passes can answer it.
+    """
+    candidate_tensors = _collect_draft_tensors(candidate)
+    baseline_tensors = _collect_draft_tensors(baseline)
+    deltas: dict[str, float] = {}
+    skipped: dict[str, str] = {}
+    for name in sorted(set(candidate_tensors) | set(baseline_tensors)):
+        left = candidate_tensors.get(name)
+        right = baseline_tensors.get(name)
+        if left is None:
+            skipped[name] = "absent from the candidate"
+            continue
+        if right is None:
+            skipped[name] = "absent from the baseline"
+            continue
+        if left.dtype != right.dtype:
+            skipped[name] = f"dtype {left.dtype} vs baseline {right.dtype}"
+            continue
+        if left.shape != right.shape:
+            skipped[name] = (
+                f"shape {list(left.shape)} vs baseline {list(right.shape)}"
+            )
+            continue
+        if left.dtype not in _DELTA_FLOAT_DTYPES:
+            skipped[name] = f"{left.dtype} is not a float dtype"
+            continue
+        deltas[name] = _relative_delta(left, right)
+    return WeightDeltaReport(deltas=deltas, skipped=skipped)
+
+
+def is_noop_training_delta(report: WeightDeltaReport) -> bool:
+    """Is *report* the signature of a cycle that only re-rounded its input?
+
+    Two signals, and deliberately their conjunction:
+
+    (a) every norm-type tensor is at or below :data:`NORM_MOVED_EPSILON` --
+        the gains did not move; and
+    (b) no tensor at all reaches :data:`MIN_TRAINED_RELATIVE_DELTA` -- nothing
+        moved further than one bf16 ULP could carry it.
+
+    Either alone is a worse test.  (b) alone would reject a genuine but small
+    update; (a) alone would reject a real head that happens to leave its
+    RMSNorm gains where they were, which is an ordinary outcome and not a
+    no-op.  Requiring both means the guard fires only on the shape all three
+    measured failures actually had.
+    """
+    if not report.deltas:
+        return False
+    norms_still = all(
+        value <= NORM_MOVED_EPSILON
+        for name, value in report.deltas.items()
+        if "norm" in name
+    )
+    nothing_moved = all(
+        value < MIN_TRAINED_RELATIVE_DELTA for value in report.deltas.values()
+    )
+    return norms_still and nothing_moved
 
 
 class TrainingError(Eagle3Error):
@@ -681,6 +1016,18 @@ class Eagle3Adapter:
     _draft_weight_baseline: str | None = None
     _draft_weight_baseline_fingerprint: str | None = None
 
+    #: Per-tensor relative Frobenius deltas against that baseline, and their
+    #: maximum.  ``None`` when no baseline directory could be resolved, for
+    #: the same reason as the fingerprints above: "the magnitude check did not
+    #: run" and "it ran and passed" must not look alike in the manifest.
+    #:
+    #: A *passing* cycle records these too.  The threshold in
+    #: :data:`MIN_TRAINED_RELATIVE_DELTA` is calibrated only from below (see
+    #: its derivation), and the only way that ever improves is if every cycle
+    #: leaves its measured deltas in the artifact.
+    _draft_weight_relative_deltas: dict[str, float] | None = None
+    _draft_weight_max_relative_delta: float | None = None
+
     def __init__(
         self,
         config: Eagle3Config,
@@ -746,6 +1093,11 @@ class Eagle3Adapter:
         params["draft_weight_baseline_fingerprint"] = (
             self._draft_weight_baseline_fingerprint
         )
+        # How far the weights actually moved, not merely that they moved.
+        # Byte-identity answered the second question; three cycles then
+        # shipped heads that differed from their baseline by one bf16 ULP.
+        params["draft_weight_relative_deltas"] = self._draft_weight_relative_deltas
+        params["draft_weight_max_relative_delta"] = self._draft_weight_max_relative_delta
         return BackendInfo(
             verifier_model=self.config.verifier_model,
             draft_model=self.config.draft_model,
@@ -989,9 +1341,25 @@ class Eagle3Adapter:
            the cycle was a no-op and the gate would be asked to distinguish a
            head from itself, so it raises :class:`StockIdenticalDraftError`.
 
+           Byte-identity turned out to be necessary but nowhere near
+           sufficient.  Three real cycles produced heads whose every tensor
+           differed from the baseline in the bytes and by *at most one bf16
+           ULP* in value -- see :data:`MIN_TRAINED_RELATIVE_DELTA` -- so the
+           identity check passed and a statistically identical head went to
+           the gate anyway.  :func:`is_noop_training_delta` is the magnitude
+           test that catches those, and it runs in addition to, never instead
+           of, the identity test.
+
         3. **These weights are the published ones.**  The fingerprint travels
            into the artifact manifest via :meth:`describe` and is re-derived
            from the artifact tree by :meth:`assert_published_weights`.
+
+        Claim 1 now also checks *arity*: ``fc.weight``'s shape states how many
+        aux hidden states the head consumes, and a cycle configured to extract
+        a different number of ``target_layer_ids`` is a shape error waiting to
+        happen in the forward pass.  Reading it from the header here costs a
+        few kilobytes and turns that into an :class:`AuxLayerCountMismatch`
+        naming both numbers.
 
         A baseline that cannot be resolved to local weights -- a Hub id absent
         from the cache -- leaves claim 2 unmade rather than assumed, and the
@@ -1003,15 +1371,43 @@ class Eagle3Adapter:
                 f"materialized draft is missing required tensors: {sorted(missing)} "
                 f"(directory: {draft_directory})"
             )
+        configured_layers = self.config.target_layer_ids
+        if configured_layers is not None:
+            expected = drafter_aux_count(draft_directory)
+            if expected != len(configured_layers):
+                # ``expected`` is the drafter's own claim, read off fc.weight;
+                # ``actual`` is what this cycle supplied.  The message reads
+                # "drafter expects {expected} ... but {actual} were provided",
+                # so they must not be swapped.
+                raise AuxLayerCountMismatch(
+                    expected=expected,
+                    actual=len(configured_layers),
+                    drafter_model=self.config.draft_model,
+                )
         fingerprint = weight_fingerprint(draft_directory)
-        baseline, baseline_fingerprint = self._baseline_weights()
+        baseline, baseline_fingerprint, baseline_directory = self._baseline_weights()
         if baseline_fingerprint is not None and baseline_fingerprint == fingerprint:
             raise StockIdenticalDraftError(str(baseline), fingerprint)
+        deltas: dict[str, float] | None = None
+        max_delta: float | None = None
+        if baseline_directory is not None:
+            report = weight_delta_report(draft_directory, baseline_directory)
+            deltas = report.deltas
+            max_delta = report.max_delta
+            if is_noop_training_delta(report):
+                raise NoOpTrainingDeltaError(
+                    str(baseline),
+                    report.deltas,
+                    threshold=MIN_TRAINED_RELATIVE_DELTA,
+                    norm_epsilon=NORM_MOVED_EPSILON,
+                )
         self._draft_weight_fingerprint = fingerprint
         self._draft_weight_baseline = baseline
         self._draft_weight_baseline_fingerprint = baseline_fingerprint
+        self._draft_weight_relative_deltas = deltas
+        self._draft_weight_max_relative_delta = max_delta
 
-    def _baseline_weights(self) -> tuple[str | None, str | None]:
+    def _baseline_weights(self) -> tuple[str | None, str | None, Path | None]:
         """Return the head this cycle built on, and its weight fingerprint.
 
         Preference order is the resolved warm start -- what training was
@@ -1020,6 +1416,11 @@ class Eagle3Adapter:
         two are the same string, and when a resolver returned something the
         cache cannot back, falling through to stock still catches the
         no-op case that matters most.
+
+        The resolved *directory* is returned alongside, because the magnitude
+        comparison needs the baseline's tensors and not merely a digest of
+        them: re-resolving it at the call site would let the two checks
+        disagree about which head "the baseline" is.
         """
         candidates = [
             reference
@@ -1031,12 +1432,12 @@ class Eagle3Adapter:
             if directory is None:
                 continue
             try:
-                return reference, weight_fingerprint(directory)
+                return reference, weight_fingerprint(directory), directory
             except DraftWeightsError:
                 # A baseline we cannot read is not evidence of anything; try
                 # the next one and, failing that, record the absence.
                 continue
-        return (candidates[0] if candidates else None), None
+        return (candidates[0] if candidates else None), None, None
 
     def assert_published_weights(self, published: Path) -> None:
         """Fail the publish unless *published* holds the weights we trained.

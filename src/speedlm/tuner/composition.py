@@ -45,7 +45,7 @@ from speedlm.training.backends.eagle3 import (
 )
 from speedlm.training.split import HeldOutTraceSnapshotLeaser
 from speedlm.tuner.artifacts import ArtifactRegistry
-from speedlm.tuner.eagle3 import Eagle3Adapter
+from speedlm.tuner.eagle3 import DraftWeightsError, Eagle3Adapter, drafter_aux_count
 from speedlm.tuner.service import TunerService, create_tuner_service
 from speedlm.tuner.state import TunerStateMachine
 
@@ -113,6 +113,90 @@ def declared_draft_depth(draft_model: str) -> int | None:
     if not isinstance(raw, dict):
         return None
     return drafter_declared_speculative_tokens(raw)
+
+
+def resolve_drafter_aux_count(
+    draft_model: str,
+    *,
+    snapshot_resolver: Callable[[str], Path | None] | None = None,
+    counter: Callable[[Path], int] | None = None,
+) -> int | None:
+    """Return the aux-layer arity *draft_model*'s weights imply, or ``None``.
+
+    The arity is read out of ``fc.weight``'s shape by
+    :func:`speedlm.tuner.eagle3.drafter_aux_count` -- the fusion projection is
+    ``hidden x (aux_count * hidden)``, so the count is a property of the tensor
+    and not of anything a config can assert.  That is the whole reason this
+    exists: ``target_layer_ids`` and ``num_aux_hidden_states`` are both
+    *claims*, and a claim that disagrees with the checkpoint is exactly the
+    failure the arity check in
+    :func:`speedlm.profiles.resolve_target_layer_ids` was written to catch.
+    Until this resolver existed that check was handed ``None`` at the only
+    production call site, so it had never run.
+
+    Resolution is *best effort*, following ``resolve_verifier_revision``
+    above and for the same reason: reading provenance off local weights is an
+    improvement, not a safety-critical precondition, and it must never be able
+    to stop the service from starting.  Two outcomes degrade to ``None``, both
+    logged at INFO with the reason:
+
+    * the drafter is a Hub id with no local snapshot -- there are no bytes on
+      this host to read an arity out of; and
+    * the snapshot has no usable ``fc.weight`` (:class:`DraftWeightsError`).
+
+    ``None`` restores today's behaviour exactly: the arity cross-check is
+    skipped and the layer-id count falls back to the documented default of 3.
+    What it must *not* do is degrade a genuine mismatch -- once a count is
+    read, disagreeing with it is a configuration error and is raised.
+
+    Only the safetensors header is read, a few kilobytes, with no torch and no
+    GPU, so this answers during composition on a login node.
+
+    Args:
+        draft_model: the profile's stock speculator, a Hub id or a local path.
+        snapshot_resolver: seam for tests; defaults to
+            :func:`speedlm.profiles.cached_snapshot_dir`.
+        counter: seam for tests; defaults to
+            :func:`speedlm.tuner.eagle3.drafter_aux_count`.
+    """
+    locate = snapshot_resolver if snapshot_resolver is not None else cached_snapshot_dir
+    count = counter if counter is not None else drafter_aux_count
+    try:
+        snapshot = locate(draft_model)
+    except OSError:
+        logger.info(
+            "could not locate local weights for drafter %r; its aux-layer arity "
+            "will not be cross-checked against the resolved target_layer_ids",
+            draft_model,
+            exc_info=True,
+        )
+        return None
+    if snapshot is None:
+        logger.info(
+            "drafter %r has no local snapshot, so its fc.weight cannot be read; "
+            "its aux-layer arity will not be cross-checked against the resolved "
+            "target_layer_ids",
+            draft_model,
+        )
+        return None
+    try:
+        aux_count = count(snapshot)
+    except (DraftWeightsError, OSError) as exc:
+        logger.info(
+            "drafter %r at %s publishes no usable fc.weight (%s), so its "
+            "aux-layer arity will not be cross-checked against the resolved "
+            "target_layer_ids",
+            draft_model,
+            snapshot,
+            exc,
+        )
+        return None
+    logger.info(
+        "drafter %r expects %d aux hidden states, read from its fc.weight shape",
+        draft_model,
+        aux_count,
+    )
+    return aux_count
 
 
 def resolve_verifier_revision(
@@ -528,6 +612,14 @@ def create_production_tuner(
         serving_tokens=profile.num_speculative_tokens,
         training_steps=training_depth,
     )
+    #: How many aux hidden states the stock head's own weights fuse.
+    #:
+    #: Named for the *stock drafter* rather than shadowing the imported
+    #: ``drafter_aux_count``, which is the function that reads it.  ``None``
+    #: when the head is not on this host or carries no usable ``fc.weight``;
+    #: see :func:`resolve_drafter_aux_count` for why that degrades instead of
+    #: raising.
+    stock_aux_count = resolve_drafter_aux_count(stock_draft_model)
     layout = ensure_layout(home)
     state = TunerStateMachine(layout.runs_dir)
     publish_guard = _PublishedWeightGuard()
@@ -551,13 +643,22 @@ def create_production_tuner(
             profile.verifier_model, tuning.verifier_revision
         ),
         warm_start_model=stock_draft_model,
-        target_layer_ids=profile.target_layer_ids or (
+        # The profile's pin, if it has one, now goes *through* the resolver
+        # rather than around it.  Short-circuiting on ``profile.target_layer_ids``
+        # meant a configured pin was never cross-checked against anything, and
+        # passing ``drafter_aux_count=None`` meant the derived case defaulted to
+        # 3 regardless of the head it was about to train.  Both stock heads do
+        # imply 3 (measured: fc.weight is (2880, 8640) for gpt-oss and
+        # (4096, 12288) for Qwen3), so this changes no production value today --
+        # it makes the agreement checked instead of assumed.
+        target_layer_ids=(
             resolve_target_layer_ids(
-                explicit=None,
+                explicit=profile.target_layer_ids,
                 num_hidden_layers=profile.num_hidden_layers,
-                drafter_aux_count=None,
+                drafter_aux_count=stock_aux_count,
             )
-            if profile.num_hidden_layers is not None
+            if profile.target_layer_ids is not None
+            or profile.num_hidden_layers is not None
             else ()
         ),
         sequence_length=min(tuning.sequence_length, profile.max_seq_len),

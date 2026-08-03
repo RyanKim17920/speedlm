@@ -14,10 +14,14 @@ from typing import Any
 import pytest
 
 import speedlm.tuner.composition as composition
-from speedlm.config import IdleTuningConfig, SpeedLMConfig
+from speedlm.config import (
+    REFERENCE_LEARNING_RATE,
+    IdleTuningConfig,
+    SpeedLMConfig,
+)
 from speedlm.gateway.control import ControlAborted
 from speedlm.gateway.vllm_http import VLLMDraftSwapClient
-from speedlm.profiles import ModelProfile
+from speedlm.profiles import AuxLayerError, ModelProfile
 from speedlm.storage import ensure_layout
 from speedlm.tuner.artifacts import ArtifactRegistry, ArtifactSpec
 from speedlm.tuner.composition import (
@@ -66,7 +70,11 @@ def _config(tmp_path: Path, profile: ModelProfile) -> SpeedLMConfig:
             training_python=str(python),
             prepared_validator_script=str(validator),
             sequence_length=20_000,
-            learning_rate=4e-6,
+            # The Speculators reference rate.  At the old 4e-6 this fixture
+            # exercised a value that made training a measured no-op, and it
+            # could not have caught the second copy of the 1e-5 bound in the
+            # Eagle-3 backend that rejected the reference rate outright.
+            learning_rate=REFERENCE_LEARNING_RATE,
             epochs=2,
             extraction_concurrency=3,
             training_port=9_123,
@@ -1138,3 +1146,255 @@ def test_declared_draft_depth_is_best_effort(
 
     assert composition.declared_draft_depth(str(drafter)) is None
     assert composition.declared_draft_depth("acme/not-in-the-cache") is None
+
+
+# ---------------------------------------------------------------------------
+# Drafter aux-layer arity, read from fc.weight
+# ---------------------------------------------------------------------------
+
+#: The two stock EAGLE-3 heads, and the ``fc.weight`` shape each one actually
+#: publishes.  Measured off the local HF cache rather than asserted from the
+#: config: gpt-oss-20b fuses 3 x 2880 into 2880 and Qwen3-8B fuses 3 x 4096
+#: into 4096, so both imply an aux-layer arity of 3 -- which is the count of
+#: target layer ids both profiles resolve today.  This is why wiring the real
+#: value in changes no production value.
+STOCK_FC_WEIGHT_SHAPES: dict[str, tuple[int, int]] = {
+    "RedHatAI/gpt-oss-20b-speculator.eagle3": (2880, 8640),
+    "RedHatAI/Qwen3-8B-speculator.eagle3": (4096, 12288),
+}
+
+
+def _write_bf16_safetensors(
+    directory: Path, tensors: dict[str, tuple[int, ...]]
+) -> Path:
+    """Write a minimal, structurally valid bf16 safetensors shard."""
+    directory.mkdir(parents=True, exist_ok=True)
+    header: dict[str, object] = {}
+    offset = 0
+    for name, shape in tensors.items():
+        size = 2
+        for extent in shape:
+            size *= extent
+        header[name] = {
+            "dtype": "BF16",
+            "shape": list(shape),
+            "data_offsets": [offset, offset + size],
+        }
+        offset += size
+    raw = json.dumps(header).encode("utf-8")
+    path = directory / "model.safetensors"
+    path.write_bytes(len(raw).to_bytes(8, "little") + raw + bytes(offset))
+    return path
+
+
+def test_drafter_aux_count_is_read_from_the_fc_weight_shape(tmp_path: Path) -> None:
+    """The arity is a property of the tensor, not of anything a config claims."""
+    drafter = tmp_path / "drafter"
+    _write_bf16_safetensors(drafter, {"fc.weight": (8, 32)})
+
+    assert (
+        composition.resolve_drafter_aux_count(
+            "acme/drafter", snapshot_resolver=lambda _model: drafter
+        )
+        == 4
+    )
+
+
+def test_an_uncached_drafter_degrades_to_an_unchecked_arity(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A Hub id with no local snapshot must not stop the service starting."""
+    with caplog.at_level("INFO", logger=composition.logger.name):
+        assert (
+            composition.resolve_drafter_aux_count(
+                "acme/never-downloaded",
+                snapshot_resolver=lambda _model: None,
+                counter=lambda _path: pytest.fail("must not read absent weights"),
+            )
+            is None
+        )
+
+    assert "no local snapshot" in caplog.text
+    assert "acme/never-downloaded" in caplog.text
+
+
+def test_a_drafter_without_a_usable_fc_weight_degrades_to_an_unchecked_arity(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """``DraftWeightsError`` is provenance lost, not a startup failure."""
+    drafter = tmp_path / "drafter"
+    # Structurally valid safetensors, but no fusion projection at all.
+    _write_bf16_safetensors(drafter, {"norm.weight": (8,)})
+
+    with caplog.at_level("INFO", logger=composition.logger.name):
+        assert (
+            composition.resolve_drafter_aux_count(
+                "acme/headless", snapshot_resolver=lambda _model: drafter
+            )
+            is None
+        )
+
+    assert "fc.weight" in caplog.text
+
+
+@pytest.mark.parametrize("model", sorted(STOCK_FC_WEIGHT_SHAPES))
+def test_both_stock_heads_imply_three_aux_layers(model: str) -> None:
+    """The no-change claim, checked against the real cached snapshots.
+
+    Skipped rather than failed when the head is not on this host: the point of
+    the resolver is that an absent snapshot is survivable, so a test asserting
+    against one would be asserting about the machine, not the code.
+    """
+    snapshot = composition.cached_snapshot_dir(model)
+    if snapshot is None:
+        pytest.skip(f"{model} is not in this host's HF cache")
+
+    from speedlm.tuner.eagle3 import _collect_draft_tensors
+
+    assert _collect_draft_tensors(snapshot)["fc.weight"].shape == (
+        STOCK_FC_WEIGHT_SHAPES[model]
+    )
+    assert composition.resolve_drafter_aux_count(model) == 3
+
+
+def _stub_composition_collaborators(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, captured: dict[str, Any]
+) -> None:
+    """Replace everything ``create_production_tuner`` builds after the profile."""
+    monkeypatch.setattr(
+        composition,
+        "ensure_layout",
+        lambda _home: SimpleNamespace(runs_dir=tmp_path / "runs"),
+    )
+    monkeypatch.setattr(composition, "TunerStateMachine", lambda _path: object())
+    monkeypatch.setattr(
+        composition,
+        "ArtifactRegistry",
+        lambda _path, **_kwargs: SimpleNamespace(active=lambda: None),
+    )
+    monkeypatch.setattr(
+        composition,
+        "HeldOutTraceSnapshotLeaser",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            suite_dir=tmp_path / "held-out",
+            training_context_hashes=frozenset(),
+        ),
+    )
+
+    def build_pipeline(**kwargs: object) -> object:
+        captured["pipeline"] = kwargs
+        return SimpleNamespace(gpu_memory_utilization=0.80)
+
+    monkeypatch.setattr(composition, "SpeculatorsPipelineConfig", build_pipeline)
+    monkeypatch.setattr(
+        composition,
+        "Eagle3Backend",
+        SimpleNamespace(from_speculators=lambda *_a, **_k: object()),
+    )
+    monkeypatch.setattr(composition, "RuntimeController", lambda **_k: object())
+    monkeypatch.setattr(composition, "BenchmarkGateRunner", lambda **_k: object())
+    monkeypatch.setattr(
+        composition, "create_tuner_service", lambda *_a, **_k: object()
+    )
+
+
+def _compose(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    profile: ModelProfile,
+    captured: dict[str, Any],
+) -> None:
+    config = _config(tmp_path, profile)
+    _stub_composition_collaborators(monkeypatch, tmp_path, captured)
+    loop = asyncio.new_event_loop()
+    try:
+        create_production_tuner(
+            config,
+            profile=profile,
+            active_draft="acme/active-draft",
+            activity=object(),  # type: ignore[arg-type]
+            admission=object(),  # type: ignore[arg-type]
+            traces=object(),  # type: ignore[arg-type]
+            capture=object(),  # type: ignore[arg-type]
+            process=object(),  # type: ignore[arg-type]
+            http=object(),  # type: ignore[arg-type]
+            child_url="http://127.0.0.1:8765",
+            loop=loop,
+            home=tmp_path / "home",
+        )
+    finally:
+        loop.close()
+
+
+def test_a_drafter_arity_contradicting_the_configured_layer_ids_is_caught(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The whole point of the wiring.
+
+    The profile pins three target layer ids; the head it would warm-start from
+    fuses *four* aux hidden states.  Those cannot both be right, and the tensor
+    is the one that cannot lie -- so composition must refuse rather than launch
+    a cycle that dies as a shape error hundreds of GPU-seconds into extraction.
+
+    Until the real count reached ``resolve_target_layer_ids`` this was
+    unreachable: the only production call site passed ``drafter_aux_count=None``
+    and the arity branch never executed.
+    """
+    drafter = tmp_path / "stock-drafter"
+    # hidden 8, fused 32 -> four aux hidden states, one more than the pin.
+    _write_bf16_safetensors(drafter, {"fc.weight": (8, 32)})
+    monkeypatch.setattr(composition, "cached_snapshot_dir", lambda _model: drafter)
+    profile = replace(_profile(), target_layer_ids=(2, 12, 21), num_hidden_layers=24)
+
+    with pytest.raises(AuxLayerError) as error:
+        _compose(tmp_path, monkeypatch, profile, {})
+
+    assert "3 entries" in str(error.value)
+    assert "4 aux layers" in str(error.value)
+
+
+def test_an_agreeing_drafter_arity_leaves_the_configured_layer_ids_alone(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The no-change case: three ids, a head that fuses three, pin preserved."""
+    drafter = tmp_path / "stock-drafter"
+    _write_bf16_safetensors(drafter, {"fc.weight": (8, 24)})
+    monkeypatch.setattr(composition, "cached_snapshot_dir", lambda _model: drafter)
+    profile = replace(_profile(), target_layer_ids=(2, 12, 21), num_hidden_layers=24)
+    captured: dict[str, Any] = {}
+
+    _compose(tmp_path, monkeypatch, profile, captured)
+
+    assert captured["pipeline"]["target_layer_ids"] == (2, 12, 21)
+
+
+def test_an_unpinned_profile_derives_its_layer_ids_from_the_drafter(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no pin, the *head's* arity sets how many layers are extracted.
+
+    Previously this fell through to the documented default of 3 whatever the
+    head expected, which is only correct by coincidence.
+    """
+    drafter = tmp_path / "stock-drafter"
+    _write_bf16_safetensors(drafter, {"fc.weight": (8, 32)})
+    monkeypatch.setattr(composition, "cached_snapshot_dir", lambda _model: drafter)
+    profile = replace(_profile(), target_layer_ids=None, num_hidden_layers=24)
+    captured: dict[str, Any] = {}
+
+    _compose(tmp_path, monkeypatch, profile, captured)
+
+    assert len(captured["pipeline"]["target_layer_ids"]) == 4
+
+
+def test_an_unreadable_drafter_preserves_the_historical_layer_ids(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Best effort means best effort: no snapshot, no check, service starts."""
+    monkeypatch.setattr(composition, "cached_snapshot_dir", lambda _model: None)
+    profile = replace(_profile(), target_layer_ids=None, num_hidden_layers=24)
+    captured: dict[str, Any] = {}
+
+    _compose(tmp_path, monkeypatch, profile, captured)
+
+    assert len(captured["pipeline"]["target_layer_ids"]) == 3

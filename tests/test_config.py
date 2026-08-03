@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 
 from speedlm.config import (
+    MAX_LEARNING_RATE,
+    REFERENCE_LEARNING_RATE,
     ConfigError,
     DivergenceCriterion,
     IdleTuningConfig,
@@ -273,12 +275,71 @@ def test_idle_tuning_config_round_trip_without_machine_specific_paths() -> None:
         {"restore_fast_path_timeout_seconds": 0},
         {"restore_fast_path_timeout_seconds": "fast"},
         {"speculators_repo": ""},
-        {"learning_rate": 1e-4},
+        {"learning_rate": 0},
+        {"learning_rate": -1e-4},
+        {"learning_rate": 1.1e-3},
+        {"learning_rate": 1.0},
+        {"learning_rate": True},
+        {"learning_rate": "1e-4"},
     ],
 )
 def test_invalid_idle_tuning_config_is_rejected(tuning: dict[str, object]) -> None:
     with pytest.raises(ConfigError):
         SpeedLMConfig.from_dict({"model": "org/model", "tuning": tuning})
+
+
+def test_reference_learning_rate_is_accepted_and_is_the_default() -> None:
+    """1e-4 -- the Speculators reference ``--lr`` -- must load.
+
+    The old ceiling of 1e-5 rejected it, and at 1e-5 the AdamW update over a
+    cycle's ~202 steps was below half a bf16 ULP: every RMSNorm tensor in the
+    published artifacts moved exactly 0.000000.  Training that cannot move a
+    weight is the regression this test exists to prevent, so both halves are
+    pinned -- the reference value loads, and it is what you get by default.
+    """
+    assert REFERENCE_LEARNING_RATE == 1e-4
+    assert SpeedLMConfig(model="org/model").tuning.learning_rate == 1e-4
+
+    configured = SpeedLMConfig.from_dict(
+        {"model": "org/model", "tuning": {"learning_rate": REFERENCE_LEARNING_RATE}}
+    )
+    assert configured.tuning.learning_rate == 1e-4
+    assert (
+        SpeedLMConfig.from_dict(configured.to_dict()).tuning.learning_rate == 1e-4
+    )
+
+
+def test_learning_rate_ceiling_leaves_headroom_above_the_reference() -> None:
+    """The bound is a fat-finger guard, not a bound sitting on the default.
+
+    A ceiling equal to the value everyone configures is indistinguishable from
+    no headroom: the first sweep above the reference would hit it.  Pin that
+    the boundary itself loads, that a decade of room exists above 1e-4, and
+    that the classic dropped-exponent typos are still refused.
+    """
+    assert MAX_LEARNING_RATE == 1e-3
+    assert MAX_LEARNING_RATE >= REFERENCE_LEARNING_RATE * 10
+
+    at_bound = SpeedLMConfig.from_dict(
+        {"model": "org/model", "tuning": {"learning_rate": MAX_LEARNING_RATE}}
+    )
+    assert at_bound.tuning.learning_rate == MAX_LEARNING_RATE
+
+    # A 5x sweep around the reference stays inside the guard.
+    for rate in (2e-4, 5e-4):
+        assert (
+            SpeedLMConfig.from_dict(
+                {"model": "org/model", "tuning": {"learning_rate": rate}}
+            ).tuning.learning_rate
+            == rate
+        )
+
+    # ...while a dropped or shifted exponent does not.
+    for typo in (1e-1, 1.0):
+        with pytest.raises(ConfigError, match="learning_rate"):
+            SpeedLMConfig.from_dict(
+                {"model": "org/model", "tuning": {"learning_rate": typo}}
+            )
 
 
 def test_benchmark_concurrency_round_trips_and_defaults_above_one() -> None:

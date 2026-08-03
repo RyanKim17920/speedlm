@@ -9,6 +9,7 @@ from pathlib import Path
 import pytest
 from draft_weights import write_draft_weights
 
+from speedlm.config import MAX_LEARNING_RATE, REFERENCE_LEARNING_RATE
 from speedlm.training.backends.eagle3 import (
     DRAFT_COPY_CHUNK_BYTES,
     MAX_SCRATCH_BYTES,
@@ -574,17 +575,77 @@ def test_all_zero_mask_raises_named_error_with_row(
     assert "trace-17" in str(raised.value)
 
 
-def test_learning_rate_above_safe_value_is_rejected(
-    tmp_path: Path,
-    pipeline: SpeculatorsPipelineConfig,
-) -> None:
+def _pipeline_with_learning_rate(
+    pipeline: SpeculatorsPipelineConfig, learning_rate: float
+) -> SpeculatorsPipelineConfig:
     values = {
         field: getattr(pipeline, field)
         for field in pipeline.__dataclass_fields__
         if field != "learning_rate"
     }
-    with pytest.raises(ValueError, match="safe 1e-5"):
-        SpeculatorsPipelineConfig(**values, learning_rate=1e-4)
+    return SpeculatorsPipelineConfig(**values, learning_rate=learning_rate)
+
+
+def test_learning_rate_above_the_fat_finger_bound_is_rejected(
+    tmp_path: Path,
+    pipeline: SpeculatorsPipelineConfig,
+) -> None:
+    # A dropped exponent is the mistake the bound exists to catch.
+    with pytest.raises(ValueError, match=r"learning_rate must be in \(0, 0\.001\]"):
+        _pipeline_with_learning_rate(pipeline, 1.0)
+    with pytest.raises(ValueError, match=r"learning_rate must be in \(0, 0\.001\]"):
+        _pipeline_with_learning_rate(pipeline, MAX_LEARNING_RATE * 10)
+
+
+def test_reference_learning_rate_is_accepted(
+    tmp_path: Path,
+    pipeline: SpeculatorsPipelineConfig,
+) -> None:
+    # The regression this change exists to prevent: 1e-5 made training a
+    # measured no-op, so the reference 1e-4 must survive composition.  It was
+    # rejected here by a second, independent copy of the old bound.
+    assert REFERENCE_LEARNING_RATE == 1e-4
+    for value in (REFERENCE_LEARNING_RATE, MAX_LEARNING_RATE):
+        assert (
+            _pipeline_with_learning_rate(pipeline, value).learning_rate == value
+        )
+
+
+def test_learning_rate_bound_and_default_track_config(
+    pipeline: SpeculatorsPipelineConfig,
+) -> None:
+    # Two independent copies of this bound is exactly what produced the bug;
+    # pin them equal so neither can move without the other.
+    field = SpeculatorsPipelineConfig.__dataclass_fields__["learning_rate"]
+    assert field.default == REFERENCE_LEARNING_RATE
+    assert _pipeline_with_learning_rate(
+        pipeline, MAX_LEARNING_RATE
+    ).learning_rate == MAX_LEARNING_RATE
+    with pytest.raises(ValueError):
+        _pipeline_with_learning_rate(pipeline, MAX_LEARNING_RATE * 1.5)
+
+
+def test_reference_learning_rate_reaches_the_trainer_argv(
+    tmp_path: Path,
+    pipeline: SpeculatorsPipelineConfig,
+) -> None:
+    # Accepted at construction is not enough: the value must arrive at
+    # ``--lr`` uncoerced.
+    runner = _FakeRunner()
+    revised = _pipeline_with_learning_rate(pipeline, REFERENCE_LEARNING_RATE)
+    backend, work = _backend(tmp_path, revised, runner)
+
+    prepared = backend.prepare(work, should_abort=lambda: False)
+    hidden = backend.extract(prepared, work, should_abort=lambda: False)
+    backend.train(hidden, work, should_abort=lambda: False)
+
+    train_argv = next(
+        call
+        for call in runner.run_calls
+        if any(str(a).endswith("train.py") for a in call)
+    )
+    assert "--lr" in train_argv
+    assert float(train_argv[train_argv.index("--lr") + 1]) == REFERENCE_LEARNING_RATE
 
 
 def test_model_revisions_are_resolved_and_used_by_prepare_and_train(

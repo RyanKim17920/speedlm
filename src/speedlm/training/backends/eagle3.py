@@ -15,9 +15,11 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Final
 
+from speedlm.config import MAX_LEARNING_RATE, REFERENCE_LEARNING_RATE
 from speedlm.profiles import DEFAULT_SPECULATIVE_TOKENS, MAX_SPECULATIVE_TOKENS
 from speedlm.training.backends.speculators_runner import (
     ProcessResult,
@@ -112,6 +114,83 @@ DEFAULT_SPECULATORS_PYTHON = Path(
     os.environ.get("SPEEDLM_TRAINING_PYTHON", sys.executable)
 )
 _SPECULATORS_DATA_NAME = "speculators-conversations.jsonl"
+
+
+class TruncatedRowPolicy(StrEnum):
+    """What a rendered corpus does with a row whose completion was cut off."""
+
+    #: Emit the row unchanged.  Restores the historical behaviour.
+    KEEP = "keep"
+    #: Omit the row from the rendered dataset.
+    DROP = "drop"
+
+
+#: ``finish_reason`` values that mean "this completion was cut off", i.e. the
+#: assistant turn on disk is a mid-sentence fragment and not a finished turn.
+#:
+#: Why this matters for a drafter: production capture caps ``max_tokens`` at
+#: 512 (``config.benchmark_max_tokens``) and ``gate/replay.py`` measured 76 of
+#: 103 held-out contexts burning the whole budget inside the thinking block and
+#: returning null content with ``finish_reason="length"``.  The tokenizer sees
+#: such a row exactly as it sees a natural stop, and the chat template appends
+#: its end-of-turn marker after the fragment -- teaching the draft that a
+#: mid-sentence fragment is a complete turn, so at serving the draft proposes a
+#: continuation precisely where the verifier emits stop.
+#:
+#: ``"length"`` is the OpenAI chat value for exhausting ``max_tokens``
+#: (:data:`speedlm.gate.replay.FINISH_REASON_LENGTH`).  ``"incomplete"`` is the
+#: Responses API's equivalent: that path files the response *status* into this
+#: same field (``gateway/responses.py``), where a truncated response reads
+#: ``"incomplete"`` and a finished one reads ``"completed"``.
+#:
+#: Deliberately a positive list and not "anything that is not ``stop``".  Three
+#: real sources produce an *unknown* value -- ``TraceRecord.finish_reason``
+#: defaults to ``None`` so corpora archived before the field existed read back
+#: ``None``, streaming chunks carry ``null`` until the terminal chunk, and
+#: ``gate/replay.py`` coerces a missing value to ``""`` -- and ``"tool_calls"``
+#: is a perfectly complete stop.  An inverted test would discard all four.
+TRUNCATED_FINISH_REASONS: Final = frozenset({"length", "incomplete"})
+
+#: Key holding a Speculators draft's auxiliary layer ids in its ``config.json``.
+_AUX_LAYER_IDS_KEY: Final = "eagle_aux_hidden_state_layer_ids"
+
+#: Largest ``safetensors`` header this module will parse, in bytes.
+#:
+#: The header is a JSON object of tensor names and shapes; a draft's runs to a
+#: few kilobytes.  The bound exists so a corrupt or hostile length prefix
+#: cannot make the guard read a gigabyte into memory.
+_SAFETENSORS_HEADER_LIMIT: Final = 16 * 1024 * 1024
+
+#: One wrapped ``val/...`` record from the trainer's stdout, up to its epoch.
+#:
+#: The trainer logs through Rich, which hard-wraps every record to 80 columns
+#: with a 20-space continuation indent, so one logical record spans six to ten
+#: physical lines and a per-line regex sees only whichever steps happened to
+#: land on the line it is looking at.  Matching the whole record with DOTALL is
+#: what makes the parse independent of where the wrap fell.
+#:
+#: ``\bepoch=`` cannot match inside ``loss_0_epoch=`` -- the preceding ``_`` is
+#: a word character, so there is no boundary there -- which is what lets the
+#: non-greedy span stop at the record's own trailing ``epoch=<n>`` field.
+_VAL_EPOCH_RECORD: Final = re.compile(r"val/loss_0_epoch=.*?\bepoch=(\d+)", re.DOTALL)
+_VAL_EPOCH_METRIC: Final = re.compile(
+    r"val/([A-Za-z0-9_]+)_epoch=(-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)"
+)
+#: Rich's right-aligned source tag, e.g. ``trainer.py:290``, stripped before parsing.
+_LOG_SOURCE_TAG: Final = re.compile(r"[ \t]+[A-Za-z0-9_]+\.py:\d+[ \t]*$", re.MULTILINE)
+
+#: The metric that governs acceptance at the first speculative position.
+#:
+#: The trainer emits two accuracy series per TTT step.  ``full_acc_k`` is the
+#: unconditional chain accuracy -- the fraction of *all* supervised positions
+#: whose draft is correct through step ``k``.  ``cond_acc_k`` is conditional on
+#: surviving step ``k-1``.  They share a numerator and differ only in
+#: denominator, so ``cond_acc_k == full_acc_k / full_acc_{k-1}``; verified
+#: against a real epoch where the series read 0.648 / 0.372 / 0.168 and 0.648 /
+#: 0.574 / 0.452, since 0.372/0.648 = 0.574 and 0.168/0.372 = 0.452.  At step 0
+#: there is nothing to condition on, so the two are equal and either would do;
+#: ``full_acc_0_epoch`` is used because it stays comparable across steps.
+ACCEPTANCE_METRIC: Final = "full_acc_0_epoch"
 
 #: Stage outputs a scratch-quota trip removes, and that a failure inventories.
 _TRANSIENT_NAMES: Final = (
@@ -349,12 +428,53 @@ class SpeculatorsPipelineConfig:
     #: corpus into 1 batch; 4096 yielded 44 steps, making this a key lever
     #: for sampler throughput and gradient frequency.
     sequence_length: int = 16_384
-    learning_rate: float = 1e-5
+    #: Learning rate handed to the trainer as ``--lr``.
+    #:
+    #: Both the default and the bound below are *imported* from
+    #: :mod:`speedlm.config` rather than restated here.  Restating them is what
+    #: produced the bug this comment exists for: ``tuning.learning_rate`` was
+    #: raised to the Speculators reference ``1e-4`` in :mod:`speedlm.config`
+    #: while this file kept an independent copy of the old ``1e-5`` bound, so a
+    #: real cycle stopped failing at training and started failing at
+    #: composition instead.  One definition, two readers.
+    learning_rate: float = REFERENCE_LEARNING_RATE
     epochs: int = 1
     seed: int = 0
     port: int = 8_131
     concurrency: int = 8
     mask_policy: MaskPolicy = MaskPolicy.ALL_ASSISTANT_TURNS
+    #: What to do with a captured row whose completion hit the token cap.
+    #:
+    #: ``DROP`` by default because a truncated row is not merely uninformative,
+    #: it is actively wrong supervision: see :data:`TRUNCATED_FINISH_REASONS`.
+    #: The cost of that default is real and is why the floor below exists --
+    #: the measured truncation rate on seed traffic under a 512-token cap is
+    #: high, so on some corpora this filter removes most rows.  When it does,
+    #: the cycle fails by name rather than training on the remainder.
+    truncated_row_policy: TruncatedRowPolicy = TruncatedRowPolicy.DROP
+    #: Rendered rows the truncation filter must leave behind, or the cycle fails.
+    #:
+    #: The accumulation gate that admits a cycle (``tuning.min_corpus_records``,
+    #: default 256, against a ``tuning.training_window_records`` window of 256)
+    #: counts *raw trace records*, before rendering and therefore before this
+    #: filter runs.  So nothing upstream can notice that a 256-record window
+    #: became sixteen trainable rows.  This is that check, and it is deliberately
+    #: a hard failure: a silently tiny corpus produces a checkpoint that looks
+    #: like every other checkpoint.  32 matches ``tuning.min_trace_records``,
+    #: the codebase's existing floor for "enough to mean anything".
+    #:
+    #: Only consulted when the filter actually removed rows; a corpus that is
+    #: small for its own reasons is not this check's business.
+    min_rendered_rows: int = 32
+    #: Fail the cycle when the final epoch does not improve on the first.
+    #:
+    #: Measured on :data:`ACCEPTANCE_METRIC` and not on the loss, because the
+    #: two disagree: the summed TTT loss is dominated by the later steps
+    #: (loss_0=0.643 against loss_2=3.571 in a total of 6.676 -> 6.425), so it
+    #: falls across epochs while step-0 accuracy -- the direct proxy for what
+    #: acceptance does at serving -- sits flat at 0.706/0.705/0.705 on gpt-oss
+    #: and 0.648/0.647/0.648 on Qwen.  A cycle gated on the loss promotes that.
+    require_accuracy_improvement: bool = True
     max_num_seqs: int = 1
     enforce_eager: bool = True
     gpu_memory_utilization: float = 0.80
@@ -431,6 +551,11 @@ class SpeculatorsPipelineConfig:
             or len(set(self.target_layer_ids)) != len(self.target_layer_ids)
         ):
             raise ValueError("target_layer_ids must be unique non-negative integers")
+        _positive_int("min_rendered_rows", self.min_rendered_rows)
+        if not isinstance(self.truncated_row_policy, TruncatedRowPolicy):
+            raise ValueError("truncated_row_policy must be a TruncatedRowPolicy")
+        if not isinstance(self.require_accuracy_improvement, bool):
+            raise ValueError("require_accuracy_improvement must be a bool")
         if not isinstance(self.mask_policy, MaskPolicy):
             raise ValueError("mask_policy must be a MaskPolicy")
         if self.mask_policy is not MaskPolicy.ALL_ASSISTANT_TURNS:
@@ -438,8 +563,19 @@ class SpeculatorsPipelineConfig:
                 "the Speculators all_assistant pipeline requires "
                 "MaskPolicy.ALL_ASSISTANT_TURNS"
             )
-        if isinstance(self.learning_rate, bool) or not 0 < self.learning_rate <= 1e-5:
-            raise ValueError("learning_rate must be positive and no greater than safe 1e-5")
+        # A fat-finger guard, not a safety boundary: nothing here has ever
+        # established where "unsafe" begins, and the previous bound of ``1e-5``
+        # called itself safe while making training a measured no-op.  See
+        # :data:`speedlm.config.MAX_LEARNING_RATE` for what the bound is and is
+        # not claiming.
+        if (
+            isinstance(self.learning_rate, bool)
+            or not 0 < self.learning_rate <= MAX_LEARNING_RATE
+        ):
+            raise ValueError(
+                "learning_rate must be in (0, "
+                f"{MAX_LEARNING_RATE:g}] (fat-finger guard, not a safety limit)"
+            )
         if (
             isinstance(self.gpu_memory_utilization, bool)
             or not isinstance(self.gpu_memory_utilization, (int, float))
@@ -514,6 +650,13 @@ class _State:
     #: could not express, because it copied the *requested* revision whether or
     #: not resolution had honoured it.
     verifier_pinned: bool | None = None
+    #: Kept/dropped row counts from the truncation filter, for the manifest.
+    rendered_rows: Mapping[str, object] | None = None
+    #: What the warm-start checkpoint declared about its aux layers, and the
+    #: verdict of the alignment check against the ids extraction actually ran.
+    warm_start_aux: Mapping[str, object] | None = None
+    #: Per-epoch validation accuracy series parsed from the trainer's stdout.
+    val_accuracy: Mapping[str, object] | None = None
 
 
 class _Resolver:
@@ -706,14 +849,17 @@ class SpeculatorsTrainingRowRenderer:
         try:
             verifier = self.resolver.verifier(guard, scratch)
             _remove(data)
-            observed_row_count = _render_speculators_dataset(
+            counts = _render_speculators_dataset(
                 snapshot,
                 data,
                 guard=guard,
                 started=started,
                 timeout=timeout_seconds,
+                policy=self.config.truncated_row_policy,
+                minimum_rows=self.config.min_rendered_rows,
             )
-            row_count = self.config.row_count or observed_row_count
+            self.state.rendered_rows = counts.to_dict()
+            row_count = self.config.row_count or counts.written
             prepare = self.runner.run(
                 [
                     str(self.config.training_python),
@@ -1045,6 +1191,12 @@ class SpeculatorsTrainingProcess:
                 guard,
                 timeout_seconds,
             )
+            # Before launching, not after: a misaligned fc trains to completion
+            # and publishes a checkpoint that looks exactly like a good one, so
+            # the only useful place to catch it is ahead of the GPU hours.
+            self.state.warm_start_aux = _check_warm_start_alignment(
+                warm_start, verifier, layers
+            )
             result = self.runner.run(
                 [
                     str(self.config.training_python),
@@ -1093,6 +1245,22 @@ class SpeculatorsTrainingProcess:
                     f"checkpoint_best is missing: {checkpoint}",
                     stderr=result.stderr,
                 )
+            # Recorded before the gate raises, so a cycle rejected for a flat
+            # acceptance proxy still leaves the series that explains why.
+            epochs = parse_val_accuracy_epochs(result.stdout)
+            self.state.val_accuracy = summarize_val_accuracy(epochs)
+            try:
+                self.state.val_accuracy = _check_accuracy_improved(
+                    epochs,
+                    result.stderr,
+                    required=self.config.require_accuracy_improvement,
+                )
+            except AccuracyRegressionError:
+                self.state.val_accuracy = {
+                    **summarize_val_accuracy(epochs),
+                    "verdict": "not_improved",
+                }
+                raise
             val_loss = _parse_val_loss(checkpoint)
             return TrainingResult(checkpoint, result.returncode, result.stderr, val_loss=val_loss)
         except BaseException as error:
@@ -1246,19 +1414,26 @@ class Eagle3Backend(Eagle3Adapter):
         satisfied or missed.
         """
         info = super().describe()
-        if self._state is None or self._state.verifier_pinned is None:
+        state = self._state
+        if state is None:
             return info
         params = dict(info.training_params)
-        params["verifier_revision_satisfied"] = self._state.verifier_pinned
-        if self._state.verifier_pinned:
-            return BackendInfo(
-                verifier_model=info.verifier_model,
-                draft_model=info.draft_model,
-                from_pretrained=info.from_pretrained,
-                training_params=params,
-            )
-        params["verifier_revision"] = None
-        params["verifier_revision_requested"] = self.config.verifier_revision
+        # Recorded whenever the stage that produces them ran, so the manifest
+        # can distinguish "the check passed" from "the check never ran" --
+        # a record written only on one outcome is unfalsifiable.
+        if state.rendered_rows is not None:
+            params["rendered_rows"] = dict(state.rendered_rows)
+        if state.warm_start_aux is not None:
+            params["warm_start_aux"] = dict(state.warm_start_aux)
+        if state.val_accuracy is not None:
+            params["val_accuracy"] = dict(state.val_accuracy)
+        if state.verifier_pinned is not None:
+            params["verifier_revision_satisfied"] = state.verifier_pinned
+            if not state.verifier_pinned:
+                params["verifier_revision"] = None
+                params["verifier_revision_requested"] = self.config.verifier_revision
+        if params == dict(info.training_params):
+            return info
         return BackendInfo(
             verifier_model=info.verifier_model,
             draft_model=info.draft_model,
@@ -1419,7 +1594,63 @@ def _speculators_record(record: Mapping[str, Any]) -> dict[str, Any] | None:
     tools = record.get("tools")
     if isinstance(tools, (list, tuple)) and tools:
         converted_record["tools"] = list(tools)
+    # Carried, not merely consulted.  The filter below decides on it, but the
+    # value also rides into the rendered dataset so the decision is auditable
+    # from the artifact rather than only from this process's logs -- and so a
+    # ``keep`` policy still leaves downstream tooling (``prepare_data.py``
+    # ignores unknown keys; they become an unused dataset column) able to see
+    # which rows were fragments.
+    finish_reason = record.get("finish_reason")
+    if isinstance(finish_reason, str) and finish_reason:
+        converted_record["finish_reason"] = finish_reason
     return converted_record
+
+
+def _is_truncated(record: Mapping[str, Any]) -> bool:
+    """Whether *record*'s completion was cut off rather than finished."""
+    value = record.get("finish_reason")
+    return isinstance(value, str) and value.strip().lower() in TRUNCATED_FINISH_REASONS
+
+
+@dataclass(frozen=True, slots=True)
+class RenderedRowCounts:
+    """What one rendering pass read, kept and discarded."""
+
+    read: int
+    written: int
+    dropped_untrainable: int
+    dropped_truncated: int
+    truncated_seen: int
+    policy: TruncatedRowPolicy
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "read": self.read,
+            "written": self.written,
+            "dropped_untrainable": self.dropped_untrainable,
+            "dropped_truncated": self.dropped_truncated,
+            "truncated_seen": self.truncated_seen,
+            "truncated_row_policy": self.policy.value,
+        }
+
+
+class TruncationFilteredCorpusError(Eagle3Error):
+    """The truncation filter left too few rows to train on."""
+
+    def __init__(self, source: Path, counts: RenderedRowCounts, minimum: int) -> None:
+        self.counts = counts
+        self.minimum = minimum
+        super().__init__(
+            f"dropping truncated rows left {counts.written} trainable rows from "
+            f"{source}, below the floor of {minimum}: "
+            f"{counts.dropped_truncated} of {counts.read} rows were truncated "
+            f"(finish_reason in {sorted(TRUNCATED_FINISH_REASONS)}) and "
+            f"{counts.dropped_untrainable} carried no trainable assistant turn. "
+            "Training on the remainder would be a silently tiny corpus. Either "
+            "raise the serving max_tokens cap so completions finish, lower "
+            "min_rendered_rows, or set truncated_row_policy to 'keep' to accept "
+            "training on truncated fragments."
+        )
 
 
 def _render_speculators_dataset(
@@ -1429,7 +1660,9 @@ def _render_speculators_dataset(
     guard: AbortCheck,
     started: float,
     timeout: float,
-) -> int:
+    policy: TruncatedRowPolicy = TruncatedRowPolicy.KEEP,
+    minimum_rows: int = 1,
+) -> RenderedRowCounts:
     """Rewrite a leased trace snapshot into the Speculators loader contract.
 
     SpeedLM captures a top-level ``messages`` key while the Speculators loader
@@ -1437,8 +1670,19 @@ def _render_speculators_dataset(
     builds an empty dataset without reporting an error. Records that carry no
     trainable assistant turn are dropped, and an entirely empty result fails loudly
     rather than reaching training as a silently empty dataset.
+
+    Rows whose completion was truncated are dropped under
+    :attr:`TruncatedRowPolicy.DROP`; see :data:`TRUNCATED_FINISH_REASONS` for
+    why a truncated row is worse than a missing one.  *minimum_rows* is applied
+    only when that filter actually removed something, so it bounds the damage
+    this filter can do without imposing a floor on corpora that are small for
+    unrelated reasons.
     """
+    read = 0
     written = 0
+    dropped_untrainable = 0
+    dropped_truncated = 0
+    truncated_seen = 0
     try:
         with (
             snapshot.path.open("r", encoding="utf-8") as source,
@@ -1456,18 +1700,48 @@ def _render_speculators_dataset(
                     raise Eagle3Error(f"{location} is not valid JSON") from error
                 if not isinstance(record, Mapping):
                     raise Eagle3Error(f"{location} is not a JSON object")
+                read += 1
                 converted = _speculators_record(record)
                 if converted is None:
+                    dropped_untrainable += 1
                     continue
+                if _is_truncated(record):
+                    truncated_seen += 1
+                    if policy is TruncatedRowPolicy.DROP:
+                        dropped_truncated += 1
+                        continue
                 output.write(json.dumps(converted, ensure_ascii=False) + "\n")
                 written += 1
     except OSError as error:
         raise Eagle3Error(
             f"cannot render Speculators rows from {snapshot.path}: {error}"
         ) from error
+    counts = RenderedRowCounts(
+        read=read,
+        written=written,
+        dropped_untrainable=dropped_untrainable,
+        dropped_truncated=dropped_truncated,
+        truncated_seen=truncated_seen,
+        policy=policy,
+    )
+    logger.info(
+        "rendered %d of %d captured rows (%d untrainable, %d truncated dropped, "
+        "%d truncated seen, policy=%s)",
+        written,
+        read,
+        dropped_untrainable,
+        dropped_truncated,
+        truncated_seen,
+        policy.value,
+    )
+    # Checked before the empty-dataset error so a corpus this filter emptied is
+    # reported as "the truncation filter did it", not as the generic "nothing
+    # converted" that predates the filter and names the wrong cause.
+    if dropped_truncated and written < minimum_rows:
+        raise TruncationFilteredCorpusError(snapshot.path, counts, minimum_rows)
     if not written:
         raise EmptySpeculatorsDatasetError(snapshot.path)
-    return written
+    return counts
 
 
 def _integer(name: str, value: object) -> int:
@@ -1491,6 +1765,247 @@ def _training_environment(config: SpeculatorsPipelineConfig) -> dict[str, str]:
     env = _environment(config)
     env["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
     return env
+
+
+class WarmStartLayerMismatchError(Eagle3Error):
+    """The warm-start checkpoint would train on different aux layers."""
+
+
+def _safetensors_shapes(path: Path) -> dict[str, list[int]]:
+    """Read tensor shapes from a ``safetensors`` file's header alone.
+
+    The format is an 8-byte little-endian header length followed by that many
+    bytes of JSON, so the shapes are readable without materializing any
+    weights -- which matters because the file this is pointed at is measured in
+    gigabytes and sits on the cycle's critical path.
+
+    Returns an empty mapping when the file cannot be parsed as safetensors;
+    callers treat that as "unavailable", never as "mismatched".
+    """
+    try:
+        with path.open("rb") as handle:
+            prefix = handle.read(8)
+            if len(prefix) != 8:
+                return {}
+            length = int.from_bytes(prefix, "little")
+            if not 0 < length <= _SAFETENSORS_HEADER_LIMIT:
+                return {}
+            raw = handle.read(length)
+            if len(raw) != length:
+                return {}
+            header = json.loads(raw.decode("utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(header, Mapping):
+        return {}
+    shapes: dict[str, list[int]] = {}
+    for name, entry in header.items():
+        if name == "__metadata__" or not isinstance(entry, Mapping):
+            continue
+        shape = entry.get("shape")
+        if isinstance(shape, list) and all(isinstance(dim, int) for dim in shape):
+            shapes[name] = list(shape)
+    return shapes
+
+
+def _checkpoint_aux_count(directory: Path, config: Mapping[str, Any]) -> int | None:
+    """How many aux hidden states the checkpoint's ``fc`` was built to consume.
+
+    EAGLE-3's ``fc`` projects the concatenated auxiliary hidden states down to
+    one hidden size, so its input dimension *is* the aux count times the hidden
+    size.  That number is baked into the weights and cannot be renegotiated by
+    a flag, which makes it the one piece of the contract that is checkable
+    without trusting any config field.
+
+    ``None`` when it cannot be determined -- a sharded checkpoint, an
+    unreadable header, an unexpected ``fc`` shape.
+    """
+    layer_config = config.get("transformer_layer_config")
+    if not isinstance(layer_config, Mapping):
+        return None
+    hidden_size = layer_config.get("hidden_size")
+    if isinstance(hidden_size, bool) or not isinstance(hidden_size, int) or hidden_size <= 0:
+        return None
+    shape = _safetensors_shapes(directory / "model.safetensors").get("fc.weight")
+    if shape is None or len(shape) != 2:
+        return None
+    inputs = shape[1]
+    if inputs <= 0 or inputs % hidden_size:
+        return None
+    return inputs // hidden_size
+
+
+def _verifier_hidden_layers(verifier: str) -> int | None:
+    """``num_hidden_layers`` from a resolved verifier snapshot, if readable.
+
+    Only a local directory is consulted.  A bare repo id would need the network
+    to answer, and a guard that reaches the Hub is a guard that can fail for
+    reasons unrelated to what it is guarding.
+    """
+    directory = Path(verifier)
+    if not directory.is_dir():
+        return None
+    try:
+        config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(config, Mapping):
+        return None
+    text_config = config.get("text_config")
+    if isinstance(text_config, Mapping) and "num_hidden_layers" in text_config:
+        config = text_config
+    layers = config.get("num_hidden_layers")
+    if isinstance(layers, bool) or not isinstance(layers, int) or layers <= 0:
+        return None
+    return layers
+
+
+def _speculators_default_aux_ids(num_hidden_layers: int) -> tuple[int, ...]:
+    """The ids ``speculators.models.utils.resolve_target_layer_ids`` substitutes.
+
+    Reproduced rather than imported because the vendored tree is read-only and
+    is not on this process's import path; the formula is pinned by the guard's
+    own tests, so a vendored change that moved it would surface as a failure
+    here rather than as a silent divergence at training time.
+    """
+    return (2, num_hidden_layers // 2, num_hidden_layers - 3)
+
+
+def _check_warm_start_alignment(
+    warm_start: str,
+    verifier: str,
+    layers: tuple[int, ...],
+) -> dict[str, object]:
+    """Prove the trainer will consume the aux layers extraction produced.
+
+    ``scripts/train.py`` calls ``model_class.from_pretrained(path, t2d=, d2t=)``
+    on the ``--from-pretrained`` path and forwards nothing else, so
+    ``--target-layer-ids`` -- the flag this backend passes, and the flag that
+    decided which hidden states the extraction server emitted -- has no effect
+    on what the trainer consumes.  ``Eagle3DraftModel.from_pretrained`` instead
+    re-resolves the ids from the checkpoint's own config, and when that config
+    declares none ``resolve_target_layer_ids`` substitutes ``[2, n//2, n-3]``
+    with only a ``warnings.warn``.  A live run logged exactly that: "Setting
+    target layers to [2, 12, 21]".
+
+    Nothing raises when the two diverge.  The fc input is simply misaligned
+    against the extracted states and the run completes.  Today it survives on
+    the arithmetic coincidence that both sides compute ``[2, n//2, n-3]``, and
+    ``tuning.compounding_warm_start`` defaults to true, so this is the default
+    path, not an edge case.
+
+    The other flags ``train.py`` drops on this path -- ``--num-layers``,
+    ``--draft-arch``, ``--norm-before-fc``, ``--embed-requires-grad`` -- are
+    *not* load-bearing for us: this backend never passes any of them, so there
+    is no requested value for the checkpoint to silently override.  Their
+    checkpoint values are recorded below rather than asserted, because they do
+    describe the architecture that will train (``norm_before_fc`` is true on
+    the gpt-oss drafter and false on the Qwen one) and a manifest that cannot
+    say which one ran cannot explain a cross-model result.
+
+    Returns the record to publish.  Raises
+    :class:`WarmStartLayerMismatchError` when divergence is proven.
+    """
+    record: dict[str, object] = {"extracted_layer_ids": list(layers)}
+    directory = Path(warm_start)
+    config_path = directory / "config.json"
+    if not directory.is_dir() or not config_path.is_file():
+        # A bare repo id: nothing on disk to read, and reaching the Hub here
+        # would let a network fault fail a cycle that is otherwise fine.
+        record["verdict"] = "unverified_no_local_checkpoint"
+        logger.warning(
+            "warm start %s is not a local checkpoint; cannot prove the trainer "
+            "will use the extracted aux layer ids %s",
+            warm_start,
+            list(layers),
+        )
+        return record
+    try:
+        config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as error:
+        raise WarmStartLayerMismatchError(
+            f"warm-start config is unreadable: {config_path}: {error}"
+        ) from error
+    if not isinstance(config, Mapping):
+        raise WarmStartLayerMismatchError(
+            f"warm-start config is not a JSON object: {config_path}"
+        )
+
+    for name in ("norm_before_fc", "embed_requires_grad", "norm_before_residual"):
+        if name in config:
+            record[name] = config[name]
+    layer_config = config.get("transformer_layer_config")
+    if isinstance(layer_config, Mapping) and "num_hidden_layers" in layer_config:
+        record["num_layers"] = layer_config["num_hidden_layers"]
+
+    declared = config.get(_AUX_LAYER_IDS_KEY)
+    aux_count = _checkpoint_aux_count(directory, config)
+    if aux_count is not None:
+        record["checkpoint_aux_count"] = aux_count
+
+    if isinstance(declared, (list, tuple)) and all(
+        not isinstance(value, bool) and isinstance(value, int) for value in declared
+    ):
+        checkpoint_ids = tuple(int(value) for value in declared)
+        record["checkpoint_layer_ids"] = list(checkpoint_ids)
+        record["verdict"] = "checkpoint_declared"
+        if checkpoint_ids != layers:
+            raise WarmStartLayerMismatchError(
+                "warm-start aux layer ids do not match the ids this cycle "
+                f"extracted with: checkpoint {list(checkpoint_ids)} != extracted "
+                f"{list(layers)} ({config_path}). scripts/train.py drops "
+                "--target-layer-ids on the --from-pretrained path, so training "
+                "would silently use the checkpoint's "
+                f"{list(checkpoint_ids)} against hidden states computed for "
+                f"{list(layers)}, misaligning the fc input with no error raised."
+            )
+    elif declared is not None:
+        raise WarmStartLayerMismatchError(
+            f"warm-start config has a malformed {_AUX_LAYER_IDS_KEY}: "
+            f"{declared!r} ({config_path})"
+        )
+    else:
+        record["checkpoint_layer_ids"] = None
+        num_hidden_layers = _verifier_hidden_layers(verifier)
+        if num_hidden_layers is None:
+            record["verdict"] = "unverified_no_verifier_config"
+            logger.warning(
+                "warm start %s declares no %s and the verifier's layer count is "
+                "not readable from %s; cannot prove the trainer will use the "
+                "extracted aux layer ids %s",
+                warm_start,
+                _AUX_LAYER_IDS_KEY,
+                verifier,
+                list(layers),
+            )
+        else:
+            derived = _speculators_default_aux_ids(num_hidden_layers)
+            record["derived_layer_ids"] = list(derived)
+            record["verifier_num_hidden_layers"] = num_hidden_layers
+            record["verdict"] = "derived_from_verifier"
+            if derived != layers:
+                raise WarmStartLayerMismatchError(
+                    "warm-start aux layer ids do not match the ids this cycle "
+                    f"extracted with: checkpoint {list(derived)} != extracted "
+                    f"{list(layers)} ({config_path}). The checkpoint declares no "
+                    f"{_AUX_LAYER_IDS_KEY}, so speculators' "
+                    "resolve_target_layer_ids substitutes [2, n//2, n-3] from the "
+                    f"verifier's {num_hidden_layers} layers, and scripts/train.py "
+                    "drops --target-layer-ids on the --from-pretrained path -- so "
+                    f"training would silently use the checkpoint's {list(derived)} "
+                    f"against hidden states computed for {list(layers)}, "
+                    "misaligning the fc input with no error raised."
+                )
+
+    if aux_count is not None and aux_count != len(layers):
+        raise WarmStartLayerMismatchError(
+            f"warm-start checkpoint's fc consumes {aux_count} auxiliary hidden "
+            f"states but this cycle extracted {len(layers)} ({list(layers)}); "
+            f"scripts/train.py drops --target-layer-ids on the --from-pretrained "
+            f"path, so training would silently use the checkpoint's arity "
+            f"({config_path})."
+        )
+    return record
 
 
 def _pin_warm_start(
@@ -2004,6 +2519,94 @@ def _writable(path: Path) -> None:
         with contextlib.suppress(OSError):
             child.chmod(0o755 if child.is_dir() else 0o644)
     path.chmod(0o755)
+
+
+class AccuracyRegressionError(TrainingError):
+    """Training's acceptance proxy did not improve across epochs."""
+
+
+def parse_val_accuracy_epochs(stdout: str) -> list[dict[str, float]]:
+    """Per-epoch validation metrics, in the order the trainer logged them.
+
+    Each entry maps a bare metric name (``full_acc_0``, ``cond_acc_1``,
+    ``loss_2``, ``loss``) to its value; the trainer's ``_epoch`` suffix is
+    stripped, and the epoch index the record reported is stored under
+    ``"epoch"``.
+
+    Robust to Rich's 80-column wrapping by matching whole records with DOTALL
+    rather than scanning line by line -- see :data:`_VAL_EPOCH_RECORD`.  Records
+    spanning the elision marker :func:`_persist_streams` inserts into an
+    oversized log are skipped rather than parsed across the hole.
+    """
+    text = _LOG_SOURCE_TAG.sub("", stdout)
+    epochs: list[dict[str, float]] = []
+    for match in _VAL_EPOCH_RECORD.finditer(text):
+        span = match.group(0)
+        if "elided" in span:
+            continue
+        metrics: dict[str, float] = {}
+        for name, value in _VAL_EPOCH_METRIC.findall(span):
+            try:
+                metrics[name] = float(value)
+            except ValueError:  # pragma: no cover - regex admits only floats
+                continue
+        if not metrics:
+            continue
+        metrics["epoch"] = float(match.group(1))
+        epochs.append(metrics)
+    return epochs
+
+
+def summarize_val_accuracy(epochs: Sequence[Mapping[str, float]]) -> dict[str, object]:
+    """Condense a parsed epoch series into the record the manifest carries."""
+    key = ACCEPTANCE_METRIC.removesuffix("_epoch")
+    summary: dict[str, object] = {
+        "metric": ACCEPTANCE_METRIC,
+        "epochs": [dict(sorted(entry.items())) for entry in epochs],
+    }
+    series = [entry[key] for entry in epochs if key in entry]
+    if series:
+        summary["first"] = series[0]
+        summary["final"] = series[-1]
+        summary["delta"] = series[-1] - series[0]
+        summary["series"] = series
+    return summary
+
+
+def _check_accuracy_improved(
+    epochs: Sequence[Mapping[str, float]],
+    stderr: str,
+    *,
+    required: bool,
+) -> dict[str, object]:
+    """Gate the cycle on the acceptance proxy rather than on the loss.
+
+    The trainer's summed TTT loss falls across epochs while
+    :data:`ACCEPTANCE_METRIC` sits flat, so a cycle gated on ``val_loss``
+    promotes a checkpoint whose step-0 acceptance did not move.  This is that
+    gate.  Silent when fewer than two epochs were logged -- there is nothing to
+    compare a single epoch against, and inventing a verdict there would be the
+    kind of check that cannot fail.
+    """
+    summary = summarize_val_accuracy(epochs)
+    series = summary.get("series")
+    if not isinstance(series, list) or len(series) < 2:
+        summary["verdict"] = "not_evaluated"
+        return summary
+    improved = series[-1] > series[0]
+    summary["verdict"] = "improved" if improved else "not_improved"
+    if improved or not required:
+        return summary
+    raise AccuracyRegressionError(
+        f"{ACCEPTANCE_METRIC} did not improve across training: "
+        f"{series[0]} -> {series[-1]} over {len(series)} epochs (series "
+        f"{series}). This is the drafter's top-1 at TTT step 0 and the direct "
+        "proxy for step-0 acceptance; the summed TTT loss can fall while it "
+        "stays flat, because the sum is dominated by the later steps. Refusing "
+        "to promote a checkpoint that did not move it. Set "
+        "require_accuracy_improvement to false to train anyway.",
+        stderr=stderr,
+    )
 
 
 def _parse_val_loss(checkpoint_best: Path) -> float | None:

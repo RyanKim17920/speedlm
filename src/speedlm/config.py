@@ -28,6 +28,37 @@ STARTUP_TIMEOUT_ENV_VAR = "SPEEDLM_STARTUP_TIMEOUT_SECONDS"
 DEFAULT_STARTUP_STALL_SECONDS = 600.0
 STARTUP_STALL_ENV_VAR = "SPEEDLM_STARTUP_STALL_SECONDS"
 
+#: Learning rate the Speculators reference recipe trains a draft head at
+#: (``speculators/scripts/train.py``: ``--lr`` default ``1e-4``).  This is the
+#: value the upstream project has actually validated EAGLE-3 heads with, so it
+#: is what this project defaults to as well.
+REFERENCE_LEARNING_RATE = 1e-4
+#: Upper bound on ``tuning.learning_rate``.
+#:
+#: The bound exists as a fat-finger guard -- a config that says ``1`` or
+#: ``0.1`` where it meant ``1e-4`` would wreck a draft head, and there is no
+#: cheap way to notice that except at parse time.  It is *not* a claim about
+#: where the safe/unsafe boundary lies, and it must not be read as one: the
+#: previous bound of ``1e-5`` was introduced with no recorded rationale (commit
+#: ee54b35, "feat(config): define portable idle tuning settings" -- no comment,
+#: no docstring, no message body justifying it) and it silently made training a
+#: no-op.  At ``1e-5`` over the ~202 optimizer steps a real cycle runs, the
+#: AdamW update to a norm weight of magnitude ~1.0-1.5 never reaches half a
+#: bf16 ULP and is truncated away at checkpoint write.  Measured on the
+#: published artifacts: every RMSNorm tensor moved EXACTLY 0.000000 and every
+#: Linear moved 1-5 bf16 ULPs (max relative delta 0.0058-0.0061 against a bf16
+#: relative ULP of 2^-7 = 0.0078), while the trainer's own step-0 accuracy
+#: stayed flat across epochs (gpt-oss 0.706/0.705/0.705).
+#:
+#: ``1e-3`` is a deliberate decade of headroom above the reference ``1e-4``:
+#: high enough that the reference recipe and any ordinary 2-5x sweep around it
+#: are comfortably inside the bound rather than sitting on its edge, low enough
+#: that the mistakes worth catching -- a dropped exponent (``1e-4`` -> ``1``),
+#: a shifted one (``1e-4`` -> ``1e-1``), a stray percent -- are still rejected.
+#: Raise it if a sweep has evidence for a larger rate; do not raise it to make
+#: one config load.
+MAX_LEARNING_RATE = 1e-3
+
 # ---------------------------------------------------------------------------
 # Exceptions
 # ---------------------------------------------------------------------------
@@ -819,7 +850,12 @@ class IdleTuningConfig:
     vllm_python: str | None = None
     prepared_validator_script: str | None = None
     sequence_length: int = 16_384
-    learning_rate: float = 1e-5
+    #: Optimizer learning rate for draft-head training, bounded by
+    #: :data:`MAX_LEARNING_RATE`.  Defaults to the Speculators reference recipe
+    #: (:data:`REFERENCE_LEARNING_RATE`); the previous default of ``1e-5`` was
+    #: 10x below it and produced checkpoints bit-identical to their
+    #: initialisation in every norm tensor.
+    learning_rate: float = REFERENCE_LEARNING_RATE
     epochs: int = 1
     #: Requests kept in flight by the Speculators *offline hidden-state
     #: extraction* step (``data_generation_offline.py --concurrency``).
@@ -967,9 +1003,11 @@ class IdleTuningConfig:
         if (
             isinstance(self.learning_rate, bool)
             or not isinstance(self.learning_rate, (int, float))
-            or not 0 < self.learning_rate <= 1e-5
+            or not 0 < self.learning_rate <= MAX_LEARNING_RATE
         ):
-            raise ConfigError("tuning.learning_rate must be in (0, 1e-5]")
+            raise ConfigError(
+                f"tuning.learning_rate must be in (0, {MAX_LEARNING_RATE:g}]"
+            )
         _validate_int_gte(self.epochs, "tuning.epochs", 1)
         _validate_int_gte(
             self.extraction_concurrency,

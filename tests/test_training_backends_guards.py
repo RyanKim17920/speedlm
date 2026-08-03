@@ -1,0 +1,883 @@
+"""Guards added to the EAGLE-3 backend: warm-start alignment, the acceptance
+gate, and the truncated-row filter.
+
+Every test here is written to be *capable of failing*.  The fixtures are real
+artifacts, not stand-ins: the trainer stdout is a verbatim excerpt of a
+production run's ``training-logs/stdout.log`` including Rich's 80-column
+wrapping, and the safetensors files are genuine containers whose headers are
+actually parsed for a shape.  The recurring defect in this repo is a green test
+that cannot observe the thing it claims to check -- an existing example writes
+an empty ``model.safetensors`` and stubs the reader to return a hardcoded key
+set, so it is structurally incapable of seeing a tensor shape.
+"""
+
+from __future__ import annotations
+
+import json
+import struct
+import time
+from collections.abc import Callable, Mapping, Sequence
+from pathlib import Path
+
+import pytest
+
+from speedlm.training.backends.eagle3 import (
+    ACCEPTANCE_METRIC,
+    TRUNCATED_FINISH_REASONS,
+    AccuracyRegressionError,
+    Eagle3Error,
+    EmptySpeculatorsDatasetError,
+    RenderedRowCounts,
+    SpeculatorsPipelineConfig,
+    SpeculatorsTrainingProcess,
+    TruncatedRowPolicy,
+    TruncationFilteredCorpusError,
+    WarmStartLayerMismatchError,
+    _check_warm_start_alignment,
+    _checkpoint_aux_count,
+    _render_speculators_dataset,
+    _Resolver,
+    _speculators_default_aux_ids,
+    _speculators_record,
+    _State,
+    parse_val_accuracy_epochs,
+    summarize_val_accuracy,
+)
+from speedlm.training.backends.speculators_runner import ProcessResult, RunningProcess
+from speedlm.tuner.eagle3 import TraceSnapshot
+
+# ---------------------------------------------------------------------------
+# Fixture: a verbatim excerpt of a real trainer stdout log.
+#
+# Source: /data/ryan.kim/speedlm-runs/qwen-cross-20260731T235000Z/results/
+#   live-idle-tuning/speedlm_home/runs/6b150b5c424f483c83f0bc49c79bc4c5/
+#   training-logs/stdout.log
+#
+# One train-step record (which the parser must ignore) followed by all three
+# validation-epoch records.  The 20-space continuation indent and the
+# right-aligned ``trainer.py:NNN`` source tags are Rich's, and the record
+# boundaries fall exactly where they fell in the run -- which is the hazard: a
+# parser that scans line by line reads only whichever TTT step happened to land
+# on the line it looked at.  (Rich's trailing pad to column 80 is the one thing
+# not reproduced, because a formatter would strip it; the parser was separately
+# run against all twelve unmodified logs under
+# /data/ryan.kim/speedlm-runs/*/**/training-logs/stdout.log and recovered three
+# epochs from each.)
+# ---------------------------------------------------------------------------
+REAL_TRAINER_STDOUT = """\
+[23:47:39] INFO     train/loss_0=1.141, train/full_acc_0=0.636,   trainer.py:233
+                    train/cond_acc_0=0.636, train/loss_1=4.125,
+                    train/full_acc_1=0.367,
+                    train/cond_acc_1=0.576, train/loss_2=5.625,
+                    train/full_acc_2=0.171,
+                    train/cond_acc_2=0.466, train/loss=10.891,
+           INFO     Validation epoch 1/3 started                  trainer.py:359
+Epoch 0 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 7/7  [ 0:00:11 < 0:00:00 , 39 it/s ]
+[23:47:55] INFO     val/loss_0_epoch=1.087,                       trainer.py:290
+                    val/full_acc_0_epoch=0.648,
+                    val/cond_acc_0_epoch=0.648,
+                    val/loss_1_epoch=3.469,
+                    val/full_acc_1_epoch=0.374,
+                    val/cond_acc_1_epoch=0.577,
+                    val/loss_2_epoch=4.746,
+                    val/full_acc_2_epoch=0.171,
+                    val/cond_acc_2_epoch=0.457,
+                    val/loss_epoch=9.301, epoch=0
+           INFO     Validation epoch 1/3 completed                trainer.py:361
+[23:48:05] INFO     Updated checkpoint_best -> 0                  trainer.py:332
+           INFO     Validation epoch 2/3 started                  trainer.py:359
+Epoch 1 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 7/7  [ 0:00:00 < 0:00:00 , 20 it/s ]
+[23:48:12] INFO     val/loss_0_epoch=1.093,                       trainer.py:290
+                    val/full_acc_0_epoch=0.647,
+                    val/cond_acc_0_epoch=0.647,
+                    val/loss_1_epoch=3.379,
+                    val/full_acc_1_epoch=0.372,
+                    val/cond_acc_1_epoch=0.574,
+                    val/loss_2_epoch=4.680,
+                    val/full_acc_2_epoch=0.169,
+                    val/cond_acc_2_epoch=0.455,
+                    val/loss_epoch=9.152, epoch=1
+           INFO     Validation epoch 2/3 completed                trainer.py:361
+[23:48:22] INFO     Updated checkpoint_best -> 1                  trainer.py:332
+           INFO     Validation epoch 3/3 started                  trainer.py:359
+Epoch 2 100% ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 7/7  [ 0:00:00 < 0:00:00 , 20 it/s ]
+[23:48:29] INFO     val/loss_0_epoch=1.091,                       trainer.py:290
+                    val/full_acc_0_epoch=0.648,
+                    val/cond_acc_0_epoch=0.648,
+                    val/loss_1_epoch=3.371,
+                    val/full_acc_1_epoch=0.372,
+                    val/cond_acc_1_epoch=0.574,
+                    val/loss_2_epoch=4.664,
+                    val/full_acc_2_epoch=0.169,
+                    val/cond_acc_2_epoch=0.454,
+                    val/loss_epoch=9.125, epoch=2
+           INFO     Validation epoch 3/3 completed                trainer.py:361
+"""
+
+
+def _write_safetensors(path: Path, shapes: Mapping[str, Sequence[int]]) -> None:
+    """Write a genuine safetensors container with the given tensor shapes.
+
+    Real bytes, real header, real offsets -- so a reader that does not actually
+    parse the header cannot pass a test that uses this.
+    """
+    header: dict[str, object] = {}
+    payload = bytearray()
+    for name, shape in shapes.items():
+        count = 1
+        for dim in shape:
+            count *= dim
+        start = len(payload)
+        payload.extend(struct.pack(f"<{count}f", *([0.0] * count)))
+        header[name] = {
+            "dtype": "F32",
+            "shape": list(shape),
+            "data_offsets": [start, len(payload)],
+        }
+    raw = json.dumps(header).encode("utf-8")
+    with path.open("wb") as handle:
+        handle.write(len(raw).to_bytes(8, "little"))
+        handle.write(raw)
+        handle.write(payload)
+
+
+def _checkpoint(
+    directory: Path,
+    *,
+    hidden_size: int = 4,
+    aux_ids: Sequence[int] | None = None,
+    declare_aux: bool = True,
+    aux_count: int = 3,
+    norm_before_fc: bool = False,
+) -> Path:
+    """Materialize a warm-start checkpoint directory shaped like a real one."""
+    directory.mkdir(parents=True, exist_ok=True)
+    config: dict[str, object] = {
+        "speculators_model_type": "eagle3",
+        "norm_before_fc": norm_before_fc,
+        "embed_requires_grad": False,
+        "norm_before_residual": True,
+        "transformer_layer_config": {
+            "hidden_size": hidden_size,
+            "num_hidden_layers": 1,
+        },
+        "speculators_config": {"verifier": {"name_or_path": "org/verifier"}},
+    }
+    if declare_aux:
+        config["eagle_aux_hidden_state_layer_ids"] = (
+            list(aux_ids) if aux_ids is not None else None
+        )
+    (directory / "config.json").write_text(json.dumps(config), encoding="utf-8")
+    _write_safetensors(
+        directory / "model.safetensors",
+        {"fc.weight": [hidden_size, aux_count * hidden_size]},
+    )
+    return directory
+
+
+def _verifier(directory: Path, num_hidden_layers: int) -> Path:
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "config.json").write_text(
+        json.dumps({"num_hidden_layers": num_hidden_layers}), encoding="utf-8"
+    )
+    return directory
+
+
+# ===========================================================================
+# FIX 1 -- warm-start aux layer alignment
+# ===========================================================================
+
+
+def test_aux_count_is_read_from_the_real_safetensors_header(tmp_path: Path) -> None:
+    """The aux count must come from the weights, not from a config field.
+
+    Shapes here are distinct per case, so a reader that returned a constant
+    fails.
+    """
+    for aux_count in (2, 3, 5):
+        directory = _checkpoint(
+            tmp_path / f"ckpt-{aux_count}", hidden_size=8, aux_count=aux_count
+        )
+        config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+        assert _checkpoint_aux_count(directory, config) == aux_count
+
+
+def test_aux_count_is_none_when_the_container_is_empty(tmp_path: Path) -> None:
+    """An empty ``model.safetensors`` must read as unavailable, never as a match.
+
+    This is the exact fixture shape that made an existing test in this suite
+    unable to observe anything; here it is asserted to be unobservable.
+    """
+    directory = _checkpoint(tmp_path / "ckpt")
+    (directory / "model.safetensors").write_bytes(b"")
+    config = json.loads((directory / "config.json").read_text(encoding="utf-8"))
+
+    assert _checkpoint_aux_count(directory, config) is None
+
+
+def test_declared_ids_that_differ_from_extraction_fail_by_name(tmp_path: Path) -> None:
+    """The whole point of the guard: divergence must not be silent."""
+    directory = _checkpoint(tmp_path / "ckpt", aux_ids=[2, 18, 33])
+
+    with pytest.raises(WarmStartLayerMismatchError) as caught:
+        _check_warm_start_alignment(str(directory), "org/verifier", (3, 9, 15))
+
+    message = str(caught.value)
+    assert "[2, 18, 33]" in message, message
+    assert "[3, 9, 15]" in message, message
+    assert "silently use the checkpoint's" in message, message
+
+
+def test_declared_ids_that_match_pass_and_record_the_evidence(tmp_path: Path) -> None:
+    directory = _checkpoint(tmp_path / "ckpt", aux_ids=[3, 9, 15], norm_before_fc=True)
+
+    record = _check_warm_start_alignment(str(directory), "org/verifier", (3, 9, 15))
+
+    assert record["verdict"] == "checkpoint_declared"
+    assert record["checkpoint_layer_ids"] == [3, 9, 15]
+    assert record["extracted_layer_ids"] == [3, 9, 15]
+    assert record["checkpoint_aux_count"] == 3
+    # Dropped by scripts/train.py on this path but not requested by us; recorded
+    # so a cross-model manifest can say which architecture actually trained.
+    assert record["norm_before_fc"] is True
+    assert record["embed_requires_grad"] is False
+    assert record["num_layers"] == 1
+
+
+def test_undeclared_ids_are_derived_from_the_verifier_and_checked(
+    tmp_path: Path,
+) -> None:
+    """A checkpoint declaring nothing is the *default* stock warm start.
+
+    ``resolve_target_layer_ids`` then substitutes ``[2, n//2, n-3]`` from the
+    verifier with only a ``warnings.warn``, and ``--target-layer-ids`` is
+    dropped -- so the check has to reproduce that substitution to see it.
+    """
+    directory = _checkpoint(tmp_path / "ckpt", aux_ids=None)
+    verifier = _verifier(tmp_path / "verifier", 36)
+
+    with pytest.raises(WarmStartLayerMismatchError) as caught:
+        _check_warm_start_alignment(str(directory), str(verifier), (3, 9, 15))
+
+    message = str(caught.value)
+    # [2, 36 // 2, 36 - 3]
+    assert "[2, 18, 33]" in message, message
+    assert "[3, 9, 15]" in message, message
+    assert "silently use the checkpoint's" in message, message
+
+
+def test_undeclared_ids_matching_the_substitution_pass(tmp_path: Path) -> None:
+    """The arithmetic coincidence the production path currently survives on."""
+    directory = _checkpoint(tmp_path / "ckpt", aux_ids=None)
+    verifier = _verifier(tmp_path / "verifier", 36)
+
+    record = _check_warm_start_alignment(str(directory), str(verifier), (2, 18, 33))
+
+    assert record["verdict"] == "derived_from_verifier"
+    assert record["derived_layer_ids"] == [2, 18, 33]
+    assert record["verifier_num_hidden_layers"] == 36
+    assert record["checkpoint_layer_ids"] is None
+
+
+def test_substitution_formula_matches_speculators(tmp_path: Path) -> None:
+    """Pin the reproduced formula so a vendored change surfaces here."""
+    assert _speculators_default_aux_ids(36) == (2, 18, 33)
+    assert _speculators_default_aux_ids(24) == (2, 12, 21)
+    assert _speculators_default_aux_ids(11) == (2, 5, 8)
+
+
+def test_aux_arity_mismatch_fails_even_when_ids_agree(tmp_path: Path) -> None:
+    """The fc's input width is baked into the weights and cannot be renegotiated."""
+    directory = _checkpoint(tmp_path / "ckpt", aux_ids=[1, 2, 3, 4], aux_count=3)
+
+    with pytest.raises(WarmStartLayerMismatchError, match="auxiliary hidden states"):
+        _check_warm_start_alignment(str(directory), "org/verifier", (1, 2, 3, 4))
+
+
+def test_a_bare_repo_id_is_reported_unverified_not_silently_passed(
+    tmp_path: Path,
+) -> None:
+    record = _check_warm_start_alignment("Org/stock-drafter", "org/verifier", (2, 3, 4))
+
+    assert record["verdict"] == "unverified_no_local_checkpoint"
+
+
+def test_undeclared_ids_without_a_readable_verifier_are_reported_unverified(
+    tmp_path: Path,
+) -> None:
+    directory = _checkpoint(tmp_path / "ckpt", aux_ids=None)
+
+    record = _check_warm_start_alignment(str(directory), "org/verifier", (2, 18, 33))
+
+    assert record["verdict"] == "unverified_no_verifier_config"
+
+
+def test_malformed_declared_ids_are_rejected(tmp_path: Path) -> None:
+    directory = _checkpoint(tmp_path / "ckpt")
+    config_path = directory / "config.json"
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config["eagle_aux_hidden_state_layer_ids"] = ["two", "eighteen"]
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+
+    with pytest.raises(WarmStartLayerMismatchError, match="malformed"):
+        _check_warm_start_alignment(str(directory), "org/verifier", (2, 18, 33))
+
+
+class _RecordingRunner:
+    """Records every subprocess launch and never actually runs one."""
+
+    def __init__(self, stdout: str = "") -> None:
+        self.run_calls: list[tuple[str, ...]] = []
+        self.stdout = stdout
+
+    def run(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: Path,
+        env: Mapping[str, str] | None,
+        timeout_seconds: float,
+        should_abort: Callable[[], bool],
+    ) -> ProcessResult:
+        del cwd, env, timeout_seconds, should_abort
+        command = tuple(argv)
+        self.run_calls.append(command)
+        if Path(command[1]).name == "train.py":
+            checkpoint = Path(command[command.index("--save-path") + 1])
+            (checkpoint / "checkpoint_best").mkdir(parents=True, exist_ok=True)
+        return ProcessResult(command, 0, self.stdout, "")
+
+    # The stages under test never start a long-running process; these exist so
+    # the fake really satisfies ProcessRunner rather than being cast to it.
+    def start(
+        self,
+        argv: Sequence[str],
+        *,
+        cwd: Path,
+        env: Mapping[str, str] | None,
+        timeout_seconds: float,
+    ) -> RunningProcess:
+        raise AssertionError(f"unexpected long-running process: {list(argv)}")
+
+    def check_running(
+        self, process: RunningProcess, *, should_abort: Callable[[], bool]
+    ) -> int | None:
+        raise AssertionError("unexpected check_running")
+
+    def terminate(
+        self, process: RunningProcess, *, grace_seconds: float
+    ) -> ProcessResult:
+        raise AssertionError("unexpected terminate")
+
+    @property
+    def scripts(self) -> list[str]:
+        return [Path(call[1]).name for call in self.run_calls if len(call) > 1]
+
+
+def _training_process(
+    tmp_path: Path,
+    runner: _RecordingRunner,
+    warm_start: Path,
+    verifier: Path,
+    *,
+    layers: tuple[int, ...] = (3, 9, 15),
+    require_accuracy_improvement: bool = True,
+) -> tuple[SpeculatorsTrainingProcess, _State]:
+    config = SpeculatorsPipelineConfig(
+        prepared_validator_script=tmp_path / "check.py",
+        speculators_repo=tmp_path / "speculators",
+        training_python=tmp_path / "python",
+        verifier_model=str(verifier),
+        warm_start_model=str(warm_start),
+        target_layer_ids=layers,
+        require_accuracy_improvement=require_accuracy_improvement,
+    )
+    state = _State()
+    state.prepared = tmp_path / "prepared"
+    state.verifier = str(verifier)
+    state.warm_start = str(warm_start)
+    state.warm_start_source = str(warm_start)
+    resolver = _Resolver(config, runner, state)
+    return SpeculatorsTrainingProcess(config, runner, resolver, state), state
+
+
+def test_the_guard_runs_before_the_gpu_hours(tmp_path: Path) -> None:
+    """A misaligned warm start must stop the cycle, not merely annotate it."""
+    warm_start = _checkpoint(tmp_path / "warm", aux_ids=[2, 18, 33])
+    verifier = _verifier(tmp_path / "verifier", 36)
+    runner = _RecordingRunner()
+    process, _ = _training_process(tmp_path, runner, warm_start, verifier)
+
+    with pytest.raises(WarmStartLayerMismatchError):
+        process.train(
+            tmp_path / "hidden",
+            tmp_path / "out",
+            from_pretrained=str(warm_start),
+            training_params={"target_layer_ids": (3, 9, 15)},
+            timeout_seconds=60.0,
+            should_abort=lambda: False,
+        )
+
+    assert "train.py" not in runner.scripts
+
+
+# ===========================================================================
+# FIX 2 -- gate on the acceptance metric, not the loss
+# ===========================================================================
+
+
+def test_parses_every_epoch_out_of_a_real_wrapped_log() -> None:
+    epochs = parse_val_accuracy_epochs(REAL_TRAINER_STDOUT)
+
+    assert [entry["epoch"] for entry in epochs] == [0.0, 1.0, 2.0]
+    # Every TTT step of every epoch, i.e. the wrap was actually reassembled.
+    assert [entry["full_acc_0"] for entry in epochs] == [0.648, 0.647, 0.648]
+    assert [entry["full_acc_1"] for entry in epochs] == [0.374, 0.372, 0.372]
+    assert [entry["full_acc_2"] for entry in epochs] == [0.171, 0.169, 0.169]
+    assert [entry["cond_acc_1"] for entry in epochs] == [0.577, 0.574, 0.574]
+    assert [entry["loss"] for entry in epochs] == [9.301, 9.152, 9.125]
+    # train/ records must not be mistaken for validation records.
+    assert all("epoch" in entry for entry in epochs)
+    assert 0.636 not in [entry["full_acc_0"] for entry in epochs]
+
+
+def test_the_loss_falls_while_the_acceptance_proxy_does_not() -> None:
+    """The premise of the whole fix, asserted on the real numbers."""
+    epochs = parse_val_accuracy_epochs(REAL_TRAINER_STDOUT)
+
+    assert epochs[-1]["loss"] < epochs[0]["loss"]
+    assert epochs[-1]["full_acc_0"] <= epochs[0]["full_acc_0"]
+
+
+def test_cond_acc_is_the_conditional_series_and_full_acc_is_not() -> None:
+    """Which series to key on is an arithmetic question, so answer it here.
+
+    ``cond_acc_k == full_acc_k / full_acc_{k-1}``: the two share a numerator
+    and differ only in denominator.  Keying the gate on the conditional series
+    would measure survival given survival, not acceptance.
+    """
+    for entry in parse_val_accuracy_epochs(REAL_TRAINER_STDOUT):
+        assert entry["cond_acc_0"] == entry["full_acc_0"]
+        assert entry["cond_acc_1"] == pytest.approx(
+            entry["full_acc_1"] / entry["full_acc_0"], abs=0.002
+        )
+        assert entry["cond_acc_2"] == pytest.approx(
+            entry["full_acc_2"] / entry["full_acc_1"], abs=0.002
+        )
+    assert ACCEPTANCE_METRIC == "full_acc_0_epoch"
+
+
+def test_a_record_spanning_the_log_elision_is_skipped() -> None:
+    """Oversized logs get their middle removed; do not parse across the hole."""
+    corrupt = REAL_TRAINER_STDOUT.replace(
+        "                    val/cond_acc_0_epoch=0.647,",
+        "\n...[918273 bytes elided]...\n",
+        1,
+    )
+
+    epochs = parse_val_accuracy_epochs(corrupt)
+
+    assert [entry["epoch"] for entry in epochs] == [0.0, 2.0]
+
+
+def test_a_flat_final_epoch_fails_the_cycle(tmp_path: Path) -> None:
+    warm_start = _checkpoint(tmp_path / "warm", aux_ids=[3, 9, 15])
+    verifier = _verifier(tmp_path / "verifier", 36)
+    runner = _RecordingRunner(stdout=REAL_TRAINER_STDOUT)
+    process, state = _training_process(tmp_path, runner, warm_start, verifier)
+
+    with pytest.raises(AccuracyRegressionError) as caught:
+        process.train(
+            tmp_path / "hidden",
+            tmp_path / "out",
+            from_pretrained=str(warm_start),
+            training_params={"target_layer_ids": (3, 9, 15)},
+            timeout_seconds=60.0,
+            should_abort=lambda: False,
+        )
+
+    assert "full_acc_0_epoch" in str(caught.value)
+    assert "train.py" in runner.scripts
+    assert state.val_accuracy is not None
+    assert state.val_accuracy["verdict"] == "not_improved"
+    assert state.val_accuracy["series"] == [0.648, 0.647, 0.648]
+
+
+def test_an_improving_run_is_allowed_through(tmp_path: Path) -> None:
+    # Lift only the final epoch's step-0 accuracy; everything else is untouched.
+    tail = REAL_TRAINER_STDOUT.rindex("val/full_acc_0_epoch=0.648,")
+    improving = (
+        REAL_TRAINER_STDOUT[:tail]
+        + "val/full_acc_0_epoch=0.712,"
+        + REAL_TRAINER_STDOUT[tail + len("val/full_acc_0_epoch=0.648,") :]
+    )
+    assert improving != REAL_TRAINER_STDOUT
+    warm_start = _checkpoint(tmp_path / "warm", aux_ids=[3, 9, 15])
+    verifier = _verifier(tmp_path / "verifier", 36)
+    runner = _RecordingRunner(stdout=improving)
+    process, state = _training_process(tmp_path, runner, warm_start, verifier)
+
+    process.train(
+        tmp_path / "hidden",
+        tmp_path / "out",
+        from_pretrained=str(warm_start),
+        training_params={"target_layer_ids": (3, 9, 15)},
+        timeout_seconds=60.0,
+        should_abort=lambda: False,
+    )
+
+    assert state.val_accuracy is not None
+    assert state.val_accuracy["verdict"] == "improved"
+    assert state.val_accuracy["series"] == [0.648, 0.647, 0.712]
+
+
+def test_the_gate_is_configurable_off(tmp_path: Path) -> None:
+    warm_start = _checkpoint(tmp_path / "warm", aux_ids=[3, 9, 15])
+    verifier = _verifier(tmp_path / "verifier", 36)
+    runner = _RecordingRunner(stdout=REAL_TRAINER_STDOUT)
+    process, state = _training_process(
+        tmp_path, runner, warm_start, verifier, require_accuracy_improvement=False
+    )
+
+    process.train(
+        tmp_path / "hidden",
+        tmp_path / "out",
+        from_pretrained=str(warm_start),
+        training_params={"target_layer_ids": (3, 9, 15)},
+        timeout_seconds=60.0,
+        should_abort=lambda: False,
+    )
+
+    # Off means "do not fail", never "do not look".
+    assert state.val_accuracy is not None
+    assert state.val_accuracy["verdict"] == "not_improved"
+
+
+def test_one_epoch_is_not_evaluated_rather_than_passed(tmp_path: Path) -> None:
+    """Nothing to compare against; inventing a verdict is the untestable kind."""
+    single = REAL_TRAINER_STDOUT[: REAL_TRAINER_STDOUT.index("Validation epoch 2/3")]
+    summary = summarize_val_accuracy(parse_val_accuracy_epochs(single))
+
+    assert summary["series"] == [0.648]
+
+    warm_start = _checkpoint(tmp_path / "warm", aux_ids=[3, 9, 15])
+    verifier = _verifier(tmp_path / "verifier", 36)
+    runner = _RecordingRunner(stdout=single)
+    process, state = _training_process(tmp_path, runner, warm_start, verifier)
+
+    process.train(
+        tmp_path / "hidden",
+        tmp_path / "out",
+        from_pretrained=str(warm_start),
+        training_params={"target_layer_ids": (3, 9, 15)},
+        timeout_seconds=60.0,
+        should_abort=lambda: False,
+    )
+
+    assert state.val_accuracy is not None
+    assert state.val_accuracy["verdict"] == "not_evaluated"
+
+
+# ===========================================================================
+# FIX 3 -- carry finish_reason and filter truncated rows
+# ===========================================================================
+
+
+def _snapshot(path: Path, records: Sequence[Mapping[str, object]]) -> TraceSnapshot:
+    path.write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+    )
+    return TraceSnapshot(path, "hash")
+
+
+def _row(index: int, finish_reason: object = ...) -> dict[str, object]:
+    record: dict[str, object] = {
+        "id": f"row-{index}",
+        "messages": [
+            {"role": "user", "content": "q"},
+            {"role": "assistant", "content": "a"},
+        ],
+    }
+    if finish_reason is not ...:
+        record["finish_reason"] = finish_reason
+    return record
+
+
+def _render(
+    tmp_path: Path,
+    records: Sequence[Mapping[str, object]],
+    *,
+    policy: TruncatedRowPolicy = TruncatedRowPolicy.KEEP,
+    minimum_rows: int = 1,
+    name: str = "out.jsonl",
+) -> tuple[RenderedRowCounts, list[dict[str, object]]]:
+    snapshot = _snapshot(tmp_path / f"snap-{name}", records)
+    destination = tmp_path / name
+    counts = _render_speculators_dataset(
+        snapshot,
+        destination,
+        guard=lambda: False,
+        started=time.monotonic(),
+        timeout=60.0,
+        policy=policy,
+        minimum_rows=minimum_rows,
+    )
+    written = [
+        json.loads(line)
+        for line in destination.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    return counts, written
+
+
+def test_finish_reason_reaches_the_rendered_row() -> None:
+    """It is captured, persisted and leased; it was dropped only here."""
+    converted = _speculators_record(_row(0, "length"))
+
+    assert converted is not None
+    assert converted["finish_reason"] == "length"
+
+
+def test_a_row_without_a_finish_reason_does_not_invent_one() -> None:
+    converted = _speculators_record(_row(0))
+
+    assert converted is not None
+    assert "finish_reason" not in converted
+
+
+def test_truncated_rows_are_dropped_and_counted(tmp_path: Path) -> None:
+    records = [
+        _row(0, "stop"),
+        _row(1, "length"),
+        _row(2, "tool_calls"),
+        _row(3, "incomplete"),
+        _row(4),
+    ]
+
+    counts, written = _render(tmp_path, records, policy=TruncatedRowPolicy.DROP)
+
+    assert [row["id"] for row in written] == ["row-0", "row-2", "row-4"]
+    assert counts.read == 5
+    assert counts.written == 3
+    assert counts.dropped_truncated == 2
+    assert counts.truncated_seen == 2
+    assert counts.dropped_untrainable == 0
+    assert counts.to_dict()["truncated_row_policy"] == "drop"
+
+
+def test_keeping_truncated_rows_still_counts_them(tmp_path: Path) -> None:
+    """The policy changes the corpus; it must not change the evidence."""
+    records = [_row(0, "stop"), _row(1, "length")]
+
+    counts, written = _render(tmp_path, records, policy=TruncatedRowPolicy.KEEP)
+
+    assert [row["id"] for row in written] == ["row-0", "row-1"]
+    assert counts.truncated_seen == 1
+    assert counts.dropped_truncated == 0
+
+
+def test_unknown_finish_reasons_are_kept_not_guessed(tmp_path: Path) -> None:
+    """``None``/``""`` mean unknown; archived corpora predate the field."""
+    records = [_row(0, None), _row(1, ""), _row(2), _row(3, "completed")]
+
+    counts, written = _render(tmp_path, records, policy=TruncatedRowPolicy.DROP)
+
+    assert len(written) == 4
+    assert counts.dropped_truncated == 0
+    assert "length" in TRUNCATED_FINISH_REASONS
+    assert "stop" not in TRUNCATED_FINISH_REASONS
+
+
+def test_the_filter_emptying_the_corpus_is_a_loud_named_failure(
+    tmp_path: Path,
+) -> None:
+    """A silently tiny corpus produces a checkpoint that looks like any other."""
+    records = [_row(index, "length") for index in range(9)] + [_row(9, "stop")]
+
+    with pytest.raises(TruncationFilteredCorpusError) as caught:
+        _render(
+            tmp_path, records, policy=TruncatedRowPolicy.DROP, minimum_rows=4
+        )
+
+    message = str(caught.value)
+    assert "1 trainable rows" in message
+    assert "below the floor of 4" in message
+    assert "9 of 10 rows were truncated" in message
+    assert "truncated_row_policy" in message
+
+
+def test_the_floor_does_not_fire_on_a_corpus_that_is_merely_small(
+    tmp_path: Path,
+) -> None:
+    """The floor bounds this filter's damage, not the corpus's own size."""
+    counts, written = _render(
+        tmp_path,
+        [_row(0, "stop")],
+        policy=TruncatedRowPolicy.DROP,
+        minimum_rows=100,
+    )
+
+    assert counts.written == 1
+    assert len(written) == 1
+
+
+def test_an_entirely_truncated_corpus_names_truncation_not_conversion(
+    tmp_path: Path,
+) -> None:
+    """``EmptySpeculatorsDatasetError`` would name the wrong cause."""
+    with pytest.raises(TruncationFilteredCorpusError):
+        _render(
+            tmp_path,
+            [_row(0, "length"), _row(1, "length")],
+            policy=TruncatedRowPolicy.DROP,
+        )
+
+
+def test_a_corpus_with_no_trainable_turn_still_raises_the_empty_error(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(EmptySpeculatorsDatasetError):
+        _render(
+            tmp_path,
+            [{"id": "x", "messages": [{"role": "user", "content": "q"}]}],
+            policy=TruncatedRowPolicy.DROP,
+        )
+
+
+def test_the_renderer_publishes_its_counts_through_the_real_stage(
+    tmp_path: Path,
+) -> None:
+    """Through ``render_rows``, not by assigning state in the test.
+
+    Otherwise nothing proves the stage that owns the filter actually reports
+    what it did, and the manifest's counts could be permanently absent.
+    """
+    from speedlm.training.backends.eagle3 import SpeculatorsTrainingRowRenderer
+
+    config = SpeculatorsPipelineConfig(
+        prepared_validator_script=tmp_path / "check.py",
+        speculators_repo=tmp_path / "speculators",
+        training_python=tmp_path / "python",
+        verifier_model=str(_verifier(tmp_path / "verifier", 36)),
+        warm_start_model=str(tmp_path / "warm"),
+        truncated_row_policy=TruncatedRowPolicy.DROP,
+        min_rendered_rows=1,
+    )
+    runner = _RecordingRunner()
+    state = _State()
+    state.verifier = config.verifier_model
+    renderer = SpeculatorsTrainingRowRenderer(
+        config, runner, _Resolver(config, runner, state), state
+    )
+    work = tmp_path / "work"
+    work.mkdir()
+    snapshot = _snapshot(
+        work / "snap.jsonl",
+        [_row(0, "stop"), _row(1, "length"), _row(2, "stop")],
+    )
+
+    renderer.render_rows(
+        snapshot,
+        work / "training-rows",
+        timeout_seconds=60.0,
+        should_abort=lambda: False,
+    )
+
+    assert state.rendered_rows is not None
+    assert state.rendered_rows["written"] == 2
+    assert state.rendered_rows["dropped_truncated"] == 1
+    # The row count handed to the prepared-dataset validator must be the
+    # post-filter count, or the validator asserts a size the corpus no longer has.
+    assert state.row_count == 2
+
+
+def test_the_policy_must_be_a_policy() -> None:
+    with pytest.raises(ValueError, match="truncated_row_policy"):
+        SpeculatorsPipelineConfig(
+            prepared_validator_script=Path("check.py"),
+            speculators_repo=Path("speculators"),
+            training_python=Path("python"),
+            verifier_model="v",
+            warm_start_model="w",
+            truncated_row_policy="drop",  # type: ignore[arg-type]
+        )
+
+
+def test_config_rejects_a_non_boolean_accuracy_gate() -> None:
+    with pytest.raises(ValueError, match="require_accuracy_improvement"):
+        SpeculatorsPipelineConfig(
+            prepared_validator_script=Path("check.py"),
+            speculators_repo=Path("speculators"),
+            training_python=Path("python"),
+            verifier_model="v",
+            warm_start_model="w",
+            require_accuracy_improvement="yes",  # type: ignore[arg-type]
+        )
+
+
+# ===========================================================================
+# All three land in the manifest
+# ===========================================================================
+
+
+def test_every_guard_publishes_its_verdict_into_the_training_params(
+    tmp_path: Path,
+) -> None:
+    """A record written only on one outcome cannot be compared against one that
+    says the opposite, so all three are written whenever their stage ran."""
+    from speedlm.training.backends.eagle3 import Eagle3Backend, Eagle3Config
+
+    backend = object.__new__(Eagle3Backend)
+    backend.config = Eagle3Config(
+        verifier_model="org/verifier",
+        draft_model="org/draft",
+        from_pretrained="org/draft",
+        training_params={"epochs": 3},
+    )
+    state = _State()
+    state.rendered_rows = RenderedRowCounts(
+        read=10,
+        written=7,
+        dropped_untrainable=1,
+        dropped_truncated=2,
+        truncated_seen=2,
+        policy=TruncatedRowPolicy.DROP,
+    ).to_dict()
+    state.warm_start_aux = {"verdict": "checkpoint_declared"}
+    state.val_accuracy = {"verdict": "improved", "final": 0.71}
+    backend._state = state
+
+    params = backend.describe().training_params
+
+    assert params["rendered_rows"]["dropped_truncated"] == 2  # type: ignore[index]
+    assert params["rendered_rows"]["truncated_row_policy"] == "drop"  # type: ignore[index]
+    assert params["warm_start_aux"]["verdict"] == "checkpoint_declared"  # type: ignore[index]
+    assert params["val_accuracy"]["final"] == 0.71  # type: ignore[index]
+    # JSON-serializable, because this becomes manifest.json.
+    json.dumps(dict(params))
+
+
+def test_describe_is_unchanged_when_no_stage_ran() -> None:
+    from speedlm.training.backends.eagle3 import Eagle3Backend, Eagle3Config
+
+    backend = object.__new__(Eagle3Backend)
+    backend.config = Eagle3Config(
+        verifier_model="org/verifier",
+        draft_model="org/draft",
+        from_pretrained="org/draft",
+        training_params={"epochs": 3},
+    )
+    backend._state = _State()
+
+    params = backend.describe().training_params
+
+    assert "rendered_rows" not in params
+    assert "val_accuracy" not in params
+    assert "warm_start_aux" not in params
+
+
+def test_eagle3_error_is_the_base_of_the_new_failures() -> None:
+    """Orchestration catches Eagle3Error; a new failure outside it escapes."""
+    assert issubclass(TruncationFilteredCorpusError, Eagle3Error)
+    assert issubclass(WarmStartLayerMismatchError, Eagle3Error)
+    assert issubclass(AccuracyRegressionError, Eagle3Error)
