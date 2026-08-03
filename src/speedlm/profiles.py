@@ -644,6 +644,215 @@ def validate_training_depth(
         )
 
 
+#: What to do when the training window and the serving context window disagree.
+#:
+#: ``record`` is the default and changes no behaviour: it resolves both numbers,
+#: logs the ratio and hands the caller a record for the artifact manifest.  It
+#: is the default because on *stock* configuration the two disagree by
+#: construction -- ``tuning.sequence_length`` defaults to 16384 while every
+#: built-in profile serves 40960..262144 -- so a policy that raised here would
+#: reject every supported deployment on first start and teach operators to
+#: disable the check.
+#:
+#: ``align`` makes them agree by construction, by emitting
+#: ``--max-model-len <training window>`` on the tuned engine.  That is a real
+#: product change and not a safe default: it *caps what clients may send*.  A
+#: deployment whose users legitimately submit 100k-token prompts would start
+#: rejecting them, which is a far worse failure than a drafter that extrapolates.
+#:
+#: ``strict`` refuses any disagreement.  Useful for a benchmark rig that intends
+#: to hold the two axes equal and wants that intent enforced; useless as a
+#: default, for the reason above.
+ContextWindowPolicy = Literal["record", "align", "strict"]
+
+CONTEXT_WINDOW_POLICIES: Final = frozenset({"record", "align", "strict"})
+
+#: Where a resolved serving context window came from.
+ContextWindowSource = Literal["passthrough", "verifier_config", "unresolved"]
+
+MAX_MODEL_LEN_OPTION: Final = "--max-model-len"
+
+
+class ContextWindowError(ProfileError):
+    """Raised when serving and training context windows cannot be reconciled."""
+
+
+@dataclass(frozen=True, slots=True)
+class ServingContextWindow:
+    """The positional range the serving engine will actually accept.
+
+    ``tokens`` is ``None`` only when neither source could answer -- the
+    operator passed no ``--max-model-len`` *and* the verifier's ``config.json``
+    is not in the local cache (or carries no usable
+    ``max_position_embeddings``).  Unresolved is reported as itself rather than
+    guessed at: an invented serving window would put a fabricated number in the
+    artifact manifest, and the manifest is the only place a gate delta can
+    later be attributed from.
+    """
+
+    tokens: int | None
+    source: ContextWindowSource
+
+
+@dataclass(frozen=True, slots=True)
+class ContextWindowAlignment:
+    """Resolved training/serving position axes and their disagreement.
+
+    ``ratio`` is serving over training, i.e. how many times further out the
+    engine may place a token than the deepest position the cycle could have
+    fitted.  ``None`` when the serving window is unresolved.
+    """
+
+    training_tokens: int
+    serving_tokens: int | None
+    source: ContextWindowSource
+    policy: ContextWindowPolicy
+    aligned: bool
+
+    @property
+    def ratio(self) -> float | None:
+        if self.serving_tokens is None:
+            return None
+        return self.serving_tokens / self.training_tokens
+
+    def as_manifest_fields(self) -> dict[str, object]:
+        """The provenance a published artifact must carry.
+
+        Every key is always present, ``None`` included, for the same reason
+        ``verifier_revision`` is: an absent key is ambiguous between "this
+        build does not record the position axis" and "this cycle could not
+        resolve it", and only one of those is attributable.
+        """
+        return {
+            "training_sequence_length": self.training_tokens,
+            "serving_context_window": self.serving_tokens,
+            "serving_context_window_source": self.source,
+            "context_window_policy": self.policy,
+            "context_window_ratio": self.ratio,
+            "context_window_aligned": self.aligned,
+        }
+
+
+def resolve_serving_context_window(
+    verifier_model: str,
+    passthrough: Sequence[str] = (),
+) -> ServingContextWindow:
+    """Resolve what the serving engine will accept, from runtime facts only.
+
+    Two sources, in the order vLLM itself resolves them:
+
+    1. the operator's ``--max-model-len`` passthrough, which wins outright;
+    2. otherwise ``max_position_embeddings`` from the verifier's cached
+       ``config.json`` -- the value vLLM falls back to, read here with
+       :func:`_cached_model_config`, the same stdlib-only lookup the rest of
+       this module uses.
+
+    No torch, no network, no GPU: this is safe to call before a cycle commits
+    to anything.  Model *names* are deliberately not consulted -- a profile's
+    ``max_seq_len`` is a declaration, and the whole point of this function is
+    to read what will actually happen.
+    """
+    supplied, raw = _option_value(passthrough, MAX_MODEL_LEN_OPTION)
+    if supplied:
+        if raw is None:
+            raise ContextWindowError(
+                f"{MAX_MODEL_LEN_OPTION} was passed through without a value"
+            )
+        try:
+            tokens = int(raw)
+        except ValueError as exc:
+            raise ContextWindowError(
+                f"{MAX_MODEL_LEN_OPTION} must be an integer, got {raw!r}"
+            ) from exc
+        if tokens < 1:
+            raise ContextWindowError(
+                f"{MAX_MODEL_LEN_OPTION} must be positive, got {tokens}"
+            )
+        return ServingContextWindow(tokens=tokens, source="passthrough")
+
+    config_path = _cached_model_config(verifier_model)
+    if config_path is None:
+        return ServingContextWindow(tokens=None, source="unresolved")
+    try:
+        raw_config = json.loads(config_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ServingContextWindow(tokens=None, source="unresolved")
+    if not isinstance(raw_config, Mapping):
+        return ServingContextWindow(tokens=None, source="unresolved")
+    declared = raw_config.get("max_position_embeddings")
+    if isinstance(declared, bool) or not isinstance(declared, int) or declared < 1:
+        return ServingContextWindow(tokens=None, source="unresolved")
+    return ServingContextWindow(tokens=declared, source="verifier_config")
+
+
+def validate_training_context_window(
+    *,
+    profile_name: str,
+    training_tokens: int,
+    serving: ServingContextWindow,
+    policy: ContextWindowPolicy = "record",
+) -> ContextWindowAlignment:
+    """Reconcile the position axis the way :func:`validate_training_depth`
+    reconciles the depth axis.
+
+    ``validate_training_depth`` refuses to train a chain shallower than the one
+    it will serve because "positions N+1..M would be extrapolation".  The
+    sequence axis carries the identical argument and had no guard at all:
+    ``tuning.sequence_length`` caps the training window at 16384 by default
+    while nothing on the serving path emits ``--max-model-len``, so the engine
+    falls back to the verifier's ``max_position_embeddings`` -- 131072 for
+    gpt-oss-20b and Llama-3.1-8B, 262144 for Qwen3.5-9B, 40960 for Qwen3-8B.
+
+    It is a *weaker* argument than the depth one, and the policy default
+    reflects that.  ``sequence_length`` is a cap, not a target: it becomes
+    ``--seq-length`` for ``prepare_data.py`` and ``--total-seq-len`` for
+    ``train.py``, so the positions the head actually sees are bounded by the
+    captured conversations, which are far shorter than 16384.  Raising the cap
+    would therefore not buy positional coverage the corpus does not contain --
+    which is why the default policy records the disagreement instead of trying
+    to close it.  See :data:`ContextWindowPolicy`.
+
+    Pure: every value it reads is already resolved by the caller, so it can run
+    before any filesystem mutation or engine start.
+    """
+    if policy not in CONTEXT_WINDOW_POLICIES:
+        raise ContextWindowError(
+            f"context window policy must be one of "
+            f"{', '.join(sorted(CONTEXT_WINDOW_POLICIES))}, got {policy!r}"
+        )
+    if isinstance(training_tokens, bool) or not isinstance(training_tokens, int):
+        raise ContextWindowError("training_tokens must be an integer")
+    if training_tokens < 1:
+        raise ContextWindowError(
+            f"training_tokens must be positive, got {training_tokens}"
+        )
+    serving_tokens = serving.tokens
+    aligned = serving_tokens is not None and serving_tokens == training_tokens
+    if policy == "strict" and not aligned:
+        if serving_tokens is None:
+            raise ContextWindowError(
+                f"profile {profile_name!r} requested the 'strict' context window "
+                f"policy, but the serving context window could not be resolved "
+                f"({serving.source}); pass {MAX_MODEL_LEN_OPTION} explicitly or "
+                "use the 'record' policy."
+            )
+        raise ContextWindowError(
+            f"profile {profile_name!r} would train on positions "
+            f"1..{training_tokens} and serve positions 1..{serving_tokens}; "
+            f"positions {training_tokens + 1}..{serving_tokens} would be "
+            f"extrapolation. Set tuning.sequence_length and "
+            f"{MAX_MODEL_LEN_OPTION} to the same value, or use the 'align' "
+            "policy to have SpeedLM emit it."
+        )
+    return ContextWindowAlignment(
+        training_tokens=training_tokens,
+        serving_tokens=serving_tokens,
+        source=serving.source,
+        policy=policy,
+        aligned=aligned,
+    )
+
+
 def cached_snapshot_dir(model: str) -> Path | None:
     """Return a local directory holding *model*'s weights, or ``None``.
 

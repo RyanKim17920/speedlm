@@ -17,9 +17,11 @@ from speedlm.profiles import (
     QWEN_3_8B_EAGLE3_PROFILE,
     QWEN_35_9B_MTP_PROFILE,
     AuxLayerError,
+    ContextWindowError,
     ModelProfile,
     ParserRegistry,
     ProfileError,
+    ServingContextWindow,
     SpeculativeDepthError,
     default_aux_layers,
     discover_vllm_parser_registry,
@@ -27,9 +29,11 @@ from speedlm.profiles import (
     load_profiles,
     resolve_model_parsers,
     resolve_profile,
+    resolve_serving_context_window,
     resolve_speculative_tokens,
     resolve_target_layer_ids,
     spread_aux_layers,
+    validate_training_context_window,
     validate_training_depth,
 )
 
@@ -903,3 +907,187 @@ def test_a_profile_cannot_request_an_unbounded_chain() -> None:
             chat_template_kind="auto",
             max_seq_len=4096,
         )
+
+
+# ---------------------------------------------------------------------------
+# Context window: the position axis, the twin of validate_training_depth
+# ---------------------------------------------------------------------------
+
+
+def _cache_verifier(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    repository: str = "openai/gpt-oss-20b",
+    config: dict[str, object] | None = None,
+) -> None:
+    hf_home = tmp_path / "hf-cache"
+    monkeypatch.setenv("HF_HOME", str(hf_home))
+    monkeypatch.delenv("HF_HUB_CACHE", raising=False)
+    if config is not None:
+        _write_cached_model(hf_home, repository, config)
+
+
+def test_an_explicit_max_model_len_outranks_the_verifier_config(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """vLLM lets the flag win, so the resolver must too."""
+    _cache_verifier(
+        tmp_path, monkeypatch, config={"max_position_embeddings": 131_072}
+    )
+
+    resolved = resolve_serving_context_window(
+        "openai/gpt-oss-20b", ("--dtype", "bfloat16", "--max-model-len", "8192")
+    )
+
+    assert resolved == ServingContextWindow(tokens=8_192, source="passthrough")
+
+
+def test_the_equals_form_of_max_model_len_is_read_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _cache_verifier(
+        tmp_path, monkeypatch, config={"max_position_embeddings": 131_072}
+    )
+
+    resolved = resolve_serving_context_window(
+        "openai/gpt-oss-20b", ("--max-model-len=4096",)
+    )
+
+    assert resolved == ServingContextWindow(tokens=4_096, source="passthrough")
+
+
+def test_the_serving_window_falls_back_to_max_position_embeddings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """What vLLM itself falls back to when no flag is given."""
+    _cache_verifier(
+        tmp_path, monkeypatch, config={"max_position_embeddings": 131_072}
+    )
+
+    resolved = resolve_serving_context_window("openai/gpt-oss-20b", ())
+
+    assert resolved == ServingContextWindow(
+        tokens=131_072, source="verifier_config"
+    )
+
+
+def test_an_uncached_verifier_reports_unresolved_rather_than_guessing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _cache_verifier(tmp_path, monkeypatch)
+
+    resolved = resolve_serving_context_window("openai/gpt-oss-20b", ())
+
+    assert resolved == ServingContextWindow(tokens=None, source="unresolved")
+
+
+def test_a_config_without_a_usable_position_count_is_unresolved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _cache_verifier(
+        tmp_path, monkeypatch, config={"max_position_embeddings": "lots"}
+    )
+
+    resolved = resolve_serving_context_window("openai/gpt-oss-20b", ())
+
+    assert resolved == ServingContextWindow(tokens=None, source="unresolved")
+
+
+@pytest.mark.parametrize("value", ["twelve", "0", "-1"])
+def test_an_unusable_max_model_len_is_rejected_before_a_gpu_cycle(
+    value: str,
+) -> None:
+    with pytest.raises(ContextWindowError):
+        resolve_serving_context_window("openai/gpt-oss-20b", ("--max-model-len", value))
+
+
+def test_a_valueless_max_model_len_is_rejected() -> None:
+    with pytest.raises(ContextWindowError):
+        resolve_serving_context_window(
+            "openai/gpt-oss-20b", ("--max-model-len", "--dtype", "bfloat16")
+        )
+
+
+def test_the_stock_mismatch_is_recorded_rather_than_raised() -> None:
+    """Stock defaults disagree 8x; a policy that raised would reject them all."""
+    alignment = validate_training_context_window(
+        profile_name="gpt-oss-20b-eagle3",
+        training_tokens=16_384,
+        serving=ServingContextWindow(tokens=131_072, source="verifier_config"),
+    )
+
+    assert alignment.aligned is False
+    assert alignment.ratio == 8.0
+    assert alignment.as_manifest_fields() == {
+        "training_sequence_length": 16_384,
+        "serving_context_window": 131_072,
+        "serving_context_window_source": "verifier_config",
+        "context_window_policy": "record",
+        "context_window_ratio": 8.0,
+        "context_window_aligned": False,
+    }
+
+
+def test_an_unresolved_serving_window_is_recorded_as_null_not_omitted() -> None:
+    alignment = validate_training_context_window(
+        profile_name="gpt-oss-20b-eagle3",
+        training_tokens=16_384,
+        serving=ServingContextWindow(tokens=None, source="unresolved"),
+    )
+
+    assert alignment.aligned is False
+    assert alignment.ratio is None
+    assert alignment.as_manifest_fields()["serving_context_window"] is None
+
+
+def test_equal_windows_are_reported_as_aligned() -> None:
+    alignment = validate_training_context_window(
+        profile_name="gpt-oss-20b-eagle3",
+        training_tokens=4_096,
+        serving=ServingContextWindow(tokens=4_096, source="passthrough"),
+        policy="strict",
+    )
+
+    assert alignment.aligned is True
+    assert alignment.ratio == 1.0
+
+
+def test_the_strict_policy_names_the_extrapolated_positions() -> None:
+    """The same argument validate_training_depth makes, on the other axis."""
+    with pytest.raises(ContextWindowError) as excinfo:
+        validate_training_context_window(
+            profile_name="gpt-oss-20b-eagle3",
+            training_tokens=16_384,
+            serving=ServingContextWindow(tokens=131_072, source="verifier_config"),
+            policy="strict",
+        )
+
+    message = str(excinfo.value)
+    assert "16385..131072" in message
+    assert "extrapolation" in message
+
+
+def test_the_strict_policy_refuses_an_unresolved_serving_window() -> None:
+    with pytest.raises(ContextWindowError):
+        validate_training_context_window(
+            profile_name="gpt-oss-20b-eagle3",
+            training_tokens=16_384,
+            serving=ServingContextWindow(tokens=None, source="unresolved"),
+            policy="strict",
+        )
+
+
+def test_an_unknown_policy_is_rejected() -> None:
+    with pytest.raises(ContextWindowError):
+        validate_training_context_window(
+            profile_name="gpt-oss-20b-eagle3",
+            training_tokens=16_384,
+            serving=ServingContextWindow(tokens=16_384, source="passthrough"),
+            policy="warn",  # type: ignore[arg-type]
+        )
+
+
+def test_context_window_errors_are_profile_errors() -> None:
+    """Callers already catching ProfileError must not miss this one."""
+    assert issubclass(ContextWindowError, ProfileError)

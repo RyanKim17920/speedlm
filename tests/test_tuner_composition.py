@@ -21,7 +21,7 @@ from speedlm.config import (
 )
 from speedlm.gateway.control import ControlAborted
 from speedlm.gateway.vllm_http import VLLMDraftSwapClient
-from speedlm.profiles import AuxLayerError, ModelProfile
+from speedlm.profiles import AuxLayerError, ContextWindowError, ModelProfile
 from speedlm.storage import ensure_layout
 from speedlm.tuner.artifacts import ArtifactRegistry, ArtifactSpec
 from speedlm.tuner.composition import (
@@ -32,6 +32,24 @@ from speedlm.tuner.composition import (
     create_production_tuner,
     resolve_verifier_revision,
 )
+
+
+@dataclass(frozen=True)
+class _FakeBackendConfig:
+    """Just enough of ``Eagle3Config`` for the manifest-provenance merge.
+
+    ``create_production_tuner`` folds the resolved context window into the
+    backend's ``training_params`` -- that mapping *is* the artifact manifest's
+    provenance -- so a double that has no ``config`` is not modelling the
+    collaborator it stands in for.
+    """
+
+    training_params: dict[str, object] = field(default_factory=dict)
+
+
+class _FakeBackend:
+    def __init__(self) -> None:
+        self.config = _FakeBackendConfig()
 
 
 def _profile() -> ModelProfile:
@@ -327,7 +345,7 @@ def test_create_production_tuner_assembles_profile_bound_collaborators(
         suite_dir=tmp_path / "held-out",
         training_context_hashes=frozenset({"train-hash"}),
     )
-    backend = object()
+    backend = _FakeBackend()
     runtime = object()
     gate = object()
     service = object()
@@ -604,7 +622,7 @@ def test_min_corpus_records_reaches_the_service(
         suite_dir=tmp_path / "held-out",
         training_context_hashes=frozenset({"train-hash"}),
     )
-    backend = object()
+    backend = _FakeBackend()
     runtime = object()
     gate = object()
     service = object()
@@ -844,7 +862,7 @@ def test_the_swap_client_is_wired_only_when_the_flag_is_on(
     monkeypatch.setattr(
         composition,
         "Eagle3Backend",
-        SimpleNamespace(from_speculators=lambda _pipeline, **_kwargs: object()),
+        SimpleNamespace(from_speculators=lambda _pipeline, **_kwargs: _FakeBackend()),
     )
 
     def build_runtime(**kwargs: object) -> object:
@@ -1289,7 +1307,7 @@ def _stub_composition_collaborators(
     monkeypatch.setattr(
         composition,
         "Eagle3Backend",
-        SimpleNamespace(from_speculators=lambda *_a, **_k: object()),
+        SimpleNamespace(from_speculators=lambda *_a, **_k: _FakeBackend()),
     )
     monkeypatch.setattr(composition, "RuntimeController", lambda **_k: object())
     monkeypatch.setattr(composition, "BenchmarkGateRunner", lambda **_k: object())
@@ -1398,3 +1416,255 @@ def test_an_unreadable_drafter_preserves_the_historical_layer_ids(
     _compose(tmp_path, monkeypatch, profile, captured)
 
     assert len(captured["pipeline"]["target_layer_ids"]) == 3
+
+
+# ---------------------------------------------------------------------------
+# Context window: the position axis of train/serve alignment
+# ---------------------------------------------------------------------------
+
+
+def _compose_tuner(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config: SpeedLMConfig,
+    profile: ModelProfile,
+    **kwargs: Any,
+) -> tuple[dict[str, Any], _FakeBackend]:
+    """Run ``create_production_tuner`` against inert collaborators."""
+    captured: dict[str, Any] = {}
+    backend = _FakeBackend()
+
+    monkeypatch.setattr(
+        composition,
+        "ensure_layout",
+        lambda _home: SimpleNamespace(runs_dir=tmp_path / "runs"),
+    )
+    monkeypatch.setattr(composition, "TunerStateMachine", lambda _path: object())
+    monkeypatch.setattr(
+        composition,
+        "ArtifactRegistry",
+        lambda _path, **_kwargs: SimpleNamespace(active=lambda: None),
+    )
+    monkeypatch.setattr(
+        composition,
+        "HeldOutTraceSnapshotLeaser",
+        lambda _traces, **_kwargs: SimpleNamespace(
+            suite_dir=tmp_path / "held-out",
+            training_context_hashes=frozenset(),
+        ),
+    )
+
+    def build_pipeline(**pipeline_kwargs: object) -> object:
+        captured["pipeline"] = pipeline_kwargs
+        return SimpleNamespace(gpu_memory_utilization=0.80)
+
+    monkeypatch.setattr(composition, "SpeculatorsPipelineConfig", build_pipeline)
+    monkeypatch.setattr(
+        composition,
+        "Eagle3Backend",
+        SimpleNamespace(from_speculators=lambda _pipeline, **_kwargs: backend),
+    )
+    monkeypatch.setattr(
+        composition, "RuntimeController", lambda **_kwargs: object()
+    )
+    monkeypatch.setattr(composition, "BenchmarkGateRunner", lambda **_kwargs: object())
+    monkeypatch.setattr(
+        composition, "create_tuner_service", lambda _config, **_kwargs: object()
+    )
+
+    loop = asyncio.new_event_loop()
+    try:
+        create_production_tuner(
+            config,
+            profile=profile,
+            active_draft="acme/active-draft",
+            activity=object(),  # type: ignore[arg-type]
+            admission=object(),  # type: ignore[arg-type]
+            traces=object(),  # type: ignore[arg-type]
+            capture=object(),  # type: ignore[arg-type]
+            process=object(),  # type: ignore[arg-type]
+            http=object(),  # type: ignore[arg-type]
+            child_url="http://127.0.0.1:8765",
+            loop=loop,
+            home=tmp_path / "home",
+            **kwargs,
+        )
+    finally:
+        loop.close()
+    return captured, backend
+
+
+def test_the_training_window_is_the_lower_of_the_two_caps(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The branch production actually takes: config below the profile.
+
+    The sibling assertion above pins ``sequence_length == profile.max_seq_len``
+    against a fixture whose ``tuning.sequence_length`` is *higher*, so ``min``
+    can only ever pick the profile side and the production branch -- 16384
+    against a 131072 profile -- is never exercised.
+    """
+    profile = _profile()
+    base = _config(tmp_path, profile)
+    config = replace(base, tuning=replace(base.tuning, sequence_length=4_096))
+    assert config.tuning.sequence_length < profile.max_seq_len
+
+    captured, _backend = _compose_tuner(tmp_path, monkeypatch, config, profile)
+
+    assert captured["pipeline"]["sequence_length"] == 4_096
+
+
+def test_the_context_window_lands_in_the_published_training_params(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A gate delta is only attributable if the artifact records the axis."""
+    profile = _profile()
+    config = _config(tmp_path, profile)
+
+    _captured, backend = _compose_tuner(
+        tmp_path,
+        monkeypatch,
+        config,
+        profile,
+        passthrough=("--max-model-len", "131072"),
+    )
+
+    assert backend.config.training_params == {
+        "training_sequence_length": profile.max_seq_len,
+        "serving_context_window": 131_072,
+        "serving_context_window_source": "passthrough",
+        "context_window_policy": "record",
+        "context_window_ratio": 131_072 / profile.max_seq_len,
+        "context_window_aligned": False,
+    }
+
+
+def test_a_launch_plan_alignment_is_preferred_over_re_deriving_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The manifest must name the window the engine was really launched with."""
+    profile = _profile()
+    config = _config(tmp_path, profile)
+    monkeypatch.setattr(composition, "resolve_profile", lambda *_a, **_k: profile)
+    plan = build_tuning_launch_plan(
+        config,
+        passthrough=("--max-model-len", "65536"),
+        child_port=8_765,
+        home=tmp_path / "plan-home",
+    )
+
+    _captured, backend = _compose_tuner(
+        tmp_path,
+        monkeypatch,
+        config,
+        profile,
+        context_window=plan.context_window,
+    )
+
+    assert backend.config.training_params["serving_context_window"] == 65_536
+
+
+def test_the_default_policy_does_not_cap_what_clients_may_send(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Emitting --max-model-len is a product change; it must never be silent."""
+    profile = _profile()
+    config = _config(tmp_path, profile)
+    monkeypatch.delenv(composition.CONTEXT_WINDOW_POLICY_ENV, raising=False)
+    monkeypatch.setattr(composition, "resolve_profile", lambda *_a, **_k: profile)
+
+    plan = build_tuning_launch_plan(
+        config,
+        passthrough=(),
+        child_port=8_765,
+        home=tmp_path / "home",
+    )
+
+    assert "--max-model-len" not in plan.argv_factory("acme/candidate")
+    assert plan.context_window is not None
+    assert plan.context_window.aligned is False
+
+
+def test_the_align_policy_makes_the_two_windows_agree_by_construction(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    config = _config(tmp_path, profile)
+    monkeypatch.setenv(composition.CONTEXT_WINDOW_POLICY_ENV, "align")
+    monkeypatch.setattr(composition, "resolve_profile", lambda *_a, **_k: profile)
+
+    plan = build_tuning_launch_plan(
+        config,
+        passthrough=(),
+        child_port=8_765,
+        home=tmp_path / "home",
+    )
+    argv = plan.argv_factory("acme/candidate")
+
+    assert argv[argv.index("--max-model-len") + 1] == str(profile.max_seq_len)
+    assert plan.context_window is not None
+    assert plan.context_window.aligned is True
+    assert plan.context_window.serving_tokens == profile.max_seq_len
+
+
+def test_the_align_policy_never_overrides_an_explicit_operator_window(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    config = _config(tmp_path, profile)
+    monkeypatch.setenv(composition.CONTEXT_WINDOW_POLICY_ENV, "align")
+    monkeypatch.setattr(composition, "resolve_profile", lambda *_a, **_k: profile)
+
+    plan = build_tuning_launch_plan(
+        config,
+        passthrough=("--max-model-len", "2048"),
+        child_port=8_765,
+        home=tmp_path / "home",
+    )
+    argv = plan.argv_factory("acme/candidate")
+
+    assert argv.count("--max-model-len") == 1
+    assert argv[argv.index("--max-model-len") + 1] == "2048"
+
+
+def test_the_strict_policy_fails_before_the_layout_is_created(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    profile = _profile()
+    config = _config(tmp_path, profile)
+    monkeypatch.setenv(composition.CONTEXT_WINDOW_POLICY_ENV, "strict")
+    monkeypatch.setattr(composition, "resolve_profile", lambda *_a, **_k: profile)
+
+    with pytest.raises(ContextWindowError):
+        build_tuning_launch_plan(
+            config,
+            passthrough=("--max-model-len", "131072"),
+            child_port=8_765,
+            home=tmp_path / "home",
+        )
+
+    assert not (tmp_path / "home").exists()
+
+
+def test_an_unknown_policy_environment_value_is_not_silently_ignored(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(composition.CONTEXT_WINDOW_POLICY_ENV, "strct")
+
+    with pytest.raises(ContextWindowError):
+        composition.context_window_policy()
+
+
+def test_an_absent_policy_environment_value_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv(composition.CONTEXT_WINDOW_POLICY_ENV, raising=False)
+
+    assert composition.context_window_policy() == "record"

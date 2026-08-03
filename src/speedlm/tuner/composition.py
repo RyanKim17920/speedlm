@@ -8,9 +8,9 @@ import logging
 import os
 from collections.abc import Callable, Sequence
 from concurrent.futures import TimeoutError as FutureTimeout
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Final
+from typing import Final, cast
 
 from speedlm.config import SpeedLMConfig
 from speedlm.gate.runner import BenchmarkGateRunner
@@ -27,13 +27,20 @@ from speedlm.gateway.process import LOOPBACK_HOST, build_vllm_argv
 from speedlm.gateway.supervisor import ThreadsafeProcessControl
 from speedlm.gateway.vllm_http import VLLMControlClient, VLLMDraftSwapClient
 from speedlm.profiles import (
+    CONTEXT_WINDOW_POLICIES,
+    MAX_MODEL_LEN_OPTION,
+    ContextWindowAlignment,
+    ContextWindowError,
+    ContextWindowPolicy,
     ModelProfile,
     cached_snapshot_dir,
     canonical_verifier_reference,
     drafter_declared_speculative_tokens,
     resolve_profile,
+    resolve_serving_context_window,
     resolve_speculative_tokens,
     resolve_target_layer_ids,
+    validate_training_context_window,
     validate_training_depth,
 )
 from speedlm.storage import ensure_layout
@@ -61,6 +68,17 @@ WORKER_EXTENSION_OPTION: Final = "--worker-extension-cls"
 DRAFT_SWAP_WORKER_EXTENSION_CLS: Final = (
     "speedlm.gateway.draft_swap.CombinedWorkerExtension"
 )
+
+#: Environment override for :data:`~speedlm.profiles.ContextWindowPolicy`.
+#:
+#: An environment variable rather than a ``tuning.*`` field only because
+#: :mod:`speedlm.config` is owned elsewhere while this is being written; it
+#: belongs beside ``tuning.sequence_length``, whose value it reconciles, and
+#: should move there.  The precedent for the mechanism is
+#: ``SPEEDLM_SPECULATORS_REPO`` / ``SPEEDLM_TRAINING_PYTHON``.
+CONTEXT_WINDOW_POLICY_ENV: Final = "SPEEDLM_CONTEXT_WINDOW_POLICY"
+
+DEFAULT_CONTEXT_WINDOW_POLICY: Final[ContextWindowPolicy] = "record"
 
 
 class ProductionTuningError(RuntimeError):
@@ -444,11 +462,103 @@ def warm_start_reference(
     return str(active.path)
 
 
+def context_window_policy() -> ContextWindowPolicy:
+    """Read the configured context-window policy, defaulting to ``record``.
+
+    An unrecognised value is a hard failure rather than a silent fallback: an
+    operator who set ``strict`` and got ``record`` because of a typo would
+    believe an enforcement is running that is not, which is the exact class of
+    unfalsifiable guarantee this module keeps removing.
+    """
+    raw = os.environ.get(CONTEXT_WINDOW_POLICY_ENV)
+    if raw is None or not raw.strip():
+        return DEFAULT_CONTEXT_WINDOW_POLICY
+    value = raw.strip()
+    if value not in CONTEXT_WINDOW_POLICIES:
+        raise ContextWindowError(
+            f"{CONTEXT_WINDOW_POLICY_ENV} must be one of "
+            f"{', '.join(sorted(CONTEXT_WINDOW_POLICIES))}, got {value!r}"
+        )
+    return cast(ContextWindowPolicy, value)
+
+
+def training_sequence_length(config: SpeedLMConfig, profile: ModelProfile) -> int:
+    """The window one cycle actually trains on.
+
+    ``tuning.sequence_length`` is a *cap*: it can only lower the training
+    window, never raise it, and the profile's ``max_seq_len`` caps it again.
+    One definition, because two readers now need it -- the pipeline that
+    trains at this length and the check that compares it against what the
+    engine will serve.
+    """
+    return min(config.tuning.sequence_length, profile.max_seq_len)
+
+
+def resolve_context_window_alignment(
+    config: SpeedLMConfig,
+    profile: ModelProfile,
+    passthrough: Sequence[str] = (),
+    *,
+    policy: ContextWindowPolicy | None = None,
+) -> ContextWindowAlignment:
+    """Reconcile the training window against the one the engine will serve.
+
+    Cheap and pre-GPU: the serving side comes from the operator's
+    ``--max-model-len`` if they passed one, otherwise from the verifier's
+    cached ``config.json``.  Logs the disagreement at the level its severity
+    warrants so a gate delta has something to be read against even when the
+    policy is not enforcing.
+    """
+    effective = context_window_policy() if policy is None else policy
+    training_tokens = training_sequence_length(config, profile)
+    serving = resolve_serving_context_window(profile.verifier_model, passthrough)
+    alignment = validate_training_context_window(
+        profile_name=profile.name,
+        training_tokens=training_tokens,
+        serving=serving,
+        policy=effective,
+    )
+    if alignment.aligned:
+        logger.info(
+            "profile %r trains and serves the same %d-token context window",
+            profile.name,
+            training_tokens,
+        )
+    elif alignment.serving_tokens is None:
+        logger.warning(
+            "profile %r trains a %d-token context window; the serving window "
+            "could not be resolved (%s), so the position axis of this cycle is "
+            "unattributable",
+            profile.name,
+            training_tokens,
+            alignment.source,
+        )
+    else:
+        logger.warning(
+            "profile %r trains a %d-token context window but serves %d "
+            "(%s, %.1fx); positions %d..%d are drafted by a head that was "
+            "never fitted there. Set %s to the training window, or set %s=align "
+            "to have SpeedLM emit it -- note that capping the served window "
+            "rejects longer client requests.",
+            profile.name,
+            training_tokens,
+            alignment.serving_tokens,
+            alignment.source,
+            alignment.ratio,
+            training_tokens + 1,
+            alignment.serving_tokens,
+            MAX_MODEL_LEN_OPTION,
+            CONTEXT_WINDOW_POLICY_ENV,
+        )
+    return alignment
+
+
 @dataclass(frozen=True, slots=True)
 class TuningLaunchPlan:
     profile: ModelProfile
     active_draft: DraftReference
     argv_factory: Callable[[DraftReference], list[str]]
+    context_window: ContextWindowAlignment | None = None
 
 
 def build_tuning_launch_plan(
@@ -498,6 +608,11 @@ def build_tuning_launch_plan(
             "already in the combined class) or disable "
             "tuning.draft_hot_swap_enabled"
         )
+    # Before ``ensure_layout`` below, which is the first filesystem mutation on
+    # this path, and long before an engine start.  This is the only place that
+    # sees the operator's passthrough *and* the resolved profile, so it is the
+    # only place that can tell what the engine will really accept.
+    context_window = resolve_context_window_alignment(config, profile, passthrough)
     _validate_training_environment(config)
 
     layout = ensure_layout(home)
@@ -531,6 +646,30 @@ def build_tuning_launch_plan(
         )
     if config.model_alias and not alias_supplied:
         base_passthrough.extend(("--served-model-name", config.model_alias))
+    if (
+        context_window.policy == "align"
+        and not context_window.aligned
+        and not _has_option(base_passthrough, MAX_MODEL_LEN_OPTION)
+    ):
+        # Opt-in only, and never silent.  Emitting this makes the two axes
+        # agree by construction -- but it also caps what clients may send, so
+        # it is a product decision the operator takes deliberately, not a
+        # default SpeedLM makes on their behalf.
+        logger.warning(
+            "context window policy 'align': emitting %s %d, so this engine will "
+            "reject requests longer than the window the drafter was trained on",
+            MAX_MODEL_LEN_OPTION,
+            context_window.training_tokens,
+        )
+        base_passthrough.extend(
+            (MAX_MODEL_LEN_OPTION, str(context_window.training_tokens))
+        )
+        context_window = replace(
+            context_window,
+            serving_tokens=context_window.training_tokens,
+            source="passthrough",
+            aligned=True,
+        )
 
     def argv_factory(draft: DraftReference) -> list[str]:
         speculative = profile.speculative_config()
@@ -556,6 +695,7 @@ def build_tuning_launch_plan(
         profile=profile,
         active_draft=active_draft,
         argv_factory=argv_factory,
+        context_window=context_window,
     )
 
 
@@ -573,8 +713,21 @@ def create_production_tuner(
     child_url: str,
     loop: asyncio.AbstractEventLoop,
     home: Path,
+    passthrough: Sequence[str] = (),
+    context_window: ContextWindowAlignment | None = None,
 ) -> TunerService:
-    """Compose every concrete collaborator used by the background service."""
+    """Compose every concrete collaborator used by the background service.
+
+    ``context_window`` is the alignment :func:`build_tuning_launch_plan`
+    already resolved for the very same launch; pass it (as
+    ``launch.context_window``) so the artifact manifest records the window the
+    *engine* was actually launched with.  When it is omitted the alignment is
+    re-derived here from ``passthrough`` -- and when that is empty too, from
+    the verifier's cached ``config.json``, which is what vLLM itself falls back
+    to.  The fallback is correct for stock deployments and only loses
+    resolution when an operator passed ``--max-model-len`` and neither argument
+    was threaded through.
+    """
     if profile.speculative_method != "eagle3" or profile.draft_model is None:
         raise ProductionTuningError(
             f"profile {profile.name!r} is not supported by the EAGLE-3 backend"
@@ -611,6 +764,16 @@ def create_production_tuner(
         profile_name=profile.name,
         serving_tokens=profile.num_speculative_tokens,
         training_steps=training_depth,
+    )
+    #: The position axis, reconciled the way the depth axis is reconciled above.
+    #:
+    #: Same shape as ``validate_training_depth``: a pure assertion over values
+    #: that are already resolved, before ``ensure_layout`` below touches the
+    #: filesystem and long before an engine starts.
+    context_alignment = (
+        resolve_context_window_alignment(config, profile, passthrough)
+        if context_window is None
+        else context_window
     )
     #: How many aux hidden states the stock head's own weights fuse.
     #:
@@ -661,7 +824,7 @@ def create_production_tuner(
             or profile.num_hidden_layers is not None
             else ()
         ),
-        sequence_length=min(tuning.sequence_length, profile.max_seq_len),
+        sequence_length=context_alignment.training_tokens,
         num_speculative_steps=training_depth,
         learning_rate=tuning.learning_rate,
         epochs=tuning.epochs,
@@ -701,6 +864,7 @@ def create_production_tuner(
             else None
         ),
     )
+    _record_context_window(backend, context_alignment)
     publish_guard.bind(backend)
     runtime = RuntimeController(
         activity=activity,
@@ -898,6 +1062,30 @@ def _validate_training_environment(config: SpeedLMConfig) -> None:
         )
 
 
+def _record_context_window(
+    backend: Eagle3Adapter,
+    alignment: ContextWindowAlignment,
+) -> None:
+    """Put the position axis into every artifact this backend publishes.
+
+    ``Eagle3Backend.from_speculators`` seeds ``training_params`` with a fixed
+    three keys and the manifest is built from that mapping
+    (``Eagle3Adapter.describe``), so provenance that composition -- and only
+    composition -- knows has to be merged in here.  Without it a gate delta
+    cannot be attributed to the position axis at all: the published manifest
+    records the depth the cycle trained but says nothing about the window, so
+    "this head was fitted on 16384 positions and served 131072" is not a fact
+    anyone can read back off an artifact.
+    """
+    backend.config = replace(
+        backend.config,
+        training_params={
+            **backend.config.training_params,
+            **alignment.as_manifest_fields(),
+        },
+    )
+
+
 def _required(value: str | None, name: str) -> str:
     if value is None:
         raise ProductionTuningError(
@@ -928,6 +1116,8 @@ def _option_value(
 
 
 __all__ = [
+    "CONTEXT_WINDOW_POLICY_ENV",
+    "DEFAULT_CONTEXT_WINDOW_POLICY",
     "DRAFT_SWAP_WORKER_EXTENSION_CLS",
     "WORKER_EXTENSION_OPTION",
     "ProductionTuningError",
@@ -935,8 +1125,11 @@ __all__ = [
     "active_draft_reference",
     "build_tuning_launch_plan",
     "cached_hub_revision",
+    "context_window_policy",
     "create_production_tuner",
     "promotion_chain_depth",
+    "resolve_context_window_alignment",
     "resolve_verifier_revision",
+    "training_sequence_length",
     "warm_start_reference",
 ]
