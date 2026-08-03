@@ -102,7 +102,7 @@ def test_rejected_gain_explains_why(speedlm_home: Path) -> None:
     assert "verdict           : reject" in result.stdout
     assert "reason            : acceptance_below_threshold" in result.stdout
     assert "acceptance delta  : +0.20 pp" in result.stdout
-    assert "threshold >= 1.00 pp" in result.stdout
+    assert "recorded, not gated" in result.stdout
     assert "rejected because" in result.stdout
 
 

@@ -223,6 +223,28 @@ class MetricsDelta:
     tpot_ms: float
     output_tok_per_sec: float
 
+    @property
+    def accepted_length_available(self) -> bool:
+        """True when :attr:`mean_accepted_length` is a measurement, not a filler.
+
+        :attr:`acceptance_available` keys off ``spec_decode_num_draft_tokens``
+        alone, but :attr:`mean_accepted_length` is divided by
+        ``spec_decode_num_drafts``, a *different* counter.  An endpoint that
+        exposes the first and not the second -- or that drafted tokens without
+        completing a draft inside the window -- yields
+        ``acceptance_available=True`` beside ``mean_accepted_length=0.0``, and
+        0.0 is not a mean accepted length: the floor is 1.0 (the bonus token)
+        whenever a draft happened at all.
+
+        The gate's promotion criterion is now the mean-accepted-length delta
+        (see :data:`speedlm.gate.decide.GATING_ACCEPTANCE_CRITERION`), so that
+        asymmetry would otherwise turn a missing counter into a measured
+        ``0.0 - 0.0 = 0.0`` delta and reject every candidate for a reason the
+        record does not name.  Asking this instead makes the gap report as
+        ``acceptance_unavailable``, which is what it is.
+        """
+        return self.acceptance_available and self.mean_accepted_length > 0.0
+
 
 def compute_delta(before: MetricsSnapshot, after: MetricsSnapshot) -> MetricsDelta:
     """Compute per-counter deltas between two snapshots.

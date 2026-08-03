@@ -30,6 +30,7 @@ from typing import Any, Final
 from speedlm.config import ConfigError, SpeedLMConfig, load_config
 from speedlm.doctor import PRIMARY_VERIFIER
 from speedlm.gate.decide import (
+    LEGACY_ACCEPTANCE_CRITERION,
     LEGACY_ACCEPTANCE_STATISTIC,
     LEGACY_THROUGHPUT_STATISTIC,
     ContextDivergence,
@@ -987,6 +988,16 @@ def _parse_repeat(record: Mapping[str, Any], source: Path) -> RepeatSummary:
         candidate_acceptance_rate=_require_float(record, "candidate_acceptance_rate", source),
         invalid_rate=_require_float(record, "invalid_rate", source),
         output_mismatches=_require_int(record, "output_mismatches", source),
+        # Optional: every decision written before the gate's promotion
+        # criterion moved to mean accepted length lacks these two columns, and
+        # 0.0 is how "never recorded" reads back -- it is not a reachable
+        # measurement, whose floor is 1.0.
+        stock_accepted_length=(
+            _optional_float(record.get("stock_accepted_length")) or 0.0
+        ),
+        candidate_accepted_length=(
+            _optional_float(record.get("candidate_accepted_length")) or 0.0
+        ),
     )
 
 
@@ -1055,6 +1066,31 @@ def parse_decision(record: Mapping[str, Any], *, source: Path) -> Decision:
             _require_str(record, "acceptance_statistic", source)
             if "acceptance_statistic" in record
             else LEGACY_ACCEPTANCE_STATISTIC
+        ),
+        # The promotion criterion.  All optional: a record written before the
+        # criterion moved off the acceptance rate carries none of them, and is
+        # labelled with what it was actually gated on rather than relabelled
+        # with the current criterion.
+        acceptance_criterion=(
+            _require_str(record, "acceptance_criterion", source)
+            if "acceptance_criterion" in record
+            else LEGACY_ACCEPTANCE_CRITERION
+        ),
+        accepted_length_delta=_optional_float(record.get("accepted_length_delta")),
+        min_accepted_length_delta=_optional_float(
+            record.get("min_accepted_length_delta")
+        ),
+        stock_avg_accepted_length=(
+            _optional_float(record.get("stock_avg_accepted_length")) or 0.0
+        ),
+        candidate_avg_accepted_length=(
+            _optional_float(record.get("candidate_avg_accepted_length")) or 0.0
+        ),
+        stock_accepted_length_stdev=(
+            _optional_float(record.get("stock_accepted_length_stdev")) or 0.0
+        ),
+        candidate_accepted_length_stdev=(
+            _optional_float(record.get("candidate_accepted_length_stdev")) or 0.0
         ),
         # Measurement context.  Optional in both directions: absent means the
         # record predates the field, and ``None`` is exactly how that reads
@@ -1489,11 +1525,38 @@ class GainReport:
             repeats=repeats,
             unit=" pp",
         )
+        # The rate delta is reported but no longer decides -- it divides by the
+        # draft depth, so it is not comparable across depths.  Saying
+        # "threshold >= 1.00 pp" here would name a bar the gate does not apply.
         lines.append(
             f"acceptance delta  : {acceptance_delta_pp:+.2f} pp{acceptance_suffix} "
-            f"({acceptance_note}; threshold >= "
-            f"{decision.min_acceptance_delta_pp:.2f} pp)"
+            f"({acceptance_note}; recorded, not gated)"
         )
+        accepted_length_delta = decision.accepted_length_delta
+        if accepted_length_delta is not None:
+            lines.append(
+                f"accepted len stock: "
+                f"{decision.stock_avg_accepted_length:.3f} tok/step"
+            )
+            lines.append(
+                f"accepted len cand : "
+                f"{decision.candidate_avg_accepted_length:.3f} tok/step"
+            )
+            length_suffix, length_note = _dispersion_fragments(
+                decision.accepted_length_dispersion,
+                decision.accepted_length_delta_standard_error,
+                repeats=repeats,
+                unit=" tok/step",
+            )
+            threshold = (
+                f">= {decision.min_accepted_length_delta:.3f} tok/step"
+                if decision.min_accepted_length_delta is not None
+                else "not recorded"
+            )
+            lines.append(
+                f"accepted len delta: {accepted_length_delta:+.3f} tok/step"
+                f"{length_suffix} ({length_note}; threshold {threshold})"
+            )
         lines.append(
             f"throughput stock  : {decision.stock_avg_tok_per_sec:.2f} tok/s"
         )

@@ -367,6 +367,15 @@ def _replay(*, completion_tokens: int, latency_s: float, repeats: int = 3) -> Re
     )
 
 
+#: Draft depth these fixtures speak at.  ``mean_accepted_length`` below is
+#: derived through it rather than pinned to a constant: the two acceptance
+#: statistics are related by ``acceptance_rate == (mean_accepted_length - 1)/k``
+#: and the gate's promotion criterion is now the accepted-length delta, so a
+#: fixture holding the length fixed while sweeping the rate would describe an
+#: impossible engine and hand the gate a zero delta on every arm.
+_FIXTURE_DRAFT_DEPTH = 5
+
+
 def _delta(*, acceptance_rate: float, output_tok_per_sec: float) -> MetricsDelta:
     return MetricsDelta(
         reset_detected=False,
@@ -374,7 +383,7 @@ def _delta(*, acceptance_rate: float, output_tok_per_sec: float) -> MetricsDelta
         drafted_tokens=1000.0,
         accepted_tokens=1000.0 * acceptance_rate,
         acceptance_rate=acceptance_rate,
-        mean_accepted_length=2.0,
+        mean_accepted_length=1.0 + acceptance_rate * _FIXTURE_DRAFT_DEPTH,
         tpot_ms=10.0,
         output_tok_per_sec=output_tok_per_sec,
     )

@@ -102,6 +102,39 @@ GATING_ACCEPTANCE_STATISTIC: Final[str] = "per_repeat_mean"
 #: each per-repeat row.  A loader must label those records as what they were.
 LEGACY_ACCEPTANCE_STATISTIC: Final[str] = "prometheus_pooled_window"
 
+#: Names the acceptance-side *quantity* the promotion criterion is applied to.
+#:
+#: ``GATING_ACCEPTANCE_STATISTIC`` above says how an arm's acceptance figure is
+#: pooled across repeats.  This says *which figure* -- a different question, and
+#: the answer changed.
+#:
+#: It used to be the acceptance rate, ``accepted_tokens / drafted_tokens``.
+#: Since ``drafted_tokens == num_drafts * k`` for a draft chain of depth ``k``,
+#: that is algebraically ``(mean_accepted_length - 1) / k``: the depth sits in
+#: the denominator, so the statistic is **not comparable across draft depths**
+#: and a deeper chain scores *lower* on it while emitting *more* tokens per
+#: step.  gpt-oss-20b at ``k=5`` scores 0.356 against Qwen3-8B's 0.380 at
+#: ``k=3`` while emitting 2.82 tokens per verifier step against 2.14.  Worse,
+#: gpt-oss's per-position conditional acceptance still rises at the last drafted
+#: position (0.689 -> 0.715 at position 5), so raising ``k`` would raise
+#: throughput while dropping the rate to ~0.31 -- and the primary promotion
+#: criterion would have rejected the largest speedup on the table.
+#:
+#: ``mean_accepted_length = 1 + accepted_tokens / num_drafts`` is tokens per
+#: verifier *step*.  No ``k`` in the denominator, directly proportional to
+#: throughput at fixed step cost, and already computed per repeat by
+#: :class:`speedlm.gate.metrics.MetricsDelta`.  See
+#: :attr:`speedlm.config.PromotionConfig.min_accepted_length_delta` for the
+#: threshold and its calibration against the archived runs.
+GATING_ACCEPTANCE_CRITERION: Final[str] = "mean_accepted_length_delta"
+
+#: What decided records written before the criterion moved off the rate.  Those
+#: runs compared ``acceptance_delta_pp`` against ``min_acceptance_delta_pp``;
+#: both fields are still recorded and still mean what they meant, so a loader
+#: labels the archived record with this rather than relabelling it as the
+#: current criterion.
+LEGACY_ACCEPTANCE_CRITERION: Final[str] = "acceptance_rate_delta_pp"
+
 
 class DispersionBasis(Enum):
     """Whether a published standard deviation is a *measurement* or an artefact.
@@ -216,6 +249,18 @@ class RepeatSummary:
     #: counter.  ``Decision.output_early_divergences`` is the total the gate
     #: actually compares against ``max_output_mismatches``.
     output_mismatches: int
+    #: Mean accepted length over *this repeat's* Prometheus window, per arm --
+    #: ``1 + accepted_tokens / num_drafts``, i.e. tokens emitted per verifier
+    #: forward pass.  This is the column the promotion criterion is computed
+    #: from; see :data:`GATING_ACCEPTANCE_CRITERION`.
+    #:
+    #: Defaulted so that an archived ``decision.json`` -- every one of which
+    #: predates these two columns -- still rebuilds through
+    #: :func:`speedlm.report.parse_decision`.  ``0.0`` is not a reachable
+    #: measurement (the floor is 1.0, the bonus token), so "record predates the
+    #: field" stays distinguishable from any real reading.
+    stock_accepted_length: float = 0.0
+    candidate_accepted_length: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -224,6 +269,17 @@ class Decision:
 
     verdict: Verdict
     reason: Reason
+    #: Arm-to-arm delta of the acceptance *rate*, in percentage points.
+    #:
+    #: **Recorded, not gated** -- see
+    #: :attr:`speedlm.config.PromotionConfig.min_acceptance_delta_pp`.  It is
+    #: still exactly what it always was (the delta of the two
+    #: ``*_avg_acceptance`` means), it is still meaningful at a fixed draft
+    #: depth, and it is the number every archived run is described by, so it
+    #: keeps its name and is populated on every path that computes deltas.  What
+    #: it no longer does is decide: it carries the draft depth in its
+    #: denominator and so cannot be compared across depths.
+    #: :attr:`accepted_length_delta` is the criterion.
     acceptance_delta_pp: float | None
     #: The throughput delta the guard is evaluated against, computed from
     #: :data:`GATING_THROUGHPUT_STATISTIC`.  Compare against
@@ -274,6 +330,38 @@ class Decision:
     #: they parted.  ``output_early_divergences`` counts the subset that parted
     #: before ``min_divergence_token_index``; that subset is what gates.
     output_divergences: tuple[ContextDivergence, ...] = ()
+
+    # -- the promotion criterion --------------------------------------------
+    # Added beside ``acceptance_delta_pp`` rather than replacing it: the rate
+    # delta keeps its name, its units and its meaning, and these carry the
+    # decision.  All default so an archived record still rebuilds; see
+    # :data:`GATING_ACCEPTANCE_CRITERION`.
+
+    #: Arm-to-arm delta of mean accepted length, in tokens per verifier step.
+    #: This is what ``min_accepted_length_delta`` is compared against.
+    #: ``None`` on every path that short-circuits above the delta computation,
+    #: exactly as ``acceptance_delta_pp`` is.
+    accepted_length_delta: float | None = None
+    #: The bar :attr:`accepted_length_delta` had to clear.  ``None`` means the
+    #: record predates the criterion and was gated on the rate instead -- read
+    #: :attr:`acceptance_criterion` rather than inferring from this.
+    min_accepted_length_delta: float | None = None
+    #: Mean of the ``per_repeat`` accepted-length column, per arm -- the same
+    #: by-construction contract ``*_avg_acceptance`` and ``*_avg_tok_per_sec``
+    #: hold, so ``accepted_length_delta`` is reproducible by hand from the
+    #: array.
+    stock_avg_accepted_length: float = 0.0
+    candidate_avg_accepted_length: float = 0.0
+    #: Sample standard deviation of that column, per arm.  Expected to be 0.0
+    #: on a deterministic greedy replay; read it through
+    #: :attr:`accepted_length_dispersion`, never as "a very tight measurement".
+    stock_accepted_length_stdev: float = 0.0
+    candidate_accepted_length_stdev: float = 0.0
+    #: Which acceptance-side quantity gated, spelled out rather than implied.
+    #: :data:`GATING_ACCEPTANCE_CRITERION` on records written by this gate;
+    #: :data:`LEGACY_ACCEPTANCE_CRITERION` is what a loader stamps on an
+    #: archived record that predates the field.
+    acceptance_criterion: str = GATING_ACCEPTANCE_CRITERION
 
     # -- measurement context -------------------------------------------------
     # What the numbers above were produced under.  Every field here changes the
@@ -342,6 +430,33 @@ class Decision:
             [r.stock_acceptance_rate for r in self.per_repeat],
             [r.candidate_acceptance_rate for r in self.per_repeat],
             scale=100.0,
+        )
+
+    @property
+    def accepted_length_dispersion(self) -> DispersionBasis:
+        """Whether the accepted-length repeats actually disagreed.
+
+        Same reading as :attr:`acceptance_dispersion`, and ``DEGENERATE`` is
+        likewise the *expected* state: both columns are derived from the same
+        deterministic counter windows, so neither samples anything.
+        """
+        return _dispersion_basis(
+            [r.stock_accepted_length for r in self.per_repeat],
+            [r.candidate_accepted_length for r in self.per_repeat],
+        )
+
+    @property
+    def accepted_length_delta_standard_error(self) -> float | None:
+        """Standard error of :attr:`accepted_length_delta`, in tokens/step.
+
+        ``None`` for ``DEGENERATE`` and ``UNSAMPLED`` alike, so anything that
+        divides the threshold by it fails loudly rather than computing an
+        infinitely well-resolved gate.  See :class:`DispersionBasis`.
+        """
+        return _delta_standard_error(
+            [r.stock_accepted_length for r in self.per_repeat],
+            [r.candidate_accepted_length for r in self.per_repeat],
+            scale=1.0,
         )
 
     @property
@@ -492,9 +607,25 @@ class Decision:
                     "candidate_acceptance_rate": r.candidate_acceptance_rate,
                     "invalid_rate": r.invalid_rate,
                     "output_mismatches": r.output_mismatches,
+                    "stock_accepted_length": r.stock_accepted_length,
+                    "candidate_accepted_length": r.candidate_accepted_length,
                 }
                 for r in self.per_repeat
             ],
+            # Which acceptance-side quantity decided, and the criterion's own
+            # delta/threshold pair.  Emitted next to -- never instead of -- the
+            # rate figures below, which every archived run is described by.
+            "acceptance_criterion": self.acceptance_criterion,
+            "accepted_length_delta": self.accepted_length_delta,
+            "min_accepted_length_delta": self.min_accepted_length_delta,
+            "stock_avg_accepted_length": self.stock_avg_accepted_length,
+            "candidate_avg_accepted_length": self.candidate_avg_accepted_length,
+            "stock_accepted_length_stdev": self.stock_accepted_length_stdev,
+            "candidate_accepted_length_stdev": self.candidate_accepted_length_stdev,
+            "accepted_length_dispersion": self.accepted_length_dispersion.value,
+            "accepted_length_delta_standard_error": (
+                self.accepted_length_delta_standard_error
+            ),
             "acceptance_statistic": self.acceptance_statistic,
             "stock_avg_acceptance": self.stock_avg_acceptance,
             "candidate_avg_acceptance": self.candidate_avg_acceptance,
@@ -782,6 +913,27 @@ def _repeat_acceptance(
     return pooled
 
 
+def _repeat_accepted_length(
+    repeat_metrics: Sequence[MetricsDelta],
+    index: int,
+    pooled: float,
+) -> float:
+    """This repeat's own mean accepted length, or the pooled figure.
+
+    Mirrors :func:`_repeat_acceptance` exactly, including its fallback, so the
+    two per-repeat columns are always populated on the same basis and
+    ``*_avg_accepted_length`` stays the literal mean of its column.  It keys off
+    :attr:`~speedlm.gate.metrics.MetricsDelta.accepted_length_available` rather
+    than ``acceptance_available`` because the two are divided by *different*
+    counters and can disagree.
+    """
+    if index < len(repeat_metrics):
+        delta = repeat_metrics[index]
+        if delta.accepted_length_available:
+            return delta.mean_accepted_length
+    return pooled
+
+
 def _collect_divergences(
     stock: ReplayResult,
     candidate: ReplayResult,
@@ -837,9 +989,18 @@ def decide_promotion(
     """Decide whether to promote the candidate head.
 
     Both thresholds are evaluated against a single, named statistic per
-    quantity: acceptance from the Prometheus ``spec_decode`` counter delta
-    (which has no timing component), and throughput from
-    :data:`GATING_THROUGHPUT_STATISTIC`.  The Prometheus decode-time throughput
+    quantity: the acceptance side from the Prometheus ``spec_decode`` counter
+    delta (which has no timing component), and throughput from
+    :data:`GATING_THROUGHPUT_STATISTIC`.
+
+    The acceptance-side criterion is the **mean-accepted-length** delta, in
+    tokens per verifier step -- see :data:`GATING_ACCEPTANCE_CRITERION` for why
+    the acceptance *rate* cannot serve, and
+    :attr:`speedlm.config.PromotionConfig.min_accepted_length_delta` for the
+    bar.  ``acceptance_delta_pp`` and ``min_acceptance_delta_pp`` are still
+    computed and recorded unchanged; they no longer decide.
+
+    The Prometheus decode-time throughput
     is still measured and reported -- as
     ``prometheus_throughput_delta_pct`` -- but it does not gate, because
     ``min_throughput_delta_pct`` is calibrated from replay dispersion.
@@ -897,6 +1058,8 @@ def decide_promotion(
     )
     s_acc = stock_metrics.acceptance_rate
     c_acc = candidate_metrics.acceptance_rate
+    s_mal = stock_metrics.mean_accepted_length
+    c_mal = candidate_metrics.mean_accepted_length
 
     # How many suite passes each arm actually completed.  This is a fact about
     # the benchmark run, so it is established before any validation short
@@ -953,6 +1116,12 @@ def decide_promotion(
                 ),
                 invalid_rate=c_run.invalid_rate,
                 output_mismatches=early_by_repeat.get(i, 0),
+                stock_accepted_length=_repeat_accepted_length(
+                    stock_repeat_metrics, i, s_mal
+                ),
+                candidate_accepted_length=_repeat_accepted_length(
+                    candidate_repeat_metrics, i, c_mal
+                ),
             )
         )
 
@@ -980,17 +1149,37 @@ def decide_promotion(
     s_acc_sd = _stdev(s_acc_series)
     c_acc_sd = _stdev(c_acc_series)
 
+    # --- The gating acceptance criterion ---
+    # Same contract again, on the quantity that actually decides: mean accepted
+    # length, in tokens per verifier step.  Unlike the rate above it carries no
+    # draft depth in its denominator, so it is comparable across a k-sweep.
+    # See :data:`GATING_ACCEPTANCE_CRITERION`.
+    s_mal_series = [r.stock_accepted_length for r in per_repeat_tuple]
+    c_mal_series = [r.candidate_accepted_length for r in per_repeat_tuple]
+    s_mal_mean = _mean(s_mal_series) if s_mal_series else s_mal
+    c_mal_mean = _mean(c_mal_series) if c_mal_series else c_mal
+    s_mal_sd = _stdev(s_mal_series)
+    c_mal_sd = _stdev(c_mal_series)
+
     def _decide(
         verdict: Verdict,
         reason: Reason,
         *,
         acceptance_delta_pp: float | None = None,
+        accepted_length_delta: float | None = None,
         throughput_delta_pct: float | None = None,
     ) -> Decision:
         return Decision(
             verdict=verdict,
             reason=reason,
             acceptance_delta_pp=acceptance_delta_pp,
+            accepted_length_delta=accepted_length_delta,
+            min_accepted_length_delta=promotion_config.min_accepted_length_delta,
+            stock_avg_accepted_length=s_mal_mean,
+            candidate_avg_accepted_length=c_mal_mean,
+            stock_accepted_length_stdev=s_mal_sd,
+            candidate_accepted_length_stdev=c_mal_sd,
+            acceptance_criterion=GATING_ACCEPTANCE_CRITERION,
             throughput_delta_pct=throughput_delta_pct,
             min_acceptance_delta_pp=promotion_config.min_acceptance_delta_pp,
             min_throughput_delta_pct=promotion_config.min_throughput_delta_pct,
@@ -1027,7 +1216,18 @@ def decide_promotion(
         return _reject(Reason.COUNTER_RESET)
 
     # --- Validation: acceptance unavailable ---
+    # Both quantities are checked, because they are divided by *different*
+    # counters: the rate by ``spec_decode_num_draft_tokens`` and the criterion
+    # by ``spec_decode_num_drafts``.  An endpoint exposing only the first would
+    # otherwise hand the gate ``0.0 - 0.0 = 0.0`` tokens/step and reject every
+    # candidate under a threshold reason, hiding a missing counter behind a
+    # verdict about the head.
     if not stock_metrics.acceptance_available or not candidate_metrics.acceptance_available:
+        return _reject(Reason.ACCEPTANCE_UNAVAILABLE)
+    if (
+        not stock_metrics.accepted_length_available
+        or not candidate_metrics.accepted_length_available
+    ):
         return _reject(Reason.ACCEPTANCE_UNAVAILABLE)
 
     # --- Validation: too few repeats ---
@@ -1055,30 +1255,34 @@ def decide_promotion(
         return _reject(Reason.THROUGHPUT_UNAVAILABLE)
 
     # --- Compute deltas ---
+    # Recorded, not gated.  Still the delta of the two ``*_avg_acceptance``
+    # means, still in percentage points, still what every archived run is
+    # described by -- see ``Decision.acceptance_delta_pp``.
     acceptance_delta_pp = (c_acc_mean - s_acc_mean) * 100.0
+
+    # The promotion criterion: tokens per verifier step, k-invariant.
+    accepted_length_delta = c_mal_mean - s_mal_mean
 
     throughput_delta_pct = (c_tps - s_tps) / s_tps * 100.0
 
+    deltas: dict[str, float | None] = {
+        "acceptance_delta_pp": acceptance_delta_pp,
+        "accepted_length_delta": accepted_length_delta,
+        "throughput_delta_pct": throughput_delta_pct,
+    }
+
     # --- Threshold: acceptance ---
-    if acceptance_delta_pp < promotion_config.min_acceptance_delta_pp:
-        return _reject(
-            Reason.ACCEPTANCE_BELOW_THRESHOLD,
-            acceptance_delta_pp=acceptance_delta_pp,
-            throughput_delta_pct=throughput_delta_pct,
-        )
+    # ``Reason.ACCEPTANCE_BELOW_THRESHOLD`` is deliberately reused rather than
+    # split: the reason string is a public contract (``speedlm.report``'s
+    # explanations, the e2e harness's ``DELTA_REASONS``, archived records), and
+    # what it says -- the acceptance side of the gate missed its bar -- is still
+    # exactly true.  Which bar is named by ``acceptance_criterion``.
+    if accepted_length_delta < promotion_config.min_accepted_length_delta:
+        return _reject(Reason.ACCEPTANCE_BELOW_THRESHOLD, **deltas)
 
     # --- Threshold: throughput ---
     if throughput_delta_pct < promotion_config.min_throughput_delta_pct:
-        return _reject(
-            Reason.THROUGHPUT_BELOW_THRESHOLD,
-            acceptance_delta_pp=acceptance_delta_pp,
-            throughput_delta_pct=throughput_delta_pct,
-        )
+        return _reject(Reason.THROUGHPUT_BELOW_THRESHOLD, **deltas)
 
     # --- Both thresholds met: PROMOTE ---
-    return _decide(
-        Verdict.PROMOTE,
-        Reason.BOTH_THRESHOLDS_MET,
-        acceptance_delta_pp=acceptance_delta_pp,
-        throughput_delta_pct=throughput_delta_pct,
-    )
+    return _decide(Verdict.PROMOTE, Reason.BOTH_THRESHOLDS_MET, **deltas)

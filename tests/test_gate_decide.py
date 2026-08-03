@@ -6,6 +6,7 @@ import pytest
 
 from speedlm.config import DivergenceCriterion, PromotionConfig
 from speedlm.gate.decide import (
+    GATING_ACCEPTANCE_CRITERION,
     GATING_ACCEPTANCE_STATISTIC,
     GATING_THROUGHPUT_STATISTIC,
     Decision,
@@ -82,28 +83,65 @@ def _make_replay(
     )
 
 
+#: Draft depth these fixtures speak at.  It has to be *a* number because the
+#: two acceptance-side statistics are related through it -- ``acceptance_rate ==
+#: (mean_accepted_length - 1) / k`` -- and a fixture that pinned
+#: ``mean_accepted_length`` to a constant while varying ``acceptance_rate``
+#: would describe an engine that cannot exist.  It used to: the constant 4.67
+#: sat next to a swept rate, so every arm in this file had an identical accepted
+#: length and the gating criterion measured nothing.
+FIXTURE_DRAFT_DEPTH = 5
+
+
 def _make_delta(
     *,
     acceptance_rate: float = 0.7,
     output_tok_per_sec: float = 100.0,
     reset_detected: bool = False,
     acceptance_available: bool = True,
+    mean_accepted_length: float | None = None,
+    draft_depth: int = FIXTURE_DRAFT_DEPTH,
 ) -> MetricsDelta:
+    """A metrics delta whose two acceptance statistics are mutually consistent.
+
+    *mean_accepted_length* defaults to ``1 + acceptance_rate * draft_depth``,
+    which is the identity vLLM's own counters satisfy.  Pass *draft_depth* to
+    describe an engine drafting at a different depth -- that is the whole point
+    of the criterion -- or *mean_accepted_length* to break the identity
+    deliberately.
+    """
+    if mean_accepted_length is None:
+        mean_accepted_length = 1.0 + acceptance_rate * draft_depth
     return MetricsDelta(
         reset_detected=reset_detected,
         acceptance_available=acceptance_available,
         drafted_tokens=1000.0,
         accepted_tokens=700.0,
         acceptance_rate=acceptance_rate,
-        mean_accepted_length=4.67,
+        mean_accepted_length=mean_accepted_length,
         tpot_ms=10.0,
         output_tok_per_sec=output_tok_per_sec,
     )
 
 
-def _pcfg(*, acc_pp: float = 1.0, throughput_pct: float = 2.0) -> PromotionConfig:
+def _pcfg(
+    *,
+    acc_pp: float = 1.0,
+    throughput_pct: float = 2.0,
+    mal: float | None = None,
+) -> PromotionConfig:
+    """Promotion config whose two acceptance bars describe the same demand.
+
+    *mal* defaults to *acc_pp* converted at :data:`FIXTURE_DRAFT_DEPTH`
+    (``delta_mal == k * delta_acc``), so a test that asks for "a 1.0 pp bar" gets
+    the bar that means the same thing under the gating criterion.  Pass it
+    explicitly to set the two independently.
+    """
+    if mal is None:
+        mal = acc_pp / 100.0 * FIXTURE_DRAFT_DEPTH
     return PromotionConfig(
         min_acceptance_delta_pp=acc_pp,
+        min_accepted_length_delta=mal,
         min_throughput_delta_pct=throughput_pct,
     )
 
@@ -529,6 +567,7 @@ def test_shipped_defaults_are_the_noise_derived_ones() -> None:
     """Pin the defaults the rest of these tests reason about."""
     pcfg = PromotionConfig()
     assert pcfg.min_acceptance_delta_pp == 1.0
+    assert pcfg.min_accepted_length_delta == 0.05
     assert pcfg.min_throughput_delta_pct == -2.0
 
 
@@ -551,6 +590,208 @@ def test_job_368670_marginal_candidate_is_rejected_under_shipped_defaults() -> N
     assert dec.acceptance_delta_pp == 0.0
     assert dec.throughput_delta_pct is not None
     assert 0.9 < dec.throughput_delta_pct < 1.0
+
+
+# ---------------------------------------------------------------------------
+# The promotion criterion is k-invariant
+#
+# Every test below is written so that gating on ``acceptance_rate`` -- the
+# behaviour these replace -- makes it fail.  The archived measurements are the
+# real ones: gpt-oss-20b drafts at k=5 and scores 0.356, Qwen3-8B drafts at k=3
+# and scores 0.380, and gpt-oss is nonetheless 28% better per verifier step.
+# ---------------------------------------------------------------------------
+
+#: gpt-oss-20b, k=5: acceptance 0.356, i.e. 2.78 tokens per verifier step.
+_GPTOSS_DEPTH = 5
+_GPTOSS_ACCEPTANCE = 0.356
+#: Qwen3-8B, k=3: acceptance 0.380, i.e. 2.14 tokens per verifier step.
+_QWEN_DEPTH = 3
+_QWEN_ACCEPTANCE = 0.380
+
+
+def test_the_gating_criterion_is_named_in_the_record() -> None:
+    """A reader must never have to infer which acceptance statistic decided."""
+    dec = _decide_with_shipped_defaults(
+        stock_acc=0.60, cand_acc=0.70, stock_tps=100.0, cand_tps=100.0
+    )
+
+    assert dec.acceptance_criterion == GATING_ACCEPTANCE_CRITERION
+    assert dec.to_dict()["acceptance_criterion"] == "mean_accepted_length_delta"
+
+
+def test_a_deeper_draft_chain_that_wins_on_tokens_per_step_is_not_rejected() -> None:
+    """The defect, stated as a test: raising k must not veto the speedup.
+
+    gpt-oss's per-position conditional acceptance is still *rising* at position
+    5 (0.689 -> 0.715), so k=5 is too shallow.  Going to k=7 drops the
+    acceptance *rate* to ~0.31 -- a -4.6 pp delta, four and a half times the old
+    1.0 pp bar in the wrong direction -- while raising accepted length from 2.78
+    to 3.17 tokens per step, which is the actual speedup.
+
+    Gating on the rate rejects this with ``acceptance_below_threshold``.  That is
+    the single best available improvement being thrown away, and it is what this
+    test exists to stop.
+    """
+    stock = _make_delta(
+        acceptance_rate=_GPTOSS_ACCEPTANCE,
+        draft_depth=_GPTOSS_DEPTH,
+        output_tok_per_sec=100.0,
+    )
+    deeper = _make_delta(acceptance_rate=0.31, draft_depth=7, output_tok_per_sec=100.0)
+
+    # The premise: the rate really did fall, and hard.
+    assert deeper.acceptance_rate < stock.acceptance_rate
+    assert (deeper.acceptance_rate - stock.acceptance_rate) * 100.0 < -4.0
+    # ...while tokens per verifier step really did rise.
+    assert deeper.mean_accepted_length > stock.mean_accepted_length
+
+    dec = decide_promotion(
+        stock,
+        deeper,
+        _valid_runs_with_tps(100.0),
+        _valid_runs_with_tps(100.0),
+        PromotionConfig(),
+    )
+
+    assert dec.verdict == Verdict.PROMOTE
+    assert dec.reason == Reason.BOTH_THRESHOLDS_MET
+    # The rate delta is still recorded, still negative, and still ignored.
+    assert dec.acceptance_delta_pp is not None
+    assert dec.acceptance_delta_pp < -4.0
+    assert dec.accepted_length_delta == pytest.approx(3.17 - 2.78, abs=1e-9)
+
+
+def test_the_same_speedup_clears_the_bar_at_every_draft_depth() -> None:
+    """One bar, one meaning: 0.10 tokens/step ships at k=3 and at k=5 alike.
+
+    Under the acceptance rate the identical improvement is 3.33 pp at k=3 and
+    2.00 pp at k=5 -- the same engine change scored 67% higher for drafting
+    shallower.  A single rate threshold therefore cannot mean the same thing at
+    two depths, which is what makes it unusable across a k-sweep.
+    """
+    gain_per_step = 0.10
+    verdicts = {}
+    for depth, base in ((_QWEN_DEPTH, _QWEN_ACCEPTANCE), (_GPTOSS_DEPTH, _GPTOSS_ACCEPTANCE)):
+        stock = _make_delta(
+            acceptance_rate=base, draft_depth=depth, output_tok_per_sec=100.0
+        )
+        candidate = _make_delta(
+            acceptance_rate=base,
+            draft_depth=depth,
+            mean_accepted_length=1.0 + base * depth + gain_per_step,
+            output_tok_per_sec=100.0,
+        )
+        dec = decide_promotion(
+            stock,
+            candidate,
+            _valid_runs_with_tps(100.0),
+            _valid_runs_with_tps(100.0),
+            PromotionConfig(),
+        )
+        verdicts[depth] = dec
+        assert dec.accepted_length_delta == pytest.approx(gain_per_step)
+
+    assert verdicts[_QWEN_DEPTH].verdict == Verdict.PROMOTE
+    assert verdicts[_GPTOSS_DEPTH].verdict == Verdict.PROMOTE
+
+
+def test_gptoss_at_k5_outranks_qwen_at_k3_on_the_gating_criterion() -> None:
+    """The archived cross-model comparison, on the statistic that decides.
+
+    0.356 < 0.380 on the rate; 2.78 > 2.14 on tokens per verifier step.  Both
+    numbers are real; only the second is comparable, because the first divides
+    by a k that differs between the two rows.
+    """
+    gptoss = _make_delta(acceptance_rate=_GPTOSS_ACCEPTANCE, draft_depth=_GPTOSS_DEPTH)
+    qwen = _make_delta(acceptance_rate=_QWEN_ACCEPTANCE, draft_depth=_QWEN_DEPTH)
+
+    # The rank inversion itself: the two statistics disagree about which head
+    # is better, and only one of them is comparable across the two depths.
+    assert gptoss.acceptance_rate < qwen.acceptance_rate
+    assert gptoss.mean_accepted_length > qwen.mean_accepted_length
+    assert gptoss.mean_accepted_length / qwen.mean_accepted_length > 1.25
+
+    # Why: the rate is exactly the accepted length rescaled by that row's own k,
+    # so comparing two rows at different k compares two different rescalings.
+    for delta, depth in ((gptoss, _GPTOSS_DEPTH), (qwen, _QWEN_DEPTH)):
+        assert delta.acceptance_rate == pytest.approx(
+            (delta.mean_accepted_length - 1.0) / depth
+        )
+    # Rescaled onto Qwen's depth, gpt-oss outscores it on the rate too.
+    assert (gptoss.mean_accepted_length - 1.0) / _QWEN_DEPTH > qwen.acceptance_rate
+
+
+def test_the_rate_delta_is_still_recorded_when_it_no_longer_decides() -> None:
+    """Backward compatibility: the archived field keeps its name and meaning.
+
+    Every decision in ``/data/ryan.kim/speedlm-runs`` is described by
+    ``acceptance_delta_pp`` against ``min_acceptance_delta_pp``.  Both stay in
+    the record, computed exactly as before, on every path that reaches the
+    deltas -- promote and both threshold rejections alike.
+    """
+    for cand_acc, expected in ((0.70, Verdict.PROMOTE), (0.60, Verdict.REJECT)):
+        dec = _decide_with_shipped_defaults(
+            stock_acc=0.60, cand_acc=cand_acc, stock_tps=100.0, cand_tps=100.0
+        )
+        record = dec.to_dict()
+        assert dec.verdict == expected
+        assert record["acceptance_delta_pp"] == pytest.approx(
+            (cand_acc - 0.60) * 100.0
+        )
+        assert record["min_acceptance_delta_pp"] == 1.0
+        assert record["accepted_length_delta"] == pytest.approx(
+            (cand_acc - 0.60) * FIXTURE_DRAFT_DEPTH
+        )
+        assert record["min_accepted_length_delta"] == 0.05
+
+
+def test_accepted_length_columns_are_the_mean_of_the_per_repeat_array() -> None:
+    """The published averages must be reproducible by hand from the array."""
+    dec = _decide_with_shipped_defaults(
+        stock_acc=0.60, cand_acc=0.70, stock_tps=100.0, cand_tps=100.0
+    )
+
+    assert dec.per_repeat
+    stock_column = [r.stock_accepted_length for r in dec.per_repeat]
+    cand_column = [r.candidate_accepted_length for r in dec.per_repeat]
+    assert dec.stock_avg_accepted_length == pytest.approx(
+        sum(stock_column) / len(stock_column)
+    )
+    assert dec.candidate_avg_accepted_length == pytest.approx(
+        sum(cand_column) / len(cand_column)
+    )
+    assert dec.accepted_length_delta == pytest.approx(
+        dec.candidate_avg_accepted_length - dec.stock_avg_accepted_length
+    )
+    # And the columns reach the record, not just the object.
+    row = dec.to_dict()["per_repeat"][0]
+    assert row["stock_accepted_length"] == pytest.approx(stock_column[0])
+    assert row["candidate_accepted_length"] == pytest.approx(cand_column[0])
+
+
+def test_a_missing_num_drafts_counter_reports_unavailable_not_a_zero_delta() -> None:
+    """The counter asymmetry must not masquerade as a measured verdict.
+
+    ``acceptance_available`` keys off ``spec_decode_num_draft_tokens`` while the
+    gating criterion divides by ``spec_decode_num_drafts``.  An endpoint
+    exposing only the first hands the gate ``mean_accepted_length == 0.0`` on
+    both arms -- a 0.0 delta, which would reject every candidate under
+    ``acceptance_below_threshold`` and blame the head for a missing counter.
+    """
+    blind = _make_delta(acceptance_rate=0.60, mean_accepted_length=0.0)
+    assert blind.acceptance_available is True
+    assert blind.accepted_length_available is False
+
+    dec = decide_promotion(
+        blind,
+        _make_delta(acceptance_rate=0.90, mean_accepted_length=0.0),
+        _valid_runs_with_tps(100.0),
+        _valid_runs_with_tps(140.0),
+        _pcfg(acc_pp=0.0, throughput_pct=0.0, mal=0.0),
+    )
+
+    assert dec.verdict == Verdict.REJECT
+    assert dec.reason == Reason.ACCEPTANCE_UNAVAILABLE
 
 
 def test_a_zeroed_gate_would_still_have_promoted_job_368670() -> None:
@@ -589,16 +830,27 @@ def test_sub_threshold_acceptance_gains_are_rejected_under_shipped_defaults() ->
         assert dec.reason == Reason.ACCEPTANCE_BELOW_THRESHOLD, gain_pp
 
 
-def test_acceptance_bar_promotes_exactly_at_one_point() -> None:
-    """The bar is inclusive: a clean 1.0 pp gain with flat throughput ships."""
-    dec = _decide_with_shipped_defaults(
-        stock_acc=0.60, cand_acc=0.61, stock_tps=100.0, cand_tps=100.0
+def test_accepted_length_bar_promotes_exactly_at_the_bar() -> None:
+    """The bar is inclusive: a gain landing exactly on it ships.
+
+    The three numbers are chosen to be exact in binary (2.0, 2.5, 0.5) so that
+    "exactly at the bar" is a real claim rather than a coin flip on the last
+    bit.  The gain this test used to make -- 0.60 -> 0.61 acceptance against a
+    1.0 pp bar -- was such a coin flip: ``(0.61-0.60)*100`` happens to land
+    1e-15 *above* 1.0, while the same gain expressed as accepted length lands
+    1.8e-16 *below* 0.05.  Neither ordering says anything about the gate.
+    """
+    dec = decide_promotion(
+        _make_delta(mean_accepted_length=2.0, output_tok_per_sec=100.0),
+        _make_delta(mean_accepted_length=2.5, output_tok_per_sec=100.0),
+        _valid_runs_with_tps(100.0),
+        _valid_runs_with_tps(100.0),
+        _pcfg(acc_pp=0.0, throughput_pct=0.0, mal=0.5),
     )
 
     assert dec.verdict == Verdict.PROMOTE
     assert dec.reason == Reason.BOTH_THRESHOLDS_MET
-    assert dec.acceptance_delta_pp is not None
-    assert abs(dec.acceptance_delta_pp - 1.0) < 1e-9
+    assert dec.accepted_length_delta == pytest.approx(0.5)
 
 
 def test_throughput_guard_tolerates_jitter_but_not_a_regression() -> None:

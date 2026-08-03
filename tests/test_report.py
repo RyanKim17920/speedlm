@@ -44,6 +44,7 @@ def _decision_dict(
     cand_acc: float = 0.68,
     stock_tps: float = 100.0,
     cand_tps: float = 112.0,
+    draft_depth: int = 5,
 ) -> dict[str, Any]:
     if per_repeat is None:
         per_repeat = [
@@ -55,6 +56,11 @@ def _decision_dict(
                 "candidate_acceptance_rate": cand_acc,
                 "invalid_rate": 0.0,
                 "output_mismatches": 0,
+                # Derived through *draft_depth* rather than pinned, because the
+                # two acceptance columns are related by
+                # ``acceptance_rate == (mean_accepted_length - 1) / k``.
+                "stock_accepted_length": 1.0 + stock_acc * draft_depth,
+                "candidate_accepted_length": 1.0 + cand_acc * draft_depth,
             }
             for i in range(num_repeats)
         ]
@@ -982,6 +988,34 @@ def _varying_repeats(count: int) -> list[dict[str, Any]]:
     ]
 
 
+def test_gain_names_the_bar_that_actually_gated(home: Path) -> None:
+    """`speedlm gain` must quote the criterion's threshold, not a dead one.
+
+    The acceptance-rate bar used to be printed as ``threshold >= 1.00 pp``
+    beside the rate delta.  It no longer gates -- the rate divides by the draft
+    depth -- so printing it there would tell a reader the gate applied a bar it
+    did not.  The gating bar is printed against the statistic it applies to.
+    """
+    payload = _decision_dict()
+    payload["accepted_length_delta"] = 0.3
+    payload["min_accepted_length_delta"] = 0.05
+    payload["stock_avg_accepted_length"] = 4.1
+    payload["candidate_avg_accepted_length"] = 4.4
+    payload["acceptance_criterion"] = "mean_accepted_length_delta"
+    _write_decision(home, payload)
+
+    text = build_gain_report(now=1_000.0).render_text()
+
+    assert "accepted len stock: 4.100 tok/step" in text
+    assert "accepted len cand : 4.400 tok/step" in text
+    assert "accepted len delta: +0.300 tok/step" in text
+    assert "threshold >= 0.050 tok/step" in text
+    # And the rate delta is still shown, explicitly as a non-gating figure.
+    assert "acceptance delta  : +6.00 pp" in text
+    assert "recorded, not gated" in text
+    assert "threshold >= 1.00 pp" not in text
+
+
 def test_gain_degenerate_dispersion_never_prints_a_bare_delta(home: Path) -> None:
     """Five bit-identical repeats are no measurement, and must not read as one.
 
@@ -998,8 +1032,11 @@ def test_gain_degenerate_dispersion_never_prints_a_bare_delta(home: Path) -> Non
     assert (
         "acceptance delta  : +6.00 pp "
         "(no variance observed across 5 identical repeats; "
-        "threshold >= 1.00 pp)" in text
+        "recorded, not gated)" in text
     )
+    # This payload predates the gating criterion, so there is no accepted-length
+    # block to render.  Absent, not zeroed: see the test below for the block.
+    assert "accepted len delta:" not in text
     # No standard error is offered where none exists.
     assert "+6.00 pp +/-" not in text
 
@@ -1014,7 +1051,7 @@ def test_gain_measured_dispersion_prints_the_standard_error(home: Path) -> None:
 
     assert report.decision is not None
     assert "acceptance delta  : +6.00 pp +/- " in text
-    assert "(n=4; threshold >= 1.00 pp)" in text
+    assert "(n=4; recorded, not gated)" in text
     assert "throughput delta  : +12.00% +/- " in text
     assert "(n=4; threshold >= 2.00%)" in text
     assert "no variance observed" not in text

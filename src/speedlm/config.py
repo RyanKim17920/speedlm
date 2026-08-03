@@ -419,7 +419,109 @@ class PromotionConfig:
     this system exists to prevent.
     """
 
+    #: **No longer the promotion criterion.  Reported, not enforced.**
+    #:
+    #: ``acceptance_rate`` is ``accepted_tokens / drafted_tokens``, and
+    #: ``drafted_tokens == num_drafts * k`` for a draft chain of depth ``k``, so
+    #: the statistic is algebraically ``(mean_accepted_length - 1) / k``.  The
+    #: ``k`` in the denominator makes it **incomparable across draft depths**,
+    #: and the archive shows the gate paying for that: Qwen3-8B at ``k=3``
+    #: scores 0.380 while gpt-oss-20b at ``k=5`` scores 0.356 -- yet gpt-oss
+    #: emits 2.82 tokens per verifier step against Qwen's 2.14, i.e. it is 28%
+    #: better at the thing speculative decoding is for, and on a like-for-like
+    #: ``k=3`` basis it would score 0.486.
+    #:
+    #: The failure that forced this change is not the mis-ranking but its
+    #: direction.  gpt-oss's per-position conditional acceptance is flat to
+    #: *rising* at the last drafted position (0.689 -> 0.715 at position 5),
+    #: which says ``k=5`` is too shallow and throughput is being left unclaimed.
+    #: Raising ``k`` would raise tokens/s while *lowering* ``acceptance_rate``
+    #: to roughly 0.31 -- a -4.6 pp delta, a hard reject under this bar.  The
+    #: primary promotion criterion would have vetoed the single largest speedup
+    #: available.  See :attr:`min_accepted_length_delta` for what gates now.
+    #:
+    #: It is still recorded on every decision, and every archived run in
+    #: ``/data/ryan.kim/speedlm-runs`` is described by it, so it keeps its name,
+    #: its units (percentage points of acceptance rate) and its default.  What
+    #: it no longer does is decide.  ``Decision.acceptance_criterion`` names the
+    #: statistic that actually gated, so a reader never has to infer it.
     min_acceptance_delta_pp: float = 1.0
+    #: The promotion criterion: required lift in **mean accepted length**, in
+    #: tokens emitted per verifier forward pass.
+    #:
+    #: ``mean_accepted_length = 1 + accepted_tokens / num_drafts`` -- tokens per
+    #: *step*, not per *drafted position*.  It carries no ``k`` in its
+    #: denominator, so two runs at different draft depths are directly
+    #: comparable, and it moves in the same direction as the speedup: at a fixed
+    #: cost per verifier step, throughput is proportional to it.  vLLM already
+    #: computes it (``speedlm.gate.metrics.MetricsDelta.mean_accepted_length``)
+    #: once per scored repeat, so nothing new is measured to gate on it.
+    #:
+    #: Why not gate on tokens/s directly, given that it is the quantity we
+    #: actually want?  Because the gate already thresholds throughput, and the
+    #: two criteria buy different things.  ``min_throughput_delta_pct`` is a
+    #: *regression guard* (see below) precisely because a positive throughput
+    #: bar cannot be earned on merit at this sample size: the one-sided 95%
+    #: minimum detectable effect is ~3.0%, and the measured standard error on
+    #: the arm-to-arm replay delta is 0.607-0.640% over five repeats.  Promoting
+    #: on tokens/s would mean re-deriving a positive bar this file has already
+    #: shown to be unreachable, and would collapse both criteria onto one noisy,
+    #: timing-confounded statistic.  Acceptance-side statistics have no timing
+    #: component at all -- greedy replay of a frozen suite against a frozen
+    #: draft is deterministic by construction -- so they isolate the head's
+    #: quality from batch composition, co-tenancy and drift.  Keeping the pair
+    #: asks two independent questions: "does the head emit more tokens per
+    #: verifier step" (this bar) and "did that not cost wall-clock"
+    #: (``min_throughput_delta_pct``).  That pair is also what keeps a deeper
+    #: draft chain honest: a larger ``k`` mechanically raises mean accepted
+    #: length, and the throughput guard is what catches the case where the extra
+    #: depth costs more per step than it buys.
+    #:
+    #: **Calibration.**  ``0.05`` tokens/step is the old ``1.0`` pp bar
+    #: re-expressed at ``k=5`` (``delta_mal = k * delta_acc``), i.e. the
+    #: strictest reading of the outgoing bar across the two depths in the
+    #: archive -- at ``k=3`` the old bar was only 0.03 tokens/step, so this is
+    #: strictly harder for Qwen and identical for gpt-oss.  No archived
+    #: rejection can therefore flip to a promotion.  Replayed over every
+    #: ``terminal-decision.json`` in ``/data/ryan.kim/speedlm-runs``:
+    #:
+    #: ===============================  ===  ============  =========  =========================
+    #: run                                k  acc delta pp  delta MAL  verdict (old -> new)
+    #: ===============================  ===  ============  =========  =========================
+    #: multicycle-20260731T190000Z        5       +6.8286    +0.3414  promote -> promote
+    #: full-gptoss-head (run2)            5       -1.2028    -0.0601  reject(acceptance) -> same
+    #: gptoss-pinned-2                    5       -0.5674    -0.0284  reject(acceptance) -> same
+    #: qwen-cross-20260801T014500Z        3       -0.5540    -0.0166  reject(acceptance) -> same
+    #: qwen-pinned-2                      3       -0.1890    -0.0057  reject(acceptance) -> same
+    #: early-divergence-3                 5      (-1.2714)  (-0.0636) reject(output_mismatch)
+    #: qwen-cross-20260731T235000Z        3      (-0.6423)  (-0.0193) reject(output_mismatch)
+    #: full-qwen-head (run2)              3      (-0.1714)  (-0.0051) reject(output_mismatch)
+    #: qwen-pinned-1                      3      (-0.2380)  (-0.0071) reject(high_invalid_rate)
+    #: ===============================  ===  ============  =========  =========================
+    #:
+    #: Parenthesised deltas are recomputed from the ``per_repeat`` column: those
+    #: four runs short-circuit *above* the delta computation and are untouched
+    #: by this threshold either way.  The five runs that do reach it split
+    #: +0.341 against -0.060 and below -- a gap of a factor of five to the bar
+    #: in the promoting direction and of nearly one in the rejecting direction,
+    #: so the archive does not constrain the bar tightly and 0.05 is chosen for
+    #: continuity with the outgoing one rather than to thread that gap.
+    #:
+    #: Against noise: job 369161 is the only archived run whose acceptance
+    #: column varies, at a per-repeat sample sd of 0.0287 pp and a standard
+    #: error on the delta of means of 0.0174 pp; at ``k=3`` those are 0.00086
+    #: and 0.00052 tokens/step, putting 0.05 at ~96 standard errors.  The
+    #: counting-noise floor from job 369005 (~224k drafted tokens per repeat,
+    #: SE 0.066 pp over five repeats) is 0.00198 tokens/step at ``k=3``, i.e.
+    #: ~25 standard errors.  In relative terms 0.05 asks for a 2.4% lift on
+    #: Qwen's 2.12 tokens/step and a 1.8% lift on gpt-oss's 2.78 -- the same
+    #: order the outgoing bar asked for, but now in a unit that does not move
+    #: when ``k`` does.  The counterfactual that motivated the change clears it
+    #: easily: gpt-oss at ``k=7`` would land near 3.17 tokens/step, ``+0.39``.
+    #:
+    #: Recalibrate from the first run whose ``per_repeat`` accepted-length
+    #: column actually varies at a *different* ``k``, not from this comment.
+    min_accepted_length_delta: float = 0.05
     #: Negative by design: a floor on regression, not a required speedup.
     min_throughput_delta_pct: float = -2.0
     #: How far into a generation the candidate must stay token-identical to
@@ -463,6 +565,9 @@ class PromotionConfig:
 
     def __post_init__(self) -> None:
         _validate_float_gte(self.min_acceptance_delta_pp, "min_acceptance_delta_pp", 0)
+        _validate_float_gte(
+            self.min_accepted_length_delta, "min_accepted_length_delta", 0
+        )
         # No lower bound of zero here: a negative value is the intended
         # regression-guard form ("reject anything more than N% slower").
         _validate_float(self.min_throughput_delta_pct, "min_throughput_delta_pct")
