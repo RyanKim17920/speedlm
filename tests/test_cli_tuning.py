@@ -11,6 +11,11 @@ import pytest
 
 import speedlm.cli as cli
 from speedlm.config import IdleTuningConfig
+from speedlm.gate.decide import EngineExecution
+
+#: Sentinel regime a stubbed launch plan reports, so a test can prove the
+#: gate was handed *this* plan's argv-derived value and not a fresh default.
+_PLAN_EXECUTION = EngineExecution(enforce_eager=True, max_num_seqs=64)
 
 
 @pytest.mark.parametrize(
@@ -224,6 +229,12 @@ def test_tuned_gateway_starts_service_and_awaits_stop_before_child_shutdown(
     def fake_create_tuner(*_args, **kwargs) -> FakeService:
         assert kwargs["capture"] is capture
         assert isinstance(kwargs["admission"], FakeAdmission)
+        # The gate publishes the engine regime on every decision, and this call
+        # site is the only thing that knows it: the same launch plan whose
+        # ``argv_factory`` was just handed to the supervisor also carries the
+        # regime read out of that argv.  Unwired, every live decision.json
+        # recorded ``engine_execution_mode: unrecorded``.
+        assert kwargs["engine_execution"] is _PLAN_EXECUTION
         events.append("service.created")
         return FakeService()
 
@@ -246,6 +257,7 @@ def test_tuned_gateway_starts_service_and_awaits_stop_before_child_shutdown(
             profile=object(),
             active_draft="base-draft",
             argv_factory=lambda _draft: ["vllm"],
+            engine_execution=_PLAN_EXECUTION,
         ),
     )
     monkeypatch.setattr(cli, "AdmissionGate", FakeAdmission)
@@ -355,6 +367,7 @@ def test_tuned_gateway_handles_signal_during_initial_model_load(
             profile=object(),
             active_draft="base-draft",
             argv_factory=lambda _draft: ["vllm"],
+            engine_execution=_PLAN_EXECUTION,
         ),
     )
     monkeypatch.setattr(cli, "AdmissionGate", FakeAdmission)

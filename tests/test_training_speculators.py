@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import pytest
-from draft_weights import write_draft_weights
+from draft_weights import write_draft_config, write_draft_weights
 
 from speedlm.config import MAX_LEARNING_RATE, REFERENCE_LEARNING_RATE
 from speedlm.training.backends.eagle3 import (
@@ -159,7 +159,10 @@ class _FakeRunner:
         if script == "train.py":
             output = Path(command[command.index("--save-path") + 1]) / "checkpoint_best"
             output.mkdir(parents=True)
-            (output / "config.json").write_text("{}\n", encoding="utf-8")
+            # A real checkpoint_best carries the Speculators draft config, and
+            # materialization now rewrites its declared speculative_tokens to
+            # the depth the cycle trained at; ``{}`` was not a stand-in for it.
+            write_draft_config(output)
             # A real container, not a placeholder: materialization now parses
             # the safetensors header to fingerprint the trained weights.
             write_draft_weights(output, seed=1)

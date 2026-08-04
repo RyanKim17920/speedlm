@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import math
+import statistics
 from collections.abc import Callable, Iterator
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -13,6 +15,7 @@ from speedlm.gate.decide import (
     CUDA_GRAPH_EXECUTION_MODE,
     EAGER_EXECUTION_MODE,
     UNRECORDED_EXECUTION_MODE,
+    DispersionBasis,
     EngineExecution,
     Reason,
     Verdict,
@@ -284,6 +287,7 @@ def _normal_scrapes(
     stock_fractions: tuple[float, ...] | None = None,
     stock_accepted_fractions: tuple[float, ...] | None = None,
     candidate_fractions: tuple[float, ...] | None = None,
+    candidate_accepted_fractions: tuple[float, ...] | None = None,
 ) -> list[str]:
     return [
         *_arm_ladder(
@@ -303,6 +307,11 @@ def _normal_scrapes(
             ),
             repeats=repeats,
             fractions=candidate_fractions,
+            # The stock arm had this axis and the candidate arm did not, so no
+            # test could give the *candidate* column per-repeat acceptance
+            # variance -- which is exactly the arm job d993eee reported
+            # bit-identically five times over.
+            accepted_fractions=candidate_accepted_fractions,
         ),
     ]
 
@@ -322,6 +331,12 @@ def _runner(
     clock: Callable[[], float] | None = None,
     events: list[str] | None = None,
     candidate_arm_first: bool = False,
+    #: Scored repeats.  Four is what a test asserting *exact* equality between
+    #: repeat windows needs: the default three makes the ladder accrue in
+    #: thirds, and a third of a float total is not representable, so windows
+    #: that are conceptually identical differ in the last bits.  Real counters
+    #: are integers and have no such problem.
+    repeats: int = 3,
 ) -> tuple[BenchmarkGateRunner, FakeEndpoint, FakeReplayExecutor, FakeTraceSource]:
     endpoint = FakeEndpoint()
     replay_executor = replay or FakeReplayExecutor()
@@ -338,6 +353,7 @@ def _runner(
         replay_executor=replay_executor,
         training_context_hashes=training_context_hashes,
         candidate_arm_first=candidate_arm_first,
+        repeats=repeats,
         clock=clock or FakeClock(),
     )
     return runner, endpoint, replay_executor, traces
@@ -1338,6 +1354,130 @@ def test_acceptance_is_measured_once_per_repeat_not_once_per_arm(
     per_repeat_windows = result.metrics["stock_per_repeat"]
     assert isinstance(per_repeat_windows, list)
     assert len(per_repeat_windows) == 3
+
+
+def test_the_candidate_arm_is_re_measured_per_repeat_too(tmp_path: Path) -> None:
+    """The per-repeat scrape ladder has to bind to *both* arms, not just stock.
+
+    Job d993eee (gpt-oss-20b) published ``candidate_acceptance_stdev = 0.0``
+    with the candidate rate bit-identical to 17 significant figures in all five
+    rows, while the stock column moved -- the exact signature of a single
+    measurement stamped N times.  Only the stock arm's side of that was under
+    test, so nothing in the suite could tell the two apart for the candidate.
+    """
+    scrapes = _normal_scrapes(candidate_accepted_fractions=(0.2, 0.5, 1.0))
+    runner, _, _, _ = _runner(tmp_path, scrapes=scrapes)
+
+    result = runner.benchmark(
+        tmp_path / "candidate",
+        timeout_seconds=30,
+        should_abort=lambda: False,
+    )
+
+    assert result.decision is not None
+    rates = [r.candidate_acceptance_rate for r in result.decision.per_repeat]
+    assert len(rates) == 3
+    assert len(set(rates)) == 3
+    assert result.decision.candidate_avg_acceptance == pytest.approx(
+        sum(rates) / len(rates)
+    )
+    assert result.decision.candidate_acceptance_stdev > 0.0
+    per_repeat_windows = result.metrics["candidate_per_repeat"]
+    assert isinstance(per_repeat_windows, list)
+    assert len(per_repeat_windows) == 3
+
+
+def test_a_frozen_candidate_column_still_moves_when_its_counters_do(
+    tmp_path: Path,
+) -> None:
+    """Zero candidate variance must be a property of the counters, not the code.
+
+    The two arms are scraped by one code path, so the only honest way to read
+    ``candidate_acceptance_stdev == 0.0`` is "these five windows really did
+    return the same integers".  This pins that by holding everything else fixed
+    and moving only the candidate's accrual schedule: a runner that stamped one
+    measurement would report 0.0 in both halves.
+    """
+    frozen = _runner(
+        tmp_path / "frozen", scrapes=_normal_scrapes(repeats=4), repeats=4
+    )[0].benchmark(
+        tmp_path / "candidate", timeout_seconds=30, should_abort=lambda: False
+    )
+    moving = _runner(
+        tmp_path / "moving",
+        scrapes=_normal_scrapes(
+            repeats=4, candidate_accepted_fractions=(0.125, 0.5, 0.75, 1.0)
+        ),
+        repeats=4,
+    )[0].benchmark(
+        tmp_path / "candidate", timeout_seconds=30, should_abort=lambda: False
+    )
+
+    assert frozen.decision is not None and moving.decision is not None
+    assert frozen.decision.candidate_acceptance_stdev == 0.0
+    assert moving.decision.candidate_acceptance_stdev > 0.0
+
+
+def test_one_frozen_arm_does_not_make_the_dispersion_degenerate(
+    tmp_path: Path,
+) -> None:
+    """Job d993eee's shape, pinned: a half-frozen delta is still ``MEASURED``.
+
+    ``DispersionBasis`` is computed from the arm-to-arm *delta*, so an arm that
+    contributed no variance is invisible in the label -- ``measured`` beside a
+    ``candidate_acceptance_stdev`` of ``0.0``.  That is defensible (the
+    unpaired SE really is the surviving arm's SE), but it is exactly what two
+    prior readings of d993eee mistook for a broken measurement, so the
+    relationship is asserted rather than left to be rediscovered.
+    """
+    # Stock moves, candidate accrues evenly and so repeats identically: the
+    # published archive shape.
+    scrapes = _normal_scrapes(
+        repeats=4, stock_accepted_fractions=(0.25, 0.5, 0.875, 1.0)
+    )
+    runner, _, _, _ = _runner(tmp_path, scrapes=scrapes, repeats=4)
+
+    result = runner.benchmark(
+        tmp_path / "candidate",
+        timeout_seconds=30,
+        should_abort=lambda: False,
+    )
+
+    decision = result.decision
+    assert decision is not None
+    assert decision.candidate_acceptance_stdev == 0.0
+    assert decision.stock_acceptance_stdev > 0.0
+    # Not DEGENERATE: the delta still varies, because one arm still varies.
+    assert decision.acceptance_dispersion is DispersionBasis.MEASURED
+    # ...and the published standard error carries information from the stock
+    # arm alone.  A reader who treats it as a two-arm measurement is over-
+    # crediting it by exactly the arm that contributed nothing.
+    stock_rates = [r.stock_acceptance_rate for r in decision.per_repeat]
+    assert decision.acceptance_delta_standard_error_pp == pytest.approx(
+        statistics.stdev(stock_rates) / math.sqrt(len(stock_rates)) * 100.0
+    )
+
+
+def test_both_arms_frozen_is_reported_as_degenerate_not_as_a_tight_gate(
+    tmp_path: Path,
+) -> None:
+    """Zero on both sides publishes no standard error at all."""
+    runner, _, _, _ = _runner(tmp_path, scrapes=_normal_scrapes(repeats=4), repeats=4)
+
+    result = runner.benchmark(
+        tmp_path / "candidate",
+        timeout_seconds=30,
+        should_abort=lambda: False,
+    )
+
+    decision = result.decision
+    assert decision is not None
+    assert decision.stock_acceptance_stdev == 0.0
+    assert decision.candidate_acceptance_stdev == 0.0
+    assert decision.acceptance_dispersion is DispersionBasis.DEGENERATE
+    # ``None`` rather than ``0.0``: anything dividing a threshold by this must
+    # fail loudly instead of computing an infinitely well-resolved gate.
+    assert decision.acceptance_delta_standard_error_pp is None
 
 
 def test_a_reset_inside_one_repeat_window_invalidates_the_arm(

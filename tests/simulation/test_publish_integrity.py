@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from draft_weights import write_draft_weights
+from draft_weights import write_draft_config, write_draft_weights
 
 from simulation.engine import DraftProfile, SimulatedEngine, running_engine
 from simulation.harness import (
@@ -240,6 +240,9 @@ class TestTheTrainedWeightsReachThePublication:
         write_draft_weights(stock, seed=1)
         trained = tmp_path / "trained"
         write_draft_weights(trained, seed=2)
+        # The guard also asserts the artifact declares the depth it trained
+        # at, so a publishable stand-in needs the Speculators config block.
+        write_draft_config(trained)
 
         adapter = self._adapter(stock)
         adapter._record_draft_weights(trained)

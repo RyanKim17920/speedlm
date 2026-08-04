@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Final, cast
 
 from speedlm.config import SpeedLMConfig
+from speedlm.gate.decide import EngineExecution
 from speedlm.gate.runner import BenchmarkGateRunner
 from speedlm.gateway.activity import ActivityTracker
 from speedlm.gateway.capture import CaptureManager
@@ -558,6 +559,16 @@ class TuningLaunchPlan:
     profile: ModelProfile
     active_draft: DraftReference
     argv_factory: Callable[[DraftReference], list[str]]
+    #: How the engine this plan launches will execute, read out of the argv
+    #: :attr:`argv_factory` produces rather than restated from config.
+    #:
+    #: The gate publishes this on every ``decision.json``; without it a live
+    #: run records ``engine_execution_mode: unrecorded`` and its throughput
+    #: number cannot be honestly compared against any other run's.  It is
+    #: derived from :attr:`active_draft`'s argv, which differs from any other
+    #: draft's argv only in the ``--speculative-config`` payload -- none of the
+    #: execution flags live there, so one draft's argv answers for all of them.
+    engine_execution: EngineExecution
     context_window: ContextWindowAlignment | None = None
 
 
@@ -695,6 +706,11 @@ def build_tuning_launch_plan(
         profile=profile,
         active_draft=active_draft,
         argv_factory=argv_factory,
+        # Read back out of the argv the supervisor will actually exec, not
+        # rebuilt from ``passthrough``: everything above may still edit
+        # ``base_passthrough`` (``--served-model-name``, an aligned
+        # ``--max-model-len``), so only the finished argv is the served truth.
+        engine_execution=EngineExecution.from_argv(argv_factory(active_draft)),
         context_window=context_window,
     )
 
@@ -715,6 +731,7 @@ def create_production_tuner(
     home: Path,
     passthrough: Sequence[str] = (),
     context_window: ContextWindowAlignment | None = None,
+    engine_execution: EngineExecution | None = None,
 ) -> TunerService:
     """Compose every concrete collaborator used by the background service.
 
@@ -727,6 +744,15 @@ def create_production_tuner(
     to.  The fallback is correct for stock deployments and only loses
     resolution when an operator passed ``--max-model-len`` and neither argument
     was threaded through.
+
+    ``engine_execution`` is likewise the one
+    :func:`build_tuning_launch_plan` already read out of the launch argv (pass
+    it as ``launch.engine_execution``).  Omitting it is not the same as
+    passing a default: the gate then records
+    :data:`speedlm.gate.decide.UNRECORDED_EXECUTION_MODE` rather than claiming
+    an execution mode nobody observed, because vLLM's own defaults are
+    version-dependent and guessing one would put an unmeasured fact in the
+    record.
     """
     if profile.speculative_method != "eagle3" or profile.draft_model is None:
         raise ProductionTuningError(
@@ -916,6 +942,12 @@ def create_production_tuner(
         held_out_fraction=tuning.held_out_fraction,
         training_context_hashes=lambda: split.training_context_hashes,
         candidate_arm_first=tuning.benchmark_candidate_arm_first,
+        # Was accepted by the runner and supplied by nothing, so every live
+        # ``decision.json`` recorded ``engine_execution_mode: unrecorded`` --
+        # and eager and CUDA-graph runs are a large throughput difference on
+        # the same weights, so an unlabelled tok/s figure is not comparable
+        # across runs.
+        engine_execution=engine_execution,
     )
     return create_tuner_service(
         config,

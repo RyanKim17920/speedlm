@@ -19,6 +19,11 @@ from speedlm.config import (
     IdleTuningConfig,
     SpeedLMConfig,
 )
+from speedlm.gate.decide import (
+    CUDA_GRAPH_EXECUTION_MODE,
+    EAGER_EXECUTION_MODE,
+    EngineExecution,
+)
 from speedlm.gateway.control import ControlAborted
 from speedlm.gateway.vllm_http import VLLMDraftSwapClient
 from speedlm.profiles import AuxLayerError, ContextWindowError, ModelProfile
@@ -175,6 +180,73 @@ def test_launch_plan_selects_the_promoted_artifact(
     assert _speculative_config(plan.argv_factory(plan.active_draft))["model"] == str(
         artifact.path
     )
+
+
+def test_the_launch_plan_reads_the_engine_regime_off_the_argv_it_will_exec(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The recorded regime must be the served one, not a restatement of config.
+
+    ``build_tuning_launch_plan`` keeps editing ``base_passthrough`` after the
+    operator's flags are read -- it appends ``--served-model-name`` and, under
+    the ``align`` policy, ``--max-model-len`` -- so only the finished argv is
+    the truth about what vLLM was told.  This asserts the plan's regime against
+    that finished argv rather than against the passthrough it started from.
+    """
+    profile = _profile()
+    config = _config(tmp_path, profile)
+    monkeypatch.setattr(composition, "resolve_profile", lambda *_args, **_kwargs: profile)
+
+    plan = build_tuning_launch_plan(
+        config,
+        passthrough=(
+            "--enforce-eager",
+            "--max-num-seqs",
+            "32",
+            "--no-enable-prefix-caching",
+            "--enable-chunked-prefill",
+        ),
+        child_port=8_765,
+        home=tmp_path / "home",
+    )
+
+    assert plan.engine_execution.execution_mode == EAGER_EXECUTION_MODE
+    assert plan.engine_execution.enforce_eager is True
+    assert plan.engine_execution.max_num_seqs == 32
+    assert plan.engine_execution.enable_prefix_caching is False
+    assert plan.engine_execution.enable_chunked_prefill is True
+    # The load-bearing claim: this is what the supervisor execs, byte for byte.
+    # ``cli._run_tuned_vllm_gateway`` hands ``plan.argv_factory`` straight to
+    # ``VLLMSupervisor``, which calls it with the draft and passes the result
+    # to ``VLLMProcess``.
+    assert plan.engine_execution == EngineExecution.from_argv(
+        plan.argv_factory(plan.active_draft)
+    )
+
+
+def test_a_launch_plan_told_no_execution_flags_does_not_invent_them(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Absent toggles stay ``None``; vLLM's own defaults are version-dependent."""
+    profile = _profile()
+    config = _config(tmp_path, profile)
+    monkeypatch.setattr(composition, "resolve_profile", lambda *_args, **_kwargs: profile)
+
+    plan = build_tuning_launch_plan(
+        config,
+        passthrough=(),
+        child_port=8_765,
+        home=tmp_path / "home",
+    )
+
+    # ``--enforce-eager`` is a bare store-true flag, so its absence really does
+    # mean graphs were captured; the other three genuinely were not observed.
+    assert plan.engine_execution.execution_mode == CUDA_GRAPH_EXECUTION_MODE
+    assert plan.engine_execution.enable_prefix_caching is None
+    assert plan.engine_execution.enable_chunked_prefill is None
+    assert plan.engine_execution.max_num_seqs is None
 
 
 def test_launch_plan_rejects_profile_for_a_different_verifier(
@@ -511,6 +583,144 @@ def test_create_production_tuner_assembles_profile_bound_collaborators(
     assert captured["service"]["state"] is state
     assert captured["service"]["artifacts"] is artifacts
     assert captured["service"]["enabled"] is True
+    # Nothing was told, so nothing is claimed.  ``BenchmarkGateRunner`` turns
+    # ``None`` into ``engine_execution_mode: unrecorded`` rather than into an
+    # assumed eager or graphed run.
+    assert captured["gate"]["engine_execution"] is None
+
+
+def _gate_kwargs_from_assembly(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    **extra: Any,
+) -> dict[str, Any]:
+    """Assemble a production tuner against stubs and return the gate's kwargs."""
+    profile = _profile()
+    config = _config(tmp_path, profile)
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        composition,
+        "ensure_layout",
+        lambda _home: SimpleNamespace(runs_dir=tmp_path / "runs"),
+    )
+    monkeypatch.setattr(composition, "TunerStateMachine", lambda _path: object())
+    monkeypatch.setattr(
+        composition,
+        "ArtifactRegistry",
+        lambda _path, **_kwargs: SimpleNamespace(active=lambda: None),
+    )
+    monkeypatch.setattr(
+        composition,
+        "HeldOutTraceSnapshotLeaser",
+        lambda _traces, **_kwargs: SimpleNamespace(
+            suite_dir=tmp_path / "held-out",
+            training_context_hashes=frozenset(),
+        ),
+    )
+    monkeypatch.setattr(
+        composition,
+        "SpeculatorsPipelineConfig",
+        lambda **_kwargs: SimpleNamespace(gpu_memory_utilization=0.80),
+    )
+    monkeypatch.setattr(
+        composition,
+        "Eagle3Backend",
+        SimpleNamespace(from_speculators=lambda _pipeline, **_kwargs: _FakeBackend()),
+    )
+    monkeypatch.setattr(composition, "RuntimeController", lambda **_kwargs: object())
+
+    def build_gate(**kwargs: object) -> object:
+        captured["gate"] = kwargs
+        return object()
+
+    monkeypatch.setattr(composition, "BenchmarkGateRunner", build_gate)
+    monkeypatch.setattr(
+        composition,
+        "create_tuner_service",
+        lambda _config, **_kwargs: object(),
+    )
+
+    loop = asyncio.new_event_loop()
+    try:
+        create_production_tuner(
+            config,
+            profile=profile,
+            active_draft="acme/active-draft",
+            activity=object(),  # type: ignore[arg-type]
+            admission=object(),  # type: ignore[arg-type]
+            traces=object(),  # type: ignore[arg-type]
+            capture=object(),  # type: ignore[arg-type]
+            process=object(),  # type: ignore[arg-type]
+            http=object(),  # type: ignore[arg-type]
+            child_url="http://127.0.0.1:8765",
+            loop=loop,
+            home=tmp_path / "home",
+            **extra,
+        )
+    finally:
+        loop.close()
+
+    gate_kwargs = captured["gate"]
+    assert isinstance(gate_kwargs, dict)
+    return gate_kwargs
+
+
+def test_the_gate_is_handed_the_engine_regime_it_will_measure_under(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``EngineExecution`` reached the runner from nothing before this.
+
+    ``BenchmarkGateRunner`` has accepted ``engine_execution`` and
+    ``decide.EngineExecution.from_argv`` has existed, but no production caller
+    supplied either -- so every live ``decision.json`` recorded
+    ``engine_execution_mode: unrecorded`` while the engine was in fact running
+    ``--enforce-eager`` (job d993eee's vLLM banner says ``enforce_eager=True``).
+    """
+    execution = EngineExecution(
+        enforce_eager=True,
+        enable_prefix_caching=True,
+        enable_chunked_prefill=True,
+        max_num_seqs=64,
+    )
+
+    gate_kwargs = _gate_kwargs_from_assembly(
+        tmp_path, monkeypatch, engine_execution=execution
+    )
+
+    assert gate_kwargs["engine_execution"] is execution
+
+
+def test_the_launch_plans_regime_survives_the_trip_to_the_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """End to end: operator flags -> launch argv -> plan -> gate constructor.
+
+    Asserting the two halves separately would leave the join untested, and the
+    join is where the wiring was missing.
+    """
+    profile = _profile()
+    config = _config(tmp_path, profile)
+    monkeypatch.setattr(composition, "resolve_profile", lambda *_args, **_kwargs: profile)
+    plan = build_tuning_launch_plan(
+        config,
+        passthrough=("--enforce-eager", "--max-num-seqs", "64"),
+        child_port=8_765,
+        home=tmp_path / "home",
+    )
+
+    # A directory of its own: the plan above already populated ``tmp_path``.
+    gate_kwargs = _gate_kwargs_from_assembly(
+        tmp_path / "assembly", monkeypatch, engine_execution=plan.engine_execution
+    )
+
+    recorded = gate_kwargs["engine_execution"]
+    assert isinstance(recorded, EngineExecution)
+    assert recorded.execution_mode == EAGER_EXECUTION_MODE
+    assert recorded.max_num_seqs == 64
+    assert recorded == EngineExecution.from_argv(plan.argv_factory(plan.active_draft))
 
 
 def test_configured_verifier_revision_is_pinned_verbatim() -> None:

@@ -634,6 +634,9 @@ async def _run_tuned_vllm_gateway(
                 config,
                 profile=launch.profile,
                 active_draft=launch.active_draft,
+                # Read off the same argv this process handed the supervisor
+                # above, so the gate's decision records the regime it measured.
+                engine_execution=launch.engine_execution,
                 activity=tracker,
                 admission=admission,
                 traces=store,

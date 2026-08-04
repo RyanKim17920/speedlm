@@ -156,3 +156,49 @@ def write_draft_weights(
     path = directory / filename
     path.write_bytes(safetensors_bytes(draft_payloads(seed=seed, names=names)))
     return path
+
+
+def speculators_config_payload(
+    depth: int = 3,
+    *,
+    methods: int = 1,
+    verifier: str = "acme/verifier",
+) -> dict[str, object]:
+    """A stock-shaped Speculators EAGLE-3 draft config declaring *depth*.
+
+    Shaped after the real ``config.json`` in
+    ``RedHatAI/gpt-oss-20b-speculator.eagle3``: production reads
+    ``speculators_config.proposal_methods[*].speculative_tokens`` out of it
+    (``speedlm.profiles.drafter_declared_speculative_tokens``) and rewrites
+    that field at materialization
+    (``speedlm.tuner.eagle3.declare_speculative_tokens``), so a fixture draft
+    that carries no such block is not a stand-in for a materialized head.
+    """
+    return {
+        "speculators_model_type": "eagle3",
+        "draft_vocab_size": 8,
+        "speculators_config": {
+            "algorithm": "eagle3",
+            "default_proposal_method": "greedy",
+            "proposal_methods": [
+                {
+                    "accept_tolerance": 0.0,
+                    "proposal_type": "greedy",
+                    "speculative_tokens": depth,
+                    "verifier_accept_k": 1,
+                }
+                for _ in range(methods)
+            ],
+            "verifier": {"architectures": [], "name_or_path": verifier},
+        },
+    }
+
+
+def write_draft_config(directory: Path, payload: object | None = None) -> Path:
+    """Write *payload* (default: a 3-deep stock-shaped config) as config.json."""
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "config.json"
+    if payload is None:
+        payload = speculators_config_payload()
+    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    return path

@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from draft_weights import write_draft_weights
+from draft_weights import write_draft_config, write_draft_weights
 
 from speedlm.config import IdleTuningConfig, SamplingConfig, SpeedLMConfig
 from speedlm.gate.replay import ReplayResult, RequestResult, RunResults
@@ -723,6 +723,10 @@ class _StubStages:
         # safetensors header, requires the trained-head tensor set, and
         # refuses a candidate whose weights match its baseline byte for byte.
         write_draft_weights(destination, seed=self.payload[-1])
+        # Materialization rewrites the draft's declared speculative_tokens to
+        # the depth the cycle trained at, so a stand-in head has to carry the
+        # Speculators config block that declaration lives in.
+        write_draft_config(destination)
         (destination / "weights.bin").write_bytes(self.payload)
         return destination
 

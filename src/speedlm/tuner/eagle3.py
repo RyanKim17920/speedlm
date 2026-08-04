@@ -7,11 +7,13 @@ the login-node test suite never imports CUDA, vLLM, or Speculators.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import inspect
 import json
 import math
 import operator
+import os
 import struct
 import time
 from collections.abc import Callable, Iterator, Mapping
@@ -23,7 +25,9 @@ from speedlm.profiles import (
     DEFAULT_SPECULATIVE_TOKENS,
     MAX_SPECULATIVE_TOKENS,
     cached_snapshot_dir,
+    drafter_declared_speculative_tokens,
 )
+from speedlm.storage import atomic_write_json
 from speedlm.traces.redact import Redactor
 from speedlm.training.base import BackendInfo
 from speedlm.training.masking import FinalAssistantMaskError, MaskPolicy
@@ -170,6 +174,27 @@ class ScratchQuotaExceeded(Eagle3Error):
 
 class StageTimeoutError(Eagle3Error):
     """An external stage exceeded its configured wall-clock timeout."""
+
+
+class DeclaredDepthError(Eagle3Error):
+    """A draft's ``config.json`` does not declare the depth it was trained at.
+
+    Speculators writes ``speculators_config.proposal_methods[*].speculative_tokens``
+    from ``ttt_steps`` only on the *converter* path
+    (``Eagle3DraftModel.from_training_args``).  On the ``--from-pretrained``
+    path -- the only path SpeedLM uses -- ``scripts/train.py`` loads the
+    warm-start config verbatim and never rewrites the field, so a head trained
+    5-deep from a vendor drafter whose converter hardcoded 3
+    (``convert/eagle/eagle3_converter.py:118``) ships declaring 3.
+
+    That declaration is not what vLLM serves at (see
+    :meth:`Eagle3Adapter.assert_published_weights`), but it is what every
+    *other* consumer reads -- including SpeedLM's own
+    :func:`speedlm.profiles.drafter_declared_speculative_tokens`, which is one
+    of the inputs to :func:`speedlm.profiles.resolve_speculative_tokens`.  An
+    artifact that misdescribes itself is a provenance defect that becomes a
+    depth defect the moment a profile stops pinning the depth explicitly.
+    """
 
 
 class DraftWeightsError(Eagle3Error):
@@ -384,6 +409,117 @@ def _collect_draft_tensors(directory: Path) -> dict[str, _TensorLocation]:
 def draft_tensor_keys(directory: Path) -> frozenset[str]:
     """Return every tensor name published by *directory*'s safetensors."""
     return frozenset(_collect_draft_tensors(directory))
+
+
+#: The Speculators draft config, which is the artifact's self-description.
+#:
+#: Deliberately *not* covered by :func:`weight_fingerprint` -- see that
+#: function's docstring.  Rewriting it changes what the artifact says about
+#: itself and cannot change what the artifact *is*, which is the whole reason
+#: the two digests are separate questions.
+_DRAFT_CONFIG_NAME: Final = "config.json"
+
+
+def declared_speculative_tokens(directory: Path) -> int | None:
+    """Return the chain depth *directory*'s ``config.json`` declares, if any.
+
+    ``None`` when the directory carries no readable declaration, on the same
+    reasoning as :func:`speedlm.profiles.drafter_declared_speculative_tokens`:
+    an unreadable or ambiguous config is no evidence, not a default.
+    """
+    path = directory / _DRAFT_CONFIG_NAME
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    return drafter_declared_speculative_tokens(payload)
+
+
+def declare_speculative_tokens(directory: Path, depth: int) -> bool:
+    """Rewrite *directory*'s declared chain depth to *depth*; report a change.
+
+    This is the publish-side repair for the inherited-declaration defect
+    described on :class:`DeclaredDepthError`.  It runs against the
+    *materialized* draft, before :class:`~speedlm.tuner.artifacts.ArtifactRegistry`
+    hashes the tree, so the content-addressed artifact id is computed over the
+    corrected config rather than being invalidated by it.
+
+    It cannot disturb :func:`weight_fingerprint`, which digests tensor names,
+    dtypes, shapes and payload bytes and nothing else -- no file names, no
+    config, no tokenizer.  The publish-time weight assertion therefore still
+    compares like with like after the rewrite.
+
+    A draft that carries no usable ``speculators_config`` block is a failure,
+    not a no-op: silently declining to fix an unrecognisable config is how the
+    stale value survived four cycles in the first place.
+    """
+    if isinstance(depth, bool) or not isinstance(depth, int) or depth < 1:
+        raise ValueError("depth must be a positive integer")
+    path = directory / _DRAFT_CONFIG_NAME
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise DeclaredDepthError(f"cannot read draft config: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise DeclaredDepthError(f"draft config is not valid JSON: {path}") from exc
+    if not isinstance(payload, dict):
+        raise DeclaredDepthError(f"draft config is not a JSON object: {path}")
+    speculators = payload.get("speculators_config")
+    if not isinstance(speculators, dict):
+        raise DeclaredDepthError(
+            f"draft config has no speculators_config object: {path}"
+        )
+    methods = speculators.get("proposal_methods")
+    if not isinstance(methods, list) or not methods:
+        raise DeclaredDepthError(
+            f"draft config declares no proposal_methods: {path}"
+        )
+    changed = False
+    for method in methods:
+        if not isinstance(method, dict):
+            raise DeclaredDepthError(
+                f"draft config has a non-object proposal method: {path}"
+            )
+        current = method.get("speculative_tokens")
+        if isinstance(current, bool) or current != depth:
+            method["speculative_tokens"] = depth
+            changed = True
+    if not changed:
+        return False
+    _rewrite_sealed_json(path, payload)
+    return True
+
+
+def _rewrite_sealed_json(path: Path, payload: object) -> None:
+    """Atomically rewrite *path*, restoring the sealed permissions around it.
+
+    The materializer chmods the draft tree to ``0o444``/``0o555`` before this
+    runs, so the rewrite has to unseal, replace and re-seal.  The modes are
+    read from the tree rather than assumed, and restored in a ``finally`` so a
+    failed write cannot leave a writable artifact behind.
+    """
+    directory = path.parent
+    try:
+        dir_mode = directory.stat().st_mode & 0o7777
+        file_mode = path.stat().st_mode & 0o7777
+    except OSError as exc:
+        raise DeclaredDepthError(f"cannot stat draft config: {path}") from exc
+    try:
+        os.chmod(directory, dir_mode | 0o300)
+        os.chmod(path, file_mode | 0o200)
+        atomic_write_json(path, payload)
+    except OSError as exc:
+        raise DeclaredDepthError(f"cannot rewrite draft config: {path}") from exc
+    finally:
+        # ``atomic_write_json`` replaces the inode, so the mode is restored on
+        # whatever now lives at *path*, and a vanished path is not worth
+        # masking the original failure over.
+        with contextlib.suppress(OSError):
+            os.chmod(path, file_mode)
+        with contextlib.suppress(OSError):
+            os.chmod(directory, dir_mode)
 
 
 def weight_fingerprint(directory: Path) -> str:
@@ -1322,6 +1458,15 @@ class Eagle3Adapter:
                 f"materializer did not return a draft directory: {draft_directory}"
             )
         self._record_draft_weights(draft_directory)
+        # Make the head describe the depth it was actually trained at.  This
+        # has to happen here, at the materialized draft, and not later at the
+        # staged artifact tree: ``ArtifactRegistry.publish`` hashes the source
+        # to derive the artifact id and then re-hashes the copy to prove
+        # nothing moved underneath it, so a rewrite inside the publish would
+        # be reported as "artifact changed while publishing".  Rewriting
+        # upstream of the first hash makes the corrected config part of the
+        # artifact's identity instead.
+        declare_speculative_tokens(draft_directory, self.config.num_speculative_steps)
         return draft_directory
 
     def _record_draft_weights(self, draft_directory: Path) -> None:
@@ -1466,6 +1611,39 @@ class Eagle3Adapter:
             raise DraftWeightsError(
                 f"published draft weights do not match the trained draft: "
                 f"expected fingerprint {expected}, got {actual} (path: {published})"
+            )
+        self._assert_published_depth(published)
+
+    def _assert_published_depth(self, published: Path) -> None:
+        """Fail the publish unless the artifact declares its trained depth.
+
+        The declaration is repaired at materialization by
+        :func:`declare_speculative_tokens`; this is the check that the repair
+        actually reached the bytes about to be published, and the reason the
+        stale value can never silently return.
+
+        Deliberately checked *here*, after the fingerprint, rather than only
+        at the rewrite site.  The rewrite runs on the materializer's output;
+        the artifact is a separate tree copied from it, and every prior defect
+        in this path was of the form "the step ran, on something else".  This
+        reads the staged tree while the rename is still revocable.
+
+        It is not a serving fix.  vLLM never reads this field for a drafter
+        passed as ``--speculative-config.model``: the only reader,
+        ``SpeculatorsConfig.build_vllm_speculative_config``, is reached solely
+        from ``maybe_override_with_speculators``, which vLLM applies to the
+        top-level ``--model`` -- SpeedLM's *verifier*, which carries no
+        ``speculators_config``.  This is a provenance check, and it is the
+        provenance that the next cycle's warm start and every external
+        consumer read.
+        """
+        expected = self.config.num_speculative_steps
+        declared = declared_speculative_tokens(published)
+        if declared != expected:
+            raise DeclaredDepthError(
+                f"published draft declares speculative_tokens={declared} but was "
+                f"trained {expected}-deep (path: {published}); the artifact would "
+                f"misdescribe itself to every consumer that reads its config"
             )
 
     def validate(
