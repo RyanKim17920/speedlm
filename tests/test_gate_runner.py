@@ -9,7 +9,14 @@ from pathlib import Path
 import pytest
 
 from speedlm.config import SamplingConfig, SpeedLMConfig
-from speedlm.gate.decide import Reason, Verdict
+from speedlm.gate.decide import (
+    CUDA_GRAPH_EXECUTION_MODE,
+    EAGER_EXECUTION_MODE,
+    UNRECORDED_EXECUTION_MODE,
+    EngineExecution,
+    Reason,
+    Verdict,
+)
 from speedlm.gate.replay import ReplayResult, RequestResult, RunResults
 from speedlm.gate.runner import (
     CORRECTNESS_CONTROL_REPEATS,
@@ -1545,3 +1552,132 @@ def test_an_unresolvable_stock_draft_fails_closed(
             timeout_seconds=30,
             should_abort=lambda: False,
         )
+
+
+# ---------------------------------------------------------------------------
+# The measurement records its own engine regime
+# ---------------------------------------------------------------------------
+def _regime_runner(
+    tmp_path: Path, execution: EngineExecution | None
+) -> BenchmarkGateRunner:
+    return BenchmarkGateRunner(
+        config=SpeedLMConfig(model="model"),
+        trace_source=FakeTraceSource((_trace(),)),
+        suite_dir=tmp_path / "suite",
+        stock_draft="stock",
+        endpoint=FakeEndpoint(),
+        metrics_source=FakeMetricsSource(_normal_scrapes()),
+        replay_executor=FakeReplayExecutor(),
+        training_context_hashes=frozenset(),
+        engine_execution=execution,
+        clock=FakeClock(),
+    )
+
+
+def test_the_decision_records_the_engine_regime_it_was_measured_under(
+    tmp_path: Path,
+) -> None:
+    """Eager and CUDA-graph runs are not comparable numbers.
+
+    They are a large throughput difference on the same weights and, for a MoE
+    target, not even bitwise equivalent -- which also moves the divergence
+    floor a run is judged against.
+    """
+    runner = _regime_runner(
+        tmp_path,
+        EngineExecution(
+            enforce_eager=False,
+            enable_chunked_prefill=True,
+            enable_prefix_caching=False,
+            max_num_seqs=64,
+        ),
+    )
+
+    result = runner.benchmark(
+        tmp_path / "candidate",
+        timeout_seconds=30,
+        should_abort=lambda: False,
+    )
+
+    assert result.decision is not None
+    record = result.decision.to_dict()
+    assert record["engine_execution_mode"] == CUDA_GRAPH_EXECUTION_MODE
+    assert record["engine_enforce_eager"] is False
+    assert record["engine_enable_chunked_prefill"] is True
+    assert record["engine_enable_prefix_caching"] is False
+    assert record["engine_max_num_seqs"] == 64
+    # The replay degree was already recorded and stays recorded: the regime is
+    # the engine *and* the traffic it was driven at.
+    assert record["replay_concurrency"] == DEFAULT_REPLAY_CONCURRENCY
+
+
+def test_an_eager_run_is_distinguishable_from_a_graph_run_in_the_record(
+    tmp_path: Path,
+) -> None:
+    eager = _regime_runner(tmp_path / "a", EngineExecution(enforce_eager=True))
+    graphed = _regime_runner(tmp_path / "b", EngineExecution(enforce_eager=False))
+
+    eager_record = eager.benchmark(
+        tmp_path / "candidate", timeout_seconds=30, should_abort=lambda: False
+    ).decision
+    graph_record = graphed.benchmark(
+        tmp_path / "candidate", timeout_seconds=30, should_abort=lambda: False
+    ).decision
+
+    assert eager_record is not None and graph_record is not None
+    assert eager_record.to_dict()["engine_execution_mode"] == EAGER_EXECUTION_MODE
+    assert (
+        graph_record.to_dict()["engine_execution_mode"] == CUDA_GRAPH_EXECUTION_MODE
+    )
+
+
+def test_a_runner_told_nothing_records_unrecorded_not_eager(
+    tmp_path: Path,
+) -> None:
+    """The runner owns no vLLM process, so silence must stay silence."""
+    runner = _regime_runner(tmp_path, None)
+
+    result = runner.benchmark(
+        tmp_path / "candidate",
+        timeout_seconds=30,
+        should_abort=lambda: False,
+    )
+
+    assert result.decision is not None
+    assert (
+        result.decision.to_dict()["engine_execution_mode"] == UNRECORDED_EXECUTION_MODE
+    )
+    assert result.metrics["engine_execution"] == {
+        "execution_mode": UNRECORDED_EXECUTION_MODE,
+        "enforce_eager": None,
+        "enable_chunked_prefill": None,
+        "enable_prefix_caching": None,
+        "max_num_seqs": None,
+    }
+
+
+def test_the_engine_regime_is_also_on_the_gate_metrics(tmp_path: Path) -> None:
+    runner = _regime_runner(
+        tmp_path, EngineExecution(enforce_eager=True, max_num_seqs=32)
+    )
+
+    result = runner.benchmark(
+        tmp_path / "candidate",
+        timeout_seconds=30,
+        should_abort=lambda: False,
+    )
+
+    assert result.metrics["engine_execution"] == {
+        "execution_mode": EAGER_EXECUTION_MODE,
+        "enforce_eager": True,
+        "enable_chunked_prefill": None,
+        "enable_prefix_caching": None,
+        "max_num_seqs": 32,
+    }
+
+
+def test_a_bogus_engine_description_is_refused_at_construction(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(ValueError, match="engine_execution"):
+        _regime_runner(tmp_path, "eager")  # type: ignore[arg-type]

@@ -1287,6 +1287,7 @@ class SpeedLMConfig:
         }
         result["promotion"] = {
             "min_acceptance_delta_pp": self.promotion.min_acceptance_delta_pp,
+            "min_accepted_length_delta": self.promotion.min_accepted_length_delta,
             "min_throughput_delta_pct": self.promotion.min_throughput_delta_pct,
             "min_divergence_token_index": self.promotion.min_divergence_token_index,
         }
@@ -1327,6 +1328,10 @@ class SpeedLMConfig:
                 self.tuning.restore_fast_path_timeout_seconds
             ),
             "draft_hot_swap_enabled": self.tuning.draft_hot_swap_enabled,
+            "val_loss_prefilter": {
+                "enabled": self.tuning.val_loss_prefilter.enabled,
+                "min_improvement": self.tuning.val_loss_prefilter.min_improvement,
+            },
         }
         result["sampling"] = {
             "temperature": self.sampling.temperature,
@@ -1384,6 +1389,7 @@ class SpeedLMConfig:
             "promotion",
             {
                 "min_acceptance_delta_pp",
+                "min_accepted_length_delta",
                 "min_throughput_delta_pct",
                 "min_divergence_token_index",
             },
@@ -1443,7 +1449,10 @@ class SpeedLMConfig:
         )
         sampling_data = _nested(data, "sampling", {"temperature", "top_p", "seed"})
 
-        # Handle nested val_loss_prefilter config
+        # Handle nested val_loss_prefilter config.  Shallow-copy to avoid
+        # mutating the caller's dict — the _nested() helper returns a reference
+        # to the original mapping, and we replace the dict with a dataclass.
+        tuning_data = dict(tuning_data)
         if "val_loss_prefilter" in tuning_data:
             vlp_data = tuning_data["val_loss_prefilter"]
             if isinstance(vlp_data, dict):

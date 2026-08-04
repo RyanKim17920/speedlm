@@ -114,6 +114,105 @@ def _positive_int(value: Any, field_name: str) -> int:
     return value
 
 
+#: One ``(range_start, range_end, num_speculative_tokens)`` band, inclusive.
+SpeculativeScheduleEntry = tuple[int, int, int]
+
+#: A batch-size-indexed draft-depth schedule, ordered and non-overlapping.
+SpeculativeSchedule = tuple[SpeculativeScheduleEntry, ...]
+
+
+def _validate_speculative_schedule(
+    value: Any,
+    *,
+    num_speculative_tokens: int,
+) -> SpeculativeSchedule:
+    """Validate a dynamic-K schedule against the vLLM fork's own contract.
+
+    The fork this project serves on replaced ``disable_by_batch_size`` with
+    ``SpeculativeConfig.num_speculative_tokens_per_batch_size``
+    (``vllm/config/speculative.py:172``), a list of inclusive
+    ``(range_start, range_end, K)`` bands that
+    ``vllm/v1/spec_decode/dynamic/utils.py:7`` expands into a dense per-batch
+    lookup consumed at ``vllm/v1/core/sched/scheduler.py:1085``.  Every rule
+    below mirrors a ``ValueError`` that validator would raise -- the point of
+    duplicating them is that a typo in a profile fails at profile load rather
+    than after a multi-hour engine boot.
+
+    Two rules are *stricter* than vLLM's:
+
+    ``K <= num_speculative_tokens``
+        vLLM silently clamps with ``min(vllm_num_speculative_tokens, K)``
+        (``utils.py:113``), so a schedule asking for more than the declared
+        depth is served quietly shallower than it reads.  A profile that lies
+        about the depth it serves is exactly the failure this module exists to
+        prevent, so it is rejected instead.
+
+    ``max(K) == num_speculative_tokens``
+        This is what keeps :func:`validate_training_depth` protecting
+        something real once ``K`` is a schedule rather than a scalar.  See that
+        function's docstring for the argument.
+    """
+    if not isinstance(value, (tuple, list)) or isinstance(value, (str, bytes)):
+        raise ProfileError("speculative_schedule must be an array of bands or null")
+    if not value:
+        raise ProfileError("speculative_schedule must not be empty")
+
+    bands: list[SpeculativeScheduleEntry] = []
+    for entry in value:
+        if (
+            not isinstance(entry, (tuple, list))
+            or isinstance(entry, (str, bytes))
+            or len(entry) != 3
+            or any(isinstance(item, bool) or not isinstance(item, int) for item in entry)
+        ):
+            raise ProfileError(
+                "each speculative_schedule band must be "
+                "[range_start, range_end, num_speculative_tokens] integers; "
+                f"got {entry!r}"
+            )
+        start, end, depth = (int(entry[0]), int(entry[1]), int(entry[2]))
+        if start < 1:
+            raise ProfileError(
+                f"speculative_schedule range_start must be at least 1; got {start}"
+            )
+        if end < start:
+            raise ProfileError(
+                f"speculative_schedule band ({start}, {end}) ends before it starts"
+            )
+        if depth < 0:
+            raise ProfileError(
+                f"speculative_schedule depth must not be negative; got {depth}"
+            )
+        if depth > num_speculative_tokens:
+            raise ProfileError(
+                f"speculative_schedule band ({start}, {end}) drafts {depth} tokens "
+                f"but the profile declares num_speculative_tokens="
+                f"{num_speculative_tokens}; vLLM would silently clamp it"
+            )
+        bands.append((start, end, depth))
+
+    if bands[0][0] != 1:
+        raise ProfileError(
+            "the first speculative_schedule band must start at batch size 1 so "
+            f"every runtime batch size has a defined depth; got {bands[0][0]}"
+        )
+    for previous, current in zip(bands, bands[1:], strict=False):
+        if current[0] <= previous[1]:
+            raise ProfileError(
+                f"speculative_schedule bands ({previous[0]}, {previous[1]}) and "
+                f"({current[0]}, {current[1]}) overlap or are out of order"
+            )
+    deepest = max(depth for _, _, depth in bands)
+    if deepest != num_speculative_tokens:
+        raise ProfileError(
+            f"speculative_schedule serves at most {deepest} draft tokens but the "
+            f"profile declares num_speculative_tokens={num_speculative_tokens}; "
+            "the declared depth is what the drafter is trained to, so it must be "
+            "the depth the schedule actually reaches"
+        )
+    return tuple(bands)
+
+
 @dataclass(frozen=True, slots=True)
 class ModelProfile:
     """Complete, immutable contract for one speculative-decoding setup."""
@@ -131,6 +230,8 @@ class ModelProfile:
     """Hidden-state scratch scales with hidden_size x num_aux_layers x tokens."""
     tool_call_parser: str | None = None
     reasoning_parser: str | None = None
+    speculative_schedule: SpeculativeSchedule | None = None
+    """Optional batch-size-indexed draft depth; ``None`` keeps ``K`` fixed."""
     trainable: bool = field(init=False)
 
     def __post_init__(self) -> None:
@@ -184,6 +285,15 @@ class ModelProfile:
             raise ProfileError(
                 f"draft_model is required for {self.speculative_method} profiles"
             )
+        if self.speculative_schedule is not None:
+            object.__setattr__(
+                self,
+                "speculative_schedule",
+                _validate_speculative_schedule(
+                    self.speculative_schedule,
+                    num_speculative_tokens=self.num_speculative_tokens,
+                ),
+            )
 
         object.__setattr__(
             self,
@@ -196,6 +306,21 @@ class ModelProfile:
         """Whether this profile may be served/benchmarked but never tuned."""
 
         return not self.trainable
+
+    @property
+    def max_served_speculative_tokens(self) -> int:
+        """Deepest draft position this profile can ever ask the drafter for.
+
+        With a fixed ``K`` that is ``num_speculative_tokens``.  With a
+        schedule it is the deepest band, which
+        :func:`_validate_speculative_schedule` pins to the same number -- so
+        this is a single, honest answer either way, and the one
+        :func:`validate_training_depth` must be handed.
+        """
+
+        if self.speculative_schedule is None:
+            return self.num_speculative_tokens
+        return max(depth for _, _, depth in self.speculative_schedule)
 
     def to_dict(self) -> dict[str, object]:
         """Return the stable JSON representation of this profile."""
@@ -215,11 +340,24 @@ class ModelProfile:
             "max_scratch_bytes": self.max_scratch_bytes,
             "tool_call_parser": self.tool_call_parser,
             "reasoning_parser": self.reasoning_parser,
+            "speculative_schedule": (
+                [list(band) for band in self.speculative_schedule]
+                if self.speculative_schedule is not None
+                else None
+            ),
             "trainable": self.trainable,
         }
 
     def speculative_config(self) -> dict[str, object]:
-        """Build the vLLM speculative-config fragment for this profile."""
+        """Build the vLLM speculative-config fragment for this profile.
+
+        ``num_speculative_tokens_per_batch_size`` is emitted *only* when the
+        profile carries a schedule.  Leaving it out is what makes
+        ``Scheduler.dynamic_sd_lookup`` stay ``None``
+        (``vllm/v1/core/sched/scheduler.py:236``) and the engine fall back to
+        the fixed ``num_speculative_tokens`` -- i.e. exactly today's
+        behaviour for every profile that does not opt in.
+        """
 
         result: dict[str, object] = {
             "method": self.speculative_method,
@@ -231,6 +369,10 @@ class ModelProfile:
             "draft_model",
         }:
             result["model"] = self.draft_model
+        if self.speculative_schedule is not None:
+            result["num_speculative_tokens_per_batch_size"] = [
+                list(band) for band in self.speculative_schedule
+            ]
         return result
 
     @classmethod
@@ -260,6 +402,7 @@ class ModelProfile:
             "max_scratch_bytes",
             "tool_call_parser",
             "reasoning_parser",
+            "speculative_schedule",
             "trainable",
         }
         missing = required - set(data)
@@ -322,6 +465,15 @@ class ModelProfile:
                 data["max_scratch_bytes"], "max_scratch_bytes"
             )
 
+        schedule_value = data.get("speculative_schedule")
+        speculative_schedule: SpeculativeSchedule | None
+        if schedule_value is None:
+            speculative_schedule = None
+        else:
+            # Fully validated by ``__post_init__``; this only fixes the shape
+            # so a JSON array of arrays becomes the tuple the dataclass holds.
+            speculative_schedule = cast(SpeculativeSchedule, schedule_value)
+
         try:
             profile = cls(
                 name=_non_empty_string(data["name"], "name"),
@@ -340,6 +492,7 @@ class ModelProfile:
                 max_scratch_bytes=cast(int | None, max_scratch_bytes_value),
                 tool_call_parser=cast(str | None, tool_call_parser_value),
                 reasoning_parser=cast(str | None, reasoning_parser_value),
+                speculative_schedule=speculative_schedule,
             )
         except ProfileError as exc:
             raise ProfileError(f"{source}: {exc}") from exc
@@ -625,6 +778,7 @@ def validate_training_depth(
     profile_name: str,
     serving_tokens: int,
     training_steps: int,
+    serving_schedule: SpeculativeSchedule | None = None,
 ) -> None:
     """Fail before a GPU cycle when the two depths disagree.
 
@@ -634,12 +788,35 @@ def validate_training_depth(
     defect was silent for a whole tuning cycle and only showed up as a
     -0.567 pp gate delta on gpt-oss against -0.189 pp on the 3/3 Qwen3
     profile.
+
+    When ``serving_schedule`` is given, ``K`` is no longer a scalar and the
+    invariant has to be restated.  The depth that matters is the **deepest**
+    band the schedule can reach, not the shallowest and not any average,
+    because acceptance degrades monotonically with position and only the deep
+    positions are extrapolation.  Run ``d993eee-gptoss-idle`` is the direct
+    measurement: a candidate drafter whose own ``speculators_config`` declared
+    ``speculative_tokens: 3`` was served at 5, and its per-position acceptance
+    against the stock drafter was at parity at position 0 (0.6850 vs 0.6871)
+    and collapsed only in the tail -- -2.4 pp at position 1, -4.4 pp at
+    position 2, -5.3 pp at position 3, -5.3 pp at position 4.  A schedule
+    whose shallow bands are trained but whose deepest band is not would
+    reproduce that regression on exactly the batch sizes that use the deepest
+    band, so the deepest band is what must be trained.
     """
-    if training_steps != serving_tokens:
+    served = serving_tokens
+    if serving_schedule is not None:
+        served = max(depth for _, _, depth in serving_schedule)
+    if training_steps != served:
+        detail = (
+            f" (deepest band of {len(serving_schedule)} in the batch-size "
+            f"schedule)"
+            if serving_schedule is not None
+            else ""
+        )
         raise SpeculativeDepthError(
             f"profile {profile_name!r} would train a {training_steps}-deep "
-            f"draft chain and serve a {serving_tokens}-deep one; positions "
-            f"{training_steps + 1}..{serving_tokens} would be extrapolation. "
+            f"draft chain and serve a {served}-deep one{detail}; positions "
+            f"{training_steps + 1}..{served} would be extrapolation. "
             "Training depth must equal num_speculative_tokens."
         )
 

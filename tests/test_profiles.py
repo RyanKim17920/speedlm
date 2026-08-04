@@ -1091,3 +1091,166 @@ def test_an_unknown_policy_is_rejected() -> None:
 def test_context_window_errors_are_profile_errors() -> None:
     """Callers already catching ProfileError must not miss this one."""
     assert issubclass(ContextWindowError, ProfileError)
+
+
+# ---------------------------------------------------------------------------
+# Dynamic-K schedules (num_speculative_tokens_per_batch_size)
+# ---------------------------------------------------------------------------
+def _scheduled(schedule: object, *, tokens: int = 5) -> ModelProfile:
+    """A gpt-oss-shaped profile carrying *schedule*."""
+
+    return ModelProfile(
+        name="scheduled",
+        verifier_model="openai/gpt-oss-20b",
+        draft_model="RedHatAI/gpt-oss-20b-speculator.eagle3",
+        speculative_method="eagle3",
+        num_speculative_tokens=tokens,
+        target_layer_ids=(2, 12, 21),
+        chat_template_kind="harmony",
+        max_seq_len=4096,
+        speculative_schedule=schedule,  # type: ignore[arg-type]
+    )
+
+
+def test_no_builtin_profile_emits_a_batch_size_schedule() -> None:
+    """The feature is additive: today's engines must stay on fixed K.
+
+    Emitting ``num_speculative_tokens_per_batch_size`` is precisely what makes
+    ``Scheduler.dynamic_sd_lookup`` stop being ``None``, so a profile that
+    emits it by accident silently changes how every batch size is drafted.
+    """
+    for profile in BUILTIN_PROFILES.values():
+        assert profile.speculative_schedule is None
+        assert "num_speculative_tokens_per_batch_size" not in profile.speculative_config()
+    assert GPT_OSS_EAGLE3_PROFILE.speculative_config() == {
+        "method": "eagle3",
+        "model": "RedHatAI/gpt-oss-20b-speculator.eagle3",
+        "num_speculative_tokens": 5,
+    }
+
+
+def test_a_schedule_reaches_the_engine_under_the_key_vllm_reads() -> None:
+    """The key name is the whole contract with ``config/speculative.py:172``."""
+    profile = _scheduled(((1, 8, 5), (9, 64, 2)))
+
+    config = profile.speculative_config()
+
+    assert config["num_speculative_tokens_per_batch_size"] == [[1, 8, 5], [9, 64, 2]]
+    # The scalar stays, because vLLM still clamps the schedule against it and
+    # falls back to it whenever the batch is empty.
+    assert config["num_speculative_tokens"] == 5
+
+
+def test_a_schedule_survives_a_json_round_trip() -> None:
+    profile = _scheduled(((1, 8, 5), (9, 64, 0)))
+
+    restored = ModelProfile.from_dict(json.loads(json.dumps(profile.to_dict())))
+
+    assert restored.speculative_schedule == ((1, 8, 5), (9, 64, 0))
+    assert restored == profile
+
+
+def test_a_json_profile_may_declare_a_schedule(tmp_path: Path) -> None:
+    """``from_dict`` rejects unknown keys, so the allowlist must know it."""
+    data = GPT_OSS_EAGLE3_PROFILE.to_dict()
+    data["speculative_schedule"] = [[1, 16, 5], [17, 256, 3]]
+
+    restored = ModelProfile.from_dict(data, source=str(tmp_path))
+
+    assert restored.speculative_schedule == ((1, 16, 5), (17, 256, 3))
+
+
+@pytest.mark.parametrize(
+    ("schedule", "match"),
+    [
+        (((2, 8, 5),), "must start at batch size 1"),
+        (((1, 8, 5), (5, 64, 3)), "overlap or are out of order"),
+        (((1, 8, 5), (64, 32, 3)), "ends before it starts"),
+        (((0, 8, 5),), "range_start must be at least 1"),
+        (((1, 8, 5), (9, 64, -1)), "must not be negative"),
+        ((), "must not be empty"),
+        (((1, 8),), "range_start, range_end, num_speculative_tokens"),
+        (((1, 8, True),), "range_start, range_end, num_speculative_tokens"),
+        ("1,8,5", "array of bands"),
+    ],
+)
+def test_a_malformed_schedule_is_rejected_at_profile_load(
+    schedule: object, match: str
+) -> None:
+    """Every rule here mirrors one vLLM would raise hours later, at engine boot."""
+    with pytest.raises(ProfileError, match=match):
+        _scheduled(schedule)
+
+
+def test_a_schedule_cannot_ask_for_more_depth_than_the_profile_declares() -> None:
+    """vLLM clamps with ``min(num_speculative_tokens, K)`` and says nothing.
+
+    A profile whose deepest band reads 8 while the engine serves 5 is a profile
+    that lies about what it serves, which is the failure mode this module
+    exists to remove.
+    """
+    with pytest.raises(ProfileError, match="silently clamp"):
+        _scheduled(((1, 8, 8),), tokens=5)
+
+
+def test_a_schedule_must_actually_reach_the_declared_depth() -> None:
+    """Otherwise ``num_speculative_tokens`` stops describing the serving depth.
+
+    It is the number the drafter is trained against, so it has to be the depth
+    the schedule reaches -- see ``validate_training_depth``.
+    """
+    with pytest.raises(ProfileError, match="must be the depth the schedule"):
+        _scheduled(((1, 8, 3), (9, 64, 2)), tokens=5)
+
+
+def test_the_deepest_band_is_what_the_profile_reports_as_served() -> None:
+    assert GPT_OSS_EAGLE3_PROFILE.max_served_speculative_tokens == 5
+    assert _scheduled(((1, 8, 5), (9, 64, 1))).max_served_speculative_tokens == 5
+
+
+def test_the_depth_guard_measures_the_deepest_band_not_the_shallowest() -> None:
+    """Run d993eee-gptoss-idle is the measurement behind this choice.
+
+    A drafter declaring ``speculative_tokens: 3`` served at 5 was at parity
+    with stock at draft position 0 (0.6850 vs 0.6871) and lost 5.3 pp at
+    position 4.  Only the deep positions are extrapolation, so the deepest
+    band is what training depth must match.
+    """
+    schedule = ((1, 8, 5), (9, 64, 3))
+
+    # Training to the shallow band is not enough, even though most batch
+    # sizes in that schedule only ever draft 3.
+    with pytest.raises(SpeculativeDepthError, match="positions 4..5"):
+        validate_training_depth(
+            profile_name="scheduled",
+            serving_tokens=5,
+            training_steps=3,
+            serving_schedule=schedule,
+        )
+
+    validate_training_depth(
+        profile_name="scheduled",
+        serving_tokens=5,
+        training_steps=5,
+        serving_schedule=schedule,
+    )
+
+
+def test_the_depth_guard_names_the_schedule_when_one_is_in_play() -> None:
+    with pytest.raises(SpeculativeDepthError, match="deepest band of 2"):
+        validate_training_depth(
+            profile_name="scheduled",
+            serving_tokens=5,
+            training_steps=2,
+            serving_schedule=((1, 8, 5), (9, 64, 3)),
+        )
+
+
+def test_every_builtin_profile_trains_to_the_depth_its_schedule_reaches() -> None:
+    for profile in BUILTIN_PROFILES.values():
+        validate_training_depth(
+            profile_name=profile.name,
+            serving_tokens=profile.num_speculative_tokens,
+            training_steps=profile.max_served_speculative_tokens,
+            serving_schedule=profile.speculative_schedule,
+        )

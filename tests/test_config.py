@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import copy
+import dataclasses
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -821,3 +824,274 @@ def test_invalid_compounding_warm_start_is_rejected(value: object) -> None:
 def test_invalid_warm_start_chain_bound_is_rejected(value: object) -> None:
     with pytest.raises(ConfigError, match="warm_start_max_chain_depth"):
         IdleTuningConfig(warm_start_max_chain_depth=value)
+
+
+# ---------------------------------------------------------------------------
+# Structural integrity: every dataclass field must be settable and round-trip
+# ---------------------------------------------------------------------------
+
+# Mapping from section name to (dataclass, sentinel_value).
+# The sentinel is used to confirm the value reaches the config instance.
+_SENTINELS: dict[str, tuple[type, Any]] = {
+    "target": (TargetConfig, "structural_test_host"),
+    "wrapper": (WrapperConfig, "structural_test_host"),
+    "buffer": (TraceBufferConfig, 999_999_999),
+    "redaction": (RedactionConfig, False),
+    "promotion": (PromotionConfig, 99.0),
+    "tuning": (IdleTuningConfig, 999),
+    "sampling": (SamplingConfig, 0.5),
+}
+
+_SENTINEL_DEFAULT: dict[str, Any] = {
+    "target": {"host": "structural_test_host", "port": 9999},
+    "wrapper": {"host": "structural_test_host", "port": 9998},
+    "buffer": {"max_tokens": 999_999_999, "max_age_days": 1.0},
+    "redaction": {"enabled": False},
+    "promotion": {
+        "min_acceptance_delta_pp": 99.0,
+        "min_accepted_length_delta": 99.0,
+        "min_throughput_delta_pct": 99.0,
+        "min_divergence_token_index": 999,
+    },
+    "tuning": {
+        "min_trace_records": 999,
+        "min_corpus_records": 999,
+        "poll_interval_seconds": 0.001,
+        "idle_confirmations": 1,
+        "retry_cooldown_seconds": 0.0,
+        "serving_recovery_interval_seconds": 0.0,
+        "held_out_fraction": 0.5,
+        "benchmark_repeats": 3,
+        "warmup_repeats": 0,
+        "benchmark_candidate_arm_first": False,
+        "benchmark_concurrency": 1,
+        "correctness_max_tokens": 1,
+        "benchmark_max_tokens": 1,
+        "training_window_records": 999,
+        "compounding_warm_start": False,
+        "warm_start_max_chain_depth": 1,
+        "verifier_revision": "structural_test",
+        "speculators_repo": "structural_test",
+        "training_python": "structural_test",
+        "vllm_python": "structural_test",
+        "prepared_validator_script": "structural_test",
+        "sequence_length": 1,
+        "learning_rate": 1e-4,
+        "epochs": 1,
+        "extraction_concurrency": 1,
+        "training_port": 1,
+        "scratch_quota_bytes": 1,
+        "shutdown_timeout_seconds": 0.001,
+        "restore_fast_path_timeout_seconds": 0.001,
+        "draft_hot_swap_enabled": True,
+        "val_loss_prefilter": {
+            "enabled": True,
+            "min_improvement": 0.0,
+        },
+    },
+    "sampling": {"temperature": 0.5, "top_p": 1.0, "seed": 999},
+}
+
+
+def test_every_dataclass_field_is_settable_from_json() -> None:
+    """No dataclass field should be unreachable from configuration JSON.
+
+    This test derives the expected key set from dataclasses.fields() and
+    confirms each field can be set via from_dict — preventing the class of
+    bug where a field exists, validates, and is documented but cannot be
+    configured because it was never added to the allow-list.
+    """
+    for section, (cls, _) in _SENTINELS.items():
+        field_names = {f.name for f in dataclasses.fields(cls)}
+        sentinel_data = _SENTINEL_DEFAULT[section]
+
+        # Every dataclass field must appear in the section's JSON data
+        missing = field_names - set(sentinel_data.keys())
+        assert not missing, (
+            f"section '{section}': dataclass fields not covered by test sentinels: "
+            f"{sorted(missing)}. Add them to _SENTINEL_DEFAULT['{section}']."
+        )
+
+        # Attempt to load config with all fields set to sentinel values
+        config_dict: dict[str, Any] = {"model": "structural-test"}
+        config_dict[section] = copy.deepcopy(sentinel_data)
+
+        try:
+            cfg = SpeedLMConfig.from_dict(config_dict)
+        except ConfigError as exc:
+            pytest.fail(
+                f"section '{section}': from_dict rejected config that sets all "
+                f"dataclass fields: {exc}"
+            )
+
+        # Verify each field reached the dataclass instance
+        section_obj = getattr(cfg, section)
+        for name in field_names:
+            actual = getattr(section_obj, name)
+            expected = sentinel_data[name]
+            # For nested dataclasses (val_loss_prefilter), compare recursively
+            if isinstance(expected, dict):
+                for nested_key, nested_val in expected.items():
+                    assert getattr(actual, nested_key) == nested_val, (
+                        f"section '{section}.{name}.{nested_key}': "
+                        f"expected {nested_val!r}, got {getattr(actual, nested_key)!r}"
+                    )
+            else:
+                assert actual == expected, (
+                    f"section '{section}.{name}': expected {expected!r}, "
+                    f"got {actual!r}"
+                )
+
+
+def test_every_dataclass_field_round_trips_through_to_dict() -> None:
+    """No dataclass field should be lost when serializing via to_dict().
+
+    This prevents the bug where a field can be set from JSON but does not
+    survive serialization — breaking config save/load cycles and making the
+    field effectively one-way.
+    """
+    for section, (cls, _) in _SENTINELS.items():
+        field_names = {f.name for f in dataclasses.fields(cls)}
+
+        # Build a config with all section fields set to sentinel values
+        config_dict: dict[str, Any] = {"model": "structural-test"}
+        config_dict[section] = copy.deepcopy(_SENTINEL_DEFAULT[section])
+        cfg = SpeedLMConfig.from_dict(config_dict)
+
+        # Serialize and check every field is present
+        dumped = cfg.to_dict()
+        dumped_section = dumped[section]
+        missing_keys = field_names - set(dumped_section.keys())
+        assert not missing_keys, (
+            f"section '{section}': dataclass fields missing from to_dict(): "
+            f"{sorted(missing_keys)}"
+        )
+
+        # Verify each sentinel value survived serialization
+        for name in field_names:
+            actual = dumped_section[name]
+            expected = _SENTINEL_DEFAULT[section][name]
+            if isinstance(expected, dict):
+                # Nested dataclass: dumped as a dict, compare key-by-key
+                assert isinstance(actual, dict), (
+                    f"section '{section}.{name}': expected dict in to_dict, "
+                    f"got {type(actual).__name__}"
+                )
+                for nested_key, nested_val in expected.items():
+                    assert actual[nested_key] == nested_val, (
+                        f"section '{section}.{name}.{nested_key}': "
+                        f"expected {nested_val!r}, got {actual.get(nested_key)!r}"
+                    )
+            else:
+                assert actual == expected, (
+                    f"section '{section}.{name}': expected {expected!r}, "
+                    f"got {actual!r}"
+                )
+
+
+def test_to_dict_does_not_emit_ghost_keys() -> None:
+    """to_dict() should not emit keys that don't correspond to dataclass fields.
+
+    A key in to_dict() that has no matching field means either stale code
+    or a field was renamed without updating serialization.
+    """
+    section_classes = {
+        "target": TargetConfig,
+        "wrapper": WrapperConfig,
+        "buffer": TraceBufferConfig,
+        "redaction": RedactionConfig,
+        "promotion": PromotionConfig,
+        "tuning": IdleTuningConfig,
+        "sampling": SamplingConfig,
+    }
+
+    cfg = SpeedLMConfig(model="structural-test")
+    dumped = cfg.to_dict()
+
+    for section, cls in section_classes.items():
+        field_names = {f.name for f in dataclasses.fields(cls)}
+        dumped_keys = set(dumped[section].keys())
+        ghosts = dumped_keys - field_names
+        assert not ghosts, (
+            f"section '{section}': to_dict() emits keys not in dataclass: "
+            f"{sorted(ghosts)}"
+        )
+
+
+def test_unknown_section_keys_are_rejected() -> None:
+    """The allow-list must reject keys that don't map to any dataclass field.
+
+    This catches the reverse of the 'unreachable field' bug: an allow-list
+    key that no longer corresponds to a real field.
+    """
+    section_classes = {
+        "target": TargetConfig,
+        "wrapper": WrapperConfig,
+        "buffer": TraceBufferConfig,
+        "redaction": RedactionConfig,
+        "promotion": PromotionConfig,
+        "tuning": IdleTuningConfig,
+        "sampling": SamplingConfig,
+    }
+
+    for section, _cls in section_classes.items():
+        # Use a sentinel name that is guaranteed not to be a field
+        fake_key = "_structural_test_fake_key_xyz"
+
+        config_dict: dict[str, Any] = {"model": "structural-test"}
+        config_dict[section] = {fake_key: 0}
+
+        with pytest.raises(ConfigError, match=f"unknown keys in {section}"):
+            SpeedLMConfig.from_dict(config_dict)
+
+
+def test_min_accepted_length_delta_is_configurable_and_round_trips() -> None:
+    """Regression test: min_accepted_length_delta must be settable from JSON.
+
+    This was the field that existed in PromotionConfig, was validated in
+    __post_init__, and documented in the README — but was never added to the
+    promotion allow-list, so setting it in config JSON raised:
+    ConfigError: unknown keys in promotion: min_accepted_length_delta
+    """
+    cfg = SpeedLMConfig.from_dict(
+        {"model": "m", "promotion": {"min_accepted_length_delta": 0.07}}
+    )
+    assert cfg.promotion.min_accepted_length_delta == 0.07
+
+    # Round-trip
+    dumped = cfg.to_dict()
+    assert dumped["promotion"]["min_accepted_length_delta"] == 0.07
+    restored = SpeedLMConfig.from_dict(dumped)
+    assert restored.promotion.min_accepted_length_delta == 0.07
+
+
+def test_val_loss_prefilter_round_trips() -> None:
+    """Regression test: val_loss_prefilter must survive to_dict/from_dict.
+
+    ValLossPreFilterConfig was settable from JSON (the allow-list included it)
+    but to_dict() never emitted it, so saving and reloading a config dropped
+    the val_loss_prefilter settings.
+    """
+    cfg = SpeedLMConfig.from_dict(
+        {
+            "model": "m",
+            "tuning": {
+                "val_loss_prefilter": {
+                    "enabled": False,
+                    "min_improvement": 0.03,
+                },
+            },
+        }
+    )
+    assert cfg.tuning.val_loss_prefilter.enabled is False
+    assert cfg.tuning.val_loss_prefilter.min_improvement == 0.03
+
+    dumped = cfg.to_dict()
+    assert dumped["tuning"]["val_loss_prefilter"] == {
+        "enabled": False,
+        "min_improvement": 0.03,
+    }
+
+    restored = SpeedLMConfig.from_dict(dumped)
+    assert restored.tuning.val_loss_prefilter.enabled is False
+    assert restored.tuning.val_loss_prefilter.min_improvement == 0.03

@@ -6,14 +6,18 @@ import pytest
 
 from speedlm.config import DivergenceCriterion, PromotionConfig
 from speedlm.gate.decide import (
+    CUDA_GRAPH_EXECUTION_MODE,
     DIVERGENCE_ALPHA,
+    EAGER_EXECUTION_MODE,
     GATING_ACCEPTANCE_CRITERION,
     GATING_ACCEPTANCE_STATISTIC,
     GATING_THROUGHPUT_STATISTIC,
+    UNRECORDED_EXECUTION_MODE,
     Decision,
     DecisionError,
     DispersionBasis,
     DivergenceBasis,
+    EngineExecution,
     Reason,
     Verdict,
     decide_promotion,
@@ -2055,3 +2059,115 @@ def test_the_flat_index_is_the_earliest_qualifying_window_not_the_shortest() -> 
     )
 
     assert dec.candidate_throughput_flat_from_repeat == 2
+
+
+# ---------------------------------------------------------------------------
+# Engine execution regime
+# ---------------------------------------------------------------------------
+def _decide(**kwargs: object) -> Decision:
+    runs = [_valid_run() for _ in range(3)]
+    return decide_promotion(
+        _make_delta(),
+        _make_delta(),
+        _make_replay(runs),
+        _make_replay(runs),
+        _pcfg(),
+        **kwargs,  # type: ignore[arg-type]
+    )
+
+
+def test_a_decision_that_was_told_nothing_says_so_rather_than_assuming_eager() -> None:
+    """Every archived run was eager, but no record said so.
+
+    Reading those records as eager would infer a fact from a habit.  The
+    absence of knowledge is itself what has to be persisted.
+    """
+    record = _decide().to_dict()
+
+    assert record["engine_execution_mode"] == UNRECORDED_EXECUTION_MODE
+    assert record["engine_enforce_eager"] is None
+    assert record["engine_max_num_seqs"] is None
+    assert UNRECORDED_EXECUTION_MODE not in (
+        EAGER_EXECUTION_MODE,
+        CUDA_GRAPH_EXECUTION_MODE,
+    )
+
+
+def test_the_two_execution_regimes_are_recorded_distinguishably() -> None:
+    """Eager and CUDA-graph are a large throughput difference on one model."""
+    eager = _decide(
+        engine_execution=EngineExecution(enforce_eager=True)
+    ).to_dict()
+    graphed = _decide(
+        engine_execution=EngineExecution(enforce_eager=False)
+    ).to_dict()
+
+    assert eager["engine_execution_mode"] == EAGER_EXECUTION_MODE
+    assert graphed["engine_execution_mode"] == CUDA_GRAPH_EXECUTION_MODE
+    assert eager["engine_execution_mode"] != graphed["engine_execution_mode"]
+    assert eager["engine_enforce_eager"] is True
+    assert graphed["engine_enforce_eager"] is False
+
+
+def test_the_scheduler_flags_that_move_throughput_reach_the_record() -> None:
+    record = _decide(
+        engine_execution=EngineExecution(
+            enforce_eager=False,
+            enable_chunked_prefill=True,
+            enable_prefix_caching=False,
+            max_num_seqs=256,
+        )
+    ).to_dict()
+
+    assert record["engine_enable_chunked_prefill"] is True
+    assert record["engine_enable_prefix_caching"] is False
+    assert record["engine_max_num_seqs"] == 256
+
+
+def test_the_engine_regime_is_read_off_the_argv_that_actually_launched_it() -> None:
+    """This is the argv ``build_vllm_argv`` produced, not a restatement of it."""
+    execution = EngineExecution.from_argv(
+        [
+            "vllm",
+            "serve",
+            "openai/gpt-oss-20b",
+            "--max-model-len",
+            "4096",
+            "--enforce-eager",
+            "--enable-chunked-prefill",
+            "--no-enable-prefix-caching",
+            "--max-num-seqs=128",
+        ]
+    )
+
+    assert execution.execution_mode == EAGER_EXECUTION_MODE
+    assert execution.enforce_eager is True
+    assert execution.enable_chunked_prefill is True
+    assert execution.enable_prefix_caching is False
+    assert execution.max_num_seqs == 128
+
+
+def test_an_argv_without_enforce_eager_describes_a_graph_capturing_engine() -> None:
+    execution = EngineExecution.from_argv(["vllm", "serve", "m"])
+
+    assert execution.enforce_eager is False
+    assert execution.execution_mode == CUDA_GRAPH_EXECUTION_MODE
+
+
+def test_a_flag_the_operator_never_passed_is_unknown_not_false() -> None:
+    """vLLM's own defaults for these are version-dependent.
+
+    Recording ``False`` would put a fact in the record that nobody measured.
+    """
+    execution = EngineExecution.from_argv(["vllm", "serve", "m", "--enforce-eager"])
+
+    assert execution.enable_chunked_prefill is None
+    assert execution.enable_prefix_caching is None
+    assert execution.max_num_seqs is None
+
+
+def test_an_engine_execution_rejects_values_it_cannot_mean() -> None:
+    with pytest.raises(ValueError, match="enforce_eager"):
+        EngineExecution(enforce_eager="yes")  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="max_num_seqs"):
+        EngineExecution(enforce_eager=True, max_num_seqs=0)

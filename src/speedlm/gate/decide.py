@@ -135,6 +135,147 @@ GATING_ACCEPTANCE_CRITERION: Final[str] = "mean_accepted_length_delta"
 #: current criterion.
 LEGACY_ACCEPTANCE_CRITERION: Final[str] = "acceptance_rate_delta_pp"
 
+#: Execution mode of an engine launched with ``--enforce-eager``.
+EAGER_EXECUTION_MODE: Final[str] = "eager"
+
+#: Execution mode of an engine left to capture CUDA graphs / ``torch.compile``.
+CUDA_GRAPH_EXECUTION_MODE: Final[str] = "cuda_graph"
+
+#: What a record says when nothing told the gate which mode it measured under.
+#:
+#: This is *not* a synonym for eager.  Every archived SpeedLM run happens to
+#: have been launched with ``--enforce-eager`` (it is operator passthrough --
+#: see ``scripts/make_snapshot_run.sh`` and ``tests/e2e/run_slurm_e2e.sh``),
+#: but no record says so, and the gate had no way to know: the runner owns no
+#: vLLM process.  Reading those records as eager would be inferring a fact
+#: from a habit.  A record that predates this field, or a runner that was
+#: given no engine description, says ``unrecorded`` and means it.
+UNRECORDED_EXECUTION_MODE: Final[str] = "unrecorded"
+
+
+@dataclass(frozen=True, slots=True)
+class EngineExecution:
+    """How the engine both arms replayed against was actually executing.
+
+    None of this changes what the gate *measures*; all of it changes what a
+    measured number is worth.  Eager and CUDA-graph execution are a large
+    throughput difference on the same weights, and for a MoE target they are
+    not even bitwise equivalent -- which is the same property
+    :data:`DIVERGENCE_ALPHA` exists to reason about, since the divergence
+    floor a run is judged against is a property of its kernels and batch
+    shapes.  A ``decision.json`` that records ``56.64`` tok/s without recording
+    which of the two produced it cannot be honestly compared to any other run.
+
+    The repo carries a claim that ``--enforce-eager`` is "speed-only, with zero
+    acceptance effect".  Nothing in this repository measures that, and this
+    class deliberately does not encode it: it records the mode as a fact and
+    leaves the question open.  Note the opposite is at least plausible --
+    acceptance is counted per verifier step, and the drafted-vs-verified
+    comparison happens in kernels that a CUDA-graph capture may select
+    differently.
+    """
+
+    enforce_eager: bool
+    enable_chunked_prefill: bool | None = None
+    enable_prefix_caching: bool | None = None
+    max_num_seqs: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.enforce_eager, bool):
+            raise ValueError("enforce_eager must be a bool")
+        for name in ("enable_chunked_prefill", "enable_prefix_caching"):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, bool):
+                raise ValueError(f"{name} must be a bool or None")
+        if self.max_num_seqs is not None and (
+            isinstance(self.max_num_seqs, bool)
+            or not isinstance(self.max_num_seqs, int)
+            or self.max_num_seqs < 1
+        ):
+            raise ValueError("max_num_seqs must be an integer >= 1 or None")
+
+    @property
+    def execution_mode(self) -> str:
+        """:data:`EAGER_EXECUTION_MODE` or :data:`CUDA_GRAPH_EXECUTION_MODE`."""
+
+        return (
+            EAGER_EXECUTION_MODE if self.enforce_eager else CUDA_GRAPH_EXECUTION_MODE
+        )
+
+    @classmethod
+    def from_argv(cls, argv: Sequence[str]) -> EngineExecution:
+        """Read the execution-relevant flags out of a ``vllm serve`` argv.
+
+        ``argv`` is what
+        :func:`speedlm.gateway.process.build_vllm_argv` produced for the engine
+        the gate replayed against, so this reads the *served* configuration
+        rather than a restatement of it.  Flags absent from the argv are
+        recorded as ``None`` -- "the operator did not pass it, so vLLM's
+        default applied" -- and never as ``False``, because vLLM's defaults for
+        chunked prefill and prefix caching are version-dependent and guessing
+        them would put a fact in the record that nobody measured.
+        ``enforce_eager`` is the one exception: it is a bare store-true flag,
+        so its absence really does mean the engine was left to capture graphs.
+        """
+
+        if isinstance(argv, (str, bytes)) or not isinstance(argv, Sequence):
+            raise ValueError("argv must be a sequence of strings")
+        tokens = [str(item) for item in argv]
+        enforce_eager = "--enforce-eager" in tokens
+        chunked = _argv_toggle(tokens, "enable-chunked-prefill")
+        prefix = _argv_toggle(tokens, "enable-prefix-caching")
+        max_num_seqs = _argv_int_option(tokens, "--max-num-seqs")
+        return cls(
+            enforce_eager=enforce_eager,
+            enable_chunked_prefill=chunked,
+            enable_prefix_caching=prefix,
+            max_num_seqs=max_num_seqs,
+        )
+
+
+def _argv_toggle(tokens: Sequence[str], name: str) -> bool | None:
+    """Resolve a vLLM ``--flag`` / ``--no-flag`` / ``--flag=true`` triple."""
+
+    result: bool | None = None
+    truthy = {"true", "1", "yes"}
+    falsy = {"false", "0", "no"}
+    for index, token in enumerate(tokens):
+        if token == f"--{name}":
+            following = tokens[index + 1] if index + 1 < len(tokens) else ""
+            if following.lower() in truthy:
+                result = True
+            elif following.lower() in falsy:
+                result = False
+            else:
+                result = True
+        elif token == f"--no-{name}":
+            result = False
+        elif token.startswith(f"--{name}="):
+            value = token.split("=", 1)[1].lower()
+            if value in truthy:
+                result = True
+            elif value in falsy:
+                result = False
+    return result
+
+
+def _argv_int_option(tokens: Sequence[str], flag: str) -> int | None:
+    """Resolve ``--flag N`` or ``--flag=N`` to an int, or ``None`` if absent."""
+
+    raw: str | None = None
+    for index, token in enumerate(tokens):
+        if token == flag and index + 1 < len(tokens):
+            raw = tokens[index + 1]
+        elif token.startswith(f"{flag}="):
+            raw = token.split("=", 1)[1]
+    if raw is None:
+        return None
+    try:
+        parsed = int(raw)
+    except ValueError:
+        return None
+    return parsed if parsed >= 1 else None
+
 #: Significance level the whole output-correctness criterion is run at.
 #:
 #: **Why the criterion is a significance test at all.**  Speculative decoding is
@@ -516,6 +657,19 @@ class Decision:
     #: original head.
     stock_draft: str | None = None
 
+    #: How the engine was executing: :data:`EAGER_EXECUTION_MODE`,
+    #: :data:`CUDA_GRAPH_EXECUTION_MODE`, or :data:`UNRECORDED_EXECUTION_MODE`
+    #: when the gate was told nothing.  Always a string, never ``None``: the
+    #: absence of knowledge is itself the fact worth persisting, and a ``None``
+    #: here would be indistinguishable from a key a reader forgot to add.
+    engine_execution_mode: str = UNRECORDED_EXECUTION_MODE
+    #: The flags behind that mode, each ``None`` when unrecorded.  See
+    #: :class:`EngineExecution`.
+    engine_enforce_eager: bool | None = None
+    engine_enable_chunked_prefill: bool | None = None
+    engine_enable_prefix_caching: bool | None = None
+    engine_max_num_seqs: int | None = None
+
     # -- dispersion of the gated statistics ---------------------------------
     # Derived from ``per_repeat`` rather than stored, so an archived decision
     # rebuilt by ``speedlm.report.parse_decision`` reports the same basis the
@@ -842,6 +996,11 @@ class Decision:
             "suite_hash": self.suite_hash,
             "num_contexts": self.num_contexts,
             "stock_draft": self.stock_draft,
+            "engine_execution_mode": self.engine_execution_mode,
+            "engine_enforce_eager": self.engine_enforce_eager,
+            "engine_enable_chunked_prefill": self.engine_enable_chunked_prefill,
+            "engine_enable_prefix_caching": self.engine_enable_prefix_caching,
+            "engine_max_num_seqs": self.engine_max_num_seqs,
         }
 
 
@@ -1203,6 +1362,7 @@ def decide_promotion(
     correctness_max_tokens: int | None = None,
     num_contexts: int | None = None,
     stock_draft: str | None = None,
+    engine_execution: EngineExecution | None = None,
 ) -> Decision:
     """Decide whether to promote the candidate head.
 
@@ -1270,6 +1430,10 @@ def decide_promotion(
             suite's hash is taken from ``stock_replay``.
         stock_draft: The draft the stock arm ran -- the baseline this delta is
             measured against.
+        engine_execution: How the engine both arms replayed against was
+            executing -- see :class:`EngineExecution`.  ``None`` records
+            :data:`UNRECORDED_EXECUTION_MODE`, which is what an archived
+            decision written before this field existed reads back as.
 
     Returns:
         A :class:`Decision` with verdict, reason, and per-repeat data.
@@ -1474,6 +1638,27 @@ def decide_promotion(
             suite_hash=stock_replay.suite_hash or None,
             num_contexts=num_contexts,
             stock_draft=stock_draft,
+            engine_execution_mode=(
+                UNRECORDED_EXECUTION_MODE
+                if engine_execution is None
+                else engine_execution.execution_mode
+            ),
+            engine_enforce_eager=(
+                None if engine_execution is None else engine_execution.enforce_eager
+            ),
+            engine_enable_chunked_prefill=(
+                None
+                if engine_execution is None
+                else engine_execution.enable_chunked_prefill
+            ),
+            engine_enable_prefix_caching=(
+                None
+                if engine_execution is None
+                else engine_execution.enable_prefix_caching
+            ),
+            engine_max_num_seqs=(
+                None if engine_execution is None else engine_execution.max_num_seqs
+            ),
         )
 
     def _reject(reason: Reason, **deltas: float | None) -> Decision:

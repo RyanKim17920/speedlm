@@ -16,7 +16,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Final, Protocol, TypeVar
 
 from speedlm.config import SamplingConfig, SpeedLMConfig
-from speedlm.gate.decide import Decision, Verdict, decide_promotion
+from speedlm.gate.decide import (
+    UNRECORDED_EXECUTION_MODE,
+    Decision,
+    EngineExecution,
+    Verdict,
+    decide_promotion,
+)
 from speedlm.gate.metrics import (
     CounterResetError,
     MetricsDelta,
@@ -347,6 +353,7 @@ class BenchmarkGateRunner:
         held_out_fraction: float = 0.2,
         training_context_hashes: TrainingHashes | None = None,
         candidate_arm_first: bool = False,
+        engine_execution: EngineExecution | None = None,
         clock: Clock = time.monotonic,
     ) -> None:
         if isinstance(repeats, bool) or not isinstance(repeats, int) or repeats < 3:
@@ -412,6 +419,16 @@ class BenchmarkGateRunner:
         if not isinstance(candidate_arm_first, bool):
             raise ValueError("candidate_arm_first must be a bool")
         self._candidate_arm_first = candidate_arm_first
+        # How the engine both arms replay against is executing.  The runner
+        # owns no vLLM process and cannot discover this -- see the module
+        # docstring -- so it is injected by whoever built the argv.  ``None``
+        # is honest and stays honest: the decision then records
+        # ``engine_execution_mode: unrecorded`` rather than assuming eager.
+        if engine_execution is not None and not isinstance(
+            engine_execution, EngineExecution
+        ):
+            raise ValueError("engine_execution must be an EngineExecution or None")
+        self._engine_execution = engine_execution
         self._clock = clock
 
     def benchmark(
@@ -554,6 +571,7 @@ class BenchmarkGateRunner:
                     correctness_max_tokens=self._correctness_max_tokens,
                     num_contexts=len(suite.contexts),
                     stock_draft=str(stock_draft),
+                    engine_execution=self._engine_execution,
                 ),
             )
             # Candidate-first ends the benchmark on the *stock* draft, which is
@@ -595,6 +613,9 @@ class BenchmarkGateRunner:
             reason=decision.reason.value,
             metrics={
                 "suite_hash": suite.suite_hash,
+                "engine_execution": _engine_execution_dict(
+                    self._engine_execution
+                ),
                 "num_contexts": len(suite.contexts),
                 # The baseline this comparison was against, as resolved when
                 # the benchmark ran.  It moves on every promotion.
@@ -980,6 +1001,33 @@ def _warmup_dict(result: ReplayResult | None) -> dict[str, object] | None:
     return {
         "num_runs": result.num_runs,
         "tok_per_sec": [run.output_tok_per_sec for run in result.run_results],
+    }
+
+
+def _engine_execution_dict(
+    execution: EngineExecution | None,
+) -> dict[str, object]:
+    """Describe the engine regime, including when it is not known.
+
+    Always returns a dict with ``execution_mode`` populated -- an omitted key
+    would be indistinguishable from a run that forgot to record it, whereas
+    :data:`speedlm.gate.decide.UNRECORDED_EXECUTION_MODE` says so.
+    """
+
+    if execution is None:
+        return {
+            "execution_mode": UNRECORDED_EXECUTION_MODE,
+            "enforce_eager": None,
+            "enable_chunked_prefill": None,
+            "enable_prefix_caching": None,
+            "max_num_seqs": None,
+        }
+    return {
+        "execution_mode": execution.execution_mode,
+        "enforce_eager": execution.enforce_eager,
+        "enable_chunked_prefill": execution.enable_chunked_prefill,
+        "enable_prefix_caching": execution.enable_prefix_caching,
+        "max_num_seqs": execution.max_num_seqs,
     }
 
 
