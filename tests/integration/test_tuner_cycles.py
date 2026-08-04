@@ -469,7 +469,11 @@ class _Replay:
     ) -> ReplayResult:
         assert endpoint_url == "http://fake-endpoint"
         assert sampling == SamplingConfig()
-        assert repeats == 1
+        # Only the correctness call may ask for more than one pass, and only
+        # on the stock arm, where the extra run measures the engine's own
+        # divergence rate against itself.
+        assert repeats == 1 or capture_tokens
+        assert repeats <= 2
         assert timeout_seconds > 0 and not should_abort()
         request = RequestResult(
             context_hash=suite.contexts[0].context_hash,

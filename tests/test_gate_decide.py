@@ -6,15 +6,18 @@ import pytest
 
 from speedlm.config import DivergenceCriterion, PromotionConfig
 from speedlm.gate.decide import (
+    DIVERGENCE_ALPHA,
     GATING_ACCEPTANCE_CRITERION,
     GATING_ACCEPTANCE_STATISTIC,
     GATING_THROUGHPUT_STATISTIC,
     Decision,
+    DecisionError,
     DispersionBasis,
     DivergenceBasis,
     Reason,
     Verdict,
     decide_promotion,
+    divergence_excess_p_value,
     first_divergence,
 )
 from speedlm.gate.metrics import MetricsDelta
@@ -385,8 +388,19 @@ def test_reject_on_output_mismatch() -> None:
     stock_metrics = _make_delta()
     cand_metrics = _make_delta()
 
-    stock_run = _make_run([_make_request_result("same output")])
-    cand_run = _make_run([_make_request_result("different output")])
+    # Four contexts rather than one: the criterion is a comparison of rates
+    # against a noise floor, so a single disagreeing context is not evidence of
+    # anything and no honest criterion can reject on it.  Every context
+    # disagreeing from the very first character is.
+    stock_run = _make_run(
+        [_make_request_result("same output", context_hash=f"ctx-{i}") for i in range(4)]
+    )
+    cand_run = _make_run(
+        [
+            _make_request_result("different output", context_hash=f"ctx-{i}")
+            for i in range(4)
+        ]
+    )
 
     stock_replay = _make_replay([stock_run for _ in range(3)])
     cand_replay = _make_replay([cand_run for _ in range(3)])
@@ -1104,48 +1118,102 @@ def _tokens(prefix: int, tail: str, length: int) -> tuple[str, ...]:
     return tuple(f"t{i}" for i in range(prefix)) + (tail,) * (length - prefix)
 
 
-def _correctness_pair(
+#: Contexts a correctness fixture uses unless a test says otherwise.
+#:
+#: Forty, not one.  The criterion these fixtures exercise compares a divergence
+#: *rate* against the engine's own divergence rate, so a suite of one context can
+#: distinguish nothing at all: 1-of-1 against a floor of 0-of-1 is what you get
+#: half the time from a fair coin.  The archived live suites are 103 and 410
+#: contexts; forty is enough for a total corruption to be overwhelming and small
+#: enough to keep the fixtures cheap.
+_CORRECTNESS_CONTEXTS = 40
+
+
+def _correctness_arms(
     *,
     diverge_at: int | None,
+    control_diverge_at: int | None = None,
+    contexts: int = _CORRECTNESS_CONTEXTS,
+    diverging: int | None = None,
+    control_diverging: int | None = None,
     length: int = 1600,
-    contexts: int = 1,
-) -> tuple[ReplayResult, ReplayResult]:
-    """Two single-repeat correctness passes that part at *diverge_at*."""
+    with_control: bool = True,
+) -> tuple[ReplayResult, ReplayResult, ReplayResult | None]:
+    """Three single-repeat correctness passes: stock, candidate, and control.
+
+    The control is a *second stock pass*, which is what the runner really
+    produces: same engine, same draft, same settings.  Whatever it disagrees
+    with the first stock pass about is engine nondeterminism by construction, so
+    a fixture that wants to model benign noise gives ``control_diverge_at`` the
+    same treatment it gives ``diverge_at``.  A fixture that wants to model a
+    broken head leaves the control clean.
+
+    ``diverging`` / ``control_diverging`` bound how many of *contexts* part, so a
+    test can express "the engine flips a near-tie on a few contexts" rather than
+    only "on all of them or none".
+    """
+    n_diverging = contexts if diverging is None else diverging
+    n_control = contexts if control_diverging is None else control_diverging
+    shared = _tokens(length, "x", length)
     stock: list[RequestResult] = []
     candidate: list[RequestResult] = []
+    control: list[RequestResult] = []
     for index in range(contexts):
-        shared = _tokens(length, "x", length)
-        stock.append(
-            _make_request_result(
-                "answer",
-                output_tokens=shared,
-                context_hash=f"ctx-{index}",
+        def _result(tokens: tuple[str, ...], index: int = index) -> RequestResult:
+            return _make_request_result(
+                "answer", output_tokens=tokens, context_hash=f"ctx-{index}"
+            )
+
+        stock.append(_result(shared))
+        candidate.append(
+            _result(
+                shared
+                if diverge_at is None or index >= n_diverging
+                else _tokens(diverge_at, "OTHER", length)
             )
         )
-        candidate.append(
-            _make_request_result(
-                "answer",
-                output_tokens=(
-                    shared if diverge_at is None else _tokens(diverge_at, "OTHER", length)
-                ),
-                context_hash=f"ctx-{index}",
+        control.append(
+            _result(
+                shared
+                if control_diverge_at is None or index >= n_control
+                else _tokens(control_diverge_at, "NOISE", length)
             )
         )
     return (
         _make_replay([_make_run(stock)]),
         _make_replay([_make_run(candidate)]),
+        _make_replay([_make_run(control)]) if with_control else None,
     )
+
+
+def _correctness_pair(
+    *, diverge_at: int | None, length: int = 1600, contexts: int = 1
+) -> tuple[ReplayResult, ReplayResult]:
+    """The stock/candidate halves of :func:`_correctness_arms`."""
+    stock, candidate, _ = _correctness_arms(
+        diverge_at=diverge_at, contexts=contexts, length=length, with_control=False
+    )
+    return stock, candidate
 
 
 def _decide_with_correctness(
     *,
     diverge_at: int | None,
+    control_diverge_at: int | None = None,
     min_divergence_token_index: int = 16,
-    contexts: int = 1,
+    contexts: int = _CORRECTNESS_CONTEXTS,
+    diverging: int | None = None,
+    control_diverging: int | None = None,
     correctness_max_tokens: int | None = None,
+    with_control: bool = True,
 ) -> Decision:
-    stock_correctness, cand_correctness = _correctness_pair(
-        diverge_at=diverge_at, contexts=contexts
+    stock_correctness, cand_correctness, control = _correctness_arms(
+        diverge_at=diverge_at,
+        control_diverge_at=control_diverge_at,
+        contexts=contexts,
+        diverging=diverging,
+        control_diverging=control_diverging,
+        with_control=with_control,
     )
     return decide_promotion(
         _make_delta(acceptance_rate=0.60),
@@ -1159,6 +1227,7 @@ def _decide_with_correctness(
         ),
         stock_correctness=stock_correctness,
         candidate_correctness=cand_correctness,
+        stock_correctness_control=control,
         correctness_max_tokens=correctness_max_tokens,
     )
 
@@ -1198,27 +1267,40 @@ def test_first_divergence_is_none_only_for_identical_generations() -> None:
 
 
 def test_candidate_diverging_at_token_3_is_rejected() -> None:
-    """Parting almost immediately is what a broken drafter looks like."""
+    """Parting almost immediately, on every context, while the engine does not.
+
+    The engine agrees with itself on all forty contexts and the candidate
+    disagrees on all forty from the third token: no noise floor explains that,
+    which is what a broken drafter looks like.
+    """
     dec = _decide_with_correctness(diverge_at=3)
 
     assert dec.verdict is Verdict.REJECT
     assert dec.reason is Reason.OUTPUT_MISMATCH
-    assert dec.output_early_divergences == 1
+    assert dec.output_early_divergences == _CORRECTNESS_CONTEXTS
+    assert dec.control_early_divergences == 0
 
 
 def test_candidate_diverging_at_token_900_of_1600_is_not_rejected_for_it() -> None:
-    """Float non-determinism deep in a long answer is not a defect."""
-    dec = _decide_with_correctness(diverge_at=900)
+    """Float non-determinism deep in a long answer is not a defect.
+
+    And it is now *shown* not to be one rather than assumed: the stock arm,
+    replayed against itself, parts at exactly the same offset just as often.
+    """
+    dec = _decide_with_correctness(diverge_at=900, control_diverge_at=900)
 
     assert dec.verdict is Verdict.PROMOTE
     assert dec.reason is Reason.BOTH_THRESHOLDS_MET
     # The divergence is still recorded -- it is simply not disqualifying.
-    assert dec.output_total_divergences == 1
+    assert dec.output_total_divergences == _CORRECTNESS_CONTEXTS
     assert dec.output_early_divergences == 0
+    assert dec.control_total_divergences == _CORRECTNESS_CONTEXTS
 
 
 def test_first_divergence_offsets_are_persisted_for_every_diverging_context() -> None:
-    dec = _decide_with_correctness(diverge_at=900, contexts=3)
+    dec = _decide_with_correctness(
+        diverge_at=900, control_diverge_at=900, contexts=3
+    )
 
     record = dec.to_dict()
     assert record["output_total_divergences"] == 3
@@ -1246,13 +1328,243 @@ def test_identical_generations_record_no_divergences_at_all() -> None:
 
 
 def test_divergence_threshold_is_configurable() -> None:
-    """The same measurement flips verdict when the bar moves past it."""
+    """The same measurement flips verdict when the bar moves past it.
+
+    Both comparisons part on all forty contexts, so the *total* statistic sees
+    40 against 40 and can never gate here -- which is what isolates the
+    threshold.  The candidate parts at token 20 and the engine parts at token
+    900, so moving the bar from 16 to 64 is the only thing that changes: the
+    early statistic goes from 0 against 0 to 40 against 0.
+    """
     assert _decide_with_correctness(
-        diverge_at=20, min_divergence_token_index=16
+        diverge_at=20, control_diverge_at=900, min_divergence_token_index=16
     ).verdict is Verdict.PROMOTE
     assert _decide_with_correctness(
-        diverge_at=20, min_divergence_token_index=64
+        diverge_at=20, control_diverge_at=900, min_divergence_token_index=64
     ).reason is Reason.OUTPUT_MISMATCH
+
+
+# ---------------------------------------------------------------------------
+# The divergence criterion is a comparison against a measured noise floor
+# ---------------------------------------------------------------------------
+
+
+def test_engine_noise_at_the_qwen_rate_does_not_reject() -> None:
+    """The false reject this criterion exists to stop, at its measured size.
+
+    Job d993eee replayed 410 held-out contexts and six of them parted, one of
+    them at token 4.  The old rule rejected on that single early occurrence
+    while the underlying numbers were the best on record (+0.83 pp acceptance,
+    +0.0248 tokens per verifier step).  Reproduced at scale here: the candidate
+    comparison and the stock-against-stock control diverge at the same rate and
+    with the same one-in-six early share, because both are the same engine.
+    """
+    stock, candidate, control = _correctness_arms(
+        diverge_at=None, contexts=410, length=128
+    )
+    # Six divergences in the candidate comparison, one of them early; six in the
+    # control, one of them early.  Same engine, same hazard.
+    def _mark(
+        replay: ReplayResult, offsets: dict[int, int], tail: str
+    ) -> ReplayResult:
+        run = replay.run_results[0]
+        results = list(run.results)
+        for ctx, offset in offsets.items():
+            results[ctx] = _make_request_result(
+                "answer",
+                output_tokens=_tokens(offset, tail, 128),
+                context_hash=f"ctx-{ctx}",
+            )
+        return _make_replay([_make_run(results)])
+
+    candidate = _mark(
+        candidate, {0: 4, 1: 44, 2: 55, 3: 78, 4: 110, 5: 119}, "OTHER"
+    )
+    control = _mark(control, {6: 9, 7: 41, 8: 60, 9: 83, 10: 101, 11: 120}, "NOISE")
+
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.60),
+        _make_delta(acceptance_rate=0.65),
+        _valid_runs_with_tps(100.0),
+        _valid_runs_with_tps(110.0),
+        PromotionConfig(
+            min_acceptance_delta_pp=1.0,
+            min_throughput_delta_pct=2.0,
+            min_divergence_token_index=16,
+        ),
+        stock_correctness=stock,
+        candidate_correctness=candidate,
+        stock_correctness_control=control,
+        correctness_max_tokens=128,
+    )
+
+    # The evidence that used to reject is still recorded in full.
+    assert dec.output_total_divergences == 6
+    assert dec.output_early_divergences == 1
+    # And it is now judged against the floor that explains it.
+    assert dec.control_total_divergences == 6
+    assert dec.control_early_divergences == 1
+    assert dec.verdict is Verdict.PROMOTE
+    assert dec.reason is Reason.BOTH_THRESHOLDS_MET
+
+
+def test_a_saturated_noise_floor_still_does_not_reject() -> None:
+    """gpt-oss-20b: 56% of contexts diverged, on a MoE target under eager.
+
+    Every archived gpt-oss gate rejected on ``output_mismatch``.  A criterion
+    that only works when the engine is nearly deterministic is not a criterion
+    for "any model, any inference configuration"; this one measures the floor
+    wherever it happens to sit.
+    """
+    dec = _decide_with_correctness(
+        diverge_at=40,
+        diverging=23,
+        control_diverge_at=40,
+        control_diverging=21,
+        contexts=41,
+    )
+
+    assert dec.divergence_rate == pytest.approx(23 / 41)
+    assert dec.control_divergence_rate == pytest.approx(21 / 41)
+    assert dec.verdict is Verdict.PROMOTE
+
+
+def test_a_corrupted_head_is_still_rejected_against_a_noisy_engine() -> None:
+    """Detection must survive the floor being large.
+
+    The same 56%-noise engine as above, but the head is genuinely broken -- a
+    mis-wired draft-to-target token map, a vocabulary mismatch, corrupted
+    weights all look the same from here: every context, first token.  No noise
+    floor short of total reaches that.
+    """
+    dec = _decide_with_correctness(
+        diverge_at=0,
+        control_diverge_at=40,
+        control_diverging=21,
+        contexts=41,
+    )
+
+    assert dec.verdict is Verdict.REJECT
+    assert dec.reason is Reason.OUTPUT_MISMATCH
+    assert dec.output_early_divergences == 41
+    assert dec.control_early_divergences == 0
+    assert dec.divergence_early_p_value is not None
+    assert dec.divergence_early_p_value < dec.divergence_alpha
+
+
+def test_a_head_that_merely_diverges_more_often_is_rejected_on_the_total() -> None:
+    """The early statistic is not the only one, and does not have to be.
+
+    A head that never parts early but parts on every context while the engine
+    parts on a tenth of them is not explained by the engine.
+    """
+    dec = _decide_with_correctness(
+        diverge_at=900, control_diverge_at=900, control_diverging=4
+    )
+
+    assert dec.verdict is Verdict.REJECT
+    assert dec.reason is Reason.OUTPUT_MISMATCH
+    assert dec.output_early_divergences == 0
+    assert dec.divergence_early_p_value == 1.0
+    assert dec.divergence_total_p_value is not None
+    assert dec.divergence_total_p_value < dec.divergence_alpha
+
+
+def test_a_modest_excess_over_the_floor_is_not_significant() -> None:
+    """The bar has to be a real bar, and it has to sit where it says it does.
+
+    Twelve divergences against a measured floor of five, over forty contexts, is
+    a one-sided p of 0.0497 -- an excess this engine produces by itself one run
+    in twenty.  Rejecting there would trade one hair trigger for a slower one.
+    The criterion runs an order of magnitude tighter than that, and this test
+    pins *where*: it fails if the significance level is loosened even to 0.1.
+    """
+    dec = _decide_with_correctness(
+        diverge_at=900, diverging=12, control_diverge_at=900, control_diverging=5
+    )
+
+    assert DIVERGENCE_ALPHA == 0.01
+    assert dec.divergence_total_p_value == pytest.approx(0.0497, abs=5e-4)
+    assert dec.divergence_total_p_value > dec.divergence_alpha
+    assert dec.verdict is Verdict.PROMOTE
+    assert dec.reason is Reason.BOTH_THRESHOLDS_MET
+
+
+def test_two_statistics_are_tested_so_the_level_is_split_between_them() -> None:
+    """Rejecting on "either statistic is significant" tests twice.
+
+    Without the Bonferroni divisor the criterion runs at twice its stated size.
+    Fourteen divergences against a floor of four sits in exactly the gap it
+    opens -- p = 0.0072, above the corrected 0.005 and below the uncorrected
+    0.01 -- so this fixture promotes only while the correction is applied.
+    """
+    dec = _decide_with_correctness(
+        diverge_at=900, diverging=14, control_diverge_at=900, control_diverging=4
+    )
+
+    assert dec.divergence_alpha == pytest.approx(DIVERGENCE_ALPHA / 2)
+    assert dec.divergence_total_p_value == pytest.approx(0.00724, abs=5e-5)
+    assert dec.verdict is Verdict.PROMOTE
+
+
+def test_the_measured_noise_floor_is_persisted_for_audit() -> None:
+    """``output_mismatch`` was unfalsifiable without the floor beside it."""
+    dec = _decide_with_correctness(
+        diverge_at=900, control_diverge_at=900, control_diverging=10
+    )
+
+    record = dec.to_dict()
+    assert record["divergence_control_available"] is True
+    assert record["divergence_trials"] == _CORRECTNESS_CONTEXTS
+    assert record["control_trials"] == _CORRECTNESS_CONTEXTS
+    assert record["control_total_divergences"] == 10
+    assert record["control_early_divergences"] == 0
+    assert record["divergence_rate"] == pytest.approx(1.0)
+    assert record["control_divergence_rate"] == pytest.approx(0.25)
+    assert record["divergence_alpha"] == pytest.approx(DIVERGENCE_ALPHA / 2)
+    # Every control divergence is recorded individually, exactly as the
+    # candidate's are, so the floor can be re-derived rather than trusted.
+    assert len(record["control_divergences"]) == 10
+    assert {d["first_divergence_index"] for d in record["control_divergences"]} == {900}
+
+
+def test_a_missing_control_is_recorded_as_missing_not_as_a_clean_engine() -> None:
+    """No control means an *assumed* floor, and the record has to say so."""
+    dec = _decide_with_correctness(diverge_at=900, with_control=False)
+
+    assert dec.divergence_control_available is False
+    assert dec.control_divergence_rate is None
+    assert dec.control_total_divergences == 0
+    # The assumed floor is zero over an equal number of trials, which is the
+    # strictest floor that is still a test -- so this fixture does reject.
+    assert dec.verdict is Verdict.REJECT
+    assert dec.reason is Reason.OUTPUT_MISMATCH
+
+
+def test_the_exact_test_is_one_sided_and_calibrated() -> None:
+    """The p-value is the hypergeometric upper tail, checked by hand."""
+    # Nothing diverged anywhere: no evidence, never significance.
+    assert divergence_excess_p_value(0, 10, 0, 10) == 1.0
+    # Every event in the candidate arm and none in the control: the chance of
+    # that split under a common rate is 1 / C(2n, k).
+    assert divergence_excess_p_value(5, 5, 0, 5) == pytest.approx(
+        1 / math.comb(10, 5)
+    )
+    assert divergence_excess_p_value(3, 40, 0, 40) == pytest.approx(
+        math.comb(40, 3) / math.comb(80, 3)
+    )
+    # One-sided: an excess in the *control* arm is not evidence against the
+    # candidate, so the p-value must be large, not small.
+    assert divergence_excess_p_value(0, 40, 8, 40) > 0.99
+    # Equal rates sit at the middle of the distribution.
+    assert 0.4 < divergence_excess_p_value(8, 40, 8, 40) < 0.8
+
+
+def test_the_exact_test_rejects_impossible_counts() -> None:
+    with pytest.raises(DecisionError, match="cannot exceed trials"):
+        divergence_excess_p_value(11, 10, 0, 10)
+    with pytest.raises(DecisionError, match="non-negative integer"):
+        divergence_excess_p_value(-1, 10, 0, 10)
 
 
 def test_a_saturated_threshold_is_named_in_the_decision_record() -> None:

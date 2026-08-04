@@ -231,12 +231,27 @@ class TestPromotion:
             for body in result.metrics_bodies.values():
                 assert "vllm:spec_decode_num_accepted_tokens_total" in body
 
-    def test_a_divergence_deep_into_the_answer_does_not_block_promotion(
+    def test_a_late_divergence_is_recorded_as_late_and_judged_against_the_floor(
         self, tmp_path: Path
     ) -> None:
-        # Position, not equality.  Parting at token 40 -- past
-        # ``min_divergence_token_index`` (16) -- is measurement noise on
-        # non-reproducible hardware, not a broken head.
+        """Position is recorded; the *verdict* comes from the measured floor.
+
+        The simulated engine is deterministic by construction -- a profile's
+        token stream is a pure function of that profile -- so the stock arm
+        replayed against itself parts nowhere at all, and the measured noise
+        floor here is exactly zero.  Against a zero floor a candidate that
+        changes the answer on *every* context is not explained by the engine,
+        wherever it happens to part, and the total-rate statistic says so.
+
+        This is the honest limit of this simulator: it cannot produce benign
+        nondeterminism, so it cannot exercise the case where a late divergence
+        is engine noise.  That case is covered where the noise floor can
+        actually be dialled in --
+        ``tests/test_gate_runner.py::test_a_divergence_the_engine_also_makes_
+        against_itself_does_not_reject`` end to end through the runner, and
+        ``tests/test_gate_decide.py::test_engine_noise_at_the_qwen_rate_does_
+        not_reject`` on job d993eee's own numbers.
+        """
         stock, candidate = _profiles(candidate_divergence_at=40)
         with _fixture(tmp_path, stock, candidate) as fixture:
             result = fixture.gate().benchmark(
@@ -249,7 +264,15 @@ class TestPromotion:
             assert all(not d.early for d in decision.output_divergences)
             assert all(d.first_divergence_index == 40 for d in decision.output_divergences)
             assert all(d.basis == "token" for d in decision.output_divergences)
-            assert decision.verdict is Verdict.PROMOTE
+            # The floor was measured, and it is zero.
+            assert decision.divergence_control_available is True
+            assert decision.control_trials == SUITE_SIZE
+            assert decision.control_total_divergences == 0
+            # So the early statistic stays silent and the total one gates.
+            assert decision.output_early_divergences == 0
+            assert decision.divergence_early_p_value == 1.0
+            assert decision.verdict is Verdict.REJECT
+            assert decision.reason is Reason.OUTPUT_MISMATCH
 
 
 class TestMeasuredRejections:

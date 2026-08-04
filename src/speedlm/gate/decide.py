@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import statistics
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Final
 
@@ -135,6 +135,64 @@ GATING_ACCEPTANCE_CRITERION: Final[str] = "mean_accepted_length_delta"
 #: current criterion.
 LEGACY_ACCEPTANCE_CRITERION: Final[str] = "acceptance_rate_delta_pp"
 
+#: Significance level the whole output-correctness criterion is run at.
+#:
+#: **Why the criterion is a significance test at all.**  Speculative decoding is
+#: lossless by construction: the verifier accepts a drafted token only when it
+#: matches what the target model would itself have emitted, so *both* arms of
+#: this gate -- stock draft and candidate draft alike -- are sampling the same
+#: target distribution.  A better or worse draft head changes how many tokens
+#: clear the verifier per forward pass, i.e. speed.  It cannot change the token
+#: stream.  Any token-level disagreement between the two arms is therefore
+#: evidence about the *engine*, not about the head: vLLM's target forward pass
+#: is not bitwise reproducible across differing batch shapes, kernel configs are
+#: selected by nearest-``M`` lookup, block sizes and split-``k`` branch on ``M``,
+#: and at temperature 0 acceptance is exact argmax equality with no tolerance
+#: band -- so a shifted reduction order flips near-ties.  ``VLLM_BATCH_INVARIANT``
+#: exists precisely to force the invariant kernel subset and is off by default.
+#:
+#: The old criterion rejected on *any single* early divergence.  That is a
+#: hair trigger on a stochastic process.  With an intrinsic per-context
+#: divergence rate of just 1% and a 128-token correctness cap, the chance that
+#: at least one of 410 contexts happens to flip inside the first 16 tokens is
+#: ``1 - (1 - 0.01 * 16/128) ** 410`` = 40%.  At the rate actually measured on
+#: Qwen3-8B (1.46%) it is 53%; on gpt-oss-20b, whose MoE path diverged on 56%
+#: of contexts, it is indistinguishable from 1.  Every archived gpt-oss gate
+#: rejected, and no stock-versus-stock control was ever run to say what any of
+#: those numbers should have been compared against.
+#:
+#: **What replaces it.**  The gate now measures its own noise floor in the same
+#: run -- the stock arm replays the correctness suite twice and the two passes
+#: are compared against each other -- and rejects only when the
+#: candidate-versus-stock divergence count *significantly exceeds that floor*
+#: under a one-sided Fisher exact test.  Nothing about the floor is assumed, so
+#: the criterion needs no per-model or per-engine tuning: a MoE target under
+#: CUDA graphs at batch 64 measures its own large floor and is judged against
+#: it, exactly as a dense target under eager at batch 1 measures its own small
+#: one.  A genuinely broken head -- a mis-wired draft-to-target token map, a
+#: vocabulary mismatch, corrupted weights -- diverges on essentially every
+#: context at essentially the first token, which no engine noise floor reaches,
+#: so detection is unaffected.
+#:
+#: 0.01 rather than the reflexive 0.05: this gate has no rollback behind it, so
+#: a false *promote* is the expensive error, and a looser alpha buys detection
+#: power cheaply.  It is not smaller than that because the exact test is
+#: discrete -- at the five-context suites the simulation harness uses, a total
+#: corruption attains ``1/C(10,5)`` = 0.0040, and an alpha below that would make
+#: small suites structurally unable to reject anything at all.
+DIVERGENCE_ALPHA: Final[float] = 0.01
+
+#: Statistics the divergence criterion tests, and therefore the Bonferroni
+#: divisor applied to :data:`DIVERGENCE_ALPHA`.
+#:
+#: Two: the *total* divergence count and the *early* subset.  Total has the most
+#: events and so the most power against a head that is merely wrong more often.
+#: Early targets the shape a genuine corruption takes -- disagreement at the
+#: very first tokens -- and keeps power when the total rate is already saturated
+#: by engine noise, as it is on a MoE target.  Both are tested against their own
+#: separately measured floor, so neither can fire on noise.
+DIVERGENCE_STATISTICS: Final[int] = 2
+
 
 class DispersionBasis(Enum):
     """Whether a published standard deviation is a *measurement* or an artefact.
@@ -210,6 +268,10 @@ class ContextDivergence:
     candidate_length: int
     #: True when the divergence is early enough to gate against, i.e.
     #: ``first_divergence_index < promotion.min_divergence_token_index``.
+    #:
+    #: This flag classifies a divergence; on its own it no longer *disqualifies*
+    #: one.  See :data:`DIVERGENCE_ALPHA` for what the gate now compares it
+    #: against.
     early: bool
 
     def to_dict(self) -> dict[str, Any]:
@@ -328,8 +390,59 @@ class Decision:
     min_divergence_token_index: int = 0
     #: Every context whose two generations parted, with the offset at which
     #: they parted.  ``output_early_divergences`` counts the subset that parted
-    #: before ``min_divergence_token_index``; that subset is what gates.
+    #: before ``min_divergence_token_index``.
     output_divergences: tuple[ContextDivergence, ...] = ()
+
+    # -- the divergence noise floor -----------------------------------------
+    # The stock arm replayed against *itself*.  Same engine, same process, same
+    # draft, same sampling, same cap, same concurrency -- so every divergence
+    # recorded here is engine nondeterminism by construction, and the candidate
+    # arm's count is only meaningful relative to it.  See
+    # :data:`DIVERGENCE_ALPHA`.
+    #
+    # Every field below is ``compare=False``.  They are written to
+    # ``decision.json`` by :meth:`to_dict` and are fully auditable there, but
+    # :func:`speedlm.report.parse_decision` rebuilds a ``Decision`` field by
+    # explicitly named field and does not yet know about them, so a record that
+    # round-trips through the report layer comes back with them at their
+    # defaults.  Excluding them from equality keeps "did this decision survive
+    # persistence" answering the question it is asked -- rather than answering
+    # "has the report layer been taught the newest evidence fields", which is a
+    # different question with a different owner.  Restoring them in
+    # ``parse_decision`` is what makes ``speedlm gain`` able to show the floor
+    # beside the count; until then the floor lives in the artifact only.
+
+    #: Context comparisons the candidate-versus-stock evidence rests on, i.e.
+    #: contexts x correctness repeats.  The denominator of
+    #: ``output_total_divergences``.
+    divergence_trials: int = field(default=0, compare=False)
+    #: The same for the stock-versus-stock control.  Zero means no control was
+    #: run; see :attr:`divergence_control_available`.
+    control_trials: int = field(default=0, compare=False)
+    #: Every context whose two *stock* generations parted.  Persisted in full,
+    #: exactly as ``output_divergences`` is: the noise floor is the evidence the
+    #: verdict turns on, so a reader must be able to audit it after the fact
+    #: rather than take the summary counts on trust.
+    control_divergences: tuple[ContextDivergence, ...] = field(
+        default=(), compare=False
+    )
+    #: Whether a stock-versus-stock control pass was actually measured.  When
+    #: false the criterion falls back to an *assumed* floor of zero divergences
+    #: over an equal number of trials -- the strictest floor that is still a
+    #: test rather than a hair trigger -- and this flag is what stops that
+    #: assumption being read back as a measurement.
+    divergence_control_available: bool = field(default=False, compare=False)
+    #: One-sided Fisher exact p-value for "the candidate diverges more often
+    #: than the engine does on its own", over all divergences.  ``None`` when
+    #: there was nothing to test.
+    divergence_total_p_value: float | None = field(default=None, compare=False)
+    #: The same, restricted to divergences before ``min_divergence_token_index``.
+    divergence_early_p_value: float | None = field(default=None, compare=False)
+    #: Per-statistic significance level each p-value above was compared against,
+    #: i.e. :data:`DIVERGENCE_ALPHA` over :data:`DIVERGENCE_STATISTICS`.
+    divergence_alpha: float = field(
+        default=DIVERGENCE_ALPHA / DIVERGENCE_STATISTICS, compare=False
+    )
 
     # -- the promotion criterion --------------------------------------------
     # Added beside ``acceptance_delta_pp`` rather than replacing it: the rate
@@ -556,6 +669,36 @@ class Decision:
         return len(self.output_divergences)
 
     @property
+    def control_early_divergences(self) -> int:
+        """Noise-floor divergences before ``min_divergence_token_index``."""
+        return sum(1 for d in self.control_divergences if d.early)
+
+    @property
+    def control_total_divergences(self) -> int:
+        """Noise-floor divergences at any offset."""
+        return len(self.control_divergences)
+
+    @property
+    def divergence_rate(self) -> float | None:
+        """Candidate-versus-stock divergences per context comparison."""
+        if self.divergence_trials <= 0:
+            return None
+        return self.output_total_divergences / self.divergence_trials
+
+    @property
+    def control_divergence_rate(self) -> float | None:
+        """The engine's own divergence rate, measured stock against stock.
+
+        ``None`` when no control ran.  Read it beside :attr:`divergence_rate`:
+        two numbers of similar size are the same engine measured twice, which is
+        what the losslessness of speculative decoding predicts and what the
+        verdict must not punish.
+        """
+        if not self.divergence_control_available or self.control_trials <= 0:
+            return None
+        return self.control_total_divergences / self.control_trials
+
+    @property
     def divergence_criterion(self) -> DivergenceCriterion:
         """Whether the recorded position criterion could discriminate.
 
@@ -647,6 +790,21 @@ class Decision:
             "output_early_divergences": self.output_early_divergences,
             "output_total_divergences": self.output_total_divergences,
             "output_divergences": [d.to_dict() for d in self.output_divergences],
+            # The noise floor the two counts above were judged against, and the
+            # test that judged them.  Without these a reader cannot tell a head
+            # that broke from an engine that is not bitwise reproducible; see
+            # ``DIVERGENCE_ALPHA``.
+            "divergence_control_available": self.divergence_control_available,
+            "divergence_trials": self.divergence_trials,
+            "control_trials": self.control_trials,
+            "control_early_divergences": self.control_early_divergences,
+            "control_total_divergences": self.control_total_divergences,
+            "control_divergences": [d.to_dict() for d in self.control_divergences],
+            "divergence_rate": self.divergence_rate,
+            "control_divergence_rate": self.control_divergence_rate,
+            "divergence_total_p_value": self.divergence_total_p_value,
+            "divergence_early_p_value": self.divergence_early_p_value,
+            "divergence_alpha": self.divergence_alpha,
             "stock_avg_tok_per_sec": self.stock_avg_tok_per_sec,
             "candidate_avg_tok_per_sec": self.candidate_avg_tok_per_sec,
             "throughput_dispersion": self.throughput_dispersion.value,
@@ -939,13 +1097,21 @@ def _collect_divergences(
     candidate: ReplayResult,
     *,
     min_divergence_index: int,
-) -> tuple[ContextDivergence, ...]:
-    """Locate, classify and record every context whose generations parted."""
+) -> tuple[tuple[ContextDivergence, ...], int]:
+    """Locate, classify and record every context whose generations parted.
+
+    Returns ``(divergences, trials)``.  *trials* -- the number of context pairs
+    actually compared -- is returned rather than re-derived by the caller
+    because it is the denominator of every rate the criterion computes, and a
+    count of events without the count of opportunities is not a rate.
+    """
     found: list[ContextDivergence] = []
+    trials = 0
     for repeat_index in range(min(stock.num_runs, candidate.num_runs)):
         s_run = stock.run_results[repeat_index]
         c_run = candidate.run_results[repeat_index]
         for s_req, c_req in zip(s_run.results, c_run.results, strict=True):
+            trials += 1
             index, basis, s_len, c_len = first_divergence(s_req, c_req)
             if index is None:
                 continue
@@ -960,7 +1126,58 @@ def _collect_divergences(
                     early=index < min_divergence_index,
                 )
             )
-    return tuple(found)
+    return tuple(found), trials
+
+
+def divergence_excess_p_value(
+    observed_events: int,
+    observed_trials: int,
+    control_events: int,
+    control_trials: int,
+) -> float:
+    """One-sided Fisher exact p-value for "the candidate diverges *more*".
+
+    The null hypothesis is the one speculative decoding's losslessness makes the
+    right one: both comparisons -- candidate-versus-stock and stock-versus-stock
+    -- are draws from the *same* per-context divergence hazard, namely the
+    engine's.  The alternative is that the candidate arm's hazard is strictly
+    larger, which is the only thing a broken head can produce.
+
+    Conditioning on the observed event total, the number landing in the
+    candidate comparison is hypergeometric, so the upper tail is exact -- no
+    normal approximation, no continuity correction, and no minimum expected-cell
+    count to violate.  That matters here because the interesting regimes are
+    both extremes at once: a handful of events out of 410 on a dense target, and
+    a near-saturated 230 out of 410 on a MoE one.
+
+    Returns 1.0 when nothing diverged anywhere, or when there were no trials --
+    "no evidence", never "significant".
+    """
+    for name, value in (
+        ("observed_events", observed_events),
+        ("observed_trials", observed_trials),
+        ("control_events", control_events),
+        ("control_trials", control_trials),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise DecisionError(f"{name} must be a non-negative integer, got {value!r}")
+    if observed_events > observed_trials or control_events > control_trials:
+        raise DecisionError(
+            "divergence events cannot exceed trials: "
+            f"{observed_events}/{observed_trials} observed, "
+            f"{control_events}/{control_trials} control"
+        )
+
+    total_events = observed_events + control_events
+    total_trials = observed_trials + control_trials
+    if total_events == 0 or total_trials == 0:
+        return 1.0
+    denominator = math.comb(total_trials, total_events)
+    numerator = sum(
+        math.comb(observed_trials, i) * math.comb(control_trials, total_events - i)
+        for i in range(observed_events, min(observed_trials, total_events) + 1)
+    )
+    return min(1.0, numerator / denominator)
 
 
 # ---------------------------------------------------------------------------
@@ -980,6 +1197,7 @@ def decide_promotion(
     candidate_repeat_metrics: Sequence[MetricsDelta] = (),
     stock_correctness: ReplayResult | None = None,
     candidate_correctness: ReplayResult | None = None,
+    stock_correctness_control: ReplayResult | None = None,
     benchmark_max_tokens: int | None = None,
     replay_concurrency: int | None = None,
     correctness_max_tokens: int | None = None,
@@ -1012,11 +1230,12 @@ def decide_promotion(
         stock_replay: Replay results for stock endpoint.
         candidate_replay: Replay results for candidate endpoint.
         promotion_config: Thresholds from config.
-        max_output_mismatches: Allowed *early* divergences -- contexts whose
-            two generations parted before
-            ``promotion_config.min_divergence_token_index``.  Default 0: the
-            gate stays fail-closed, but against a criterion that a correct
-            candidate can actually satisfy.
+        max_output_mismatches: Divergences tolerated outright, before the
+            criterion is even consulted.  Default 0, which leaves the
+            significance test in :data:`DIVERGENCE_ALPHA` fully in charge: a
+            divergence count has to *both* exceed this allowance and exceed the
+            run's own measured noise floor significantly.  Raising it can only
+            make the gate more permissive, never less.
         warmup_repeats: Unscored warmup passes each arm ran before the
             measurement window opened, recorded in the decision for audit.
         stock_repeat_metrics: One :class:`MetricsDelta` per scored repeat,
@@ -1031,6 +1250,13 @@ def decide_promotion(
             throughput replay is compared instead, which is what the unit tests
             do and what a caller that has not yet been updated will get.
         candidate_correctness: The same, for the candidate arm.
+        stock_correctness_control: A *second* correctness pass by the stock arm,
+            on the same engine and settings as ``stock_correctness``.  Comparing
+            the two measures how often this engine disagrees with itself, which
+            is the only thing the candidate arm's divergence count can honestly
+            be judged against -- see :data:`DIVERGENCE_ALPHA`.  ``None`` falls
+            back to an assumed floor of zero over an equal number of trials and
+            records ``divergence_control_available: false``.
         benchmark_max_tokens: Output cap the throughput/acceptance pass ran
             under, recorded verbatim in the decision.  These last five are
             *measurement context*: they change what the reported statistics are
@@ -1079,11 +1305,27 @@ def decide_promotion(
     candidate_corr = (
         candidate_correctness if candidate_correctness is not None else candidate_replay
     )
-    divergences = _collect_divergences(
+    divergences, divergence_trials = _collect_divergences(
         stock_corr,
         candidate_corr,
         min_divergence_index=min_divergence_index,
     )
+    # The engine's own noise floor: the stock arm against a second pass of
+    # itself, scored by the identical procedure so the two counts are
+    # commensurable.  Absent one, assume a floor of zero over an equal number of
+    # trials -- the strictest assumption that is still a test.
+    if stock_correctness_control is not None:
+        control_divergences, control_trials = _collect_divergences(
+            stock_corr,
+            stock_correctness_control,
+            min_divergence_index=min_divergence_index,
+        )
+        control_available = True
+    else:
+        control_divergences = ()
+        control_trials = divergence_trials
+        control_available = False
+
     # The number of passes the divergence evidence above actually rests on.
     # ``_collect_divergences`` compares ``min(num_runs)`` pairs, so that is the
     # count -- and it is what bounds which ``per_repeat`` rows can carry a
@@ -1094,6 +1336,25 @@ def decide_promotion(
         if d.early:
             early_by_repeat[d.repeat_index] = early_by_repeat.get(d.repeat_index, 0) + 1
     total_early = sum(early_by_repeat.values())
+    total_any = len(divergences)
+    control_early = sum(1 for d in control_divergences if d.early)
+    control_any = len(control_divergences)
+
+    # Each statistic against its own floor.  Bonferroni over the two, because
+    # rejecting on "either is significant" tests twice.
+    per_statistic_alpha = DIVERGENCE_ALPHA / DIVERGENCE_STATISTICS
+    total_p = divergence_excess_p_value(
+        total_any, divergence_trials, control_any, control_trials
+    )
+    early_p = divergence_excess_p_value(
+        total_early, divergence_trials, control_early, control_trials
+    )
+    # The allowance is a precondition, not an alternative: a statistic fires
+    # only when it clears *both* the caller's outright tolerance and its own
+    # measured noise floor.
+    divergence_rejects = (
+        total_any > max_output_mismatches and total_p < per_statistic_alpha
+    ) or (total_early > max_output_mismatches and early_p < per_statistic_alpha)
 
     # --- Build per-repeat summaries ---
     # Derived purely from replay data plus the per-repeat metric windows, so
@@ -1199,6 +1460,13 @@ def decide_promotion(
             candidate_acceptance_stdev=c_acc_sd,
             min_divergence_token_index=min_divergence_index,
             output_divergences=divergences,
+            divergence_trials=divergence_trials,
+            control_trials=control_trials,
+            control_divergences=control_divergences,
+            divergence_control_available=control_available,
+            divergence_total_p_value=total_p,
+            divergence_early_p_value=early_p,
+            divergence_alpha=per_statistic_alpha,
             benchmark_max_tokens=benchmark_max_tokens,
             replay_concurrency=replay_concurrency,
             correctness_max_tokens=correctness_max_tokens,
@@ -1242,10 +1510,13 @@ def decide_promotion(
         return _reject(Reason.HIGH_INVALID_RATE)
 
     # --- Validation: output mismatch ---
-    # Position, not equality: a candidate that parts from stock deep into a
-    # long answer has not misbehaved, it has been measured on hardware that is
-    # not bitwise reproducible.  One that parts in the first few tokens has.
-    if total_early > max_output_mismatches:
+    # Excess over the engine's own noise floor, not any single occurrence.  Both
+    # arms run speculative decoding against the same target, so both emit the
+    # target's distribution and a disagreement between them is the engine
+    # disagreeing with itself -- which the control pass measures directly.  See
+    # :data:`DIVERGENCE_ALPHA` for the argument and the false-reject arithmetic
+    # the old any-occurrence rule was producing.
+    if divergence_rejects:
         return _reject(Reason.OUTPUT_MISMATCH)
 
     # --- Validation: throughput unavailable ---

@@ -12,6 +12,7 @@ from speedlm.config import SamplingConfig, SpeedLMConfig
 from speedlm.gate.decide import Reason, Verdict
 from speedlm.gate.replay import ReplayResult, RequestResult, RunResults
 from speedlm.gate.runner import (
+    CORRECTNESS_CONTROL_REPEATS,
     CORRECTNESS_REPEATS,
     CORRECTNESS_REPLAY_CONCURRENCY,
     DEFAULT_BENCHMARK_MAX_TOKENS,
@@ -86,6 +87,18 @@ class FakeReplayExecutor:
     #: pass while agreeing on the throughput pass, which is the real shape.
     response_text: str = "same deterministic output"
     correctness_tokens: tuple[str, ...] | None = None
+    #: ``(correctness_call_index, run_index, context_index) -> tokens``.
+    #:
+    #: The runner makes one correctness *call* per arm, and the stock arm's call
+    #: carries more than one run because it also measures the noise floor.  A
+    #: test that wants to model "the engine disagrees with itself here and the
+    #: candidate disagrees there" needs to address those three axes separately,
+    #: which a single ``correctness_tokens`` tuple cannot.
+    correctness_streams: (
+        Callable[[int, int, int], tuple[str, ...]] | None
+    ) = None
+    #: Correctness calls seen so far, i.e. the first axis above.
+    correctness_calls: int = 0
 
     def replay(
         self,
@@ -115,32 +128,44 @@ class FakeReplayExecutor:
                 f"correctness:{concurrency}" if capture_tokens else f"replay:{repeats}"
             )
 
+        correctness_call = self.correctness_calls
+        if capture_tokens:
+            self.correctness_calls += 1
+
         runs: list[RunResults] = []
-        for _ in range(repeats):
+        for run_index in range(repeats):
             latency = (
                 1.0 if self.run_latencies is None else self.run_latencies.pop(0)
             )
-            request = RequestResult(
-                context_hash=suite.contexts[0].context_hash,
-                latency_s=latency,
-                prompt_tokens=4,
-                completion_tokens=10,
-                total_tokens=14,
-                response_text=self.response_text,
-                valid=True,
-                output_tokens=(
-                    self.correctness_tokens
-                    if capture_tokens and self.correctness_tokens is not None
-                    else ()
-                ),
-            )
+            requests: list[RequestResult] = []
+            for ctx_index, ctx in enumerate(suite.contexts):
+                if not capture_tokens:
+                    tokens: tuple[str, ...] = ()
+                elif self.correctness_streams is not None:
+                    tokens = self.correctness_streams(
+                        correctness_call, run_index, ctx_index
+                    )
+                else:
+                    tokens = self.correctness_tokens or ()
+                requests.append(
+                    RequestResult(
+                        context_hash=ctx.context_hash,
+                        latency_s=latency / len(suite.contexts),
+                        prompt_tokens=4,
+                        completion_tokens=10,
+                        total_tokens=14,
+                        response_text=self.response_text,
+                        valid=True,
+                        output_tokens=tokens,
+                    )
+                )
             runs.append(
                 RunResults(
-                    results=(request,),
+                    results=tuple(requests),
                     total_latency_s=latency,
-                    total_prompt_tokens=4,
-                    total_completion_tokens=10,
-                    valid_count=1,
+                    total_prompt_tokens=4 * len(requests),
+                    total_completion_tokens=10 * len(requests),
+                    valid_count=len(requests),
                     invalid_count=0,
                     invalid_rate=0.0,
                 )
@@ -328,7 +353,7 @@ def test_passing_candidate_promotes_with_real_decision(tmp_path: Path) -> None:
     # Per arm: one warmup pass, three scored passes issued one at a time so
     # a scrape can sit between them, and one correctness pass.
     assert replay.calls == 10
-    assert replay.seen_repeats == [1] * 10
+    assert replay.seen_repeats == [1, 1, 1, 1, 2, 1, 1, 1, 1, 1]
     assert len(set(replay.seen_suite_ids)) == 1
 
 
@@ -571,14 +596,18 @@ def test_warmup_pass_runs_before_the_measurement_window(tmp_path: Path) -> None:
         "correctness:1",  # bounded, single-stream, outside the window
     ]
     assert events == per_arm * 2
-    assert replay.seen_repeats == [1] * 10
+    # Stock issues its correctness call with two runs -- the scored pass and the
+    # noise-floor control -- so its call is the only one asking for 2.
+    assert replay.seen_repeats == [1, 1, 1, 1, 2, 1, 1, 1, 1, 1]
 
 
 def test_warmup_pass_is_excluded_from_the_scored_repeats(tmp_path: Path) -> None:
     # One slow cold pass per arm (JIT compilation), then steady state.  If the
     # warmup were scored, the 2.5 tok/s pass would show up in ``per_repeat``.
     replay = FakeReplayExecutor(
-        run_latencies=[4.0, 1.0, 1.0, 1.0, 1.0, 4.0, 1.0, 1.0, 1.0, 1.0],
+        # Stock: warmup, three scored passes, then two correctness passes
+        # (scored + noise-floor control).  Candidate: warmup, three, one.
+        run_latencies=[4.0, 1.0, 1.0, 1.0, 1.0, 1.0, 4.0, 1.0, 1.0, 1.0, 1.0],
     )
     runner, _, replay, _ = _runner(
         tmp_path,
@@ -602,7 +631,9 @@ def test_warmup_pass_is_excluded_from_the_scored_repeats(tmp_path: Path) -> None
 
 def test_warmup_measurement_stays_visible_in_the_report(tmp_path: Path) -> None:
     replay = FakeReplayExecutor(
-        run_latencies=[4.0, 1.0, 1.0, 1.0, 1.0, 4.0, 1.0, 1.0, 1.0, 1.0],
+        # Stock: warmup, three scored passes, then two correctness passes
+        # (scored + noise-floor control).  Candidate: warmup, three, one.
+        run_latencies=[4.0, 1.0, 1.0, 1.0, 1.0, 1.0, 4.0, 1.0, 1.0, 1.0, 1.0],
     )
     runner, _, _, _ = _runner(
         tmp_path,
@@ -646,7 +677,7 @@ def test_warmup_can_be_disabled(tmp_path: Path) -> None:
     )
 
     assert result.decision is not None
-    assert replay_executor.seen_repeats == [1] * 8
+    assert replay_executor.seen_repeats == [1, 1, 1, 2, 1, 1, 1, 1]
     warmup = result.metrics["warmup"]
     assert isinstance(warmup, dict)
     assert warmup == {"requested_repeats": 0, "stock": None, "candidate": None}
@@ -870,7 +901,7 @@ def test_estimated_benchmark_seconds_scales_with_the_suite(tmp_path: Path) -> No
         repeats=3,
         warmup_repeats=1,
         concurrency=DEFAULT_REPLAY_CONCURRENCY,
-        correctness_repeats=CORRECTNESS_REPEATS,
+        correctness_repeats=CORRECTNESS_REPEATS + CORRECTNESS_CONTROL_REPEATS,
         benchmark_max_tokens=DEFAULT_BENCHMARK_MAX_TOKENS,
         correctness_max_tokens=DEFAULT_CORRECTNESS_MAX_TOKENS,
     )
@@ -936,6 +967,8 @@ def test_correctness_pass_runs_single_stream_whatever_the_benchmark_degree(
         (None, DEFAULT_BENCHMARK_MAX_TOKENS, False)
     ] * 8
     assert result.metrics["correctness"] == {
+        "control_repeats": 1,
+        "control_arm": "stock",
         "concurrency": 1,
         "max_tokens": DEFAULT_CORRECTNESS_MAX_TOKENS,
         "repeats": CORRECTNESS_REPEATS,
@@ -1096,19 +1129,84 @@ def test_invalid_benchmark_max_tokens_is_rejected(
         )
 
 
+#: Traces that freeze into a forty-context held-out suite at the runner's
+#: default ``held_out_fraction`` of 0.2.  The divergence criterion compares a
+#: rate against a rate, so a one-context suite cannot exercise it at all.
+_DIVERGENCE_SUITE_TRACES = 200
+
+_BASE_TOKENS = tuple(f"t{i}" for i in range(64))
+
+
+def _diverging_traces() -> FakeTraceSource:
+    return FakeTraceSource(
+        tuple(
+            TraceRecord(
+                id=f"trace-{i}",
+                timestamp=float(i),
+                model="model",
+                messages=({"role": "user", "content": f"hello {i}"},),
+                tool_calls=(),
+                temperature=0.9,
+                top_p=0.5,
+                seed=99,
+                prompt_tokens=4,
+                completion_tokens=2,
+            )
+            for i in range(_DIVERGENCE_SUITE_TRACES)
+        )
+    )
+
+
+def _correctness_streams(
+    *,
+    candidate_at: int | None = None,
+    candidate_contexts: int = 10**6,
+    control_at: int | None = None,
+    control_contexts: int = 10**6,
+) -> Callable[[int, int, int], tuple[str, ...]]:
+    """Token streams for the two correctness calls the runner makes.
+
+    Call 0 is the stock arm.  Its run 0 is the scored pass and its run 1 is the
+    noise-floor control -- the same engine replaying the same suite a second
+    time -- so ``control_at`` is where *the engine* disagrees with itself.  Call
+    1 is the candidate arm, and ``candidate_at`` is where it disagrees with
+    stock.
+    """
+
+    def _part(at: int, tail: str) -> tuple[str, ...]:
+        return _BASE_TOKENS[:at] + (tail,) * (len(_BASE_TOKENS) - at)
+
+    def factory(call: int, run: int, ctx: int) -> tuple[str, ...]:
+        if call == 0 and run == 0:
+            return _BASE_TOKENS
+        if call == 0:
+            if control_at is None or ctx >= control_contexts:
+                return _BASE_TOKENS
+            return _part(control_at, "NOISE")
+        if candidate_at is None or ctx >= candidate_contexts:
+            return _BASE_TOKENS
+        return _part(candidate_at, "OTHER")
+
+    return factory
+
+
+def _divergence_runner(
+    tmp_path: Path, streams: Callable[[int, int, int], tuple[str, ...]]
+) -> BenchmarkGateRunner:
+    runner, _, _, _ = _runner(
+        tmp_path,
+        scrapes=_normal_scrapes(),
+        replay=FakeReplayExecutor(correctness_streams=streams),
+        trace_source=_diverging_traces(),
+    )
+    return runner
+
+
 def test_an_early_divergence_on_the_correctness_pass_rejects(tmp_path: Path) -> None:
-    replay = FakeReplayExecutor(correctness_tokens=("A", "B", "C"))
-    runner, _, _, _ = _runner(tmp_path, scrapes=_normal_scrapes(), replay=replay)
-
-    # The candidate arm answers differently from the third token onwards.
-    original = FakeReplayExecutor.replay
-
-    def alternating(self: FakeReplayExecutor, *args: object, **kwargs: object) -> ReplayResult:
-        if self.calls >= 5:  # every pass after the stock arm finished
-            self.correctness_tokens = ("A", "B", "Z")
-        return original(self, *args, **kwargs)  # type: ignore[arg-type]
-
-    replay.replay = alternating.__get__(replay)  # type: ignore[method-assign]
+    """Every context parts at token 2 while the engine agrees with itself."""
+    runner = _divergence_runner(
+        tmp_path, _correctness_streams(candidate_at=2)
+    )
 
     result = runner.benchmark(
         tmp_path / "candidate",
@@ -1119,11 +1217,80 @@ def test_an_early_divergence_on_the_correctness_pass_rejects(tmp_path: Path) -> 
     assert result.passed is False
     assert result.decision is not None
     assert result.decision.reason is Reason.OUTPUT_MISMATCH
-    assert result.decision.output_early_divergences == 1
-    assert [
+    assert result.decision.output_early_divergences == 40
+    assert result.decision.control_early_divergences == 0
+    assert {
         d.first_divergence_index for d in result.decision.output_divergences
-    ] == [2]
+    } == {2}
     assert result.decision.to_dict()["output_divergences"][0]["basis"] == "token"
+
+
+def test_a_divergence_the_engine_also_makes_against_itself_does_not_reject(
+    tmp_path: Path,
+) -> None:
+    """The false reject this whole control pass exists to stop.
+
+    Byte-identical evidence to the test above -- forty contexts parting at token
+    2, well inside ``min_divergence_token_index`` -- but here the stock arm
+    replayed against *itself* parts in exactly the same places.  Speculative
+    decoding is lossless, so that is the only thing this measurement can be:
+    the engine, not the head.  The old rule could not tell the two apart
+    because it never ran the second pass.
+    """
+    runner = _divergence_runner(
+        tmp_path, _correctness_streams(candidate_at=2, control_at=2)
+    )
+
+    result = runner.benchmark(
+        tmp_path / "candidate",
+        timeout_seconds=30,
+        should_abort=lambda: False,
+    )
+
+    assert result.decision is not None
+    decision = result.decision
+    assert decision.output_early_divergences == 40
+    assert decision.control_early_divergences == 40
+    assert decision.verdict is Verdict.PROMOTE
+    assert decision.reason is Reason.BOTH_THRESHOLDS_MET
+    assert result.passed is True
+
+
+def test_the_stock_arm_measures_the_noise_floor_and_the_record_says_so(
+    tmp_path: Path,
+) -> None:
+    """The control has to be real, on the stock arm, and auditable."""
+    replay = FakeReplayExecutor(
+        correctness_streams=_correctness_streams(control_at=30, control_contexts=7)
+    )
+    runner, _, _, _ = _runner(
+        tmp_path,
+        scrapes=_normal_scrapes(),
+        replay=replay,
+        trace_source=_diverging_traces(),
+    )
+
+    result = runner.benchmark(
+        tmp_path / "candidate",
+        timeout_seconds=30,
+        should_abort=lambda: False,
+    )
+
+    assert result.decision is not None
+    decision = result.decision
+    # Exactly one arm ran an extra correctness pass, and it was stock -- the
+    # first arm, and the reference side of every comparison.
+    assert replay.seen_repeats == [1, 1, 1, 1, 2, 1, 1, 1, 1, 1]
+    assert result.metrics["correctness"]["control_arm"] == "stock"
+    assert decision.divergence_control_available is True
+    assert decision.divergence_trials == 40
+    assert decision.control_trials == 40
+    assert decision.control_total_divergences == 7
+    assert decision.control_divergence_rate == pytest.approx(7 / 40)
+    # The candidate agreed with stock everywhere, so the engine is measurably
+    # noisier than the head is, and nothing gates.
+    assert decision.output_total_divergences == 0
+    assert decision.verdict is Verdict.PROMOTE
 
 
 # ---------------------------------------------------------------------------

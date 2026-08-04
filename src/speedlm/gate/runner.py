@@ -109,13 +109,49 @@ DEFAULT_CORRECTNESS_MAX_TOKENS: Final = 128
 #: carries the justification and the acceptance-bias disclosure.
 DEFAULT_BENCHMARK_MAX_TOKENS: Final = 512
 
-#: Suite passes the correctness check makes per arm.
+#: Suite passes the correctness check scores per arm.
 #:
-#: One.  The check is a predicate about the head, not a statistic about the
-#: machine, so repeating it buys resolution on a quantity that has none -- and
-#: every extra pass is a fresh draw against the benign-divergence hazard, i.e.
-#: it strictly *increases* the false-reject rate without improving detection.
+#: One.  Raising it does not fix the false-reject problem it looks like it
+#: should: every extra pass is another fresh draw against the engine's
+#: divergence hazard, so under an any-occurrence rule more repeats strictly
+#: *increase* the false-reject rate.  What fixes it is knowing what the hazard
+#: is, which is what :data:`CORRECTNESS_CONTROL_REPEATS` buys.
 CORRECTNESS_REPEATS: Final = 1
+
+#: Extra correctness passes the *stock* arm makes, to measure the engine's own
+#: divergence rate against itself.
+#:
+#: One, and it is the whole fix.  Speculative decoding is lossless -- the
+#: verifier only accepts a drafted token the target would have emitted anyway --
+#: so both arms sample the same distribution and a token-level disagreement
+#: between them says nothing about the draft head.  It says the engine is not
+#: bitwise reproducible, which on vLLM it is not: kernel configs are chosen by
+#: nearest-``M`` lookup, block sizes and split-``k`` branch on ``M``, and greedy
+#: acceptance is exact argmax equality with no tolerance band, so a shifted
+#: reduction order flips near-ties.
+#:
+#: Until this existed the gate had no idea what rate that produced.  It never
+#: once replayed one arm against itself, so ``output_mismatch`` was a count with
+#: no denominator: every archived gpt-oss run diverged on roughly half its
+#: contexts and every archived Qwen run on a few percent, and there was no way
+#: to tell either apart from a broken head.  Running the stock arm's correctness
+#: pass twice on the same engine, same draft, same sampling, same cap and same
+#: concurrency makes every divergence between those two passes engine noise *by
+#: construction*, and gives :func:`speedlm.gate.decide.decide_promotion` a floor
+#: measured under the exact conditions the candidate is judged under.
+#:
+#: The cost is one bounded, single-stream suite pass per gate -- the correctness
+#: cap is an order of magnitude below the throughput cap, so this is a small
+#: fraction of a cycle.
+#:
+#: It is deliberately the *stock* arm that repeats: it is the incumbent, it is
+#: the reference side of every comparison, and it exists on every run including
+#: the ones where the candidate engine fails to come up.  The floor it measures
+#: is same-process, so it does not capture whatever additional variation comes
+#: from the two arms running in separate engine processes with separately
+#: autotuned kernel caches; that residue is unmeasured and makes the floor a
+#: lower bound, i.e. the criterion errs toward rejecting rather than promoting.
+CORRECTNESS_CONTROL_REPEATS: Final = 1
 
 
 def _validated_concurrency(value: int, name: str) -> int:
@@ -284,6 +320,10 @@ class _ArmMeasurement:
     pooled_delta: MetricsDelta
     #: The bounded, single-stream output-correctness pass.
     correctness: ReplayResult
+    #: A second such pass by the *same* arm, when one was run.  Compared against
+    #: ``correctness`` it measures the engine's divergence rate against itself;
+    #: see :data:`CORRECTNESS_CONTROL_REPEATS`.
+    correctness_control: ReplayResult | None = None
 
 
 class BenchmarkGateRunner:
@@ -463,7 +503,16 @@ class BenchmarkGateRunner:
                     f"{arm} warmup",
                     lambda available: self._warmup(suite, available, should_abort),
                 )
-                return warmup, self._measure_arm(arm, suite, stage, scrape, should_abort)
+                return warmup, self._measure_arm(
+                    arm,
+                    suite,
+                    stage,
+                    scrape,
+                    should_abort,
+                    # Only the reference arm measures the noise floor; see
+                    # :data:`CORRECTNESS_CONTROL_REPEATS`.
+                    control=arm == "stock",
+                )
 
             # Resolved once, here, rather than at construction: what counts as
             # "stock" is whatever is serving when this benchmark runs, and both
@@ -495,6 +544,7 @@ class BenchmarkGateRunner:
                     candidate_repeat_metrics=candidate_arm.repeat_deltas,
                     stock_correctness=stock_arm.correctness,
                     candidate_correctness=candidate_arm.correctness,
+                    stock_correctness_control=stock_arm.correctness_control,
                     # Measurement context.  These were already published on
                     # ``GateResult.metrics``, which nothing persists, so a
                     # decision.json could not say what cap, degree, suite or
@@ -569,6 +619,10 @@ class BenchmarkGateRunner:
                     "concurrency": CORRECTNESS_REPLAY_CONCURRENCY,
                     "max_tokens": self._correctness_max_tokens,
                     "repeats": CORRECTNESS_REPEATS,
+                    # Extra stock-arm passes that measure the engine's own
+                    # divergence rate; see ``CORRECTNESS_CONTROL_REPEATS``.
+                    "control_repeats": CORRECTNESS_CONTROL_REPEATS,
+                    "control_arm": "stock",
                 },
                 "stock_runs": stock_arm.replay.num_runs,
                 "candidate_runs": candidate_arm.replay.num_runs,
@@ -615,7 +669,11 @@ class BenchmarkGateRunner:
             repeats=self._repeats,
             warmup_repeats=self._warmup_repeats,
             concurrency=self._replay_concurrency,
-            correctness_repeats=CORRECTNESS_REPEATS,
+            # Charged per arm, and only the stock arm runs the control -- so
+            # this over-books by one bounded pass.  Deliberate: a deadline that
+            # is one correctness pass too generous costs nothing, and one that
+            # is a pass too tight kills the run before it decides.
+            correctness_repeats=CORRECTNESS_REPEATS + CORRECTNESS_CONTROL_REPEATS,
             benchmark_max_tokens=self._benchmark_max_tokens,
             correctness_max_tokens=self._correctness_max_tokens,
         )
@@ -627,6 +685,8 @@ class BenchmarkGateRunner:
         stage: Callable[[str, Callable[[float], object]], object],
         scrape: Callable[[str, str], MetricsSnapshot],
         should_abort: AbortCheck,
+        *,
+        control: bool = False,
     ) -> _ArmMeasurement:
         """Run one arm's scored repeats and its correctness pass.
 
@@ -643,6 +703,14 @@ class BenchmarkGateRunner:
         bounded and single-stream, so folding it into the measurement window
         would contaminate both the acceptance counters and the decode-time
         throughput with traffic that is not the workload being measured.
+
+        With ``control`` set the arm makes
+        ``CORRECTNESS_REPEATS + CORRECTNESS_CONTROL_REPEATS`` correctness passes
+        in one call rather than ``CORRECTNESS_REPEATS``, and the trailing passes
+        are returned separately as the noise-floor control.  They are issued
+        back to back on the one engine on purpose: anything that differs between
+        the two passes is nondeterminism the same engine produced under the same
+        settings, which is exactly the quantity the criterion needs.
         """
         snapshots = [scrape(f"{arm} metrics pre-scrape", f"{arm}-before")]
         runs: list[RunResults] = []
@@ -660,11 +728,14 @@ class BenchmarkGateRunner:
             )
             snapshots.append(scrape(f"{arm} metrics scrape after repeat {index}", label))
 
-        correctness = stage(
+        correctness_runs = stage(
             f"{arm} correctness pass",
-            lambda available: self._correctness_replay(suite, available, should_abort),
+            lambda available: self._correctness_replay(
+                suite, available, should_abort, control=control
+            ),
         )
-        assert isinstance(correctness, ReplayResult)
+        assert isinstance(correctness_runs, ReplayResult)
+        correctness, correctness_control = _split_correctness(correctness_runs)
 
         repeat_deltas = tuple(
             _safe_delta(before, after)
@@ -687,6 +758,7 @@ class BenchmarkGateRunner:
             repeat_deltas=repeat_deltas,
             pooled_delta=pooled,
             correctness=correctness,
+            correctness_control=correctness_control,
         )
 
     def _resolve_stock_draft(self) -> DraftReference:
@@ -788,6 +860,8 @@ class BenchmarkGateRunner:
         suite: BenchmarkSuite,
         timeout_seconds: float,
         should_abort: AbortCheck,
+        *,
+        control: bool = False,
     ) -> ReplayResult:
         """One bounded, single-stream pass whose only job is output agreement.
 
@@ -795,12 +869,22 @@ class BenchmarkGateRunner:
         on purpose: ``benchmark_concurrency`` is a throughput knob, and letting
         it reach this pass is exactly the conflation that made job 369005's
         equality check unsound.
+
+        ``control`` adds :data:`CORRECTNESS_CONTROL_REPEATS` further passes so
+        the arm can be compared against itself.  They go through this same call,
+        under this same cap and this same concurrency, because a floor measured
+        under different conditions from the measurement is not that
+        measurement's floor.
         """
         return self._replay_executor.replay(
             suite,
             self._endpoint.url,
             self._config.sampling,
-            repeats=CORRECTNESS_REPEATS,
+            repeats=(
+                CORRECTNESS_REPEATS + CORRECTNESS_CONTROL_REPEATS
+                if control
+                else CORRECTNESS_REPEATS
+            ),
             timeout_seconds=timeout_seconds,
             should_abort=should_abort,
             concurrency=CORRECTNESS_REPLAY_CONCURRENCY,
@@ -825,6 +909,33 @@ class BenchmarkGateRunner:
 
 
 GateRunner = BenchmarkGateRunner
+
+
+def _split_correctness(
+    result: ReplayResult,
+) -> tuple[ReplayResult, ReplayResult | None]:
+    """Divide a correctness replay into its scored passes and its control.
+
+    The first :data:`CORRECTNESS_REPEATS` passes are the arm's own correctness
+    evidence; anything beyond them is the noise-floor control.  An arm that ran
+    no extra passes returns ``None`` for the control rather than an empty
+    :class:`~speedlm.gate.replay.ReplayResult`, so "no control was run" cannot be
+    mistaken downstream for "a control ran and found nothing".
+    """
+    scored = result.run_results[:CORRECTNESS_REPEATS]
+    extra = result.run_results[CORRECTNESS_REPEATS:]
+    measured = ReplayResult(
+        run_results=scored,
+        num_runs=len(scored),
+        suite_hash=result.suite_hash,
+    )
+    if not extra:
+        return measured, None
+    return measured, ReplayResult(
+        run_results=extra,
+        num_runs=len(extra),
+        suite_hash=result.suite_hash,
+    )
 
 
 def _reset_delta(before: MetricsSnapshot, after: MetricsSnapshot) -> MetricsDelta:

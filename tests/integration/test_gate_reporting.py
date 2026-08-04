@@ -184,8 +184,11 @@ class _Replay:
         assert endpoint_url == "http://fake-endpoint"
         assert sampling == SamplingConfig()
         # One unscored warmup pass per arm, then the scored repeats one at a
-        # time, then the bounded single-stream correctness pass.
-        assert repeats == 1
+        # time, then the bounded single-stream correctness pass.  Only that last
+        # call may ask for more than one pass, and only on the stock arm, where
+        # the extra run is the noise-floor control.
+        assert repeats == 1 or capture_tokens
+        assert repeats <= 2
         assert capture_tokens is (concurrency == 1 and max_tokens is not None)
         assert timeout_seconds > 0 and not should_abort()
         request = RequestResult(
