@@ -82,6 +82,7 @@ logger = logging.getLogger(__name__)
 HOOK_POINTS: tuple[str, ...] = ("_model_forward", "sample_tokens")
 
 
+
 # ---------------------------------------------------------------------------
 # Worker extension
 # ---------------------------------------------------------------------------
@@ -119,6 +120,12 @@ class ActivationCaptureExtension:
     _patched_class: Any = None
     _patched_attr: str | None = None
     _installed_wrapper: Any = None
+
+    #: Resolved once per activation instead of once per forward pass.  Only the
+    #: *object* is cached; ``aux_hidden_state_layers`` is still re-read on every
+    #: buffer call, because that tuple is what labels the rows and the engine
+    #: may change it under us.
+    _inner_model: Any = None
 
     # These must be per-instance (mutable) — lazy-initialized on first use.
     _pending: dict[int, list] | None = None
@@ -163,6 +170,10 @@ class ActivationCaptureExtension:
             logger.warning("capture already active; resetting")
             self._deactivate_impl()
 
+        # A fresh session must re-resolve the model: the cached inner model
+        # from a previous activation is not safe to carry over.
+        self._inner_model = None
+
         self._capture_active = True
         self._capture_dir = capture_dir
         os.makedirs(capture_dir, exist_ok=True)
@@ -194,15 +205,10 @@ class ActivationCaptureExtension:
 
         import torch  # lazy: only available at runtime inside the vLLM venv
 
-        # Group by layer index
-        by_layer: dict[int, list[Tensor]] = {}
-        for layer_idx, tensors in pending.items():
-            by_layer[layer_idx] = tensors
-
         # Stack tensors per layer
         saved: dict[str, Tensor] = {}
-        for lidx in sorted(by_layer.keys()):
-            layer_tensors = by_layer[lidx]
+        for lidx in sorted(pending.keys()):
+            layer_tensors = pending[lidx]
             if len(layer_tensors) == 1:
                 stacked = layer_tensors[0]
             else:
@@ -342,6 +348,7 @@ class ActivationCaptureExtension:
         self._ensure_init()
         self._capture_active = False
         self._deactivate_impl()
+        self._inner_model = None
         logger.info("Activation capture deactivated")
 
     # -- internal --
@@ -585,9 +592,9 @@ class ActivationCaptureExtension:
         aux_hidden_states is a list of tensors, one per collected layer,
         in layer-index order. Each tensor has shape (num_scheduled_tokens, H).
         """
-        self._ensure_init()
         if not self._capture_active:
             return
+        self._ensure_init()
 
         # Use actual layer indices from the model's aux_hidden_state_layers.
         # These are the indices the runner configured via
@@ -603,8 +610,11 @@ class ActivationCaptureExtension:
         #: so failing the request is strictly better than writing mislabelled
         #: activations into a training cache.
         try:
-            runner = self.model_runner  # type: ignore[attr-defined]
-            inner_model = self._resolve_inner_model(runner.model)
+            inner_model = self._inner_model
+            if inner_model is None:
+                runner = self.model_runner  # type: ignore[attr-defined]
+                inner_model = self._resolve_inner_model(runner.model)
+                self._inner_model = inner_model
             layer_indices: tuple[int, ...] = inner_model.aux_hidden_state_layers
         except Exception as exc:
             raise RuntimeError(
@@ -621,11 +631,63 @@ class ActivationCaptureExtension:
                 f"labelling cannot be trusted"
             )
 
-        with self._get_lock():
-            pending = self._get_pending()
-            for i, tensor in enumerate(aux_hidden_states):
-                cpu_tensor = tensor.detach().cpu()
-                key = layer_indices[i]
-                if key not in pending:
-                    pending[key] = []
-                pending[key].append(cpu_tensor)
+        host_tensors = self._to_host(aux_hidden_states)
+
+        assert self._lock is not None and self._pending is not None
+        with self._lock:
+            pending = self._pending
+            for i, tensor in enumerate(host_tensors):
+                pending.setdefault(layer_indices[i], []).append(tensor)
+
+    # -- device-to-host transfer --
+
+    def _to_host(self, aux_hidden_states: list[Tensor]) -> list[Tensor]:
+        """Copy one forward pass' aux states to the host in ONE transfer.
+
+        ``Tensor.cpu()`` enqueues a ``cudaMemcpyAsync`` and then drains the
+        stream, so calling it per aux layer costs four pipeline stalls per
+        forward pass -- on the serving path, once for every decode step.  The
+        four aux tensors always share a shape (``num_scheduled_tokens``, H),
+        a dtype and a device, so stacking them on-device first turns those
+        four stalls into one.  The device-side stack is a copy at HBM
+        bandwidth of a buffer far smaller than the forward's own transient
+        activations; the host-side byte count is unchanged.
+
+        Slicing the fused host tensor back out per layer costs nothing (the
+        slices are views) and drops the per-step host allocations from four
+        to one.
+
+        Falls back to the per-layer copy whenever the tensors are not uniform
+        or the stack is refused: a slower capture is always preferable to a
+        lost or mislabelled row.
+        """
+        try:
+            if len(aux_hidden_states) > 1 and self._is_fusable(aux_hidden_states):
+                import torch
+
+                # One ``detach`` on the stacked result rather than one per
+                # layer: stacking cannot smuggle in a graph that detaching
+                # afterwards would not drop.
+                fused = torch.stack(aux_hidden_states).detach().cpu()
+                return list(torch.unbind(fused))
+        except Exception:
+            logger.warning(
+                "fused device-to-host capture copy failed; falling back "
+                "to one transfer per aux layer",
+                exc_info=True,
+            )
+        return [tensor.detach().cpu() for tensor in aux_hidden_states]
+
+    @staticmethod
+    def _is_fusable(aux_hidden_states: list[Tensor]) -> bool:
+        """True when all aux tensors can go home in a single stacked copy."""
+        first = aux_hidden_states[0]
+        shape = first.shape
+        dtype = first.dtype
+        device = first.device
+        return all(
+            tensor.shape == shape
+            and tensor.dtype == dtype
+            and tensor.device == device
+            for tensor in aux_hidden_states[1:]
+        )
