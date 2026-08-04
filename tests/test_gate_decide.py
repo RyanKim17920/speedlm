@@ -1,5 +1,6 @@
 """Tests for gate/decide.py — no GPU, no network."""
 
+import dataclasses
 import math
 
 import pytest
@@ -22,6 +23,7 @@ from speedlm.gate.decide import (
     Verdict,
     decide_promotion,
     divergence_excess_p_value,
+    divergence_position_p_value,
     first_divergence,
 )
 from speedlm.gate.metrics import MetricsDelta
@@ -2171,3 +2173,343 @@ def test_an_engine_execution_rejects_values_it_cannot_mean() -> None:
         EngineExecution(enforce_eager="yes")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="max_num_seqs"):
         EngineExecution(enforce_eager=True, max_num_seqs=0)
+
+
+# ---------------------------------------------------------------------------
+# The divergence position statistic
+#
+# Greedy speculative decoding verifies by exact argmax equality with no
+# tolerance band, so a sound engine emits the verifier's own trajectory
+# whatever the draft head proposes.  The arms can then only part where
+# floating-point noise flips an argmax at a near-tie -- and near-ties are not
+# concentrated at any offset.  Every test below is a statement about that
+# null, and each one is paired with the perturbation that breaks it.
+# ---------------------------------------------------------------------------
+
+
+def _diverging_arms(
+    *,
+    contexts: int,
+    offsets: dict[int, int],
+    window: int,
+) -> tuple[ReplayResult, ReplayResult]:
+    """Two correctness passes over *contexts* contexts, parting where told.
+
+    ``offsets`` maps a context index to the token offset at which the candidate
+    arm's generation departs from the stock arm's.  Every generation is exactly
+    *window* tokens long on both sides, so no divergence this builds is a
+    length artefact -- the offsets are the only thing under test.
+    """
+    stock: list[RequestResult] = []
+    candidate: list[RequestResult] = []
+    for i in range(contexts):
+        base = tuple(f"t{j}" for j in range(window))
+        stock.append(
+            _make_request_result(
+                "".join(base), context_hash=f"ctx-{i}", output_tokens=base
+            )
+        )
+        if i in offsets:
+            at = offsets[i]
+            other = base[:at] + tuple(f"x{j}" for j in range(at, window))
+        else:
+            other = base
+        candidate.append(
+            _make_request_result(
+                "".join(other), context_hash=f"ctx-{i}", output_tokens=other
+            )
+        )
+    return (
+        _make_replay([_make_run(stock)]),
+        _make_replay([_make_run(candidate)]),
+    )
+
+
+def test_position_statistic_clears_a_flat_hazard() -> None:
+    """The Qwen shape: a handful of late partings, none of them evidence.
+
+    Ten of 410 contexts part somewhere in a 128-token window, three of them
+    inside the first sixteen tokens.  A flat per-token hazard calibrated from
+    the other seven puts about one context in that first sixteen, and three
+    against an expectation of one is not a finding.  This is the observation
+    that the old zero-floor Fisher test rejected at p = 9.2e-4.
+    """
+    p = divergence_position_p_value(
+        3, 10, 410, min_divergence_index=16, max_tokens=128
+    )
+    assert p > DIVERGENCE_ALPHA / 2
+
+
+def test_position_statistic_clears_a_nondeterministic_engine() -> None:
+    """The gpt-oss shape: half the contexts part, and it is still not evidence.
+
+    211 of 410 contexts parting inside 128 tokens is a per-token flip hazard of
+    about 0.56%, which predicts roughly 35 of them inside the first sixteen
+    tokens.  Five were seen.  The statistic has to calibrate to the engine in
+    front of it, or a model whose engine is merely noisier than another one
+    fails the gate for being noisy.
+    """
+    p = divergence_position_p_value(
+        5, 211, 410, min_divergence_index=16, max_tokens=128
+    )
+    assert p > DIVERGENCE_ALPHA / 2
+
+
+def test_position_statistic_catches_a_head_whose_output_is_its_own() -> None:
+    """The failure the gate exists for: verification not actually verifying.
+
+    A head served without verification -- or verified with a tolerance band --
+    stops emitting the verifier's trajectory immediately, so the partings pile
+    up at the front of the window instead of spreading across it.  400 of 410
+    contexts part and 390 of those part inside the first sixteen tokens, where
+    the run's own hazard predicts about 39.
+    """
+    p = divergence_position_p_value(
+        390, 400, 410, min_divergence_index=16, max_tokens=128
+    )
+    assert p < DIVERGENCE_ALPHA / 2
+
+
+def test_position_statistic_catches_front_loading_without_a_high_rate() -> None:
+    """Front-loading is the signal, not volume.
+
+    The same ten partings as the benign case, but six of them inside the first
+    sixteen tokens rather than three.  The rate is identical and unremarkable;
+    only the shape has changed, and the shape is what the null constrains.
+    """
+    benign = divergence_position_p_value(
+        3, 10, 410, min_divergence_index=16, max_tokens=128
+    )
+    front_loaded = divergence_position_p_value(
+        6, 10, 410, min_divergence_index=16, max_tokens=128
+    )
+    assert benign > DIVERGENCE_ALPHA / 2
+    assert front_loaded < DIVERGENCE_ALPHA / 2
+
+
+def test_position_statistic_reports_no_evidence_rather_than_significance() -> None:
+    """Every branch with nothing to test returns 1.0, never a small number."""
+    assert divergence_position_p_value(
+        0, 10, 410, min_divergence_index=16, max_tokens=128
+    ) == 1.0
+    assert divergence_position_p_value(
+        0, 0, 410, min_divergence_index=16, max_tokens=128
+    ) == 1.0
+    assert divergence_position_p_value(
+        0, 0, 0, min_divergence_index=16, max_tokens=128
+    ) == 1.0
+    # A threshold at or past the window makes every divergence early by
+    # construction: there is no late window to calibrate against and no
+    # contrast to test.  ``DivergenceCriterion`` already names this shape.
+    assert divergence_position_p_value(
+        10, 10, 410, min_divergence_index=128, max_tokens=128
+    ) == 1.0
+    # Every context still alive at the threshold parted afterwards, so the
+    # calibrated hazard is unbounded and no early count can surprise.
+    assert divergence_position_p_value(
+        2, 410, 410, min_divergence_index=16, max_tokens=128
+    ) == 1.0
+
+
+def test_a_control_can_exonerate_but_never_condemn() -> None:
+    """The asymmetry that keeps an unmeasurable floor from being read as one.
+
+    The gate's control replays stock against stock inside a single engine
+    incarnation, while the measurement straddles a restart.  That makes the
+    control a lower bound on the true floor: useless as evidence the candidate
+    is at fault, sound as evidence that it is not.  So it may only ever raise
+    the null rate.
+    """
+    condemning = divergence_position_p_value(
+        390, 400, 410, min_divergence_index=16, max_tokens=128
+    )
+    assert condemning < DIVERGENCE_ALPHA / 2
+    # The same evidence, against an engine that demonstrably front-loads on its
+    # own: no longer a finding about the head.
+    exonerated = divergence_position_p_value(
+        390,
+        400,
+        410,
+        min_divergence_index=16,
+        max_tokens=128,
+        control_early_rate=390 / 410,
+    )
+    assert exonerated > DIVERGENCE_ALPHA / 2
+    # And a control that saw nothing cannot make a benign run look guilty.
+    assert divergence_position_p_value(
+        3, 10, 410, min_divergence_index=16, max_tokens=128, control_early_rate=0.0
+    ) == divergence_position_p_value(
+        3, 10, 410, min_divergence_index=16, max_tokens=128
+    )
+
+
+def test_position_statistic_rejects_impossible_arguments() -> None:
+    with pytest.raises(DecisionError, match="early_events"):
+        divergence_position_p_value(
+            -1, 10, 410, min_divergence_index=16, max_tokens=128
+        )
+    with pytest.raises(DecisionError, match="cannot exceed the total"):
+        divergence_position_p_value(
+            11, 10, 410, min_divergence_index=16, max_tokens=128
+        )
+    with pytest.raises(DecisionError, match="cannot exceed trials"):
+        divergence_position_p_value(
+            3, 411, 410, min_divergence_index=16, max_tokens=128
+        )
+    with pytest.raises(DecisionError, match="control_early_rate"):
+        divergence_position_p_value(
+            3, 10, 410, min_divergence_index=16, max_tokens=128, control_early_rate=1.5
+        )
+
+
+# ---------------------------------------------------------------------------
+# The criterion built on it
+# ---------------------------------------------------------------------------
+
+
+def test_a_same_session_control_is_not_a_comparable_null() -> None:
+    """The bug this whole change exists for.
+
+    A control whose two passes share a replay session was collected inside one
+    engine incarnation; the measured pair, whose two sides carry *different*
+    session ids, was not.  Testing the second against the first is not a test,
+    and the decision has to say so on its face rather than publish a p-value
+    that reads as though it were.
+    """
+    stock, candidate = _diverging_arms(
+        contexts=40, offsets={i: 40 + i for i in range(10)}, window=128
+    )
+    stock = dataclasses.replace(stock, session_id="stock-session")
+    candidate = dataclasses.replace(candidate, session_id="candidate-session")
+    control, _ = _diverging_arms(contexts=40, offsets={}, window=128)
+    control = dataclasses.replace(control, session_id="stock-session")
+
+    dec = decide_promotion(
+        _make_delta(), _make_delta(mean_accepted_length=5.0),
+        _make_replay([_valid_run(100.0) for _ in range(3)]),
+        _make_replay([_valid_run(110.0) for _ in range(3)]),
+        _pcfg(),
+        stock_correctness=stock,
+        candidate_correctness=candidate,
+        stock_correctness_control=control,
+        correctness_max_tokens=128,
+    )
+    assert dec.divergence_control_available is True
+    assert dec.divergence_control_comparable is False
+    # Ten late partings out of forty, against a control of zero collected the
+    # easy way.  The Fisher test says "significant"; it is not a test.
+    assert dec.divergence_total_p_value is not None
+    assert dec.divergence_total_p_value < DIVERGENCE_ALPHA / 2
+    assert dec.reason is not Reason.OUTPUT_MISMATCH
+
+
+def test_a_cross_session_control_is_comparable_and_gates() -> None:
+    """Give the control the boundary the measurement has and the rate channel
+    comes back.
+
+    This is the runner change the finding asks for: collect the control's
+    second pass in its own replay session, across the same engine restart the
+    arms are separated by, and the excess test recovers its meaning.
+    """
+    stock, candidate = _diverging_arms(
+        contexts=40, offsets={i: 40 + i for i in range(10)}, window=128
+    )
+    stock = dataclasses.replace(stock, session_id="stock-session")
+    candidate = dataclasses.replace(candidate, session_id="candidate-session")
+    control, _ = _diverging_arms(contexts=40, offsets={}, window=128)
+    control = dataclasses.replace(control, session_id="control-session")
+
+    dec = decide_promotion(
+        _make_delta(), _make_delta(mean_accepted_length=5.0),
+        _make_replay([_valid_run(100.0) for _ in range(3)]),
+        _make_replay([_valid_run(110.0) for _ in range(3)]),
+        _pcfg(),
+        stock_correctness=stock,
+        candidate_correctness=candidate,
+        stock_correctness_control=control,
+        correctness_max_tokens=128,
+    )
+    assert dec.divergence_control_comparable is True
+    assert dec.verdict is Verdict.REJECT
+    assert dec.reason is Reason.OUTPUT_MISMATCH
+
+
+def test_front_loaded_divergence_gates_with_no_comparable_control() -> None:
+    """The teeth.  A corrupted head is caught without any usable floor.
+
+    Same topology as the non-comparable case above -- same-session control,
+    cross-session measurement, so the rate channel is inert -- but the partings
+    are at the front of the window instead of spread through it.
+    """
+    stock, candidate = _diverging_arms(
+        contexts=40, offsets={i: i % 4 for i in range(36)}, window=128
+    )
+    stock = dataclasses.replace(stock, session_id="stock-session")
+    candidate = dataclasses.replace(candidate, session_id="candidate-session")
+    control, _ = _diverging_arms(contexts=40, offsets={}, window=128)
+    control = dataclasses.replace(control, session_id="stock-session")
+
+    dec = decide_promotion(
+        _make_delta(), _make_delta(mean_accepted_length=5.0),
+        _make_replay([_valid_run(100.0) for _ in range(3)]),
+        _make_replay([_valid_run(110.0) for _ in range(3)]),
+        _pcfg(),
+        stock_correctness=stock,
+        candidate_correctness=candidate,
+        stock_correctness_control=control,
+        correctness_max_tokens=128,
+    )
+    assert dec.divergence_control_comparable is False
+    assert dec.divergence_position_p_value is not None
+    assert dec.divergence_position_p_value < DIVERGENCE_ALPHA / 2
+    assert dec.verdict is Verdict.REJECT
+    assert dec.reason is Reason.OUTPUT_MISMATCH
+
+
+def test_the_measured_qwen_evidence_no_longer_rejects() -> None:
+    """The run that prompted this: 10 partings in 410, three of them early.
+
+    Reproduced at the shape the artifact records -- token basis, every
+    generation at the 128-token cap, a same-session control of zero -- because
+    the point of the change is that *this* evidence stops being a rejection
+    while the evidence in the test above keeps being one.
+    """
+    offsets = {0: 119, 1: 4, 2: 118, 3: 113, 4: 4, 5: 27, 6: 104, 7: 44, 8: 74, 9: 4}
+    stock, candidate = _diverging_arms(contexts=410, offsets=offsets, window=128)
+    stock = dataclasses.replace(stock, session_id="stock-session")
+    candidate = dataclasses.replace(candidate, session_id="candidate-session")
+    control, _ = _diverging_arms(contexts=410, offsets={}, window=128)
+    control = dataclasses.replace(control, session_id="stock-session")
+
+    dec = decide_promotion(
+        _make_delta(), _make_delta(mean_accepted_length=5.0),
+        _make_replay([_valid_run(100.0) for _ in range(3)]),
+        _make_replay([_valid_run(110.0) for _ in range(3)]),
+        _pcfg(),
+        stock_correctness=stock,
+        candidate_correctness=candidate,
+        stock_correctness_control=control,
+        correctness_max_tokens=128,
+    )
+    assert dec.output_total_divergences == 10
+    assert dec.output_early_divergences == 3
+    assert dec.control_total_divergences == 0
+    # The old criterion's verdict, still recorded, still significant, and now
+    # explicitly not a null the gate is entitled to use.
+    assert dec.divergence_total_p_value is not None
+    assert dec.divergence_total_p_value < DIVERGENCE_ALPHA / 2
+    assert dec.divergence_control_comparable is False
+    assert dec.reason is not Reason.OUTPUT_MISMATCH
+
+
+def test_replay_stamps_every_invocation_with_its_own_session() -> None:
+    """Two invocations are two sessions; a result rebuilt from slices is none.
+
+    The decider reads "same non-empty id" as "one live engine, no restart in
+    between".  Nothing that did not come straight out of ``replay_suite`` may
+    make that claim, so the default has to be the empty string rather than
+    anything a comparison could mistake for agreement.
+    """
+    assert ReplayResult(run_results=(), num_runs=0, suite_hash="h").session_id == ""
+    first = _make_replay([_valid_run()])
+    assert "session_id" in first.to_dict()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+import uuid
 from dataclasses import dataclass
 from typing import Any, Final
 
@@ -131,6 +132,24 @@ class ReplayResult:
     run_results: tuple[RunResults, ...]
     num_runs: int
     suite_hash: str
+    #: Identifies the single :func:`replay_suite` invocation that produced every
+    #: run in ``run_results``.  Two results carrying the *same* non-empty id
+    #: were collected back-to-back against one live engine, with no restart,
+    #: no weight reload and no cache teardown between them; two results
+    #: carrying *different* non-empty ids were not.
+    #:
+    #: This exists because the gate's divergence criterion compares a measured
+    #: pair against a control pair, and that comparison is only a test if both
+    #: pairs span the same boundaries.  A control collected inside one
+    #: invocation cannot bound the variation of a measurement that spans two,
+    #: and without this stamp the decider has no way to notice.  See
+    #: :func:`speedlm.gate.decide.decide_promotion`.
+    #:
+    #: Empty means *unstamped*, which the decider must read as "provenance
+    #: unknown", never as "same session": a :class:`ReplayResult` rebuilt from
+    #: slices of another one (as the runner's correctness split does) carries no
+    #: claim about how its runs were collected.
+    session_id: str = ""
 
     @property
     def avg_invalid_rate(self) -> float:
@@ -153,6 +172,7 @@ class ReplayResult:
             "run_results": [r.to_dict() for r in self.run_results],
             "num_runs": self.num_runs,
             "suite_hash": self.suite_hash,
+            "session_id": self.session_id,
         }
 
 
@@ -547,4 +567,7 @@ async def replay_suite(
         run_results=tuple(runs),
         num_runs=len(runs),
         suite_hash=suite.suite_hash,
+        # Minted per invocation, not per run: every repeat above ran against the
+        # same live engine, and that is exactly what this id asserts.
+        session_id=uuid.uuid4().hex,
     )

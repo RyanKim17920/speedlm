@@ -479,3 +479,25 @@ def test_missing_usage_falls_back_to_the_surfaced_text(
 
     assert request.valid
     assert request.completion_tokens == 0
+
+
+def test_each_invocation_gets_its_own_session_id(client: _RecordingClient) -> None:
+    """One id per invocation, shared by its repeats, never reused.
+
+    The gate's divergence criterion reads two results carrying the same
+    non-empty id as "collected back-to-back against one live engine, no restart
+    in between" -- which is what decides whether its control is a valid null at
+    all.  So the stamp has to be minted per call and has to actually differ
+    between calls; a constant would make every comparison look same-engine and
+    an empty string would make every comparison look unknowable.
+    """
+    first = _replay(_suite(3), repeats=2)
+    second = _replay(_suite(3), repeats=2)
+
+    assert first.session_id
+    assert second.session_id
+    assert first.session_id != second.session_id
+    # Repeats inside one invocation really did share an engine, so they share
+    # the id: it is a property of the call, not of the run.
+    assert first.num_runs == 2
+    assert first.to_dict()["session_id"] == first.session_id

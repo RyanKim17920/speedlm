@@ -579,6 +579,25 @@ class Decision:
     divergence_total_p_value: float | None = field(default=None, compare=False)
     #: The same, restricted to divergences before ``min_divergence_token_index``.
     divergence_early_p_value: float | None = field(default=None, compare=False)
+    #: Whether the control pair spans the same engine boundary as the measured
+    #: pair, and is therefore a valid null for it.
+    #:
+    #: The two Fisher p-values above compare "candidate arm versus stock arm"
+    #: against "stock arm versus stock arm".  That is only a test if both pairs
+    #: were collected across the same conditions.  In the runner's topology they
+    #: are not: the measured pair straddles a full vLLM teardown, weight reload
+    #: and cache rebuild, while the control's two passes run back-to-back inside
+    #: one live engine.  A same-engine control replays an identical computation
+    #: and so reports zero by construction, which turns the Fisher test into a
+    #: hair trigger on any nonzero measured count.  When this is false the rate
+    #: channel is recorded but does not gate; see
+    #: :attr:`divergence_position_p_value` for the channel that does.
+    divergence_control_comparable: bool = field(default=False, compare=False)
+    #: One-sided p-value for "the divergences are front-loaded", from
+    #: :func:`divergence_position_p_value`.  This is the control-free channel,
+    #: and it is what rejects a genuinely broken head.  ``None`` when the run
+    #: recorded no early divergence to test.
+    divergence_position_p_value: float | None = field(default=None, compare=False)
     #: Per-statistic significance level each p-value above was compared against,
     #: i.e. :data:`DIVERGENCE_ALPHA` over :data:`DIVERGENCE_STATISTICS`.
     divergence_alpha: float = field(
@@ -949,6 +968,8 @@ class Decision:
             # that broke from an engine that is not bitwise reproducible; see
             # ``DIVERGENCE_ALPHA``.
             "divergence_control_available": self.divergence_control_available,
+            "divergence_control_comparable": self.divergence_control_comparable,
+            "divergence_position_p_value": self.divergence_position_p_value,
             "divergence_trials": self.divergence_trials,
             "control_trials": self.control_trials,
             "control_early_divergences": self.control_early_divergences,
@@ -1339,6 +1360,155 @@ def divergence_excess_p_value(
     return min(1.0, numerator / denominator)
 
 
+def _binomial_upper_tail(events: int, trials: int, rate: float) -> float:
+    """``P(X >= events)`` for ``X ~ Binomial(trials, rate)``, exactly.
+
+    Summed in log space because the gate's denominators run to hundreds of
+    trials, where ``rate ** k`` underflows to zero long before the binomial
+    coefficient it is multiplied by overflows a float.
+    """
+    if events <= 0:
+        return 1.0
+    if events > trials:
+        return 0.0
+    if rate <= 0.0:
+        return 0.0
+    if rate >= 1.0:
+        return 1.0
+    log_p = math.log(rate)
+    log_q = math.log1p(-rate)
+    log_n_fact = math.lgamma(trials + 1)
+    terms = [
+        math.exp(
+            log_n_fact
+            - math.lgamma(k + 1)
+            - math.lgamma(trials - k + 1)
+            + k * log_p
+            + (trials - k) * log_q
+        )
+        for k in range(events, trials + 1)
+    ]
+    return min(1.0, math.fsum(terms))
+
+
+def divergence_position_p_value(
+    early_events: int,
+    total_events: int,
+    trials: int,
+    *,
+    min_divergence_index: int,
+    max_tokens: int,
+    control_early_rate: float = 0.0,
+) -> float:
+    """One-sided p-value for "these divergences are *front-loaded*".
+
+    This is the divergence statistic that does not need a control, and it is
+    the one that survives the discovery that the gate's control is not a valid
+    null for the comparison it is used against (see
+    :func:`decide_promotion`).
+
+    The null is the one greedy speculative decoding actually licenses.
+    Verification accepts a drafted token only on exact ``argmax`` equality with
+    the verifier -- no tolerance band, no probability, no RNG -- so a *sound*
+    engine emits the verifier's own greedy trajectory whatever the draft head
+    proposes.  The two arms can therefore only part where floating-point noise
+    flips an ``argmax`` at a near-tie, and near-ties are not concentrated at any
+    particular offset: the per-token flip hazard is flat.  Under a flat hazard
+    the first-divergence offset is memoryless, and the share of contexts parting
+    inside the first ``min_divergence_index`` tokens is pinned by the share
+    parting over the remaining window.
+
+    The alternative is what a genuinely broken head produces.  If verification
+    is bypassed, or a tolerance band is opened, or the served head is not the
+    head that was measured, the emitted text stops being the verifier's
+    trajectory *immediately* -- the divergences pile up at the front of the
+    window and the flat-hazard null is violated by orders of magnitude.
+
+    The hazard is calibrated from this run's own late window rather than
+    assumed, which is what makes the statistic valid across models: an engine
+    whose arms part in 2% of contexts and one whose arms part in 51% are
+    scored against their own hazards, not against a shared constant.
+
+    Args:
+        early_events: Contexts that parted before ``min_divergence_index``.
+        total_events: Contexts that parted at any offset.
+        trials: Context comparisons attempted -- the denominator.
+        min_divergence_index: Offset separating "early" from "late".
+        max_tokens: Output cap of the correctness pass, i.e. the width of the
+            window in which a divergence could have been seen at all.
+        control_early_rate: Early divergences per trial the *engine* produced
+            replaying stock against stock, when a control ran.  It raises the
+            null rate and can only ever make this test harder to reject.
+
+            That asymmetry is the point.  The gate's control is collected
+            inside a single engine incarnation while the measurement straddles
+            a restart, so it is a *lower bound* on the true floor -- which
+            makes it unusable as evidence that the candidate is at fault, and
+            perfectly usable as evidence that it is not.  Letting a control
+            exonerate but never condemn is what keeps a floor this design
+            cannot measure from being read as though it had.
+
+    Returns:
+        ``P(early >= early_events)`` under the flat-hazard null.  ``1.0``
+        whenever the run carries no usable evidence -- no divergences, no
+        trials, a window the threshold saturates, or a late window that
+        produced nothing to calibrate against.  "No evidence" is never
+        "significant".
+    """
+    for name, value in (
+        ("early_events", early_events),
+        ("total_events", total_events),
+        ("trials", trials),
+        ("min_divergence_index", min_divergence_index),
+        ("max_tokens", max_tokens),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise DecisionError(f"{name} must be a non-negative integer, got {value!r}")
+    if not 0.0 <= control_early_rate <= 1.0:
+        raise DecisionError(
+            f"control_early_rate must lie in [0, 1], got {control_early_rate!r}"
+        )
+    if early_events > total_events:
+        raise DecisionError(
+            f"early divergences cannot exceed the total: {early_events} > {total_events}"
+        )
+    if total_events > trials:
+        raise DecisionError(
+            f"divergences cannot exceed trials: {total_events} > {trials}"
+        )
+    if early_events == 0 or trials == 0:
+        return 1.0
+    # A threshold at or beyond the cap makes every divergence "early" by
+    # construction; there is no late window left to calibrate against and no
+    # contrast left to test.  ``divergence_criterion`` already names this
+    # configuration; here it simply carries no evidence.
+    if min_divergence_index >= max_tokens:
+        return 1.0
+
+    at_risk = trials - early_events
+    late_events = total_events - early_events
+    if at_risk <= 0 or late_events <= 0:
+        # Nothing survived to the late window, or nothing parted in it.  Fall
+        # back to the small-hazard limit of the same null, where a flat hazard
+        # puts exactly ``min_divergence_index / max_tokens`` of its mass early.
+        # This is the branch a fully bypassed verifier lands in, and it must
+        # still be able to reject.
+        null_rate = min_divergence_index / max_tokens
+    elif late_events >= at_risk:
+        # Every context still alive at the threshold parted afterwards, so the
+        # calibrated hazard is unbounded and no early count is surprising.
+        return 1.0
+    else:
+        late_survival = 1.0 - late_events / at_risk
+        per_token_survival = late_survival ** (
+            1.0 / (max_tokens - min_divergence_index)
+        )
+        null_rate = 1.0 - per_token_survival**min_divergence_index
+    return _binomial_upper_tail(
+        early_events, trials, max(null_rate, control_early_rate)
+    )
+
+
 # ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
@@ -1490,6 +1660,35 @@ def decide_promotion(
         control_trials = divergence_trials
         control_available = False
 
+    # Is that floor a valid null for the comparison it is used against?
+    #
+    # The measured pair is stock-arm-versus-candidate-arm, and those two arms
+    # are served by two different engine incarnations -- the runner restarts
+    # vLLM to change the draft head -- so the pair straddles a weight reload, a
+    # KV and prefix cache rebuild, and a fresh kernel-autotune state.  The
+    # control pair is stock-versus-stock inside a *single* incarnation, which
+    # replays a bit-identical computation and therefore reports zero however
+    # noisy the engine is across restarts.  Testing a cross-incarnation count
+    # against a same-incarnation floor of zero is not a test: it rejects on the
+    # first divergence, whatever produced it.
+    #
+    # ``ReplayResult.session_id`` is what makes the topology visible.  Distinct
+    # non-empty ids mean two different replay invocations; an empty id is a
+    # result that carries no claim about how it was collected and must not be
+    # read as agreement.  The control is comparable only when the measured pair
+    # spans invocations *and* the control pair spans invocations too.
+    control_session = (
+        stock_correctness_control.session_id if stock_correctness_control else ""
+    )
+    control_comparable = bool(
+        control_available
+        and stock_corr.session_id
+        and candidate_corr.session_id
+        and control_session
+        and stock_corr.session_id != candidate_corr.session_id
+        and stock_corr.session_id != control_session
+    )
+
     # The number of passes the divergence evidence above actually rests on.
     # ``_collect_divergences`` compares ``min(num_runs)`` pairs, so that is the
     # count -- and it is what bounds which ``per_repeat`` rows can carry a
@@ -1513,12 +1712,71 @@ def decide_promotion(
     early_p = divergence_excess_p_value(
         total_early, divergence_trials, control_early, control_trials
     )
+    # The control-free channel.  It asks whether the divergences sit where a
+    # sound engine's floating-point noise would put them, and it needs no floor
+    # to do it -- see :func:`divergence_position_p_value`.
+    #
+    # The window is the correctness pass's own cap when the caller declared one
+    # -- that is the pair ``divergence_criterion`` is classified from, so the
+    # two readings stay consistent.  A caller that declared none still leaves
+    # the window observable: no comparison could have found a divergence past
+    # the longest generation it actually compared.
+    divergence_window = correctness_max_tokens or max(
+        (max(d.stock_length, d.candidate_length) for d in divergences),
+        default=0,
+    )
+    position_p = divergence_position_p_value(
+        total_early,
+        total_any,
+        divergence_trials,
+        min_divergence_index=min_divergence_index,
+        max_tokens=divergence_window,
+        control_early_rate=(
+            control_early / control_trials if control_trials > 0 else 0.0
+        ),
+    )
+
     # The allowance is a precondition, not an alternative: a statistic fires
     # only when it clears *both* the caller's outright tolerance and its own
-    # measured noise floor.
-    divergence_rejects = (
-        total_any > max_output_mismatches and total_p < per_statistic_alpha
-    ) or (total_early > max_output_mismatches and early_p < per_statistic_alpha)
+    # null.
+    #
+    # The position channel always gates.  Its null holds for any model and any
+    # inference configuration -- a perfectly deterministic engine and a wildly
+    # nondeterministic one are each scored against their own measured hazard --
+    # and it is the channel a genuinely broken head trips, because bypassed or
+    # loosened verification moves the divergences to the front of the window.
+    #
+    # The two rate channels gate only against a comparable control.  Without
+    # one their null is a floor of zero collected under strictly easier
+    # conditions than the measurement, and a test against that floor rejects
+    # any nonzero count -- including the count that draft-independent
+    # floating-point noise produces on every engine that is not batch-invariant.
+    # They stay computed and recorded either way, so the evidence survives even
+    # where it does not decide.
+    position_rejects = (
+        total_early > max_output_mismatches and position_p < per_statistic_alpha
+    )
+    # Unanimity needs no distributional null.  A floor is a rate and a rate
+    # cannot exceed one, so "the candidate parted on every context while the
+    # engine's own control did not" is an excess statement that stands on the
+    # two rates alone -- no hazard model, no significance test, no assumption
+    # about how the two passes were collected.  It is also the observation the
+    # position channel cannot reach: where the threshold saturates the window
+    # every divergence is early by construction, leaving the flat-hazard null
+    # with no late window to calibrate against.  So this gates whether or not
+    # the control is comparable -- but it still defers to a control that
+    # reproduced the same unanimity, which is the engine speaking, not the head.
+    unanimous_rejects = (
+        divergence_trials > 0
+        and total_any == divergence_trials
+        and total_any > max_output_mismatches
+        and control_any < control_trials
+    )
+    rate_rejects = control_comparable and (
+        (total_any > max_output_mismatches and total_p < per_statistic_alpha)
+        or (total_early > max_output_mismatches and early_p < per_statistic_alpha)
+    )
+    divergence_rejects = position_rejects or unanimous_rejects or rate_rejects
 
     # --- Build per-repeat summaries ---
     # Derived purely from replay data plus the per-repeat metric windows, so
@@ -1628,6 +1886,8 @@ def decide_promotion(
             control_trials=control_trials,
             control_divergences=control_divergences,
             divergence_control_available=control_available,
+            divergence_control_comparable=control_comparable,
+            divergence_position_p_value=position_p if total_early else None,
             divergence_total_p_value=total_p,
             divergence_early_p_value=early_p,
             divergence_alpha=per_statistic_alpha,
