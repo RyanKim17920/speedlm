@@ -15,6 +15,7 @@ from speedlm.training.backends.eagle3 import (
     MAX_SCRATCH_BYTES,
     STAGE_LOG_DIR_NAME,
     Eagle3Backend,
+    Eagle3Error,
     EmptySpeculatorsDatasetError,
     FinalAssistantMaskError,
     ScratchQuotaExceeded,
@@ -306,6 +307,11 @@ def test_pipeline_uses_exact_stage_argv_and_separate_draft(
             # the profile served.
             "--ttt-steps",
             "3",
+            # Also explicit, and for the same reason: the trainer weights step
+            # ``s`` by ``gamma ** s`` and sums, so an unpassed gamma left the
+            # manifest unable to say how the objective was weighted.
+            "--ttt-step-loss-decay",
+            "1.0",
             "--no-resume-from-checkpoint",
             "--save-best",
         ),
@@ -347,6 +353,60 @@ def test_pipeline_uses_exact_stage_argv_and_separate_draft(
     assert draft != trained.checkpoint_best
     assert not (draft / "optimizer_state_dict.pt").exists()
     assert runner.started[0].terminated == 1
+
+
+@pytest.mark.parametrize("decay", [0.5, 0.75, 0.9, 1.0])
+def test_the_configured_step_loss_decay_reaches_the_trainer_uncoerced(
+    tmp_path: Path,
+    pipeline: SpeculatorsPipelineConfig,
+    decay: float,
+) -> None:
+    """The lever is useless if it does not survive the trip to argv.
+
+    Exactly the failure the ``--ttt-steps`` fix had to be tested against: a
+    dropped flag or a quiet clamp leaves the trainer on its own default while
+    every record upstream claims the configured value.  So this asserts the
+    flag is present *and* that the number beside it round-trips, rather than
+    asserting the config field the caller just set.
+    """
+    pipeline = replace(pipeline, ttt_step_loss_decay=decay)
+    runner = _FakeRunner()
+    backend, work = _backend(tmp_path, pipeline, runner)
+
+    prepared = backend.prepare(work, should_abort=lambda: False)
+    hidden = backend.extract(prepared, work, should_abort=lambda: False)
+    backend.train(hidden, work, should_abort=lambda: False)
+
+    argv = next(
+        call for call in runner.run_calls if Path(call[1]).name == "train.py"
+    )
+    assert "--ttt-step-loss-decay" in argv
+    assert float(argv[argv.index("--ttt-step-loss-decay") + 1]) == decay
+
+
+def test_a_bad_decay_in_the_training_params_fails_instead_of_clamping(
+    tmp_path: Path,
+    pipeline: SpeculatorsPipelineConfig,
+) -> None:
+    """The manifest params are the live override path, so they must be checked.
+
+    ``training_params`` is what the tuner actually hands the trainer, so a
+    value that arrives there out of range must stop the cycle rather than be
+    repaired into a run whose manifest disagrees with its gradient.
+    """
+    runner = _FakeRunner()
+    backend, work = _backend(tmp_path, pipeline, runner)
+    prepared = backend.prepare(work, should_abort=lambda: False)
+    hidden = backend.extract(prepared, work, should_abort=lambda: False)
+    backend.config = replace(
+        backend.config,
+        training_params={**backend.config.training_params, "ttt_step_loss_decay": 4.0},
+    )
+
+    with pytest.raises(Eagle3Error, match="ttt_step_loss_decay"):
+        backend.train(hidden, work, should_abort=lambda: False)
+
+    assert not any(Path(call[1]).name == "train.py" for call in runner.run_calls)
 
 
 def test_hidden_state_server_caps_context_at_configured_sequence_length(

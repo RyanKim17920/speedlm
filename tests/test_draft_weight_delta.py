@@ -28,13 +28,13 @@ from speedlm.training.masking import MaskPolicy
 from speedlm.tuner.eagle3 import (
     BF16_RELATIVE_ULP,
     MIN_TRAINED_RELATIVE_DELTA,
-    NORM_MOVED_EPSILON,
     REQUIRED_DRAFT_TENSORS,
     AuxLayerCountMismatch,
     DraftWeightsError,
     Eagle3Adapter,
     Eagle3Config,
     NoOpTrainingDeltaError,
+    WeightDeltaReport,
     _bf16_to_floats,
     drafter_aux_count,
     is_noop_training_delta,
@@ -46,10 +46,8 @@ from speedlm.tuner.eagle3 import (
 _HIDDEN = 32
 _AUX = 3
 
-#: Norm vectors are deliberately long.  ``qwen-pinned-2`` moved exactly *one*
-#: element of ``layers.0.input_layernorm.weight`` (4,096 wide) for a relative
-#: delta of 1.0e-5, and reproducing "a single element moved" is the whole
-#: reason :data:`NORM_MOVED_EPSILON` is an epsilon rather than an equality.
+#: Norm vectors are deliberately long so a single moved element reproduces
+#: the tiny norm deltas measured from bf16 AdamW training.
 _NORM_ELEMENTS = 8192
 
 #: bf16 bit patterns for the binade ``[1.0, 2.0)``: sign 0, exponent 127,
@@ -174,8 +172,8 @@ def test_the_floor_sits_above_every_measured_dither() -> None:
     """
     assert MIN_TRAINED_RELATIVE_DELTA == 2.0 * BF16_RELATIVE_ULP == 0.015625
     assert MIN_TRAINED_RELATIVE_DELTA > BF16_RELATIVE_ULP > 0.006090
-    # Every measured non-zero norm delta was 1.0e-5 .. 3.0e-5.
-    assert NORM_MOVED_EPSILON > 3.0e-5
+    assert MIN_TRAINED_RELATIVE_DELTA < 0.0236
+    assert MIN_TRAINED_RELATIVE_DELTA < 0.031
 
 
 def test_the_same_values_in_f32_and_bf16_give_the_same_delta(tmp_path: Path) -> None:
@@ -299,8 +297,8 @@ def test_a_single_moved_norm_element_does_not_excuse_the_no_op(
 ) -> None:
     """``qwen-pinned-2`` moved exactly one element of an input layernorm.
 
-    A strict "norms are exactly zero" test would have let that run through,
-    which is why the comparison is against an epsilon.
+    Norm movement is not consulted because bf16 AdamW cannot reliably move
+    gains at 1.0; the all-tensor trained-delta floor is the only signal.
     """
     report = weight_delta_report(
         _write(tmp_path / "cand", _noop_candidate()),
@@ -308,8 +306,26 @@ def test_a_single_moved_norm_element_does_not_excuse_the_no_op(
     )
 
     moved = report.deltas["layers.0.input_layernorm.weight"]
-    assert 0.0 < moved <= NORM_MOVED_EPSILON
+    assert 0.0 < moved < MIN_TRAINED_RELATIVE_DELTA
     assert is_noop_training_delta(report)
+
+
+def test_a_nominal_norm_delta_cannot_veto_the_all_tensor_floor() -> None:
+    """No tensor-name substring gets a second vote in the guard."""
+    report = WeightDeltaReport(
+        deltas={
+            "layers.0.input_layernorm.weight": 1.0e-3,
+            "layers.0.self_attn.q_proj.weight": 1.0e-3,
+        },
+        skipped={},
+    )
+
+    assert is_noop_training_delta(report)
+
+
+def test_an_empty_delta_report_is_vacuously_a_no_op() -> None:
+    """Document that ``all()`` of an empty delta iterable is true."""
+    assert is_noop_training_delta(WeightDeltaReport(deltas={}, skipped={}))
 
 
 def test_a_genuinely_trained_head_is_not_condemned(tmp_path: Path) -> None:
@@ -325,19 +341,13 @@ def test_a_genuinely_trained_head_is_not_condemned(tmp_path: Path) -> None:
 
 
 def test_a_moved_head_whose_norms_stayed_put_is_still_trained(tmp_path: Path) -> None:
-    """The two signals are a conjunction, and this is why.
-
-    Norm gains that did not move are an ordinary outcome; on their own they
-    say nothing.  Only "norms still AND nothing anywhere reached the floor" is
-    the re-rounding signature.  Were this an ``or``, this head -- projections
-    moved ~6 %, three orders of magnitude past one ULP -- would be rejected.
-    """
+    """A projection over the all-tensor floor proves that the head trained."""
     base = _write(tmp_path / "stock", _baseline_head())
     moved = _map_head(_baseline_head(), _PROJECTION_NAMES, lambda v: _shift(v, 12))
     candidate = _write(tmp_path / "draft", moved)
 
     report = weight_delta_report(candidate, base)
-    assert all(report.deltas[name] <= NORM_MOVED_EPSILON for name in _NORM_NAMES)
+    assert all(report.deltas[name] == 0.0 for name in _NORM_NAMES)
     assert report.max_delta > MIN_TRAINED_RELATIVE_DELTA
     assert not is_noop_training_delta(report)
 
@@ -359,9 +369,8 @@ def test_without_a_resolvable_baseline_the_check_cannot_fire(tmp_path: Path) -> 
 def test_a_passing_cycle_records_its_deltas_in_the_manifest(tmp_path: Path) -> None:
     """A pass has to be as diagnosable as a failure.
 
-    The floor is calibrated only from below -- no genuinely trained candidate
-    existed to measure -- so the recorded deltas of passing cycles are the
-    only evidence that will ever refine it.
+    The recorded deltas preserve the evidence needed to keep validating the
+    floor against future trained candidates.
     """
     base = _write(tmp_path / "stock", _baseline_head())
     trained = _map_head(_baseline_head(), _PROJECTION_NAMES + _NORM_NAMES, lambda v: _shift(v, 12))

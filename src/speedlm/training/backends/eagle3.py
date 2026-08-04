@@ -107,6 +107,13 @@ MAX_INVENTORY_ENTRIES: Final = 64
 #: keeps the last write covered, so nothing is merely deferred to the caller.
 DRAFT_COPY_CHUNK_BYTES: Final = 16 * 1024 * 1024
 
+#: No decay: every TTT step's loss carries the same weight in the summed
+#: objective.  Matches the Speculators trainer's own ``--ttt-step-loss-decay``
+#: default (``scripts/train.py:667``), so naming the flag changes nothing.
+#: See :attr:`SpeculatorsPipelineConfig.ttt_step_loss_decay` for what moving it
+#: would mean and what evidence would justify it.
+DEFAULT_TTT_STEP_LOSS_DECAY: Final = 1.0
+
 DEFAULT_SPECULATORS_REPO = Path(
     os.environ.get("SPEEDLM_SPECULATORS_REPO", "speculators")
 )
@@ -424,6 +431,40 @@ class SpeculatorsPipelineConfig:
     #: serving truth, and checked against it by
     #: :func:`speedlm.profiles.validate_training_depth`.
     num_speculative_steps: int = DEFAULT_SPECULATIVE_TOKENS
+    #: Per-TTT-step loss weight decay, passed through as
+    #: ``--ttt-step-loss-decay``.
+    #:
+    #: The trainer weights step ``s``'s loss by ``gamma ** s``
+    #: (``exp_loss_decay`` in ``speculators/models/metrics.py``) and *sums* the
+    #: weighted per-step losses into one objective -- which is what
+    #: ``ttt_loss_reduction: "sum"`` in the manifest records.  So ``gamma``
+    #: chooses how the gradient is split between the near positions, which
+    #: dominate expected accepted length, and the deep ones, which do not.
+    #:
+    #: ``1.0`` is no decay: every step counts equally.  It is the trainer's own
+    #: default (``scripts/train.py:667``) and was previously inherited rather
+    #: than passed, so nothing recorded it and nothing could vary it.  The
+    #: default here is deliberately that same ``1.0`` -- naming the flag must
+    #: not silently change what any cycle trains.
+    #:
+    #: The reason to move it: with no decay and a summed objective, the deep
+    #: steps dominate simply because they are harder.  Measured per-step
+    #: training losses on the gpt-oss run under
+    #: ``/data/ryan.kim/speedlm-runs/d993eee-gptoss-idle`` were 0.755, 2.000,
+    #: 2.959, 3.622, 4.144 for steps 0..4, so most of the gradient went to the
+    #: positions that contribute least.  That arm measured -7.38% throughput
+    #: with position-0 acceptance at parity (0.6850 vs 0.6871) and the loss
+    #: confined to the tail (-2.4/-4.4/-5.3/-5.3 pp at positions 1..4), while
+    #: the depth-3 Qwen arm was flat (-0.29%).  A ``gamma < 1`` is the lever
+    #: that would shift that gradient back toward position 0.
+    #:
+    #: What would justify changing it: a GPU sweep of ``gamma`` at fixed depth
+    #: showing an *end-to-end throughput* gain against the stock baseline on
+    #: the same traffic -- not a lower training loss, and not a higher
+    #: position-0 acceptance alone, since trading tail acceptance for head
+    #: acceptance can leave tokens-per-verifier-step unchanged.  Until such a
+    #: sweep exists this stays at 1.0; it is a value to measure, not to guess.
+    ttt_step_loss_decay: float = DEFAULT_TTT_STEP_LOSS_DECAY
     #: Sequence length for training. A value of 16384 collapsed a 512-record
     #: corpus into 1 batch; 4096 yielded 44 steps, making this a key lever
     #: for sampler throughput and gradient frequency.
@@ -539,6 +580,16 @@ class SpeculatorsPipelineConfig:
             raise ValueError(
                 f"num_speculative_steps must be at most {MAX_SPECULATIVE_TOKENS}"
             )
+        # Bounded above by 1.0 because a gamma above 1 would weight the *deep*
+        # steps even more heavily, which is the direction the gpt-oss
+        # regression already came from; and above 0 because 0 would train
+        # nothing but step 0 while still paying for the deeper rollout.
+        if (
+            isinstance(self.ttt_step_loss_decay, bool)
+            or not isinstance(self.ttt_step_loss_decay, (int, float))
+            or not 0 < self.ttt_step_loss_decay <= 1
+        ):
+            raise ValueError("ttt_step_loss_decay must be in (0, 1]")
         if self.row_count is not None:
             _positive_int("row_count", self.row_count)
         if self.port > 65_535:
@@ -1175,6 +1226,15 @@ class SpeculatorsTrainingProcess:
                 f"num_speculative_steps must be in 1..{MAX_SPECULATIVE_TOKENS}, "
                 f"got {ttt_steps}"
             )
+        # Same shape as the depth above, and for the same reason: the flag was
+        # never passed, so the trainer used its own default and the manifest
+        # could not say which weighting produced a gate result.
+        decay = _fraction(
+            "ttt_step_loss_decay",
+            training_params.get(
+                "ttt_step_loss_decay", self.config.ttt_step_loss_decay
+            ),
+        )
         scratch = destination.parent
         guard = _guard(
             scratch, self.config.scratch_quota_bytes, should_abort, (destination,)
@@ -1227,6 +1287,8 @@ class SpeculatorsTrainingProcess:
                     str(seq_len),
                     "--ttt-steps",
                     str(ttt_steps),
+                    "--ttt-step-loss-decay",
+                    repr(decay),
                     "--no-resume-from-checkpoint",
                     "--save-best",
                 ],
@@ -1473,6 +1535,12 @@ class Eagle3Backend(Eagle3Adapter):
                 "learning_rate": pipeline.learning_rate,
                 "epochs": pipeline.epochs,
                 "seed": pipeline.seed,
+                # Lands beside the ``ttt_loss_reduction: "sum"`` that
+                # ``Eagle3Config.effective_training_params`` already writes --
+                # the two describe one objective, and "sum" alone does not say
+                # how the summed terms were weighted.  Recorded here so a gate
+                # result can be attributed to the weighting that produced it.
+                "ttt_step_loss_decay": pipeline.ttt_step_loss_decay,
             },
             timeouts=pipeline.timeouts,
             scratch_quota_bytes=pipeline.scratch_quota_bytes,
@@ -1751,6 +1819,24 @@ def _integer(name: str, value: object) -> int:
         return int(value)
     except ValueError as error:
         raise Eagle3Error(f"{name} must be integer-valued") from error
+
+
+def _fraction(name: str, value: object) -> float:
+    """Parse a training-parameter value that must land in ``(0, 1]``.
+
+    Deliberately does *not* clamp.  A clamp would turn a configuration mistake
+    into a silently different training run, which is the exact failure the
+    explicit ``--ttt-steps`` pass-through was added to prevent.
+    """
+    if isinstance(value, bool) or not isinstance(value, (int, float, str)):
+        raise Eagle3Error(f"{name} must be a number in (0, 1]")
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise Eagle3Error(f"{name} must be a number in (0, 1]") from error
+    if not 0 < parsed <= 1:
+        raise Eagle3Error(f"{name} must be a number in (0, 1], got {parsed}")
+    return parsed
 
 
 def _environment(config: SpeculatorsPipelineConfig) -> dict[str, str]:

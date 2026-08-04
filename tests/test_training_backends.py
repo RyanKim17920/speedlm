@@ -21,12 +21,14 @@ from speedlm.profiles import (
 from speedlm.training.backends.eagle3 import (
     _RESOLVE_MODEL,
     _VALIDATE_DRAFT,
+    DEFAULT_TTT_STEP_LOSS_DECAY,
     REQUIRED_DRAFT_TENSORS,
     Eagle3Adapter,
     Eagle3Backend,
     Eagle3Config,
     Eagle3Error,
     SpeculatorsPipelineConfig,
+    _fraction,
     _Resolver,
     _State,
 )
@@ -719,6 +721,91 @@ def test_pipeline_config_rejects_an_out_of_range_depth(tmp_path: Path) -> None:
 def test_the_qwen_profile_that_was_unaffected_still_trains_three() -> None:
     """Qwen3-8B was 3/3 and must stay 3/3; the fix is not "always 5"."""
     assert QWEN_3_8B_EAGLE3_PROFILE.num_speculative_tokens == 3
+
+
+# --- TTT step loss weighting: summed, and now recorded ---------------------
+
+
+def test_the_step_loss_decay_default_is_todays_behaviour(tmp_path: Path) -> None:
+    """Naming the flag must not change what any existing cycle trains.
+
+    The Speculators trainer defaults ``--ttt-step-loss-decay`` to 1.0
+    (``scripts/train.py:667``), which weights step ``s`` by ``1.0 ** s`` -- no
+    decay at all.  Every run to date inherited that, so anything other than 1.0
+    here would silently reweight the objective of runs nobody re-tuned.
+    """
+    assert DEFAULT_TTT_STEP_LOSS_DECAY == 1.0
+    assert _pipeline(tmp_path).ttt_step_loss_decay == 1.0
+
+
+@pytest.mark.parametrize("decay", [0.0, -0.5, 1.5, True, "0.7", None])
+def test_pipeline_config_rejects_a_decay_outside_the_unit_interval(
+    tmp_path: Path,
+    decay: object,
+) -> None:
+    """A gamma above 1 weights the deep steps *harder*, the wrong direction.
+
+    Zero is rejected too: it would train step 0 only while still paying for the
+    full rollout, which is a depth change wearing a weighting's clothes.
+    ``True`` is a bool that would otherwise pass ``0 < x <= 1``, and a string
+    is a JSON-config shape that must not be silently coerced.
+    """
+    with pytest.raises(ValueError, match="ttt_step_loss_decay"):
+        replace(_pipeline(tmp_path), ttt_step_loss_decay=decay)
+
+
+def test_the_decay_lands_in_the_manifest_beside_the_reduction(
+    tmp_path: Path,
+) -> None:
+    """"sum" alone does not say how the summed terms were weighted.
+
+    ``ttt_loss_reduction: "sum"`` records that the per-step losses are added
+    into one objective; without the gamma beside it, two runs with opposite
+    gradient allocations produce identical manifests and no gate result can be
+    attributed to the weighting that produced it.
+    """
+    traces = tmp_path / "traces.jsonl"
+    traces.write_text(
+        json.dumps({"messages": [{"role": "assistant", "content": "ok"}]}) + "\n",
+        encoding="utf-8",
+    )
+    backend = Eagle3Backend.from_speculators(
+        replace(
+            _pipeline(tmp_path),
+            target_layer_ids=(3, 9, 15),
+            ttt_step_loss_decay=0.8,
+        ),
+        trace_source=traces,
+    )
+
+    # ``effective_training_params`` is what the publish path hands the
+    # manifest; ``describe`` is the other reader of the same dict.
+    params = backend.config.effective_training_params
+    assert params["ttt_loss_reduction"] == "sum"
+    assert params["ttt_step_loss_decay"] == 0.8
+    assert backend.describe().training_params["ttt_step_loss_decay"] == 0.8
+
+
+@pytest.mark.parametrize("value", [0.0, -0.5, 1.5, True, None, [0.7]])
+def test_the_trainer_refuses_a_bad_decay_rather_than_clamping(value: object) -> None:
+    """A clamp would turn a config mistake into a quietly different run.
+
+    That is the same failure mode the explicit ``--ttt-steps`` pass-through was
+    added to prevent, so the parse must reject rather than repair.
+    """
+    with pytest.raises(Eagle3Error, match="ttt_step_loss_decay"):
+        _fraction("ttt_step_loss_decay", value)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [(1.0, 1.0), (0.7, 0.7), (1, 1.0), ("0.5", 0.5)],
+)
+def test_a_valid_decay_survives_the_parse_unchanged(
+    value: object,
+    expected: float,
+) -> None:
+    assert _fraction("ttt_step_loss_decay", value) == expected
 
 
 def test_the_validator_requires_the_fusion_projection(tmp_path: Path) -> None:
