@@ -2,15 +2,24 @@ from __future__ import annotations
 
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
 
-from speedlm.gate.decide import DispersionBasis, Reason, Verdict
+from speedlm.gate.decide import (
+    DIVERGENCE_ALPHA,
+    DIVERGENCE_STATISTICS,
+    DispersionBasis,
+    Reason,
+    Verdict,
+)
 from speedlm.report import (
+    GainReport,
     GainStatus,
     GatewayState,
+    ReportError,
     build_gain_report,
     build_status_report,
     find_latest_decision,
@@ -45,6 +54,7 @@ def _decision_dict(
     stock_tps: float = 100.0,
     cand_tps: float = 112.0,
     draft_depth: int = 5,
+    min_accepted_length_delta: float = 0.05,
 ) -> dict[str, Any]:
     if per_repeat is None:
         per_repeat = [
@@ -78,6 +88,14 @@ def _decision_dict(
         "candidate_avg_acceptance": cand_acc,
         "stock_avg_tok_per_sec": stock_tps,
         "candidate_avg_tok_per_sec": cand_tps,
+        # Accepted-length criterion fields (added in GAP 1).
+        # Derived from acceptance rates via the same relation:
+        # mean_accepted_length = 1 + acceptance_rate * draft_depth.
+        "accepted_length_delta": (cand_acc - stock_acc) * draft_depth,
+        "min_accepted_length_delta": min_accepted_length_delta,
+        "stock_avg_accepted_length": 1.0 + stock_acc * draft_depth,
+        "candidate_avg_accepted_length": 1.0 + cand_acc * draft_depth,
+        "acceptance_criterion": "mean_accepted_length_delta",
     }
 
 
@@ -983,6 +1001,9 @@ def _varying_repeats(count: int) -> list[dict[str, Any]]:
             "candidate_acceptance_rate": 0.68 - i / 1000.0,
             "invalid_rate": 0.0,
             "output_mismatches": 0,
+            # Accepted-length fields varying with the acceptance rate.
+            "stock_accepted_length": 1.0 + (0.62 + i / 1000.0) * 5,
+            "candidate_accepted_length": 1.0 + (0.68 - i / 1000.0) * 5,
         }
         for i in range(count)
     ]
@@ -1029,16 +1050,17 @@ def test_gain_degenerate_dispersion_never_prints_a_bare_delta(home: Path) -> Non
     text = report.render_text()
 
     assert report.decision is not None
+    # The acceptance delta shows degenerate dispersion qualifier.
     assert (
         "acceptance delta  : +6.00 pp "
         "(no variance observed across 5 identical repeats; "
         "recorded, not gated)" in text
     )
-    # This payload predates the gating criterion, so there is no accepted-length
-    # block to render.  Absent, not zeroed: see the test below for the block.
-    assert "accepted len delta:" not in text
-    # No standard error is offered where none exists.
+    # No standard error is offered for degenerate dispersion.
     assert "+6.00 pp +/-" not in text
+    # The accepted-length block also shows degenerate dispersion.
+    assert "accepted len delta:" in text
+    assert "tok/step (no variance observed across 5 identical repeats;" in text
 
 
 def test_gain_measured_dispersion_prints_the_standard_error(home: Path) -> None:
@@ -1243,3 +1265,388 @@ def test_archived_homes_render_a_gain_report(path: Path) -> None:
         for label in ("acceptance delta  :", "throughput delta  :"):
             line = next(ln for ln in text.splitlines() if ln.startswith(label))
             assert "no variance observed" in line or "+/-" in line
+
+
+# ---------------------------------------------------------------------------
+# gain — to_dict() JSON output includes accepted-length fields (GAP 1)
+# ---------------------------------------------------------------------------
+
+
+def test_gain_json_thresholds_includes_min_accepted_length_delta(
+    home: Path,
+) -> None:
+    """to_dict() thresholds must expose min_accepted_length_delta."""
+    payload = _decision_dict()
+    payload["accepted_length_delta"] = 0.3
+    payload["min_accepted_length_delta"] = 0.05
+    payload["stock_avg_accepted_length"] = 4.1
+    payload["candidate_avg_accepted_length"] = 4.4
+    payload["acceptance_criterion"] = "mean_accepted_length_delta"
+    _write_decision(home, payload)
+
+    result = build_gain_report(now=1_000.0).to_dict()
+
+    assert "min_accepted_length_delta" in result["thresholds"]
+    assert result["thresholds"]["min_accepted_length_delta"] == 0.05
+
+
+def test_gain_json_measurement_includes_accepted_length_block(
+    home: Path,
+) -> None:
+    """to_dict() measurement block must carry accepted-length stats when deltas
+    are measured."""
+    payload = _decision_dict()
+    payload["accepted_length_delta"] = 0.3
+    payload["min_accepted_length_delta"] = 0.05
+    payload["stock_avg_accepted_length"] = 4.1
+    payload["candidate_avg_accepted_length"] = 4.4
+    payload["acceptance_criterion"] = "mean_accepted_length_delta"
+    _write_decision(home, payload)
+
+    result = build_gain_report(now=1_000.0).to_dict()
+    measurement = result["measurement"]
+
+    assert measurement is not None
+    assert measurement["acceptance_criterion"] == "mean_accepted_length_delta"
+    assert measurement["accepted_length_delta"] == 0.3
+    assert measurement["stock_accepted_length"] == 4.1
+    assert measurement["candidate_accepted_length"] == 4.4
+    assert "accepted_length_dispersion" in measurement
+    assert "accepted_length_delta_standard_error" in measurement
+
+
+def test_gain_json_per_repeat_rows_include_accepted_length(
+    home: Path,
+) -> None:
+    """to_dict() per_repeat rows must carry stock/candidate accepted_length."""
+    payload = _decision_dict(num_repeats=2)
+    payload["accepted_length_delta"] = 0.3
+    payload["min_accepted_length_delta"] = 0.05
+    payload["stock_avg_accepted_length"] = 4.1
+    payload["candidate_avg_accepted_length"] = 4.4
+    _write_decision(home, payload)
+
+    result = build_gain_report(now=1_000.0).to_dict()
+
+    for row in result["per_repeat"]:
+        assert "stock_accepted_length" in row
+        assert "candidate_accepted_length" in row
+        # _decision_dict derives these from acceptance_rate:
+        # 1.0 + rate * draft_depth == 1.0 + 0.62 * 5 == 4.1
+        assert row["stock_accepted_length"] == pytest.approx(4.1)
+        assert row["candidate_accepted_length"] == pytest.approx(4.4)
+
+
+# ---------------------------------------------------------------------------
+# gain -- deltas_measured recognises EITHER acceptance statistic
+#
+# The gate's promotion criterion moved from the acceptance rate to the mean
+# accepted length.  Requiring *both* deltas made every decision.json written
+# before that move -- which is every archived run on disk -- render as "not
+# measured", silently destroying the readout of the whole archive.  These pin
+# the either-not-both predicate.
+# ---------------------------------------------------------------------------
+
+
+def _legacy_decision_dict() -> dict[str, Any]:
+    """A decision exactly as the gate wrote it before the criterion moved.
+
+    Every accepted-length key is absent, at the top level and per repeat --
+    which is what the records under ``/data/ryan.kim/speedlm-runs`` actually
+    look like.
+    """
+    payload = _decision_dict()
+    for key in (
+        "accepted_length_delta",
+        "min_accepted_length_delta",
+        "stock_avg_accepted_length",
+        "candidate_avg_accepted_length",
+        "acceptance_criterion",
+    ):
+        del payload[key]
+    for row in payload["per_repeat"]:
+        del row["stock_accepted_length"]
+        del row["candidate_accepted_length"]
+    return payload
+
+
+def test_legacy_decision_without_accepted_length_renders_acceptance_delta(
+    home: Path,
+) -> None:
+    """REGRESSION GUARD.  A record carrying ``acceptance_delta_pp`` and no
+    ``accepted_length_delta`` must print its acceptance delta, not "not
+    measured".  This is the exact shape of every archived run on disk."""
+    payload = _legacy_decision_dict()
+    assert "accepted_length_delta" not in payload
+    _write_decision(home, payload)
+
+    report = build_gain_report(now=1_000.0)
+    text = report.render_text()
+
+    assert report.deltas_measured is True
+    assert "acceptance delta  : +6.00 pp" in text
+    assert "throughput delta  : +12.00%" in text
+    assert "not measured" not in text
+    # It carries no accepted-length statistic, so it must claim none.
+    assert "accepted len" not in text
+
+
+def test_legacy_decision_json_reports_deltas_measured(home: Path) -> None:
+    """The JSON readout of a legacy record must agree with the text one."""
+    _write_decision(home, _legacy_decision_dict())
+
+    result = build_gain_report(now=1_000.0).to_dict()
+
+    assert result["deltas_measured"] is True
+    assert result["measurement"] is not None
+    assert result["measurement"]["acceptance_delta_pp"] == pytest.approx(6.0)
+    # Absent, never a measured zero.
+    assert result["measurement"]["accepted_length_delta"] is None
+    assert result["thresholds"]["min_accepted_length_delta"] is None
+
+
+def test_deltas_measured_true_on_accepted_length_alone() -> None:
+    """The mirror case: only the new statistic present."""
+    decision = replace(
+        parse_decision(_decision_dict(), source=Path("d.json")),
+        acceptance_delta_pp=None,
+    )
+    report = GainReport(
+        status=GainStatus.MEASURED, detail="Verdict: ok.", decision=decision
+    )
+
+    assert report.deltas_measured is True
+    text = report.render_text()
+    assert "accepted len delta: +0.300 tok/step" in text
+    # No rate delta was recorded, so none may be printed.
+    assert "acceptance delta" not in text
+    assert "acceptance stock" not in text
+
+
+def test_deltas_measured_false_when_neither_acceptance_statistic_present() -> None:
+    """Either-not-both is not "anything goes": with no acceptance statistic at
+    all there is nothing to report."""
+    decision = replace(
+        parse_decision(_decision_dict(), source=Path("d.json")),
+        acceptance_delta_pp=None,
+        accepted_length_delta=None,
+    )
+    report = GainReport(
+        status=GainStatus.MEASURED, detail="Verdict: ok.", decision=decision
+    )
+
+    assert report.deltas_measured is False
+    assert "acceptance        : not measured" in report.render_text()
+
+
+def test_deltas_measured_false_without_throughput_delta() -> None:
+    """Throughput has no second statistic to fall back on, so it stays
+    mandatory even when an acceptance statistic is present."""
+    decision = replace(
+        parse_decision(_decision_dict(), source=Path("d.json")),
+        throughput_delta_pct=None,
+    )
+    report = GainReport(
+        status=GainStatus.MEASURED, detail="Verdict: ok.", decision=decision
+    )
+
+    assert report.deltas_measured is False
+
+
+# ---------------------------------------------------------------------------
+# gain -- the divergence noise floor round-trips and is surfaced
+#
+# The gate rejects on divergence only when the candidate-versus-stock count
+# significantly exceeds a stock-versus-stock floor measured in the same run.
+# ``parse_decision`` rebuilds a Decision field by explicit field, so those
+# fields have to be named there or the floor never reaches ``speedlm gain``.
+# ---------------------------------------------------------------------------
+
+
+def _divergence_entry(
+    *, index: int, early: bool, context: str = "ctx-a", repeat: int = 0
+) -> dict[str, Any]:
+    return {
+        "context_hash": context,
+        "repeat_index": repeat,
+        "first_divergence_index": index,
+        "basis": "token_mismatch",
+        "stock_length": 128,
+        "candidate_length": 128,
+        "early": early,
+    }
+
+
+def _decision_with_control() -> dict[str, Any]:
+    """A divergence rejection carrying its measured noise floor."""
+    payload = _decision_dict(
+        verdict="reject",
+        reason="output_mismatch",
+        acceptance_delta_pp=None,
+        throughput_delta_pct=None,
+    )
+    payload["min_divergence_token_index"] = 16
+    payload["output_divergences"] = [
+        _divergence_entry(index=9, early=True, context="ctx-1"),
+        _divergence_entry(index=80, early=False, context="ctx-2"),
+    ]
+    payload["control_divergences"] = [
+        _divergence_entry(index=4, early=True, context="ctx-3"),
+        _divergence_entry(index=61, early=False, context="ctx-4"),
+        _divergence_entry(index=99, early=False, context="ctx-5"),
+    ]
+    payload["divergence_trials"] = 410
+    payload["control_trials"] = 410
+    payload["divergence_control_available"] = True
+    payload["divergence_total_p_value"] = 0.42
+    payload["divergence_early_p_value"] = 0.61
+    # Deliberately NOT the default DIVERGENCE_ALPHA/DIVERGENCE_STATISTICS, so a
+    # hardcoded or defaulted alpha cannot pass for a round-tripped one.
+    payload["divergence_alpha"] = 0.0025
+    return payload
+
+
+def test_parse_decision_round_trips_the_divergence_noise_floor() -> None:
+    decision = parse_decision(_decision_with_control(), source=Path("d.json"))
+
+    assert decision.divergence_trials == 410
+    assert decision.control_trials == 410
+    assert decision.divergence_control_available is True
+    assert len(decision.control_divergences) == 3
+    assert decision.control_total_divergences == 3
+    assert decision.control_early_divergences == 1
+    assert decision.control_divergence_rate == pytest.approx(3 / 410)
+    assert decision.divergence_rate == pytest.approx(2 / 410)
+    assert decision.divergence_total_p_value == pytest.approx(0.42)
+    assert decision.divergence_early_p_value == pytest.approx(0.61)
+    assert decision.divergence_alpha == pytest.approx(0.0025)
+    # The control's own evidence survives, not just its summary counts.
+    assert decision.control_divergences[0].context_hash == "ctx-3"
+    assert decision.control_divergences[0].first_divergence_index == 4
+
+
+def test_absent_divergence_control_never_reads_as_a_measured_zero() -> None:
+    """A record predating the control must come back saying "no control ran",
+    not "the engine diverged zero times"."""
+    decision = parse_decision(_decision_dict(), source=Path("d.json"))
+
+    assert decision.divergence_control_available is False
+    assert decision.control_divergences == ()
+    assert decision.control_trials == 0
+    assert decision.divergence_trials == 0
+    # Rates are None -- never 0.0, which would claim a perfectly deterministic
+    # engine was measured.
+    assert decision.control_divergence_rate is None
+    assert decision.divergence_rate is None
+    assert decision.divergence_total_p_value is None
+    assert decision.divergence_early_p_value is None
+    # No alpha was recorded, so the criterion's own per-statistic level is
+    # what the record reads back as -- not zero, which would be no test at all.
+    assert decision.divergence_alpha == pytest.approx(
+        DIVERGENCE_ALPHA / DIVERGENCE_STATISTICS
+    )
+
+
+def test_gain_text_shows_the_noise_floor_beside_the_candidate_rate(
+    home: Path,
+) -> None:
+    """An operator reading a rejection must see the engine's own divergence
+    rate; without it the candidate's count means nothing."""
+    _write_decision(home, _decision_with_control())
+
+    text = build_gain_report(now=1_000.0).render_text()
+
+    assert "divergence rate   : candidate 2/410 (0.49% of context comparisons)" in text
+    assert (
+        "engine noise floor: stock vs stock 3/410 (0.73%), 1 before token 16" in text
+    )
+    assert "divergence test   : total p 0.4200, early p 0.6100" in text
+    assert "alpha 0.0025" in text
+
+
+def test_gain_text_says_so_when_the_floor_was_only_assumed(home: Path) -> None:
+    payload = _decision_with_control()
+    payload["divergence_control_available"] = False
+    payload["control_divergences"] = []
+    payload["control_trials"] = 0
+    _write_decision(home, payload)
+
+    text = build_gain_report(now=1_000.0).render_text()
+
+    assert "divergence rate   : candidate 2/410" in text
+    assert "engine noise floor: no stock-vs-stock control ran" in text
+    assert "assumed a zero-divergence floor" in text
+    # "not measured" is this report's phrase for a statistic with no numbers at
+    # all; the divergence counts here ARE measured.
+    assert "engine noise floor: not measured" not in text
+
+
+def test_legacy_divergence_record_claims_no_floor_at_all(home: Path) -> None:
+    """A record from before the criterion existed was judged against no floor,
+    so the report must not describe one -- assumed or otherwise."""
+    payload = _legacy_decision_dict()
+    payload["verdict"] = "reject"
+    payload["reason"] = "output_mismatch"
+    payload["acceptance_delta_pp"] = None
+    payload["throughput_delta_pct"] = None
+    payload["min_divergence_token_index"] = 16
+    payload["output_divergences"] = [_divergence_entry(index=9, early=True)]
+    _write_decision(home, payload)
+
+    text = build_gain_report(now=1_000.0).render_text()
+
+    # The evidence it does carry is still shown.
+    assert "divergences       : 1 contexts parted" in text
+    assert "engine noise floor" not in text
+    assert "divergence rate" not in text
+    assert "divergence test" not in text
+
+
+def test_gain_json_exposes_the_divergence_floor_on_an_unmeasured_reject(
+    home: Path,
+) -> None:
+    """``output_mismatch`` has no speed deltas at all, so the divergence block
+    must live outside the ``deltas_measured`` branch -- it is the entire basis
+    of that verdict."""
+    _write_decision(home, _decision_with_control())
+
+    result = build_gain_report(now=1_000.0).to_dict()
+    divergence = result["divergence"]
+
+    assert result["deltas_measured"] is False
+    assert result["measurement"] is None
+    assert divergence["candidate_total"] == 2
+    assert divergence["candidate_early"] == 1
+    assert divergence["candidate_trials"] == 410
+    assert divergence["candidate_rate"] == pytest.approx(2 / 410)
+    assert divergence["control_available"] is True
+    assert divergence["control_total"] == 3
+    assert divergence["control_early"] == 1
+    assert divergence["control_trials"] == 410
+    assert divergence["control_rate"] == pytest.approx(3 / 410)
+    assert divergence["total_p_value"] == pytest.approx(0.42)
+    assert divergence["early_p_value"] == pytest.approx(0.61)
+    assert divergence["alpha"] == pytest.approx(0.0025)
+    assert len(divergence["control_divergences"]) == 3
+
+
+def test_gain_json_control_fields_are_null_when_no_control_ran(home: Path) -> None:
+    _write_decision(home, _legacy_decision_dict())
+
+    divergence = build_gain_report(now=1_000.0).to_dict()["divergence"]
+
+    assert divergence["control_available"] is False
+    for key in ("control_total", "control_early", "control_trials", "control_rate"):
+        assert divergence[key] is None, key
+    assert divergence["candidate_trials"] is None
+    assert divergence["candidate_rate"] is None
+
+
+def test_control_divergences_must_be_a_list() -> None:
+    """The control array gets the same validation as the candidate one; it is
+    the evidence the verdict turns on."""
+    payload = _decision_with_control()
+    payload["control_divergences"] = {"not": "a list"}
+
+    with pytest.raises(ReportError, match="control_divergences"):
+        parse_decision(payload, source=Path("d.json"))

@@ -30,6 +30,8 @@ from typing import Any, Final
 from speedlm.config import ConfigError, SpeedLMConfig, load_config
 from speedlm.doctor import PRIMARY_VERIFIER
 from speedlm.gate.decide import (
+    DIVERGENCE_ALPHA,
+    DIVERGENCE_STATISTICS,
     LEGACY_ACCEPTANCE_CRITERION,
     LEGACY_ACCEPTANCE_STATISTIC,
     LEGACY_THROUGHPUT_STATISTIC,
@@ -1062,6 +1064,35 @@ def parse_decision(record: Mapping[str, Any], *, source: Path) -> Decision:
             else 0
         ),
         output_divergences=_parse_divergences(record, source),
+        # The divergence noise floor.  All optional: a record written before
+        # the gate measured its own engine nondeterminism carries none of these
+        # keys, and each absence reads back as "no control was run" rather than
+        # as a measurement.  ``divergence_trials``/``control_trials`` at zero
+        # make ``divergence_rate``/``control_divergence_rate`` return ``None``
+        # -- never a rate of 0.0 -- and ``divergence_control_available`` stays
+        # False, which is what stops the criterion's *assumed* zero floor being
+        # read back as a measured one.
+        divergence_trials=_optional_int(record.get("divergence_trials")) or 0,
+        control_trials=_optional_int(record.get("control_trials")) or 0,
+        control_divergences=_parse_divergences(
+            record, source, key="control_divergences"
+        ),
+        divergence_control_available=bool(
+            record.get("divergence_control_available", False)
+        ),
+        divergence_total_p_value=_optional_float(
+            record.get("divergence_total_p_value")
+        ),
+        divergence_early_p_value=_optional_float(
+            record.get("divergence_early_p_value")
+        ),
+        # Absent means the record predates the test entirely; it is then
+        # rendered only alongside a p-value, and there are none.
+        divergence_alpha=(
+            _require_float(record, "divergence_alpha", source)
+            if "divergence_alpha" in record
+            else DIVERGENCE_ALPHA / DIVERGENCE_STATISTICS
+        ),
         acceptance_statistic=(
             _require_str(record, "acceptance_statistic", source)
             if "acceptance_statistic" in record
@@ -1109,14 +1140,22 @@ def parse_decision(record: Mapping[str, Any], *, source: Path) -> Decision:
 def _parse_divergences(
     record: Mapping[str, Any],
     source: Path,
+    *,
+    key: str = "output_divergences",
 ) -> tuple[ContextDivergence, ...]:
-    raw = record.get("output_divergences", [])
+    """Parse one divergence array -- the candidate's, or the control's.
+
+    Both are persisted in the same shape by ``Decision.to_dict``, and the
+    control array is the noise floor's own evidence, so it gets the same
+    per-entry validation rather than being trusted wholesale.
+    """
+    raw = record.get(key, [])
     if not isinstance(raw, list):
-        raise ReportError(f"{source}: 'output_divergences' must be a list")
+        raise ReportError(f"{source}: '{key}' must be a list")
     parsed: list[ContextDivergence] = []
     for item in raw:
         if not isinstance(item, Mapping):
-            raise ReportError(f"{source}: each 'output_divergences' entry must be an object")
+            raise ReportError(f"{source}: each '{key}' entry must be an object")
         parsed.append(
             ContextDivergence(
                 context_hash=_require_str(item, "context_hash", source),
@@ -1317,12 +1356,31 @@ class GainReport:
 
     @property
     def deltas_measured(self) -> bool:
-        """True only when the gate actually produced comparable numbers."""
+        """True only when the gate actually produced comparable numbers.
+
+        *Either* acceptance statistic counts, not both.  The gate's promotion
+        criterion moved from the acceptance rate to the mean accepted length,
+        and every decision written before that move carries
+        ``acceptance_delta_pp`` and no ``accepted_length_delta`` -- which is
+        every archived run on disk.  Demanding both would relabel that entire
+        archive "not measured" even though the numbers in it were measured, and
+        the reader would lose the only readout those runs have.  Demanding
+        either keeps a legacy record printing exactly what it printed before
+        while letting a record that carries only the new statistic print that.
+
+        ``throughput_delta_pct`` stays mandatory: the throughput line has no
+        second statistic to fall back on, so without it there is nothing to
+        report.
+        """
+        decision = self.decision
         return (
-            self.decision is not None
-            and self.decision.reason not in UNMEASURED_REASONS
-            and self.decision.acceptance_delta_pp is not None
-            and self.decision.throughput_delta_pct is not None
+            decision is not None
+            and decision.reason not in UNMEASURED_REASONS
+            and (
+                decision.acceptance_delta_pp is not None
+                or decision.accepted_length_delta is not None
+            )
+            and decision.throughput_delta_pct is not None
         )
 
     # -- rendering ---------------------------------------------------------
@@ -1358,6 +1416,7 @@ class GainReport:
         result["num_repeats"] = decision.num_repeats
         result["thresholds"] = {
             "min_acceptance_delta_pp": decision.min_acceptance_delta_pp,
+            "min_accepted_length_delta": decision.min_accepted_length_delta,
             "min_throughput_delta_pct": decision.min_throughput_delta_pct,
         }
         # What the deltas were measured *over*.  Emitted even for an aborted
@@ -1376,8 +1435,41 @@ class GainReport:
             # rows at or beyond this index were never checked.
             "correctness_repeats": decision.correctness_repeats,
         }
+        # The divergence evidence and the floor it was judged against.  Emitted
+        # outside the ``deltas_measured`` branch on purpose: an
+        # ``output_mismatch`` rejection has no speed deltas at all and is
+        # entirely a statement about divergence, so this is the one verdict for
+        # which suppressing it would hide the whole basis of the decision.
+        #
+        # Every control field is ``None`` -- never ``0`` -- when no control ran.
+        # A floor that was never measured is not a floor of zero; the criterion
+        # only *assumed* that value, and ``control_available`` is what says so.
+        control_measured = decision.divergence_control_available
+        result["divergence"] = {
+            "min_divergence_token_index": decision.min_divergence_token_index,
+            "candidate_early": decision.output_early_divergences,
+            "candidate_total": decision.output_total_divergences,
+            "candidate_trials": decision.divergence_trials or None,
+            "candidate_rate": decision.divergence_rate,
+            "control_available": control_measured,
+            "control_early": (
+                decision.control_early_divergences if control_measured else None
+            ),
+            "control_total": (
+                decision.control_total_divergences if control_measured else None
+            ),
+            "control_trials": decision.control_trials if control_measured else None,
+            "control_rate": decision.control_divergence_rate,
+            "control_divergences": [
+                d.to_dict() for d in decision.control_divergences
+            ],
+            "total_p_value": decision.divergence_total_p_value,
+            "early_p_value": decision.divergence_early_p_value,
+            "alpha": decision.divergence_alpha,
+        }
         if self.deltas_measured:
             result["measurement"] = {
+                "acceptance_criterion": decision.acceptance_criterion,
                 "stock_acceptance": decision.stock_avg_acceptance,
                 "candidate_acceptance": decision.candidate_avg_acceptance,
                 "acceptance_delta_pp": decision.acceptance_delta_pp,
@@ -1388,6 +1480,13 @@ class GainReport:
                 "acceptance_dispersion": decision.acceptance_dispersion.value,
                 "acceptance_delta_standard_error_pp": (
                     decision.acceptance_delta_standard_error_pp
+                ),
+                "stock_accepted_length": decision.stock_avg_accepted_length,
+                "candidate_accepted_length": decision.candidate_avg_accepted_length,
+                "accepted_length_delta": decision.accepted_length_delta,
+                "accepted_length_dispersion": decision.accepted_length_dispersion.value,
+                "accepted_length_delta_standard_error": (
+                    decision.accepted_length_delta_standard_error
                 ),
                 "stock_tok_per_sec": decision.stock_avg_tok_per_sec,
                 "candidate_tok_per_sec": decision.candidate_avg_tok_per_sec,
@@ -1406,6 +1505,8 @@ class GainReport:
                     "candidate_acceptance_rate": r.candidate_acceptance_rate,
                     "invalid_rate": r.invalid_rate,
                     "output_mismatches": r.output_mismatches,
+                    "stock_accepted_length": r.stock_accepted_length,
+                    "candidate_accepted_length": r.candidate_accepted_length,
                 }
                 for r in decision.per_repeat
             ]
@@ -1474,6 +1575,79 @@ class GainReport:
             )
         return lines
 
+    @staticmethod
+    def _divergence_lines(decision: Decision) -> list[str]:
+        """Render the divergence evidence *and the floor it was judged against*.
+
+        A raw divergence count is not readable on its own.  The gate's own
+        criterion compares the candidate-versus-stock count against a
+        stock-versus-stock control replayed in the same run, because a target
+        forward pass is not bitwise reproducible and a MoE target diverges from
+        itself on a majority of contexts.  Printing "230 contexts parted" with
+        no floor beside it invites exactly the false-rejection reading the
+        criterion was changed to stop, so the two rates are rendered together or
+        the absence of the floor is stated outright.
+        """
+        lines: list[str] = []
+        if decision.output_divergences:
+            offsets = sorted(
+                d.first_divergence_index for d in decision.output_divergences
+            )
+            lines.append(
+                f"divergences       : {len(offsets)} contexts parted "
+                f"({decision.output_early_divergences} before token "
+                f"{decision.min_divergence_token_index}); "
+                f"first-divergence offsets min {offsets[0]}, "
+                f"median {offsets[len(offsets) // 2]}, max {offsets[-1]}"
+            )
+        candidate_rate = decision.divergence_rate
+        if candidate_rate is not None:
+            lines.append(
+                f"divergence rate   : candidate {decision.output_total_divergences}"
+                f"/{decision.divergence_trials} ({candidate_rate * 100:.2f}% of "
+                f"context comparisons)"
+            )
+        control_rate = decision.control_divergence_rate
+        if control_rate is not None:
+            lines.append(
+                f"engine noise floor: stock vs stock "
+                f"{decision.control_total_divergences}/{decision.control_trials} "
+                f"({control_rate * 100:.2f}%), "
+                f"{decision.control_early_divergences} before token "
+                f"{decision.min_divergence_token_index}"
+            )
+        elif candidate_rate is not None:
+            # Never zeros: a floor that was not measured is not a floor of
+            # zero, and the criterion only *assumed* that value.
+            #
+            # Gated on the candidate rate rather than on the divergence list,
+            # so it appears only for records the divergence criterion actually
+            # judged.  A record written before the criterion existed has no
+            # trials and gets no line: it was gated by the old
+            # any-early-divergence rule, against no floor at all, and saying
+            # "the criterion assumed a zero floor" would describe a test that
+            # never ran on it.
+            # Worded as the missing *control*, not as "not measured": in this
+            # report "not measured" is the phrase for a statistic with no
+            # numbers behind it at all, and the divergence counts above are
+            # measured -- it is only the floor they should be read against that
+            # is absent.
+            lines.append(
+                "engine noise floor: no stock-vs-stock control ran (the "
+                "criterion assumed a zero-divergence floor)"
+            )
+        p_total = decision.divergence_total_p_value
+        p_early = decision.divergence_early_p_value
+        if p_total is not None or p_early is not None:
+            total_str = "n/a" if p_total is None else f"{p_total:.4f}"
+            early_str = "n/a" if p_early is None else f"{p_early:.4f}"
+            lines.append(
+                f"divergence test   : total p {total_str}, early p {early_str} "
+                f"(one-sided Fisher exact; rejects below alpha "
+                f"{decision.divergence_alpha:.4f})"
+            )
+        return lines
+
     def render_text(self) -> str:
         lines = ["SpeedLM gain"]
         # First, before any number: whatever follows may not be what is being
@@ -1505,33 +1679,45 @@ class GainReport:
             lines.append("acceptance        : not measured")
             lines.append("throughput        : not measured")
             lines.append("speedup           : not measured")
+            # An ``output_mismatch`` rejection is unmeasured on the speed
+            # statistics and yet is *entirely* about divergence -- so this is
+            # precisely the verdict whose evidence, and whose noise floor, the
+            # reader most needs.  Withholding it here would leave the operator
+            # with a bare "rejected" and nothing to audit.
+            lines.extend(self._divergence_lines(decision))
             lines.append(self.detail)
             return "\n".join(lines)
 
         acceptance_delta_pp = decision.acceptance_delta_pp
         throughput_delta_pct = decision.throughput_delta_pct
-        assert acceptance_delta_pp is not None
         assert throughput_delta_pct is not None
-        lines.append(
-            f"acceptance stock  : {decision.stock_avg_acceptance * 100:.2f}%"
-        )
-        lines.append(
-            f"acceptance cand   : {decision.candidate_avg_acceptance * 100:.2f}%"
-        )
         repeats = len(decision.per_repeat)
-        acceptance_suffix, acceptance_note = _dispersion_fragments(
-            decision.acceptance_dispersion,
-            decision.acceptance_delta_standard_error_pp,
-            repeats=repeats,
-            unit=" pp",
-        )
-        # The rate delta is reported but no longer decides -- it divides by the
-        # draft depth, so it is not comparable across depths.  Saying
-        # "threshold >= 1.00 pp" here would name a bar the gate does not apply.
-        lines.append(
-            f"acceptance delta  : {acceptance_delta_pp:+.2f} pp{acceptance_suffix} "
-            f"({acceptance_note}; recorded, not gated)"
-        )
+        # Each acceptance statistic renders only when the record carries it.
+        # ``deltas_measured`` admits a record holding either one, so neither
+        # block may assume the other's presence: a legacy record has only the
+        # rate delta below, a record written under the current criterion has
+        # both, and a record with only the length delta prints only that.
+        if acceptance_delta_pp is not None:
+            lines.append(
+                f"acceptance stock  : {decision.stock_avg_acceptance * 100:.2f}%"
+            )
+            lines.append(
+                f"acceptance cand   : {decision.candidate_avg_acceptance * 100:.2f}%"
+            )
+            acceptance_suffix, acceptance_note = _dispersion_fragments(
+                decision.acceptance_dispersion,
+                decision.acceptance_delta_standard_error_pp,
+                repeats=repeats,
+                unit=" pp",
+            )
+            # The rate delta is reported but no longer decides -- it divides by
+            # the draft depth, so it is not comparable across depths.  Saying
+            # "threshold >= 1.00 pp" here would name a bar the gate does not
+            # apply.
+            lines.append(
+                f"acceptance delta  : {acceptance_delta_pp:+.2f} pp{acceptance_suffix} "
+                f"({acceptance_note}; recorded, not gated)"
+            )
         accepted_length_delta = decision.accepted_length_delta
         if accepted_length_delta is not None:
             lines.append(
@@ -1585,17 +1771,7 @@ class GainReport:
                     f"invalid {r.invalid_rate * 100:.2f}%, "
                     f"mismatches {r.output_mismatches}"
                 )
-        if decision.output_divergences:
-            offsets = sorted(
-                d.first_divergence_index for d in decision.output_divergences
-            )
-            lines.append(
-                f"divergences       : {len(offsets)} contexts parted "
-                f"({decision.output_early_divergences} before token "
-                f"{decision.min_divergence_token_index}); "
-                f"first-divergence offsets min {offsets[0]}, "
-                f"median {offsets[len(offsets) // 2]}, max {offsets[-1]}"
-            )
+        lines.extend(self._divergence_lines(decision))
         lines.append(self.detail)
         return "\n".join(lines)
 

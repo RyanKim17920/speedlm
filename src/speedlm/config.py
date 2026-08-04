@@ -494,13 +494,14 @@ class PromotionConfig:
     #: qwen-cross-20260801T014500Z        3       -0.5540    -0.0166  reject(acceptance) -> same
     #: qwen-pinned-2                      3       -0.1890    -0.0057  reject(acceptance) -> same
     #: early-divergence-3                 5      (-1.2714)  (-0.0636) reject(output_mismatch)
+    #: d993eee-qwen-idle                  3       (+0.8274)  (+0.0248) reject(output_mismatch)
     #: qwen-cross-20260731T235000Z        3      (-0.6423)  (-0.0193) reject(output_mismatch)
     #: full-qwen-head (run2)              3      (-0.1714)  (-0.0051) reject(output_mismatch)
     #: qwen-pinned-1                      3      (-0.2380)  (-0.0071) reject(high_invalid_rate)
     #: ===============================  ===  ============  =========  =========================
     #:
     #: Parenthesised deltas are recomputed from the ``per_repeat`` column: those
-    #: four runs short-circuit *above* the delta computation and are untouched
+    #: five runs short-circuit *above* the delta computation and are untouched
     #: by this threshold either way.  The five runs that do reach it split
     #: +0.341 against -0.060 and below -- a gap of a factor of five to the bar
     #: in the promoting direction and of nearly one in the rejecting direction,

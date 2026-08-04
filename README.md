@@ -119,24 +119,33 @@ training and artifact contract is validated.
 ```json
 {
   "promotion": {
+    "min_accepted_length_delta": 0.05,
     "min_acceptance_delta_pp": 1.0,
     "min_throughput_delta_pct": -2.0
   }
 }
 ```
 
-The two knobs are not symmetric, and the defaults are derived from the measured
+The knobs are not symmetric, and the defaults are derived from the measured
 dispersion of live gate runs rather than picked round.
 
-`min_acceptance_delta_pp` is the **promotion criterion**. Raising draft
-acceptance is the entire point of idle tuning, so a candidate that does not
-measurably improve acceptance is not worth shipping however good its clock
-looks. Acceptance comes from vLLM's `spec_decode` counters over a deterministic
-greedy replay of a frozen suite, so it carries no timing component: on job
-368670 the two arms produced byte-identical counters (1155 drafted, 730
-accepted, delta exactly 0.0 pp). The noise floor is therefore the counter
-quantum itself — one accepted token in ~1155, or 0.087 pp. The 1.0 pp default is
-about twelve accepted tokens, a ~2% relative lift in acceptance.
+`min_accepted_length_delta` is the **promotion criterion**. It measures mean
+accepted length in tokens per verifier step (`1 + accepted_tokens / num_drafts`),
+which is directly proportional to throughput at fixed step cost. Unlike the
+acceptance rate (`(mean_accepted_length - 1) / k`), it does not divide by the
+draft depth and is comparable across different `k` values. The 0.05 default is
+the old 1.0 pp bar re-expressed at `k=5`, so no archived rejection can flip to
+a promotion. Acceptance comes from vLLM's `spec_decode` counters over a
+deterministic greedy replay of a frozen suite, so it carries no timing
+component: on job 368670 the two arms produced byte-identical counters (1155
+drafted, 730 accepted, delta exactly 0.0 pp). The noise floor is therefore the
+counter quantum itself, making the 0.05 bar approximately a 2% relative lift in
+accepted length.
+
+`min_acceptance_delta_pp` is **recorded, not gated**. The acceptance-rate delta
+is still computed and published for backward compatibility, but it carries the
+draft depth in its denominator and cannot be compared across depths, so it no
+longer drives promotion decisions.
 
 `min_throughput_delta_pct` is a **regression guard**, and is negative on
 purpose: it asks only that the candidate not be visibly slower. The gate

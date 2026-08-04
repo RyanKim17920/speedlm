@@ -356,14 +356,19 @@ payload is exactly `Decision.to_dict()` (`src/speedlm/gate/decide.py:256-298`).
 It refuses to persist when `num_repeats != len(per_repeat)` (`:120-125`).
 
 Top-level keys include `verdict`, `reason`, `acceptance_delta_pp`,
-`throughput_statistic`, `throughput_delta_pct`, `prometheus_throughput_delta_pct`,
-`min_acceptance_delta_pp`, `min_throughput_delta_pct`, `num_repeats`,
-`warmup_repeats`, `per_repeat[]`, the stock/candidate acceptance means and
-stdevs, and the output-divergence summary.
+`accepted_length_delta`, `throughput_statistic`, `throughput_delta_pct`,
+`prometheus_throughput_delta_pct`, `min_acceptance_delta_pp`,
+`min_accepted_length_delta`, `min_throughput_delta_pct`, `num_repeats`,
+`warmup_repeats`, `per_repeat[]`, the acceptance criterion
+(`acceptance_criterion`), the stock/candidate acceptance means and stdevs,
+the stock/candidate accepted-length means and stdevs, and the output-divergence
+summary. The gate promotes on `accepted_length_delta >= min_accepted_length_delta`
+(not on `acceptance_delta_pp`; see `GATING_ACCEPTANCE_CRITERION` in
+`src/speedlm/gate/decide.py`).
 
 `per_repeat[]` rows (`decide.py:269-280`): `repeat_index, stock_tok_per_sec,
 candidate_tok_per_sec, stock_acceptance_rate, candidate_acceptance_rate,
-invalid_rate, output_mismatches`.
+invalid_rate, output_mismatches, stock_accepted_length, candidate_accepted_length`.
 `output_divergences[]` rows (`:140-149`): `context_hash, repeat_index,
 first_divergence_index, basis` (`"token"` or `"character"`, `:112-113`),
 `stock_length, candidate_length, early`.

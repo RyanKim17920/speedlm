@@ -185,7 +185,10 @@ def _failure_diagnosis(result: Mapping[str, object]) -> str:
 
 # Verdicts reached after computing both deltas, i.e. the gate ran the whole
 # comparison and judged it against the thresholds.  These are the only reasons
-# for which `acceptance_delta_pp` and `throughput_delta_pct` are populated.
+# for which `acceptance_delta_pp`, `accepted_length_delta`, and
+# `throughput_delta_pct` are populated.  The gate now decides on
+# `accepted_length_delta` against `min_accepted_length_delta`; the rate
+# delta is still recorded but no longer gates.
 DELTA_REASONS = frozenset(
     {
         "both_thresholds_met",
@@ -508,7 +511,9 @@ def _assert_gate_measured_something(decision: JsonObject) -> None:
     assert num_repeats > 0, decision
     if reason in DELTA_REASONS:
         assert decision.get("acceptance_delta_pp") is not None, decision
+        assert decision.get("accepted_length_delta") is not None, decision
         assert decision.get("throughput_delta_pct") is not None, decision
+        assert decision.get("acceptance_criterion") == "mean_accepted_length_delta", decision
     else:
         # Short-circuited above the delta computation.  Requiring the deltas
         # here would be unsatisfiable, so require the evidence that actually
@@ -546,6 +551,11 @@ def _assert_gate_measured_something(decision: JsonObject) -> None:
     ]
     assert all(isinstance(v, (int, float)) for v in acceptances), decision
     assert any(v > 0.0 for v in acceptances if isinstance(v, (int, float))), decision
+    # The gating criterion is mean accepted length, not acceptance rate.
+    # Assert that its per-arm means are populated and > 1.0 (the floor).
+    for field in ("stock_avg_accepted_length", "candidate_avg_accepted_length"):
+        value = decision.get(field)
+        assert isinstance(value, (int, float)) and value > 1.0, decision
 
 
 #: What `Eagle3Converter._build_eagle3_speculator_config` hardcodes into every
