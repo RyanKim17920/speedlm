@@ -786,6 +786,35 @@ def test_the_decay_lands_in_the_manifest_beside_the_reduction(
     assert backend.describe().training_params["ttt_step_loss_decay"] == 0.8
 
 
+@pytest.mark.parametrize("enabled", [False, True])
+def test_the_dilation_flag_is_explicit_and_recorded_in_the_manifest(
+    tmp_path: Path,
+    enabled: bool,
+) -> None:
+    pipeline = replace(
+        _pipeline(tmp_path),
+        target_layer_ids=(3, 9, 15),
+        dilate_loss_mask_span_starts=enabled,
+    )
+    traces = tmp_path / "traces.jsonl"
+    traces.write_text(
+        json.dumps({"messages": [{"role": "assistant", "content": "ok"}]}) + "\n",
+        encoding="utf-8",
+    )
+
+    backend = Eagle3Backend.from_speculators(pipeline, trace_source=traces)
+
+    assert SpeculatorsPipelineConfig(
+        prepared_validator_script=tmp_path / "validate.py",
+        verifier_model="v",
+        warm_start_model="w",
+    ).dilate_loss_mask_span_starts is False
+    assert (
+        backend.describe().training_params["dilate_loss_mask_span_starts"]
+        is enabled
+    )
+
+
 @pytest.mark.parametrize("value", [0.0, -0.5, 1.5, True, None, [0.7]])
 def test_the_trainer_refuses_a_bad_decay_rather_than_clamping(value: object) -> None:
     """A clamp would turn a config mistake into a quietly different run.

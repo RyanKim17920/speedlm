@@ -1038,6 +1038,48 @@ def _authorship_renderer(
     return renderer, runner, state
 
 
+def test_enabled_loss_mask_dilation_runs_between_prepare_and_validation(
+    tmp_path: Path,
+) -> None:
+    """The post-pass must use the training venv and precede validation."""
+    renderer, runner, _ = _authorship_renderer(
+        tmp_path, dilate_loss_mask_span_starts=True
+    )
+    work = tmp_path / "work"
+    work.mkdir()
+    snapshot = _snapshot(work / "snap.jsonl", [_generated(0)])
+
+    renderer.render_rows(  # type: ignore[attr-defined]
+        snapshot,
+        work / "training-rows",
+        timeout_seconds=60.0,
+        should_abort=lambda: False,
+    )
+
+    stage_calls = [
+        call
+        for call in runner.run_calls
+        if Path(call[1]).name
+        in {"prepare_data.py", "dilate_prepared_loss_mask.py", "check.py"}
+    ]
+    assert [Path(call[1]).name for call in stage_calls] == [
+        "prepare_data.py",
+        "dilate_prepared_loss_mask.py",
+        "check.py",
+    ]
+    assert stage_calls[1] == (
+        str(tmp_path / "python"),
+        str(
+            Path(__file__).parents[1]
+            / "src"
+            / "speedlm"
+            / "training"
+            / "dilate_prepared_loss_mask.py"
+        ),
+        str(work / "training-rows"),
+    )
+
+
 def test_the_authorship_filter_runs_in_the_real_render_stage(
     tmp_path: Path,
 ) -> None:

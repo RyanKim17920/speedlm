@@ -120,6 +120,9 @@ DEFAULT_SPECULATORS_REPO = Path(
 DEFAULT_SPECULATORS_PYTHON = Path(
     os.environ.get("SPEEDLM_TRAINING_PYTHON", sys.executable)
 )
+LOSS_MASK_DILATION_SCRIPT: Final = (
+    Path(__file__).resolve().parents[1] / "dilate_prepared_loss_mask.py"
+)
 _SPECULATORS_DATA_NAME = "speculators-conversations.jsonl"
 
 
@@ -212,6 +215,7 @@ _TRANSIENT_NAMES: Final = (
 #: same string identifies a stage on its success path and its failure path.
 _EXTRACTION_STAGE: Final = "hidden-state-extraction"
 _ROW_RENDER_STAGE: Final = "training-row-rendering"
+_MASK_DILATION_STAGE: Final = "loss-mask-left-dilation"
 _TRAINING_STAGE: Final = "training"
 _QUOTA_STAGE: Final = "scratch-quota"
 _SPECULATORS_ROLES = {
@@ -519,6 +523,13 @@ class SpeculatorsPipelineConfig:
     #: offline corpus has a named opt-in rather than a corpus the authorship
     #: filter empties with no way back.
     trust_untagged_assistant_messages: bool = False
+    #: Extend every prepared loss-mask span one position to the left.
+    #:
+    #: Speculators shifts ``loss_mask`` when it constructs labels, so the mask
+    #: position immediately before assistant content supervises its first token.
+    #: Off by default because this changes the training objective; operators
+    #: must opt in explicitly and the value is recorded in the draft manifest.
+    dilate_loss_mask_span_starts: bool = False
     #: Fail the cycle when the final epoch does not improve on the first.
     #:
     #: Measured on :data:`ACCEPTANCE_METRIC` and not on the loss, because the
@@ -621,6 +632,8 @@ class SpeculatorsPipelineConfig:
             raise ValueError("require_accuracy_improvement must be a bool")
         if not isinstance(self.trust_untagged_assistant_messages, bool):
             raise ValueError("trust_untagged_assistant_messages must be a bool")
+        if not isinstance(self.dilate_loss_mask_span_starts, bool):
+            raise ValueError("dilate_loss_mask_span_starts must be a bool")
         if not isinstance(self.mask_policy, MaskPolicy):
             raise ValueError("mask_policy must be a MaskPolicy")
         if self.mask_policy is not MaskPolicy.ALL_ASSISTANT_TURNS:
@@ -953,6 +966,20 @@ class SpeculatorsTrainingRowRenderer:
             )
             persist_stage_output(scratch, _ROW_RENDER_STAGE, prepare)
             _success("Speculators prepare", prepare)
+            if self.config.dilate_loss_mask_span_starts:
+                dilation = self.runner.run(
+                    [
+                        str(self.config.training_python),
+                        str(LOSS_MASK_DILATION_SCRIPT),
+                        str(destination),
+                    ],
+                    cwd=self.config.speculators_repo,
+                    env=_environment(self.config),
+                    timeout_seconds=timeout_seconds,
+                    should_abort=guard,
+                )
+                persist_stage_output(scratch, _MASK_DILATION_STAGE, dilation)
+                _success("prepared loss-mask dilation", dilation)
             checked = self.runner.run(
                 [
                     str(self.config.training_python),
@@ -1558,6 +1585,9 @@ class Eagle3Backend(Eagle3Adapter):
                 # how the summed terms were weighted.  Recorded here so a gate
                 # result can be attributed to the weighting that produced it.
                 "ttt_step_loss_decay": pipeline.ttt_step_loss_decay,
+                "dilate_loss_mask_span_starts": (
+                    pipeline.dilate_loss_mask_span_starts
+                ),
             },
             timeouts=pipeline.timeouts,
             scratch_quota_bytes=pipeline.scratch_quota_bytes,
