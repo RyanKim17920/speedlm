@@ -1,7 +1,7 @@
 # The e2e harness
 
 **Status:** descriptive. Everything below was read out of the sources at commit
-`eabc533` and, where marked *(measured)*, executed. This documents what the
+`1c8f5c0` and, where marked *(measured)*, executed. This documents what the
 harness **is**, not what it should be.
 
 **Audience:** anyone about to burn GPU hours on a `tests/e2e/` run, or trying to
@@ -9,7 +9,7 @@ read the artifacts one left behind.
 
 **Citation convention.** Every technical claim carries a `file:line` reference
 relative to `/admin/home/ryan.kim/speedlm-fr` unless the path is absolute. Line
-numbers are pinned to commit `eabc533` and will drift. Anything not confirmed
+numbers are pinned to commit `1c8f5c0` and will drift. Anything not confirmed
 against a source or a measurement is labelled **[unverified]**. Keep that
 discipline when editing this file — a confidently wrong line here costs a GPU
 job.
@@ -62,15 +62,15 @@ under the vLLM venv. The idle-tuning flavor runs under the **project** venv —
 see `/data/ryan.kim/speedlm-runs/qwen-cross-20260801T063000Z/job.sbatch`, whose
 last line is `"$repo/.venv/bin/python" -m pytest`. That works because
 `test_live_idle_tuning.py` never imports torch in-process; it drives the gateway
-over HTTP and spawns the engine as a subprocess (`tests/e2e/test_live_idle_tuning.py:573`).
+over HTTP and spawns the engine as a subprocess (`tests/e2e/test_live_idle_tuning.py:867`).
 
 Which flavor needs which:
 
 | flavor | test module | interpreter | why |
 |---|---|---|---|
 | idle tuning | `test_live_idle_tuning.py` | project `.venv` | pure HTTP driver, no in-process torch |
-| activation capture | `test_serving_activation_capture.py` | vLLM venv | imports `torch` and `safetensors.safe_open`; without them its `pytestmark` skipif (`:63-64`) turns the file into a skip |
-| draft hot-swap | `test_serving_draft_hot_swap.py` | vLLM venv | parses safetensors headers by hand (`:400-408`) so it needs no in-process torch, but is kept on the vLLM venv by convention and to match the engine it drives |
+| activation capture | `test_serving_activation_capture.py` | vLLM venv | imports `torch` and `safetensors.safe_open`; without them its `pytestmark` skipif (`:142-143`) turns the file into a skip |
+| draft hot-swap | `test_serving_draft_hot_swap.py` | vLLM venv | parses safetensors headers by hand (`:421-429`) so it needs no in-process torch, but is kept on the vLLM venv by convention and to match the engine it drives |
 
 ---
 
@@ -83,14 +83,14 @@ export SPEEDLM_E2E_DRAFT_HOT_SWAP=1
 export SPEEDLM_E2E_ARTIFACT_DIR=/data/ryan.kim/speedlm-runs/<run>/results
 export PYTHONPATH=<repo>/src:/data/ryan.kim/pylibs/pytest
 
-"$vllm_env/bin/python" -m pytest -o addopts='' -p no:cacheprovider -q -s \
+"$vllm_env/bin/python" -m pytest -o addopts='' -p no:cacheprovider -q -ra -s \
     tests/e2e/test_serving_draft_hot_swap.py
 ```
 
 **`--gres=gpu:1` is genuinely required.** Not because the tests detect a GPU
 gracefully, but because they *assert*:
-`test_serving_activation_capture.py:95,98`, `test_capture_harness_matrix.py:53,56`,
-`test_agent_harness.py:110,111`, `test_model_matrix.py:172` all hard-assert
+`test_serving_activation_capture.py:456,459`, `test_capture_harness_matrix.py:70,73`,
+`test_agent_harness.py:126,127`, `test_model_matrix.py:189` all hard-assert
 `SLURM_JOB_ID` / `CUDA_VISIBLE_DEVICES` after the skip gate. Outside an
 allocation these **fail**, they do not skip.
 
@@ -110,7 +110,7 @@ What the override actually does is drop `-ra` — and `-ra` is the flag
 
 ```
 # without -o addopts=''
-SKIPPED [1] tests/e2e/test_serving_draft_hot_swap.py:116: set SPEEDLM_E2E_DRAFT_HOT_SWAP=1 in an allocated GPU job
+SKIPPED [1] tests/e2e/test_serving_draft_hot_swap.py:137: set SPEEDLM_E2E_DRAFT_HOT_SWAP=1 in an allocated GPU job
 1 skipped in 0.44s
 
 # with -o addopts=''
@@ -118,10 +118,8 @@ SKIPPED [1] tests/e2e/test_serving_draft_hot_swap.py:116: set SPEEDLM_E2E_DRAFT_
 ```
 
 The second form is how a misconfigured GPU job silently reports "1 skipped" with
-no reason attached. Every emitted `job.sbatch` currently uses `-o addopts=''`;
-that is the established convention and is safe when a single named file is run,
-but if you are debugging why a run did nothing, **drop it first** and the reason
-appears.
+no reason attached. Snapshot jobs retain `-o addopts=''` but now add `-ra`
+explicitly, so a gate skip always prints its reason in the Slurm log.
 
 ---
 
@@ -134,46 +132,46 @@ All gates compare with `!= "1"` and call `pytest.skip`. Only the literal string
 
 | variable | gate site | enables |
 |---|---|---|
-| `SPEEDLM_E2E_IDLE_TUNING` | `test_live_idle_tuning.py:163` | idle-tuning full cycle |
-| `SPEEDLM_E2E_ACTIVATION_CAPTURE` | `test_serving_activation_capture.py:93` | stage-0 activation capture |
-| `SPEEDLM_E2E_DRAFT_HOT_SWAP` | `test_serving_draft_hot_swap.py:115` | live drafter hot-swap |
-| `SPEEDLM_E2E` | `test_live_vllm.py:25`, `test_proxy_overhead.py:60`, `test_token_fidelity.py:27`, `test_model_matrix.py:163`, `test_capture_harness_matrix.py:51`, `test_agent_harness.py:108` | the six generic live tests |
+| `SPEEDLM_E2E_IDLE_TUNING` | `test_live_idle_tuning.py:223` | idle-tuning full cycle |
+| `SPEEDLM_E2E_ACTIVATION_CAPTURE` | `test_serving_activation_capture.py:454` | stage-0 activation capture |
+| `SPEEDLM_E2E_DRAFT_HOT_SWAP` | `test_serving_draft_hot_swap.py:136` | live drafter hot-swap |
+| `SPEEDLM_E2E` | `test_live_vllm.py:60`, `test_proxy_overhead.py:130`, `test_token_fidelity.py:44`, `test_model_matrix.py:180`, `test_capture_harness_matrix.py:68`, `test_agent_harness.py:124` | the six generic live tests |
 
 Two caveats on the generic `SPEEDLM_E2E` group:
 
 - `test_model_matrix.py` additionally **hard-asserts** `SPEEDLM_MATRIX_CELL` is
-  set and is a known cell (`:165-171`) — an assert, not a skip.
+  set and is a known cell (`:182-188`) — an assert, not a skip.
 - `test_capture_harness_matrix.py` and `test_agent_harness.py` gate on
   `SPEEDLM_E2E=1` but read **no** `SPEEDLM_E2E_*` config variables at all. Their
-  knobs are `SPEEDLM_CAPTURE_*` (`:62,64,75,102,392,606,655,686,748`) and
-  `SPEEDLM_AGENT_*` (`:196,198,207,287,389,423,448,938,946,1010`). Exporting
+  knobs are `SPEEDLM_CAPTURE_*` (`:79,81,92,119,409,623,672,703,765`) and
+  `SPEEDLM_AGENT_*` (`:212,214,223,303,405,439,464,954,962,1026`). Exporting
   `SPEEDLM_E2E_MODEL` and friends does nothing for them.
 
 ### 4.2 Configuration variables
 
 | variable | read at | default | controls |
 |---|---|---|---|
-| `SPEEDLM_E2E_ARTIFACT_DIR` | `test_token_fidelity.py:218`, `test_proxy_overhead.py:537`, `test_live_vllm.py:306`, `test_serving_activation_capture.py:109`, `test_serving_draft_hot_swap.py:131`, `test_live_idle_tuning.py:167` | **none — hard failure if unset** | root under which each stage creates its subdirectory. The shell runners default it to `$repo/log_artifacts` (`run_slurm_e2e.sh:5`), Python does not. |
-| `SPEEDLM_E2E_READY_TIMEOUT` | `test_live_vllm.py:58` / `test_serving_activation_capture.py:125` / `test_serving_draft_hot_swap.py:178` / `test_live_idle_tuning.py:527` | **`360` / `360` / `900` / `900`** — four sites, three defaults | seconds to wait for engine readiness. `float()`. |
-| `SPEEDLM_E2E_TUNING_TIMEOUT` | `test_live_idle_tuning.py:528` | `7200` | seconds for the tuning run itself |
-| `SPEEDLM_E2E_REQUEST_TIMEOUT` | `test_live_idle_tuning.py:529` | `1200` | per-HTTP-request timeout during seeding/chat |
-| `SPEEDLM_E2E_VLLM_ARGS` | `test_live_vllm.py:303`, `test_proxy_overhead.py:532`, `test_live_idle_tuning.py:214`, `test_token_fidelity.py:228` | `"[]"` everywhere **except** `test_token_fidelity.py`, which defaults to `["--max-model-len","4096","--gpu-memory-utilization","0.85","--enforce-eager"]` (`:230-236`) | extra `vllm serve` args. JSON array of strings; asserted list-of-str. |
-| `SPEEDLM_E2E_MODEL` | `test_live_vllm.py:301`, `test_proxy_overhead.py:530` | `"Qwen/Qwen3.5-2B"` / module `MODEL_DEFAULT` | model served |
-| `SPEEDLM_E2E_STAGE` | `test_live_vllm.py:302`, `test_proxy_overhead.py:531` | `"stage1-qwen"` / `"proxy-overhead"` | artifact subdirectory name |
-| `SPEEDLM_E2E_TUNING_CONFIG` | `test_live_idle_tuning.py:166` | **none — required, asserted `is_file()`** | the SpeedLM config JSON driving the run |
-| `SPEEDLM_E2E_TUNING_PROFILE` | `test_live_idle_tuning.py:168` | `None` | optional profile copied into the run |
-| `SPEEDLM_E2E_PROMPT_CORPUS` | `test_live_idle_tuning.py:57` | `None` → synthetic prompts | JSONL prompt corpus, see §7 |
-| `SPEEDLM_E2E_SEED_REQUESTS` | `test_live_idle_tuning.py:200` | `max(config.tuning.min_trace_records, config.tuning.min_corpus_records)` — derived from the config, not a literal (`:211`) | seed chat requests fired before tuning; must be `> 0` |
-| `SPEEDLM_E2E_ALLOW_UNMEASURED_GATE` | `test_live_idle_tuning.py:157` | unset → `False` | lets a gate decision that measured zero samples pass instead of failing (`:437`). **Module-level**, so `monkeypatch.setenv` cannot reach it. |
-| `SPEEDLM_E2E_VERIFIER_MODEL` | `test_serving_activation_capture.py:102`, `test_serving_draft_hot_swap.py:124` | **none — required** | verifier/target model |
-| `SPEEDLM_E2E_DRAFTER_MODEL` | `test_serving_activation_capture.py:105`, `test_serving_draft_hot_swap.py:127` | **none — required** | speculative drafter |
-| `SPEEDLM_E2E_DRAFTER_DIR` | `test_serving_draft_hot_swap.py:148` | resolve from `HF_HOME/hub/<slug>` | pins the drafter snapshot **directory**; validated by asserting `config.json` exists in it (`:150-153`) |
-| `SPEEDLM_E2E_VLLM_PYTHON` | `test_serving_activation_capture.py:78`, `test_serving_draft_hot_swap.py:82`, `src/speedlm/activation_capture/offline_extract.py:24` | `/admin/home/ryan.kim/speedlm/.preflight/venvs/vllm/bin/python` | interpreter for vLLM-venv subprocesses |
-| `SPEEDLM_E2E_PORT` | `test_serving_activation_capture.py:536,757`, `test_serving_draft_hot_swap.py:607` | an auto-assigned free port | engine port. `int()` — a non-numeric value raises `ValueError`, not a clean assertion. |
-| `SPEEDLM_E2E_PROMPT` | `test_serving_activation_capture.py:533,755`, `test_serving_draft_hot_swap.py:605` | `"The quick brown fox jumps over the lazy dog."` | the canary prompt |
-| `SPEEDLM_E2E_TARGET_LAYER_IDS` | `test_serving_activation_capture.py:140` | `[4, 12, 20]` (`:144`) | aux layer ids for offline extraction, cross-checked against the engine's actual aux layers (`:606`) |
-| `SPEEDLM_E2E_STRICT_VERDICT` | `test_serving_activation_capture.py:733` | `"1"` → strict | whether a FAIL comparison verdict fails the test. **Only the literal `"0"` disables**; empty string leaves strict on. |
-| `SPEEDLM_E2E_CAPTURE_METRICS` | `test_live_vllm.py:516` | unset → off | scrape acceptance metrics into `acceptance-metrics.txt` |
+| `SPEEDLM_E2E_ARTIFACT_DIR` | `test_token_fidelity.py:235`, `test_proxy_overhead.py:612`, `test_live_vllm.py:374`, `test_serving_activation_capture.py:470`, `test_serving_draft_hot_swap.py:152`, `test_live_idle_tuning.py:227` | **none — hard failure if unset** | root under which each stage creates its subdirectory. The shell runners default it to `$repo/log_artifacts` (`run_slurm_e2e.sh:5`), Python does not. |
+| `SPEEDLM_E2E_READY_TIMEOUT` | `test_live_vllm.py:93` / `test_serving_activation_capture.py:486` / `test_serving_draft_hot_swap.py:199` / `test_live_idle_tuning.py:821` | **`360` / `360` / `900` / `900`** — four sites, three defaults | seconds to wait for engine readiness. `float()`. |
+| `SPEEDLM_E2E_TUNING_TIMEOUT` | `test_live_idle_tuning.py:822` | `7200` | seconds for the tuning run itself |
+| `SPEEDLM_E2E_REQUEST_TIMEOUT` | `test_live_idle_tuning.py:823` | `1200` | per-HTTP-request timeout during seeding/chat |
+| `SPEEDLM_E2E_VLLM_ARGS` | `test_live_vllm.py:371`, `test_proxy_overhead.py:607`, `test_live_idle_tuning.py:274`, `test_token_fidelity.py:245` | `"[]"` everywhere **except** `test_token_fidelity.py`, which supplies the bounded defaults near `:245-255` | extra `vllm serve` args. JSON array of strings; asserted list-of-str. |
+| `SPEEDLM_E2E_MODEL` | `test_live_vllm.py:369`, `test_proxy_overhead.py:605` | `"Qwen/Qwen3.5-2B"` / module `MODEL_DEFAULT` | model served |
+| `SPEEDLM_E2E_STAGE` | `test_live_vllm.py:370`, `test_proxy_overhead.py:606` | `"stage1-qwen"` / `"proxy-overhead"` | artifact subdirectory name |
+| `SPEEDLM_E2E_TUNING_CONFIG` | `test_live_idle_tuning.py:226` | **none — required, asserted `is_file()`** | the SpeedLM config JSON driving the run |
+| `SPEEDLM_E2E_TUNING_PROFILE` | `test_live_idle_tuning.py:228` | `None` | optional profile copied into the run |
+| `SPEEDLM_E2E_PROMPT_CORPUS` | `test_live_idle_tuning.py:63` | `None` → synthetic prompts | JSONL prompt corpus, see §7 |
+| `SPEEDLM_E2E_SEED_REQUESTS` | `test_live_idle_tuning.py:260` | `max(config.tuning.min_trace_records, config.tuning.min_corpus_records)` — derived from the config, not a literal (`:271`) | seed chat requests fired before tuning; must be `> 0` |
+| `SPEEDLM_E2E_ALLOW_UNMEASURED_GATE` | `test_live_idle_tuning.py:217` | unset → `False` | lets a gate decision that measured zero samples pass instead of failing (`:507`). **Module-level**, so `monkeypatch.setenv` cannot reach it. |
+| `SPEEDLM_E2E_VERIFIER_MODEL` | `test_serving_activation_capture.py:463`, `test_serving_draft_hot_swap.py:145` | **none — required** | verifier/target model |
+| `SPEEDLM_E2E_DRAFTER_MODEL` | `test_serving_activation_capture.py:466`, `test_serving_draft_hot_swap.py:148` | **none — required** | speculative drafter |
+| `SPEEDLM_E2E_DRAFTER_DIR` | `test_serving_draft_hot_swap.py:169` | resolve from `HF_HOME/hub/<slug>` | pins the drafter snapshot **directory**; validated by asserting `config.json` exists in it (`:171-174`) |
+| `SPEEDLM_E2E_VLLM_PYTHON` | `test_serving_activation_capture.py:157`, `test_serving_draft_hot_swap.py:97`, `src/speedlm/activation_capture/offline_extract.py:25` | `/admin/home/ryan.kim/speedlm/.preflight/venvs/vllm/bin/python` | interpreter for vLLM-venv subprocesses |
+| `SPEEDLM_E2E_PORT` | `test_serving_activation_capture.py:1646,2145`, `test_serving_draft_hot_swap.py:640` | an auto-assigned free port | engine port. `int()` — a non-numeric value raises `ValueError`, not a clean assertion. |
+| `SPEEDLM_E2E_PROMPT` | `test_serving_activation_capture.py:1635,2141`, `test_serving_draft_hot_swap.py:638` | `"The quick brown fox jumps over the lazy dog."` | the canary prompt |
+| `SPEEDLM_E2E_TARGET_LAYER_IDS` | `test_serving_activation_capture.py:630` | derive from drafter declaration, model depth, and profile (`:642-671`) | aux layer ids for offline extraction, cross-checked against the engine's actual aux layers (`:1742-1748`) |
+| `SPEEDLM_E2E_STRICT_VERDICT` | `test_serving_activation_capture.py:2022` | `"1"` → strict | whether a FAIL comparison verdict fails the test. **Only the literal `"0"` disables**; empty string leaves strict on. |
+| `SPEEDLM_E2E_CAPTURE_METRICS` | `test_live_vllm.py:611` | unset → off | scrape acceptance metrics into `acceptance-metrics.txt` |
 
 ---
 
@@ -185,18 +183,18 @@ Each of these has cost real time. All six were re-verified against the sources.
 
 **Confirmed, and already fixed** in `tests/e2e/` — no module there uses
 `importorskip` any more; all nine declare `pytestmark`. The pattern is
-documented in-tree at `test_serving_draft_hot_swap.py:52-55` ("a module-level
+documented in-tree at `test_serving_draft_hot_swap.py:66-69` ("a module-level
 `importorskip` would make the whole file collect as zero tests on any
 interpreter without torch — a silent pass, not a skip") and
-`test_serving_activation_capture.py:47-50`.
+`test_serving_activation_capture.py:126-129`.
 
 The fix is a module-level `pytestmark` list combining the marker with a
-`skipif`, e.g. `test_serving_activation_capture.py:61-71`, so both tests always
+`skipif`, e.g. `test_serving_activation_capture.py:140-150`, so both tests always
 *collect* and are always *reported*.
 
 `pyproject.toml:53-64` records why `-ra` exists at all: this exact failure mode.
 `importorskip` **inside a function body** is fine and still used
-(`tests/test_draft_swap.py:1507`, `tests/test_training_rows.py:1509,1518`) —
+(`tests/test_draft_swap.py:1910`, `tests/test_training_rows.py:1509,1518`) —
 function scope does not abort collection.
 
 ### 5.2 The served model id is the resolved snapshot path, not the repo id
@@ -204,36 +202,36 @@ function scope does not abort collection.
 vLLM registers the model under its **resolved snapshot path**. Sending the
 friendly repo id gets a **404, not a 400** — so it reads like a routing bug, not
 a bad argument. The id is therefore always read back from `/v1/models` rather
-than assumed: `_get_served_model_id` at `test_serving_draft_hot_swap.py:251-267`
-(docstring `:253-257`), threaded as a keyword-only arg through every request
-(`:343,357`; call sites `:711,745,807,819`). A 404 is caught and re-raised with
-the actual served ids listed (`:367-375`). Same pattern in
-`test_serving_activation_capture.py:215-232,254-287`.
+than assumed: `_get_served_model_id` at `test_serving_draft_hot_swap.py:272-288`
+(docstring `:274-278`), threaded as a keyword-only arg through every request
+(`:364,378`; call sites `:762,819,882,894`). A 404 is caught and re-raised with
+the actual served ids listed (`:388-396`). Same pattern in
+`test_serving_activation_capture.py:740-757,779-821`.
 
 Related: the *drafter* must also be a resolved **directory**, not a repo id —
-`hot_swap_draft` takes a directory (`_resolve_drafter_dir`, `:140-168`).
+`hot_swap_draft` takes a directory (`_resolve_drafter_dir`, `:161-189`).
 
 ### 5.3 `--worker-extension-cls` needs a DOTTED path
 
 `pkg.mod.Class`, never `pkg.mod:Class`. vLLM resolves it with
 `resolve_obj_by_qualname`, which does `qualname.rsplit(".", 1)` then `getattr` —
 so the colon form tries to import `pkg` and look up an attribute literally named
-`mod:Class`. Constant and reasoning: `src/speedlm/tuner/composition.py:52-58`;
-test-side constant `test_serving_draft_hot_swap.py:85-87`, flag constructed at
-`:630-631`. Also noted at `src/speedlm/gateway/draft_swap.py:12-14` and
-`src/speedlm/activation_capture/hook.py:26,66`.
+`mod:Class`. Constant and reasoning: `src/speedlm/tuner/composition.py:65-71`;
+test-side constant `test_serving_draft_hot_swap.py:100-102`, flag constructed at
+`:663-664`. Also noted at `src/speedlm/gateway/draft_swap.py:12-14` and
+`src/speedlm/activation_capture/hook.py:26,94`.
 
 ### 5.4 `/collective_rpc` needs `VLLM_SERVER_DEV_MODE=1` and takes STRING args only
 
 vLLM only mounts `/collective_rpc` when `VLLM_SERVER_DEV_MODE` is truthy;
-without it **every RPC 404s** (`test_serving_draft_hot_swap.py:192-200`).
+without it **every RPC 404s** (`test_serving_draft_hot_swap.py:213-221`).
 Production sets it at `src/speedlm/cli.py:522` and
 `src/speedlm/gateway/vllm_http.py:110`, with an error message asserting it at
 `vllm_http.py:300`.
 
 Args are serialized to strings — enforced by `"args": [str(a) for a in args]`
-at `test_serving_draft_hot_swap.py:288,336`, mirrored in `vllm_http.py:189` and
-documented at `draft_swap.py:267-269`. Dev mode also mounts extra routes; the
+at `test_serving_draft_hot_swap.py:309,357`, mirrored in `vllm_http.py:189` and
+documented at `draft_swap.py:286-288`. Dev mode also mounts extra routes; the
 allowlist note is at `vllm_http.py:36` and the route list is under test at
 `tests/security/test_vllm_dev_routes.py:8`.
 
@@ -242,35 +240,35 @@ allowlist note is at `vllm_http.py:36` and the route list is under test at
 It appends the class to `worker_class.__bases__`. There is no instance
 construction, so **any state must be a class-level default plus lazy init**.
 
-`src/speedlm/gateway/draft_swap.py:271-275`: "vLLM never calls `__init__` on an
+`src/speedlm/gateway/draft_swap.py:290-294`: "vLLM never calls `__init__` on an
 extension — it appends the class to `worker_class.__bases__`. This class
 therefore holds no instance state at all; the attributes below are bare
 annotations (not assignments) so they do not appear in `dir()`" — annotations at
-`:278-281`. The lazy pattern itself lives in
-`src/speedlm/activation_capture/hook.py:78` with defaults at `:84-91` and
-`_ensure_init` / `_get_lock` / `_get_pending` at `:93,104,110`. The composite
-`CombinedWorkerExtension` (`draft_swap.py:738`) inherits it unchanged and
-explains why at `:750-756`.
+`:299-302`. The lazy pattern itself lives in
+`src/speedlm/activation_capture/hook.py:106` with defaults at `:112-132` and
+`_ensure_init` / `_get_lock` / `_get_pending` at `:134,145,151`. The composite
+`CombinedWorkerExtension` (`draft_swap.py:886`) inherits it unchanged and
+explains why at `:898-904`.
 
 ### 5.6 `finish_reason == "length"` is NORMAL
 
 It means the response hit `max_tokens`, which is ordinary serving behaviour on
 realistic prompts (ultrachat p95 ≈ 2751 chars) and still produces valid training
-traces. `test_live_idle_tuning.py:338-345` accepts both:
+traces. `test_live_idle_tuning.py:398-405` accepts both:
 `assert finish in ("stop", "length")`. No gate rejects on `"length"` —
 `finish_reason` is recorded verbatim in replay results
-(`src/speedlm/gate/replay.py:45-48,65,252,267,279`).
+(`src/speedlm/gate/replay.py:46-49,87,380,391,403`).
 
 The one place a specific value is demanded is the tool-calling harness, which
-requires `"tool_calls"` for tool-call traces (`test_agent_harness.py:898`); its
-non-tool branch only requires a non-empty string (`:900`).
+requires `"tool_calls"` for tool-call traces (`test_agent_harness.py:914`); its
+non-tool branch only requires a non-empty string (`:916`).
 
 ---
 
 ## 6. Reading the artifacts
 
 Run artifacts live under `<SPEEDLM_HOME>/runs` (`src/speedlm/storage.py:54-69`),
-with per-cycle directories `<runs>/<run_id>` (`src/speedlm/tuner/orchestrator.py:489`).
+with per-cycle directories `<runs>/<run_id>` (`src/speedlm/tuner/orchestrator.py:537`).
 
 ### `events.jsonl` — `<runs>/events.jsonl`
 
@@ -293,8 +291,8 @@ each phase took. A `recovery: true` record means the process restarted mid-cycle
 
 ### `scheduler.json` — `<runs>/scheduler.json`
 
-Written by `TunerService._write_scheduler_status` (`src/speedlm/tuner/service.py:761-768`,
-payload `:716-759`). Write failures are logged, not raised (`:767-768`) — so an
+Written by `TunerService._write_scheduler_status` (`src/speedlm/tuner/service.py:872-879`,
+payload `:820-870`). Write failures are logged, not raised (`:878-879`) — so an
 absent or stale file is not itself an error.
 
 Fields: `schema_version` (=1), `enabled`, `lifecycle`, `serving_unrestored`,
@@ -304,8 +302,8 @@ Fields: `schema_version` (=1), `enabled`, `lifecycle`, `serving_unrestored`,
 (`{outcome, artifact_id, error, decision_path, val_loss, serving_restored,
 gate_acceptance}`), `last_error`.
 Watermark sub-fields: `count, tokens, oldest, newest, unknown_token_records`
-(`:120-124`). The reader treats the file as unusable if `enabled` is not a bool
-or `lifecycle` is missing (`src/speedlm/report.py:547-553`). `serving_unrestored`
+(`:138-142`). The reader treats the file as unusable if `enabled` is not a bool
+or `lifecycle` is missing (`src/speedlm/report.py:549-556`). `serving_unrestored`
 is read back as `bool | None`, where `None` means the record predates the field —
 never `False`, which would let an old record reassure a reader about a condition
 it never checked. `speedlm status` prints a `SERVING : NOT RESTORED` line when it
@@ -351,9 +349,9 @@ banners.
 ### `decision.json` — `<run_dir>/decision.json`
 
 The promotion verdict. Written by `write_decision`
-(`src/speedlm/tuner/orchestrator.py:106-132`, called from `:763-779` via `:615`);
-payload is exactly `Decision.to_dict()` (`src/speedlm/gate/decide.py:256-298`).
-It refuses to persist when `num_repeats != len(per_repeat)` (`:120-125`).
+(`src/speedlm/tuner/orchestrator.py:121-147`, called from `:817-833` via `:664`);
+payload is exactly `Decision.to_dict()` (`src/speedlm/gate/decide.py:904-1025`).
+It refuses to persist when `num_repeats != len(per_repeat)` (`:135-140`).
 
 Top-level keys include `verdict`, `reason`, `acceptance_delta_pp`,
 `accepted_length_delta`, `throughput_statistic`, `throughput_delta_pct`,
@@ -366,30 +364,30 @@ summary. The gate promotes on `accepted_length_delta >= min_accepted_length_delt
 (not on `acceptance_delta_pp`; see `GATING_ACCEPTANCE_CRITERION` in
 `src/speedlm/gate/decide.py`).
 
-`per_repeat[]` rows (`decide.py:269-280`): `repeat_index, stock_tok_per_sec,
+`per_repeat[]` rows (`decide.py:917-930`): `repeat_index, stock_tok_per_sec,
 candidate_tok_per_sec, stock_acceptance_rate, candidate_acceptance_rate,
 invalid_rate, output_mismatches, stock_accepted_length, candidate_accepted_length`.
-`output_divergences[]` rows (`:140-149`): `context_hash, repeat_index,
-first_divergence_index, basis` (`"token"` or `"character"`, `:112-113`),
+`output_divergences[]` rows (`:418-427`): `context_hash, repeat_index,
+first_divergence_index, basis` (`"token"` or `"character"`, `:386-387`),
 `stock_length, candidate_length, early`.
 
 **Which number gates:** `throughput_delta_pct`. `prometheus_throughput_delta_pct`
-is explicitly diagnostic and **never gates** (`decide.py:181-185,207-212`) — do
+is explicitly diagnostic and **never gates** (`decide.py:487-491,513-518`) — do
 not quote it as the result.
 
 ### `gate-metrics/*.prom.gz` — `<run_dir>/gate-metrics/`
 
-Written by `write_metrics_bodies` (`src/speedlm/tuner/orchestrator.py:135-176`,
-called at `:776`). Each file is a **verbatim Prometheus text exposition body**,
+Written by `write_metrics_bodies` (`src/speedlm/tuner/orchestrator.py:150-191`,
+called at `:830`). Each file is a **verbatim Prometheus text exposition body**,
 gzipped with `mtime=0` for reproducibility, one file per scrape label
-(`:165-170`). Labels must match `^[A-Za-z0-9][A-Za-z0-9._-]*$` or the write is
-refused (`:39,161-164`).
+(`:180-185`). Labels must match `^[A-Za-z0-9][A-Za-z0-9._-]*$` or the write is
+refused (`:54,176-179`).
 
-Labels emitted by the gate runner (`src/speedlm/gate/runner.py:618-632`):
+Labels emitted by the gate runner (`src/speedlm/gate/runner.py:1086-1109`):
 `<arm>-before`, `<arm>-after-repeat-<i>` for every repeat but the last, and
 `<arm>-after` for the final one, where arm ∈ {stock, candidate}. The raw
 exposition is kept because acceptance is a **counter delta** and the reported
-rates must stay reconcilable (`runner.py:407-411`). The metrics of interest are
+rates must stay reconcilable (`runner.py:748-752`). The metrics of interest are
 vLLM's `vllm:spec_decode_*` counters plus decode throughput.
 
 ```bash
@@ -399,21 +397,21 @@ zcat <run_dir>/gate-metrics/candidate-after.prom.gz | rg 'spec_decode'
 ### `result.json` (hot-swap) — present keys tell you the phase reached
 
 `tests/e2e/test_serving_draft_hot_swap.py` writes it in a **`finally`** block
-(`:834-837`) into `<SPEEDLM_E2E_ARTIFACT_DIR>/draft-hot-swap-<UTC ts>/result.json`
-(`:186-188`), so the file exists even on failure. Read it by asking which keys
+(`:923-926`) into `<SPEEDLM_E2E_ARTIFACT_DIR>/draft-hot-swap-<UTC ts>/result.json`
+(`:207-209`), so the file exists even on failure. Read it by asking which keys
 are *present*:
 
 | key | written at | means it got past |
 |---|---|---|
-| `verifier`, `drafter`, `drafter_dir`, `worker_extension_cls` | `:653-658` | process launch only — nothing verified |
-| `served_model_id` | `:663` | engine reached `/health` and `/v1/models` answered |
-| `injected_rpc_calls` | `:670` | phase 1: injection log line parsed (assertions on it are `:671-678`) |
-| `draft_info_before` | `:695-699` | phase 2: real drafter reachable with non-empty shapes |
-| `null_swap` | `:728` | phase 3b: null swap succeeded and parameter count matched (`:722-727`) |
-| `canary_tokens` | `:756` | phase 4 and the phase-3c token-identity check |
-| `post_swap_spec_metrics` | `:774-780` | phase 6: spec-decode counters advanced |
-| `incompatible_rejection_body` | `:789` | phase 5: the bad swap was rejected non-200 (`:786-788`) |
-| `capture_meta` | `:824` | phase 7: capture flushed and artifacts validated (`:823`) |
+| `verifier`, `drafter`, `drafter_dir`, `worker_extension_cls` | `:686-691` | process launch only — nothing verified |
+| `served_model_id` | `:696` | engine reached `/health` and `/v1/models` answered |
+| `injected_rpc_calls` | `:703` | phase 1: injection log line parsed (assertions on it are `:704-711`) |
+| `draft_info_before` | `:736-741` | phase 2: real drafter reachable with non-empty shapes |
+| `null_swap` | `:789` | phase 3b: null swap succeeded and parameter count matched (`:782-788`) |
+| `canary_tokens` | `:830` | phase 4 and the phase-3c token-identity check |
+| `post_swap_spec_metrics` | `:848-854` | phase 6: spec-decode counters advanced |
+| `incompatible_rejection_body` | `:863` | phase 5: the bad swap was rejected non-200 (`:860-862`) |
+| `capture_meta` | `:899` | phase 7: capture flushed and artifacts validated (`:898`) |
 
 Diagnostic rules: no `served_model_id` ⇒ never became ready. `null_swap` present
 but `canary_tokens` absent ⇒ died in the meta-device or token-identity check.
@@ -446,8 +444,8 @@ messages; drop first-user messages over 4096 chars (the harness caps `max_tokens
 at 512, `:13-17`); order-preserving exact-duplicate dedup.
 
 Wired in via `SPEEDLM_E2E_PROMPT_CORPUS`, loaded by
-`_load_prompt_corpus` (`test_live_idle_tuning.py:57`), which asserts `is_file()`
-(`:61`) and parses JSONL objects with a `messages` list. Unset ⇒ the test falls
+`_load_prompt_corpus` (`test_live_idle_tuning.py:63`), which asserts `is_file()`
+(`:67`) and parses JSONL objects with a `messages` list. Unset ⇒ the test falls
 back to synthetic prompts.
 
 Note the **default differs by consumer**: `tests/simulation/corpus.py:32` hard-codes
@@ -517,14 +515,24 @@ the snapshot. *(measured: the gate passes with `PYTHONPATH` set and correctly
 fails when it is dropped.)*
 
 Subprocesses are covered too — every engine spawn builds its environment with
-`os.environ.copy()` (`test_serving_draft_hot_swap.py:198`,
-`test_serving_activation_capture.py:162`, `test_live_idle_tuning.py:565`), so the
+`os.environ.copy()` (`test_serving_draft_hot_swap.py:219`,
+`test_serving_activation_capture.py:687`, `test_live_idle_tuning.py:859`), so the
 vLLM worker that loads `--worker-extension-cls speedlm...` inherits `PYTHONPATH`
 and resolves the extension from the snapshot as well.
 
 Snapshots are ~2.5 MB, named for the full sha, and reused across runs of the same
 commit. **`git archive` serializes the commit only** — uncommitted local edits are
-not included, and the script warns when the tree is dirty.
+not included. The launcher records `source_tree_dirty_at_generation` both in
+`job.sbatch` and the run-level `snapshot-provenance.txt`, as well as warning on
+stderr, so a snapshot result cannot be mistaken for excluded working-tree work.
+
+For idle tuning, the launcher derives `SPEEDLM_E2E_TUNING_TIMEOUT` from the
+requested Slurm wall time with a 15-minute margin; `--tuning-timeout` can
+override it only with a positive value below the wall time. Both deadlines are
+printed by the generated job. Its preamble also clears inherited result-relaxing
+switches (`SPEEDLM_E2E_ALLOW_UNMEASURED_GATE`,
+`SPEEDLM_E2E_STRICT_VERDICT`, `SPEEDLM_E2E_HF_REFERENCE`, and
+`VLLM_USE_V2_MODEL_RUNNER`) before applying explicit launcher options.
 
 ---
 
@@ -550,12 +558,12 @@ promotion arithmetic, artifact publication, pointer promotion and the persisted
 
 > **It models arithmetic, not physics.** Acceptance and latency are *dialled in
 > rather than emergent* (`tests/simulation/engine.py:45-48`): defaults
-> `acceptance_rate=0.40`, `seconds_per_request=0.004` (`:65-72`). A simulation
+> `acceptance_rate=0.40`, `seconds_per_request=0.004` (`:72-79`). A simulation
 > that had to actually speculate in order to produce a 10 pp acceptance lift
 > would be testing the simulator instead of the gate. **It therefore never
 > validates the speedup.**
 
-The explicit boundaries (`engine.py:143-162`):
+The explicit boundaries (`engine.py:169-192`):
 
 - **No tokenizer.** The token stream is synthetic and divergence indices are
   exact by construction, so it cannot catch a real tokenisation mismatch.

@@ -37,8 +37,8 @@
 # GPU if `speedlm.__file__` does not live under the snapshot.
 #
 # Subprocesses are covered too: every engine spawn in the e2e tests builds its
-# environment with `os.environ.copy()` (test_serving_draft_hot_swap.py:198,
-# test_serving_activation_capture.py:162, test_live_idle_tuning.py:565), so the
+# environment with `os.environ.copy()` (test_serving_draft_hot_swap.py:219,
+# test_serving_activation_capture.py:687, test_live_idle_tuning.py:859), so the
 # vLLM worker that loads `--worker-extension-cls speedlm...` inherits PYTHONPATH
 # and resolves the extension from the snapshot as well.
 #
@@ -80,7 +80,11 @@ Optional:
   --commit REF          commit/ref to snapshot            (default: HEAD)
   --run-name NAME       run directory name under
                         /data/ryan.kim/speedlm-runs       (default: <flavor>-snap-<UTC>)
+  --run-root PATH       parent directory for run artifacts
+                        (default: /data/ryan.kim/speedlm-runs)
   --time HH:MM:SS       SBATCH --time                     (default: per flavor)
+  --tuning-timeout SEC  SPEEDLM_E2E_TUNING_TIMEOUT       (idle-tuning only;
+                        default: wall time minus 15 minutes)
   --partition P         SBATCH --partition                (default: n)
   --cpus N              SBATCH --cpus-per-task            (default: 16)
   --tuning-config PATH  SPEEDLM_E2E_TUNING_CONFIG         (idle-tuning only, required)
@@ -157,6 +161,7 @@ flavor=""
 commit_ref="HEAD"
 run_name=""
 sbatch_time=""
+tuning_timeout=""
 partition="n"
 cpus=16
 tuning_config=""
@@ -183,7 +188,9 @@ while [[ $# -gt 0 ]]; do
         --flavor)         flavor="$2"; shift 2 ;;
         --commit)         commit_ref="$2"; shift 2 ;;
         --run-name)       run_name="$2"; shift 2 ;;
+        --run-root)       RUN_ROOT="$2"; shift 2 ;;
         --time)           sbatch_time="$2"; shift 2 ;;
+        --tuning-timeout) tuning_timeout="$2"; shift 2 ;;
         --partition)      partition="$2"; shift 2 ;;
         --cpus)           cpus="$2"; shift 2 ;;
         --tuning-config)  tuning_config="$2"; shift 2 ;;
@@ -257,7 +264,7 @@ case "$flavor" in
         default_time="12:00:00"
         [[ -n "$tuning_config" ]] || {
             echo "error: --tuning-config is required for --flavor idle-tuning" >&2
-            echo "       (test_live_idle_tuning.py:166 hard-fails without SPEEDLM_E2E_TUNING_CONFIG)" >&2
+            echo "       (test_live_idle_tuning.py:226 hard-fails without SPEEDLM_E2E_TUNING_CONFIG)" >&2
             exit 2
         }
         ;;
@@ -319,7 +326,7 @@ case "$flavor" in
         job_suffix="fidelity"
         # Three chat requests plus six /tokenize round trips.  Load dominates.
         default_time="01:30:00"
-        # test_token_fidelity.py:39 hardcodes MODEL = "Qwen/Qwen3.5-2B" with no
+        # test_token_fidelity.py:56 hardcodes MODEL = "Qwen/Qwen3.5-2B" with no
         # env override, and that model is NOT in /data/ryan.kim/hf-cache -- the
         # only local copy is under ob-cache.  Point HF_HOME there unless the
         # caller said otherwise, or the offline load fails instantly.
@@ -340,7 +347,7 @@ case "$flavor" in
         default_time="01:30:00"
         [[ -n "$matrix_cell" ]] || {
             echo "error: --matrix-cell is required for --flavor model-matrix" >&2
-            echo "       (test_model_matrix.py:166 hard-fails without SPEEDLM_MATRIX_CELL)" >&2
+            echo "       (test_model_matrix.py:183 hard-fails without SPEEDLM_MATRIX_CELL)" >&2
             echo "       cells: gpt-oss-20b-eagle3 qwen3.5-9b-mtp qwen3.5-2b-none qwen3.5-2b-ngram" >&2
             exit 2
         }
@@ -384,6 +391,56 @@ esac
 
 sbatch_time="${sbatch_time:-$default_time}"
 
+# Keep the idle-tuning test's own deadline inside the allocation.  Slurm time
+# accepts several formats; this launcher accepts HH:MM:SS and D-HH:MM:SS and
+# normalizes them so both deadlines can be printed and compared before an
+# allocation exists.
+slurm_time_seconds() {
+    local value="$1" days=0 hours minutes seconds
+    if [[ "$value" =~ ^([0-9]+)-([0-9]+):([0-9]{2}):([0-9]{2})$ ]]; then
+        days="${BASH_REMATCH[1]}"
+        hours="${BASH_REMATCH[2]}"
+        minutes="${BASH_REMATCH[3]}"
+        seconds="${BASH_REMATCH[4]}"
+    elif [[ "$value" =~ ^([0-9]+):([0-9]{2}):([0-9]{2})$ ]]; then
+        hours="${BASH_REMATCH[1]}"
+        minutes="${BASH_REMATCH[2]}"
+        seconds="${BASH_REMATCH[3]}"
+    else
+        echo "error: invalid --time '$value' (want HH:MM:SS or D-HH:MM:SS)" >&2
+        return 2
+    fi
+    (( 10#$minutes < 60 && 10#$seconds < 60 )) || {
+        echo "error: invalid --time '$value' (minutes and seconds must be < 60)" >&2
+        return 2
+    }
+    echo $((10#$days * 86400 + 10#$hours * 3600 + 10#$minutes * 60 + 10#$seconds))
+}
+
+wall_time_seconds="$(slurm_time_seconds "$sbatch_time")"
+if [[ "$flavor" == "idle-tuning" ]]; then
+    timeout_margin_seconds=900
+    if [[ -z "$tuning_timeout" ]]; then
+        (( wall_time_seconds > timeout_margin_seconds )) || {
+            echo "error: idle-tuning wall time must exceed the 900-second timeout margin" >&2
+            exit 2
+        }
+        tuning_timeout=$((wall_time_seconds - timeout_margin_seconds))
+    fi
+    [[ "$tuning_timeout" =~ ^[0-9]+$ ]] || {
+        echo "error: --tuning-timeout must be an integer number of seconds" >&2
+        exit 2
+    }
+    tuning_timeout=$((10#$tuning_timeout))
+    (( tuning_timeout > 0 && tuning_timeout < wall_time_seconds )) || {
+        echo "error: tuning timeout ($tuning_timeout seconds) must be positive and less than Slurm wall time ($wall_time_seconds seconds)" >&2
+        exit 2
+    }
+elif [[ -n "$tuning_timeout" ]]; then
+    echo "error: --tuning-timeout is valid only for --flavor idle-tuning" >&2
+    exit 2
+fi
+
 # --------------------------------------------------------------------------
 # Resolve the commit to a full sha.  A ref is ambiguous over time; the snapshot
 # directory is named for the sha so the mapping run -> code is one-to-one.
@@ -407,10 +464,12 @@ if [[ -e "$run_dir" ]]; then
     exit 1
 fi
 
-# Warn loudly if the tree is dirty.  git archive serializes the COMMIT, so any
-# uncommitted change is silently absent from the snapshot -- exactly the kind of
-# surprise this script exists to prevent.
-if ! git diff --quiet HEAD -- 2>/dev/null || [[ -n "$(git status --porcelain --untracked-files=no)" ]]; then
+# Record dirtiness as provenance, not just as terminal output.  git archive
+# serializes the COMMIT, so every tracked modification and untracked file is
+# absent from the snapshot.
+source_tree_dirty=0
+if [[ -n "$(git status --porcelain)" ]]; then
+    source_tree_dirty=1
     echo "WARNING: working tree has uncommitted changes." >&2
     echo "         The snapshot contains commit $short_sha ONLY; local edits are NOT included." >&2
 fi
@@ -451,6 +510,15 @@ fi
 
 mkdir -p "$run_dir/results"
 
+cat > "$run_dir/snapshot-provenance.txt" <<EOF
+snapshot_commit=$sha
+snapshot_source_ref=$commit_ref
+source_repo=$REPO
+source_tree_dirty_at_generation=$source_tree_dirty
+generated_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+note=git archive contains the snapshot commit only; working-tree changes are excluded
+EOF
+
 # --------------------------------------------------------------------------
 # Emit the sbatch.
 #
@@ -482,6 +550,9 @@ snapshot=$snapshot
 run_dir=$run_dir
 commit=$sha
 interpreter=$interpreter
+slurm_wall_time=$sbatch_time
+slurm_wall_time_seconds=$wall_time_seconds
+source_tree_dirty_at_generation=$source_tree_dirty
 
 cd "\$snapshot"
 
@@ -489,6 +560,14 @@ export PATH="$VLLM_ENV/bin$extra_path:\$PATH"
 export HF_HOME=$hf_home
 export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1
 export TOKENIZERS_PARALLELISM=false PYTHONUNBUFFERED=1
+
+# Do not inherit result-relaxing switches from the submission shell.  The two
+# activation-capture controls are re-exported below only when their launcher
+# options were supplied.  The runner override is likewise owned by --runner.
+unset SPEEDLM_E2E_ALLOW_UNMEASURED_GATE \
+    SPEEDLM_E2E_STRICT_VERDICT \
+    SPEEDLM_E2E_HF_REFERENCE \
+    VLLM_USE_V2_MODEL_RUNNER
 
 # The snapshot must beat the project venv's editable install.  PYTHONPATH is
 # consulted before site-packages, so <snapshot>/src lands at sys.path[1] while
@@ -510,9 +589,9 @@ export SPEEDLM_E2E_TUNING_CONFIG="$tuning_config"
 EOF
         [[ -n "$tuning_profile" ]] && echo "export SPEEDLM_E2E_TUNING_PROFILE=\"$tuning_profile\""
         [[ -n "$corpus" ]] && echo "export SPEEDLM_E2E_PROMPT_CORPUS=$corpus"
-        cat <<'EOF'
+        cat <<EOF
 export SPEEDLM_E2E_READY_TIMEOUT=1800
-export SPEEDLM_E2E_TUNING_TIMEOUT=36000
+export SPEEDLM_E2E_TUNING_TIMEOUT=$tuning_timeout
 export SPEEDLM_E2E_REQUEST_TIMEOUT=1800
 EOF
         ;;
@@ -581,7 +660,7 @@ EOF
         echo "export SPEEDLM_AGENT_CLI=scripted"
         echo "export SPEEDLM_AGENT_STARTUP_TIMEOUT=1800"
         echo "export SPEEDLM_AGENT_SUBPROCESS_TIMEOUT=420"
-        # test_agent_harness.py:193 builds per-model defaults already.
+        # test_agent_harness.py:209 builds per-model defaults already.
         vllm_args_var="SPEEDLM_AGENT_VLLM_ARGS"
         ;;
 esac
@@ -601,6 +680,11 @@ echo "started_at=\$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "job=\$SLURM_JOB_ID host=\$(hostname -f)"
 echo "commit=\$commit"
 echo "snapshot=\$snapshot"
+echo "source_tree_dirty_at_generation=\$source_tree_dirty_at_generation"
+echo "slurm_wall_time=\$slurm_wall_time (\$slurm_wall_time_seconds seconds)"
+if [[ -n "$tuning_timeout" ]]; then
+    echo "pytest_tuning_timeout=$tuning_timeout seconds"
+fi
 echo "interpreter=\$interpreter"
 echo "PYTHONPATH=\$PYTHONPATH"
 # Never pipe nvidia-smi into head under \`set -o pipefail\`: head exits early,
@@ -628,7 +712,7 @@ if not actual.is_relative_to(snapshot):
 print("provenance OK: imports resolve to the snapshot")
 PYEOF
 
-"\$interpreter" -m pytest -o addopts='' -p no:cacheprovider -q -s \\
+"\$interpreter" -m pytest -o addopts='' -p no:cacheprovider -q -ra -s \\
     "\$snapshot/$test_path"$pytest_k_arg
 
 echo "finished_at=\$(date -u +%Y-%m-%dT%H:%M:%SZ)"
