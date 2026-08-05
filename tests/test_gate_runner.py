@@ -28,8 +28,12 @@ from speedlm.gate.runner import (
     DEFAULT_BENCHMARK_MAX_TOKENS,
     DEFAULT_CORRECTNESS_MAX_TOKENS,
     DEFAULT_REPLAY_CONCURRENCY,
+    NON_STATIONARY_REASON,
+    STATIONARITY_SPLIT_T_STATISTIC,
     BenchmarkGateRunner,
     HttpReplayExecutor,
+    _block_schedule,
+    _delta_shift,
 )
 from speedlm.gate.suite import BenchmarkSuite, FrozenContext, SuiteError
 from speedlm.traces.store import TraceRecord
@@ -1821,3 +1825,452 @@ def test_a_bogus_engine_description_is_refused_at_construction(
 ) -> None:
     with pytest.raises(ValueError, match="engine_execution"):
         _regime_runner(tmp_path, "eager")  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Interleaved arms and measurement stationarity
+#
+# The gate used to run every stock repeat and then every candidate repeat, which
+# makes arm identity and wall-clock the same axis.  Job badba71 is what that
+# costs: the stock arm's replay throughput read 96.7, 96.9, 96.3, 105.4, 104.8
+# tok/s while the candidate arm -- already finished -- was flat at 98.3, 98.3,
+# 97.7, 97.9, 97.8.  The engine did bit-identical work either side of the step,
+# so the arm means the gate published (100.0 vs 98.0) have the opposite sign to
+# the three repeats where both arms saw the same machine (96.65 vs 98.10).
+# ---------------------------------------------------------------------------
+
+
+def _block_ladder(
+    *,
+    repeats: int,
+    per_repeat: tuple[float, float, float, float],
+) -> list[str]:
+    """One block's scrapes: its opening one, then one after each of its repeats.
+
+    Every block starts from zeroed counters because every block boundary is a
+    draft change and therefore an engine restart.  A ladder that carried totals
+    across the boundary would be modelling a restart that did not happen.
+    """
+    return [
+        _snapshot(
+            generated=per_repeat[0] * i,
+            elapsed_ns=per_repeat[1] * i,
+            accepted=per_repeat[2] * i,
+            rejected=per_repeat[3] * i,
+        )
+        for i in range(repeats + 1)
+    ]
+
+
+#: Per-repeat counter increments for each arm.  The candidate accepts 70 of
+#: every 100 drafted tokens against the stock arm's 50, which is a lift both
+#: promotion criteria clear, so any rejection in these tests is about the
+#: measurement rather than about the head.
+_STOCK_PER_REPEAT = (100.0, 1_000_000_000.0, 50.0, 50.0)
+_CANDIDATE_PER_REPEAT = (100.0, 1_000_000_000.0, 70.0, 30.0)
+
+
+def _scheduled_scrapes(schedule: tuple[tuple[str, int], ...]) -> list[str]:
+    scrapes: list[str] = []
+    for arm, repeats in schedule:
+        scrapes.extend(
+            _block_ladder(
+                repeats=repeats,
+                per_repeat=(
+                    _STOCK_PER_REPEAT if arm == "stock" else _CANDIDATE_PER_REPEAT
+                ),
+            )
+        )
+    return scrapes
+
+
+def _blocked_runner(
+    tmp_path: Path,
+    *,
+    arm_blocks: int,
+    repeats: int = 4,
+    candidate_arm_first: bool = True,
+    run_latencies: list[float] | None = None,
+    events: list[str] | None = None,
+) -> tuple[BenchmarkGateRunner, FakeEndpoint, FakeReplayExecutor]:
+    first = "candidate" if candidate_arm_first else "stock"
+    schedule = _block_schedule(first, blocks=arm_blocks, repeats=repeats)
+    endpoint = FakeEndpoint()
+    replay = FakeReplayExecutor(run_latencies=run_latencies, events=events)
+    runner = BenchmarkGateRunner(
+        config=SpeedLMConfig(model="model"),
+        trace_source=FakeTraceSource((_trace(),)),
+        suite_dir=tmp_path / "suite",
+        stock_draft="stock",
+        endpoint=endpoint,
+        metrics_source=FakeMetricsSource(_scheduled_scrapes(schedule), events=events),
+        replay_executor=replay,
+        training_context_hashes=frozenset(),
+        candidate_arm_first=candidate_arm_first,
+        repeats=repeats,
+        arm_blocks=arm_blocks,
+        clock=FakeClock(),
+    )
+    return runner, endpoint, replay
+
+
+#: A machine that runs at one speed for the first half of a job and a different
+#: speed for the second, which is the shape job badba71 recorded.  The fake
+#: replay executor pops one latency per suite pass in the order the passes are
+#: issued, so this is a function of wall-clock and of nothing else -- neither
+#: arm is faster than the other by construction.
+def _stepped_latencies(total_passes: int, *, step_at: int) -> list[float]:
+    return [1.0 if i < step_at else 0.5 for i in range(total_passes)]
+
+
+def test_arm_blocks_interleave_the_arms_in_mirrored_rounds(tmp_path: Path) -> None:
+    runner, endpoint, _ = _blocked_runner(tmp_path, arm_blocks=2)
+
+    runner.benchmark(
+        tmp_path / "candidate", timeout_seconds=30, should_abort=lambda: False
+    )
+
+    # ABBA, not ABAB: the mirrored round is what puts the two arms at the same
+    # average position in time.  ABAB would leave the first arm systematically
+    # earlier, which is the confound in a smaller font.
+    assert endpoint.activations == [
+        tmp_path / "candidate",
+        "stock",
+        "stock",
+        tmp_path / "candidate",
+    ]
+
+
+def test_every_block_pays_its_own_warmup_and_opens_its_own_window(
+    tmp_path: Path,
+) -> None:
+    events: list[str] = []
+    runner, _, _ = _blocked_runner(tmp_path, arm_blocks=2, events=events)
+
+    result = runner.benchmark(
+        tmp_path / "candidate", timeout_seconds=30, should_abort=lambda: False
+    )
+
+    # Equal engine lifecycle: every measurement window of either arm opens
+    # activate -> warm -> scrape, never straight off a restart and never off an
+    # engine that has been serving since the previous block.
+    block = ["replay:1", "scrape", "replay:1", "scrape", "replay:1", "scrape"]
+    assert events == [
+        *block,
+        *block,
+        *block,
+        "correctness:1",  # stock's last block also measures the noise floor
+        *block,
+        "correctness:1",
+    ]
+    warmup = result.metrics["warmup"]
+    assert isinstance(warmup, dict)
+    assert warmup["stock"] == {"num_runs": 2, "tok_per_sec": [10.0, 10.0]}
+    assert warmup["candidate"] == {"num_runs": 2, "tok_per_sec": [10.0, 10.0]}
+    # One unscored pass preceded each window, not two: the arm ran two warmups
+    # but neither window opened on more than one.
+    assert result.decision is not None
+    assert result.decision.warmup_repeats == 1
+
+
+def test_a_mid_run_machine_step_is_attributed_to_an_arm_when_they_run_in_turn(
+    tmp_path: Path,
+) -> None:
+    # The control for the test below.  One block per arm, a machine that doubles
+    # in speed halfway through, and two arms that are identical by construction:
+    # the gate reports the machine as a 50% throughput difference between drafts.
+    runner, _, _ = _blocked_runner(
+        tmp_path,
+        arm_blocks=1,
+        run_latencies=_stepped_latencies(13, step_at=7),
+    )
+
+    result = runner.benchmark(
+        tmp_path / "candidate", timeout_seconds=30, should_abort=lambda: False
+    )
+
+    assert result.decision is not None
+    per_repeat = result.decision.per_repeat
+    assert [r.candidate_tok_per_sec for r in per_repeat] == [10.0, 10.0, 10.0, 10.0]
+    assert [r.stock_tok_per_sec for r in per_repeat] == [20.0, 20.0, 20.0, 20.0]
+    assert result.decision.throughput_delta_pct == pytest.approx(-50.0)
+
+
+def test_interleaving_makes_a_mid_run_machine_step_common_mode(
+    tmp_path: Path,
+) -> None:
+    # Same machine, same step, same two identical arms -- but every arm now has
+    # repeats either side of the step, so the step lands on both and cancels.
+    runner, _, _ = _blocked_runner(
+        tmp_path,
+        arm_blocks=2,
+        run_latencies=_stepped_latencies(15, step_at=7),
+    )
+
+    result = runner.benchmark(
+        tmp_path / "candidate", timeout_seconds=30, should_abort=lambda: False
+    )
+
+    assert result.decision is not None
+    per_repeat = result.decision.per_repeat
+    assert [r.candidate_tok_per_sec for r in per_repeat] == [10.0, 10.0, 20.0, 20.0]
+    assert [r.stock_tok_per_sec for r in per_repeat] == [10.0, 10.0, 20.0, 20.0]
+    assert result.decision.throughput_delta_pct == pytest.approx(0.0)
+    assert result.passed is True
+
+
+def test_per_repeat_counters_stay_attributed_to_the_arm_that_earned_them(
+    tmp_path: Path,
+) -> None:
+    # The scrape ladder is per repeat and the blocks are interleaved, so the
+    # ladder is now consumed out of arm order.  Every one of the candidate's
+    # four repeats must still carry the candidate's acceptance and none of the
+    # stock arm's, in both of its blocks.
+    runner, _, _ = _blocked_runner(tmp_path, arm_blocks=2)
+
+    result = runner.benchmark(
+        tmp_path / "candidate", timeout_seconds=30, should_abort=lambda: False
+    )
+
+    assert result.decision is not None
+    per_repeat = result.decision.per_repeat
+    assert len(per_repeat) == 4
+    assert [r.stock_acceptance_rate for r in per_repeat] == [0.5, 0.5, 0.5, 0.5]
+    assert [r.candidate_acceptance_rate for r in per_repeat] == [0.7, 0.7, 0.7, 0.7]
+    assert [r.stock_accepted_length for r in per_repeat] == [1.5, 1.5, 1.5, 1.5]
+    assert [r.candidate_accepted_length for r in per_repeat] == [1.7, 1.7, 1.7, 1.7]
+
+
+def test_the_restart_between_blocks_is_not_a_counter_reset(tmp_path: Path) -> None:
+    # Each block's counters start from zero because each block boundary restarts
+    # the engine.  Differencing the arm's last scrape against its first would
+    # call that a reset and zero the whole Prometheus window; summing the blocks
+    # reports what the arm actually did.
+    runner, _, _ = _blocked_runner(tmp_path, arm_blocks=2)
+
+    result = runner.benchmark(
+        tmp_path / "candidate", timeout_seconds=30, should_abort=lambda: False
+    )
+
+    stock = result.metrics["stock"]
+    assert isinstance(stock, dict)
+    assert stock["reset_detected"] is False
+    # Four repeats of 100 tokens over four seconds, in two blocks of two.
+    assert stock["drafted_tokens"] == pytest.approx(400.0)
+    assert stock["accepted_tokens"] == pytest.approx(200.0)
+    assert stock["acceptance_rate"] == pytest.approx(0.5)
+    assert stock["output_tok_per_sec"] == pytest.approx(100.0)
+
+
+def test_a_reset_inside_a_block_still_invalidates_the_arm(tmp_path: Path) -> None:
+    # Pooling per block must not become a way of not noticing a restart that
+    # happened inside one.
+    first = "candidate"
+    schedule = _block_schedule(first, blocks=2, repeats=4)
+    scrapes = _scheduled_scrapes(schedule)
+    # The stock arm's first block is scrapes[3:6].  Drop its closing rung back
+    # to zero: within the block the counters went backwards, which is a restart
+    # underneath the measurement rather than between two of them.  The block's
+    # own endpoints still look monotone, so only the per-repeat ladder can see
+    # it -- sampling more finely must not make the gate blinder.
+    scrapes[5] = _snapshot(generated=0, elapsed_ns=0, accepted=0, rejected=0)
+    endpoint = FakeEndpoint()
+    runner = BenchmarkGateRunner(
+        config=SpeedLMConfig(model="model"),
+        trace_source=FakeTraceSource((_trace(),)),
+        suite_dir=tmp_path / "suite",
+        stock_draft="stock",
+        endpoint=endpoint,
+        metrics_source=FakeMetricsSource(scrapes),
+        replay_executor=FakeReplayExecutor(),
+        training_context_hashes=frozenset(),
+        candidate_arm_first=True,
+        repeats=4,
+        arm_blocks=2,
+        clock=FakeClock(),
+    )
+
+    result = runner.benchmark(
+        tmp_path / "candidate", timeout_seconds=30, should_abort=lambda: False
+    )
+
+    stock = result.metrics["stock"]
+    assert isinstance(stock, dict)
+    assert stock["reset_detected"] is True
+    assert stock["output_tok_per_sec"] == 0.0
+
+
+def test_the_record_says_how_the_arms_were_interleaved(tmp_path: Path) -> None:
+    runner, _, _ = _blocked_runner(tmp_path, arm_blocks=2)
+
+    result = runner.benchmark(
+        tmp_path / "candidate", timeout_seconds=30, should_abort=lambda: False
+    )
+
+    assert result.metrics["schedule"] == {
+        "arm_blocks": 2,
+        "blocks": [
+            {"arm": "candidate", "repeats": 2},
+            {"arm": "stock", "repeats": 2},
+            {"arm": "stock", "repeats": 2},
+            {"arm": "candidate", "repeats": 2},
+        ],
+    }
+
+
+def test_the_deadline_covers_every_blocks_warmup(tmp_path: Path) -> None:
+    runner, _, _ = _blocked_runner(tmp_path, arm_blocks=2)
+
+    estimate = runner.estimated_benchmark_seconds()
+
+    assert estimate is not None
+    assert estimate == derive_benchmark_timeout(
+        num_contexts=1,
+        repeats=4,
+        # Two blocks per arm, one warmup pass each.  Charging one would size the
+        # deadline for a benchmark that is not the one about to run.
+        warmup_repeats=2,
+        concurrency=DEFAULT_REPLAY_CONCURRENCY,
+        correctness_repeats=CORRECTNESS_REPEATS + CORRECTNESS_CONTROL_REPEATS,
+        benchmark_max_tokens=DEFAULT_BENCHMARK_MAX_TOKENS,
+        correctness_max_tokens=DEFAULT_CORRECTNESS_MAX_TOKENS,
+    )
+
+
+@pytest.mark.parametrize("blocks", [0, -1, True, 1.5, 5])
+def test_an_impossible_block_count_is_refused_at_construction(
+    tmp_path: Path, blocks: object
+) -> None:
+    with pytest.raises(ValueError, match="arm_blocks"):
+        BenchmarkGateRunner(
+            config=SpeedLMConfig(model="model"),
+            trace_source=FakeTraceSource((_trace(),)),
+            suite_dir=tmp_path / "suite",
+            stock_draft="stock",
+            endpoint=FakeEndpoint(),
+            metrics_source=FakeMetricsSource([]),
+            replay_executor=FakeReplayExecutor(),
+            training_context_hashes=frozenset(),
+            repeats=4,
+            arm_blocks=blocks,  # type: ignore[arg-type]
+        )
+
+
+def test_a_drift_that_landed_on_one_arm_cannot_promote(tmp_path: Path) -> None:
+    # The step falls inside the candidate's *last* block, so only the candidate
+    # sees it: the arm-to-arm delta is +50% and both acceptance criteria are
+    # met, and it is still not a measurement anyone may promote on.
+    runner, _, _ = _blocked_runner(
+        tmp_path,
+        arm_blocks=2,
+        run_latencies=_stepped_latencies(15, step_at=12),
+    )
+
+    result = runner.benchmark(
+        tmp_path / "candidate", timeout_seconds=30, should_abort=lambda: False
+    )
+
+    assert result.decision is not None
+    # The numbers say promote.  The measurement says the numbers moved.
+    assert result.decision.verdict is Verdict.PROMOTE
+    assert result.decision.throughput_delta_pct == pytest.approx(50.0)
+    assert result.passed is False
+    assert result.reason == NON_STATIONARY_REASON
+    stationarity = result.metrics["throughput_stationarity"]
+    assert isinstance(stationarity, dict)
+    assert stationarity["stationary"] is False
+    assert stationarity["testable"] is True
+    assert stationarity["delta_shift_pct"] == pytest.approx(-100.0)
+
+
+def test_a_vetoed_promotion_leaves_the_candidate_off_the_endpoint(
+    tmp_path: Path,
+) -> None:
+    # The schedule ends on the candidate, and a promotion would leave it there.
+    # A vetoed one must not: the cycle is a rejection and the incumbent is what
+    # a rejection wants serving.
+    runner, endpoint, _ = _blocked_runner(
+        tmp_path,
+        arm_blocks=2,
+        run_latencies=_stepped_latencies(15, step_at=12),
+    )
+
+    result = runner.benchmark(
+        tmp_path / "candidate", timeout_seconds=30, should_abort=lambda: False
+    )
+
+    assert result.passed is False
+    assert endpoint.activations.count(tmp_path / "candidate") == 2
+
+
+def test_drift_both_arms_saw_alike_is_not_a_veto(tmp_path: Path) -> None:
+    # Common-mode drift is exactly what interleaving converts one-arm drift
+    # into.  If it vetoed, interleaving would have made the gate unable to
+    # promote anything on a machine that ever changes speed.
+    runner, _, _ = _blocked_runner(
+        tmp_path,
+        arm_blocks=2,
+        run_latencies=_stepped_latencies(15, step_at=7),
+    )
+
+    result = runner.benchmark(
+        tmp_path / "candidate", timeout_seconds=30, should_abort=lambda: False
+    )
+
+    assert result.decision is not None
+    assert result.decision.verdict is Verdict.PROMOTE
+    stationarity = result.metrics["throughput_stationarity"]
+    assert isinstance(stationarity, dict)
+    assert stationarity["stationary"] is True
+    assert stationarity["delta_shift_pct"] == pytest.approx(0.0)
+    assert result.passed is True
+
+
+def test_three_repeats_are_too_few_to_test_stationarity(tmp_path: Path) -> None:
+    # One residual degree of freedom: the noise estimate the test divides by is
+    # a single number.  The record says so rather than pretending to an answer.
+    runner, _, _ = _blocked_runner(
+        tmp_path,
+        arm_blocks=1,
+        repeats=3,
+        run_latencies=[1.0, 1.0, 1.0, 0.5, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+    )
+
+    result = runner.benchmark(
+        tmp_path / "candidate", timeout_seconds=30, should_abort=lambda: False
+    )
+
+    stationarity = result.metrics["throughput_stationarity"]
+    assert isinstance(stationarity, dict)
+    assert stationarity["testable"] is False
+    assert stationarity["delta_shift_pct"] is None
+    assert stationarity["stationary"] is True
+
+
+def test_the_badba71_throughput_columns_are_refused(tmp_path: Path) -> None:
+    # The measured record, replayed through the statistic: the arms' own
+    # per-repeat throughput from
+    # /data/ryan.kim/speedlm-runs/badba71-qwen-idle/results/live-idle-tuning/
+    # terminal-decision.json.  The stock arm steps ~9% at repeat 3 and the
+    # candidate is flat, and no gate may promote on that.
+    stock = [96.71830719494932, 96.9263209671876, 96.31751837940375,
+             105.38536874951427, 104.82736865294721]
+    candidate = [98.28308475279226, 98.33892993129433, 97.68240747785654,
+                 97.89756179890995, 97.79420060172598]
+    paired = [100.0 * (c - s) / s for s, c in zip(stock, candidate, strict=True)]
+
+    shift, statistic = _delta_shift(paired)
+
+    assert shift == pytest.approx(8.40, abs=0.01)
+    assert statistic == pytest.approx(50.2, abs=0.1)
+    assert statistic >= STATIONARITY_SPLIT_T_STATISTIC
+    assert abs(shift) >= 2.0
+
+
+def test_a_flat_pair_of_columns_reads_as_no_shift() -> None:
+    # The other end of the same statistic: repeats that never moved must not be
+    # called drift by a test whose whole job is to find drift.
+    shift, statistic = _delta_shift([1.4, 1.5, 1.45, 1.42, 1.48])
+
+    assert abs(shift) < 0.1
+    assert statistic < STATIONARITY_SPLIT_T_STATISTIC

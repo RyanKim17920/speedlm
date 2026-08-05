@@ -14,7 +14,7 @@ from typing import Final, cast
 
 from speedlm.config import SpeedLMConfig
 from speedlm.gate.decide import EngineExecution
-from speedlm.gate.runner import BenchmarkGateRunner
+from speedlm.gate.runner import INTERLEAVED_ARM_BLOCKS, BenchmarkGateRunner
 from speedlm.gateway.activity import ActivityTracker
 from speedlm.gateway.capture import CaptureManager
 from speedlm.gateway.control import (
@@ -936,6 +936,15 @@ def create_production_tuner(
         # left the arms' cold start unmeasurable in production; see
         # ``IdleTuningConfig.warmup_repeats``.  The default is unchanged.
         warmup_repeats=tuning.warmup_repeats,
+        # Interleaved, not sequential.  Running one arm to completion and then
+        # the other makes arm identity and wall-clock the same axis, and job
+        # badba71 is what that costs: the stock arm's throughput stepped ~9%
+        # mid-run on a machine change that had nothing to do with either draft,
+        # and the arm means the gate published had the opposite sign to the
+        # repeats where both arms saw the same machine.  See
+        # :data:`speedlm.gate.runner.DEFAULT_ARM_BLOCKS` for the design and for
+        # what the extra engine activations cost.
+        arm_blocks=INTERLEAVED_ARM_BLOCKS,
         replay_concurrency=tuning.benchmark_concurrency,
         correctness_max_tokens=tuning.correctness_max_tokens,
         benchmark_max_tokens=tuning.benchmark_max_tokens,
