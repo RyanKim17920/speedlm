@@ -90,7 +90,7 @@ def measured_cycle(
 
 
 class TestARejectingCycle:
-    def test_candidate_first_pays_two_launches_where_stock_first_pays_four(
+    def test_candidate_first_pays_three_launches_where_stock_first_pays_four(
         self, tmp_path: Path, engine: SimulatedEngine
     ) -> None:
         with measured_cycle(
@@ -99,14 +99,14 @@ class TestARejectingCycle:
             result = simulation.run_cycle(run_id="reject", payload=b"weights-worse")
             assert result.outcome is CycleOutcome.REJECTED
             candidate_first = simulation.restarts
-            # The candidate arm reused the engine CANDIDATE_STARTING built...
+            # The candidate arm deliberately rebuilds the engine that
+            # CANDIDATE_STARTING built so both scored arms begin from the same
+            # lifecycle state.
             assert simulation.endpoint is not None
             assert simulation.endpoint.requested[0].endswith(str(result.artifact_id))
-            assert not simulation.endpoint.restarted[0].endswith(
-                str(result.artifact_id)
-            )
-            # ...and the benchmark ended on stock, so the rollback had nothing
-            # to put back and took the wake-in-place fast path.
+            assert simulation.endpoint.restarted[0].endswith(str(result.artifact_id))
+            # The benchmark ended on stock, so rollback still takes the
+            # wake-in-place fast path.
             assert simulation.serving == STOCK_REFERENCE
             assert simulation.state.state is TunerState.READY
 
@@ -118,7 +118,7 @@ class TestARejectingCycle:
             stock_first = simulation.restarts
             assert simulation.serving == STOCK_REFERENCE
 
-        assert candidate_first == 2
+        assert candidate_first == 3
         assert stock_first == 4
         assert candidate_first < stock_first
 

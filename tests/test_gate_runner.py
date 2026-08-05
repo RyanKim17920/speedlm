@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import statistics
 from collections.abc import Callable, Iterator
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import pytest
@@ -34,6 +34,7 @@ from speedlm.gate.runner import (
     HttpReplayExecutor,
     _block_schedule,
     _delta_shift,
+    _stationarity,
 )
 from speedlm.gate.suite import BenchmarkSuite, FrozenContext, SuiteError
 from speedlm.traces.store import TraceRecord
@@ -1541,7 +1542,7 @@ def _candidate_first_scrapes(**kwargs: object) -> list[str]:
     return [*scrapes[half:], *scrapes[:half]]
 
 
-def test_candidate_first_reuses_the_running_engine_and_ends_on_stock(
+def test_candidate_first_ends_on_stock_after_a_rejection(
     tmp_path: Path,
 ) -> None:
     """A rejection must leave stock serving, so the rollback has nothing to do."""
@@ -2181,29 +2182,35 @@ def test_the_same_arm_twice_in_a_row_still_restarts_between_the_blocks(
     assert all(block.restarted for block in result.decision.block_schedule)
 
 
-def test_only_the_first_block_may_reuse_the_engine_that_is_already_serving(
-    tmp_path: Path,
+@pytest.mark.parametrize(
+    ("candidate_arm_first", "arm_blocks"),
+    [(True, 1), (True, 2), (False, 1), (False, 2)],
+)
+def test_every_scored_block_restarts_even_when_its_draft_is_already_serving(
+    tmp_path: Path, candidate_arm_first: bool, arm_blocks: int
 ) -> None:
-    # The saving the short-circuit was added for: CANDIDATE_STARTING has
-    # already launched the candidate, and the benchmark's first block is
-    # allowed to measure it rather than pay a second launch for an identical
-    # configuration.  That licence stops after the first block, and the record
-    # says which block used it.
-    runner, endpoint, _ = _blocked_runner(tmp_path, arm_blocks=2)
-    endpoint.serving = tmp_path / "candidate"
+    # A lifecycle exemption on block 0 follows the configured first arm and can
+    # therefore give exactly one arm a differently warmed engine.  Seed the
+    # endpoint with whichever arm starts and prove the invariant holds for both
+    # arm orders and both sequential and interleaved schedules.
+    runner, endpoint, _ = _blocked_runner(
+        tmp_path,
+        arm_blocks=arm_blocks,
+        candidate_arm_first=candidate_arm_first,
+    )
+    first_draft: Path | str = (
+        tmp_path / "candidate" if candidate_arm_first else "stock"
+    )
+    endpoint.serving = first_draft
 
     result = runner.benchmark(
         tmp_path / "candidate", timeout_seconds=30, should_abort=lambda: False
     )
 
-    assert endpoint.restarts == ["stock", "stock", tmp_path / "candidate"]
     assert result.decision is not None
-    assert [block.restarted for block in result.decision.block_schedule] == [
-        False,
-        True,
-        True,
-        True,
-    ]
+    assert endpoint.restarts == endpoint.activations
+    assert len(result.decision.block_schedule) == arm_blocks * 2
+    assert all(block.restarted for block in result.decision.block_schedule)
 
 
 def test_a_scored_block_that_did_not_restart_fails_the_gate(tmp_path: Path) -> None:
@@ -2357,6 +2364,55 @@ def test_drift_both_arms_saw_alike_is_not_a_veto(tmp_path: Path) -> None:
     assert result.passed is True
 
 
+def test_a_material_but_unresolved_shift_is_not_reported_stationary(
+    tmp_path: Path,
+) -> None:
+    # The five observed Qwen repeats from validation run 8b72d9a.  Its 5.79 pp
+    # shift is material against the 2 pp gate guard but t=3.26 does not clear
+    # the separately calibrated t=4 veto threshold.  That is inconclusive, not
+    # stationary and not proven non-stationary.
+    stock = [
+        108.79319274844678,
+        106.81521366730192,
+        108.9306418484082,
+        107.91547867921285,
+        105.95777060501634,
+    ]
+    candidate = [
+        108.39005841808734,
+        105.60687377455913,
+        106.23926421354913,
+        109.35422247906325,
+        111.3896477693752,
+    ]
+    runner, _, _ = _blocked_runner(tmp_path, arm_blocks=2, repeats=5)
+    result = runner.benchmark(
+        tmp_path / "candidate", timeout_seconds=30, should_abort=lambda: False
+    )
+    assert result.decision is not None
+    decision = replace(
+        result.decision,
+        per_repeat=tuple(
+            replace(
+                row,
+                stock_tok_per_sec=stock[i],
+                candidate_tok_per_sec=candidate[i],
+            )
+            for i, row in enumerate(result.decision.per_repeat)
+        ),
+    )
+
+    stationarity = _stationarity(decision, 2.0).to_dict()
+
+    assert stationarity["delta_shift_pct"] == pytest.approx(-5.786281423785017)
+    assert stationarity["delta_shift_t_statistic"] == pytest.approx(
+        3.2607438439334224
+    )
+    assert stationarity["status"] == "material_shift_unresolved"
+    assert stationarity["stationary"] is False
+    assert stationarity["vetoed"] is False
+
+
 def test_three_repeats_are_too_few_to_test_stationarity(tmp_path: Path) -> None:
     # One residual degree of freedom: the noise estimate the test divides by is
     # a single number.  The record says so rather than pretending to an answer.
@@ -2375,7 +2431,8 @@ def test_three_repeats_are_too_few_to_test_stationarity(tmp_path: Path) -> None:
     assert isinstance(stationarity, dict)
     assert stationarity["testable"] is False
     assert stationarity["delta_shift_pct"] is None
-    assert stationarity["stationary"] is True
+    assert stationarity["status"] == "untestable"
+    assert stationarity["stationary"] is False
 
 
 def test_the_badba71_throughput_columns_are_refused(tmp_path: Path) -> None:

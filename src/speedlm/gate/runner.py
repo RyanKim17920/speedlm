@@ -199,8 +199,11 @@ CORRECTNESS_CONTROL_REPEATS: Final = 1
 #: where 1 block was 2.  Measured on job badba71 (Qwen3-8B): a restart is ~100s
 #: and a suite pass ~174s, so +2 restarts and +2 warmups is ~548s on a 1043s
 #: benchmark phase.  On gpt-oss-20b (job 369162) a restart is ~90s and a pass
-#: ~301s, so ~782s on 1808s.  There is one further restart on top: mirrored
-#: rounds end on whichever arm *started*, so with
+#: ~301s, so ~782s on 1808s.  Requiring block 0 to restart adds one activation
+#: when the configured first arm is already serving -- production's
+#: candidate-first case after CANDIDATE_STARTING: about 100s on Qwen and 90s on
+#: gpt-oss from those measurements.  There is one
+#: further restart on top: mirrored rounds end on whichever arm *started*, so with
 #: ``benchmark_candidate_arm_first`` the benchmark now ends on the candidate and
 #: a rejecting cycle pays the rollback restart that one-block candidate-first
 #: order avoided (~100s).  Call it +50-60% of the benchmark phase.
@@ -406,10 +409,10 @@ class DraftEndpoint(Protocol):
 
         An endpoint that can tell what is already running may satisfy the call
         without restarting -- but only when *allow_engine_reuse* is set.  The
-        gate clears it for every measurement block after the first, because a
-        block that opens on an engine that has been serving since the previous
-        block did not open from the same lifecycle state as its neighbours, and
-        the difference lands on whichever arm the schedule happened to repeat.
+        gate clears it for every scored measurement block.  A block that
+        inherits an engine launched before the benchmark did not open from the
+        same lifecycle state as its peer, and the difference lands on whichever
+        arm the schedule starts with.
         See :data:`DEFAULT_ARM_BLOCKS`.
 
         Returns:
@@ -812,11 +815,9 @@ class BenchmarkGateRunner:
                 "candidate": candidate_draft,
             }
 
-            # Running the candidate first reuses the engine that the cycle's
-            # CANDIDATE_STARTING phase already built.  See
-            # ``tuning.benchmark_candidate_arm_first``, and
-            # :data:`DEFAULT_ARM_BLOCKS` for what the mirrored rounds do to the
-            # arm the benchmark ends on.
+            # Arm order balances wall-clock position only.  It never changes
+            # engine lifecycle: every scored block restarts below, including a
+            # candidate-first block after CANDIDATE_STARTING built that draft.
             first_arm = "candidate" if self._candidate_arm_first else "stock"
             schedule = _block_schedule(
                 first_arm, blocks=self._arm_blocks, repeats=self._repeats
@@ -829,31 +830,22 @@ class BenchmarkGateRunner:
             blocks_run: list[MeasurementBlock] = []
             for block_index, (arm, block_repeats) in enumerate(schedule):
                 builder = arms[arm]
-                # Reuse of an already-serving engine is a saving exactly once:
-                # the benchmark's first block, whose arm the cycle's
-                # CANDIDATE_STARTING phase already launched.  At every later
-                # block it is a defect.  Mirrored rounds put the same arm back
-                # to back at the round boundary -- candidate, stock, stock,
-                # candidate -- so without this the second of that pair would be
-                # the one block in the gate that did *not* restart, while every
-                # other block did, and the step that produces lands on one arm.
-                # Run 1c8f5c0 recorded exactly that: stock repeats 259.4,
-                # 259.3, 260.8, 265.9, 266.2 tok/s, a 2.5% step at the block-0
-                # to block-1 boundary, against a flat candidate -- enough to
-                # trip the stationarity veto on an artifact the harness made.
-                restarted = activate(
-                    arm, drafts[arm], allow_engine_reuse=block_index == 0
-                )
+                # No scored-block exemption: CANDIDATE_STARTING may already have
+                # built block 0's candidate engine, but reusing only that engine
+                # makes one arm's lifecycle systematically different.  Paying
+                # one more activation makes the invariant independent of arm
+                # order, block count, model, and inference configuration.
+                restarted = activate(arm, drafts[arm], allow_engine_reuse=False)
                 # Checked, not assumed.  The flag is a request to the endpoint;
                 # this is the endpoint's answer, and the invariant is a
                 # property of the answer.  Fail-closed: the benchmark yields no
                 # decision rather than a decision whose arms were measured
                 # under different engine lifecycles.
-                if block_index > 0 and not restarted:
+                if not restarted:
                     raise BenchmarkAborted(
                         f"{arm} block {block_index} opened on an engine it did "
-                        "not restart: every measurement window after the first "
-                        "must open from activate, warm, then score"
+                        "not restart: every scored measurement window must open "
+                        "from activate, warm, then score"
                     )
                 blocks_run.append(
                     MeasurementBlock(
@@ -941,9 +933,7 @@ class BenchmarkGateRunner:
                 block_schedule=tuple(blocks_run),
                 throughput_stationarity=stationarity,
             )
-            promoted = decision.verdict is Verdict.PROMOTE and (
-                stationarity.stationary or not PROMOTION_REQUIRES_STATIONARITY
-            )
+            promoted = decision.verdict is Verdict.PROMOTE and not stationarity.vetoed
 
             # The last block of the schedule leaves *its* arm serving.  A
             # promotion is the one case that needs the candidate back: the
@@ -1439,17 +1429,19 @@ def _stationarity(
     the record beside it: they answer the different, and still useful, question
     of whether ``warmup_repeats`` was large enough.
 
-    Non-stationary means the largest split shift is *both* resolvable above the
-    column's own noise (:data:`STATIONARITY_SPLIT_T_STATISTIC`) and at least
-    ``materiality_pct`` percentage points wide.  Both conditions are needed:
+    Proven non-stationary means the largest split shift is *both* resolvable
+    above the column's own noise (:data:`STATIONARITY_SPLIT_T_STATISTIC`) and at
+    least ``materiality_pct`` percentage points wide.  Both conditions are needed:
     without the first, a tightly-measured irrelevance vetoes; without the
     second, a large ``t`` on a fraction of a point does.  The materiality bar is
     the magnitude of ``PromotionConfig.min_throughput_delta_pct`` -- the width of
     the guard the gate is deciding with -- so a delta that moved by more than
     the whole guard during the run cannot support a decision made with it.
 
-    Below :data:`MIN_STATIONARITY_REPEATS` repeats the answer is ``testable:
-    False`` and nothing is vetoed; see that constant.
+    A material shift below the t bar is recorded as
+    ``material_shift_unresolved``: it is neither called stationary nor used as
+    proof of drift.  Below :data:`MIN_STATIONARITY_REPEATS` repeats the answer is
+    ``untestable`` and nothing is vetoed; see that constant.
     """
     repeats = decision.per_repeat
     paired = [
@@ -1462,13 +1454,6 @@ def _stationarity(
         len(paired) == len(repeats) and len(paired) >= MIN_STATIONARITY_REPEATS
     )
     shift, statistic = _delta_shift(paired) if testable else (None, None)
-    drifted = (
-        testable
-        and statistic is not None
-        and shift is not None
-        and statistic >= STATIONARITY_SPLIT_T_STATISTIC
-        and abs(shift) >= materiality_pct
-    )
     return ThroughputStationarity(
         testable=testable,
         min_repeats=MIN_STATIONARITY_REPEATS,
@@ -1490,7 +1475,14 @@ def _stationarity(
         candidate_trend_pct_per_repeat=(
             decision.candidate_throughput_trend_pct_per_repeat
         ),
-        stationary=not drifted,
+        # True now means what it says: the sample was testable and no material
+        # shift was observed.  A material but unresolved shift is a distinct
+        # status and remains below the calibrated veto threshold.
+        stationary=(
+            testable
+            and shift is not None
+            and abs(shift) < materiality_pct
+        ),
         required_for_promotion=PROMOTION_REQUIRES_STATIONARITY,
     )
 

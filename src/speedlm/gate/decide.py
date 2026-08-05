@@ -35,6 +35,15 @@ class Verdict(Enum):
     REJECT = "reject"
 
 
+class StationarityStatus(Enum):
+    """What the finite stationarity sample actually established."""
+
+    UNTESTABLE = "untestable"
+    STATIONARY = "stationary"
+    MATERIAL_SHIFT_UNRESOLVED = "material_shift_unresolved"
+    NON_STATIONARY = "non_stationary"
+
+
 class Reason(Enum):
     """Enumerated reasons for a verdict."""
     BOTH_THRESHOLDS_MET = "both_thresholds_met"
@@ -479,11 +488,10 @@ class MeasurementBlock:
     arm: str
     #: Scored repeats this block contributed.
     repeats: int
-    #: Whether opening this block cost an engine restart.  Only the benchmark's
-    #: very first block may legitimately read ``False`` -- it may reuse an
-    #: engine the cycle already launched for that arm -- and every later block
-    #: must restart, or its measurement window did not open from the same
-    #: engine-lifecycle state as its neighbours.  See
+    #: Whether opening this block cost an engine restart.  Every scored block
+    #: must read ``True``: otherwise exactly one arm can inherit a lifecycle the
+    #: cycle established before the benchmark, while its peer is measured after
+    #: activation.  See
     #: :data:`speedlm.gate.runner.DEFAULT_ARM_BLOCKS`.
     restarted: bool
 
@@ -505,8 +513,9 @@ class ThroughputStationarity:
     run could not be asked afterwards whether its veto was live.
     """
 
-    #: False when there were too few scored repeats to test at all, in which
-    #: case ``stationary`` is True by default and vetoed nothing.
+    #: Whether no material shift was observed in a testable sample.  False does
+    #: not by itself mean drift was proven: inspect :attr:`status` to distinguish
+    #: an unresolved material shift and an untestable sample from a proven one.
     testable: bool
     stationary: bool
     required_for_promotion: bool
@@ -522,6 +531,29 @@ class ThroughputStationarity:
     stock_trend_pct_per_repeat: float | None
     candidate_trend_pct_per_repeat: float | None
 
+    @property
+    def status(self) -> StationarityStatus:
+        """Classify absent, immaterial, unresolved, and proven shift evidence."""
+        if (
+            not self.testable
+            or self.delta_shift_pct is None
+            or self.delta_shift_t_statistic is None
+        ):
+            return StationarityStatus.UNTESTABLE
+        if abs(self.delta_shift_pct) < self.materiality_pct:
+            return StationarityStatus.STATIONARY
+        if self.delta_shift_t_statistic >= self.min_shift_t_statistic:
+            return StationarityStatus.NON_STATIONARY
+        return StationarityStatus.MATERIAL_SHIFT_UNRESOLVED
+
+    @property
+    def vetoed(self) -> bool:
+        """Whether the stationarity evidence vetoes an otherwise-promotion."""
+        return (
+            self.required_for_promotion
+            and self.status is StationarityStatus.NON_STATIONARY
+        )
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "testable": self.testable,
@@ -534,7 +566,11 @@ class ThroughputStationarity:
             "candidate_flat_from_repeat": self.candidate_flat_from_repeat,
             "stock_trend_pct_per_repeat": self.stock_trend_pct_per_repeat,
             "candidate_trend_pct_per_repeat": self.candidate_trend_pct_per_repeat,
-            "stationary": self.stationary,
+            "status": self.status.value,
+            # Derived on serialization so legacy records whose Boolean meant
+            # "not proven otherwise" are normalized from their actual evidence.
+            "stationary": self.status is StationarityStatus.STATIONARY,
+            "vetoed": self.vetoed,
             "required_for_promotion": self.required_for_promotion,
         }
 

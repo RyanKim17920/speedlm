@@ -73,25 +73,26 @@ every mitigation ship with a detector.
 
 `speedlm vllm serve` runs a gateway in front of a managed vLLM child, journals
 every admitted exchange, and normalizes completed request/response pairs into a
-bounded trace store (`README.md:18-27`). When the gateway goes quiet, the tuner
-closes admission, drains, sleeps the serving engine, and runs a tuning cycle
-(`README.md:170-176`).
+bounded trace store (README, **How it is structured**). When the gateway goes
+quiet, the tuner closes admission, drains, sleeps the serving engine, and runs a
+tuning cycle (README, **Promotion thresholds**).
 
 Inside that cycle, the EAGLE-3 backend must produce a hidden-states file for
 Speculators training. It does so by shelling out to the Speculators
 `prepare_data.py` script to build the arrow dataset
-(`src/speedlm/training/backends/eagle3.py:452-474`), validating the prepared
-dataset in a second subprocess with `--require-nonzero-loss-mask`
-(`:476-490`), and then running a **separate hidden-state generation stage** that
-stands up its own vLLM engine over the verifier.
+(`SpeculatorsTrainingRowRenderer.render_rows` in
+`src/speedlm/training/backends/eagle3.py`), validating the prepared dataset in a
+second subprocess with `--require-nonzero-loss-mask`, and then running a
+**separate hidden-state generation stage** that stands up its own vLLM engine
+over the verifier.
 
 That second engine needs the verifier weights resident in GPU memory at the same
 time the serving engine's allocation must be released, which is why the cycle
 carries a hard memory precondition before it will proceed
-(`src/speedlm/tuner/composition.py:330`, default at
-`src/speedlm/training/backends/eagle3.py:188`, enforcement at
-`src/speedlm/gateway/control.py:270` and `:277`). See Section 8 for exactly what
-that precondition says — the popular one-line summary of it is wrong.
+(`create_production_tuner` in `src/speedlm/tuner/composition.py`, default in
+`SpeculatorsPipelineConfig`, enforcement in `GPUMemoryPrecondition` in
+`src/speedlm/gateway/control.py`). See Section 8 for exactly what that
+precondition says — the popular one-line summary of it is wrong.
 
 ### 2.2 Measured cost — read the caveats
 
@@ -138,22 +139,23 @@ Corrections to figures that have circulated informally, so they are not repeated
   values, which happen to be the **corpus maxima**, not means.
 - "`BENCHMARKING` 496.5 s, n=5" is wrong. Only **4** `BENCHMARKING` intervals
   exist in the entire corpus. The `benchmark_repeats` default of 5
-  (`README.md:165`, `src/speedlm/config.py`) is a count of held-out suite passes
-  *inside* one benchmark stage, not a sample size for the stage duration.
+  (README, **Promotion thresholds**; `src/speedlm/config.py`) is a count of
+  held-out suite passes *inside* one benchmark stage, not a sample size for the
+  stage duration.
 - "1024.4 s total cycle" is the sum of four work stages of one cycle, not its
   wall clock (1134.8 s), and not a corpus mean (295.0 s over 21 complete cycles,
   range 97.8-1134.8 s — but that mean is dominated by aborts).
 - "Up to 120 s of GPU-memory-release wait" is **not a measurement**. It is the
   constant `DEFAULT_GPU_MEMORY_TIMEOUT_SECONDS = 120.0`
-  (`src/speedlm/gateway/control.py:44`) — a timeout ceiling. No stage in the
+  (`src/speedlm/gateway/control.py`) — a timeout ceiling. No stage in the
   corpus measures a GPU-release wait, and `SLEEPING` never exceeded 11.4 s.
 
 ### 2.3 The shape of the problem
 
 Sleeping the engine costs ~6.4 s and waking it costs ~0.067 s. Against that, the
 cycle spends ~200 s extracting, and both `CANDIDATE_STARTING` (~113 s) and a
-large share of `BENCHMARKING` are vLLM engine startup and weight loading
-(`README.md:167-168` attributes the benchmark phase's cost to engine restarts).
+large share of `BENCHMARKING` are believed to be vLLM engine startup and weight
+loading. The event data does not separate startup from replay within that stage.
 
 So the cycle is overwhelmingly **fixed overhead — process starts and weight
 loads — rather than useful work.** The frequently-quoted "~90% overhead, ~10%
@@ -383,8 +385,8 @@ Add capture directly where `aux_hidden_states` is unpacked
 - **Con:** it requires shipping a patched vLLM (a fork, a build-time patch, or an
   import-time monkeypatch of a private method). This repository currently pins
   vLLM as an out-of-band part of the GPU host image and deliberately does not
-  declare it as a runtime dependency (`README.md:190-193`); a patch changes that
-  posture.
+  declare it as a runtime dependency (README, **GPU runtime stack**); a patch
+  changes that posture.
 
 ### 5.4 Option C — upstream a connector change
 
@@ -433,11 +435,13 @@ in production paths:
    key while the loader read `conversations`, so the prepared dataset came out
    empty and training "succeeded" on nothing. Fixed in commit `46a6308`. The
    guard that now makes it loud is `EmptySpeculatorsDatasetError`, raised when
-   `written == 0` at `src/speedlm/training/backends/eagle3.py:1070`, pinned by
+   `written == 0` in `_render_speculators_dataset` in
+   `src/speedlm/training/backends/eagle3.py`, pinned by
    `tests/test_training_speculators.py:750`.
 2. **Silently zero-sample gate.** The gate could return a favorable decision from
    an empty replay. Fixed in commits `6779110` and `20231d3`. The guard is the
-   `TOO_FEW_REPEATS` rejection at `src/speedlm/gate/decide.py:329-330`, pinned by
+   `Reason.TOO_FEW_REPEATS` rejection in `decide` in
+   `src/speedlm/gate/decide.py`, pinned by
    `tests/test_gate_decide.py:450` (empty replay plus favorable metrics must still
    REJECT) and asserted end-to-end at
    `tests/e2e/test_live_idle_tuning.py:330-344`.
@@ -919,9 +923,10 @@ that warns and returns `None` when the loaded token ids do not match
 In this repository, serving-side capture stores **no token IDs at all** — the
 trace store's record structure (`src/speedlm/traces/store.py:69-141`) has no
 token-id field. The mask is instead re-derived by shelling out to Speculators'
-`prepare_data.py` (`src/speedlm/training/backends/eagle3.py:452-474`), with
-validation via `--require-nonzero-loss-mask` (`:476-490`) and offender
-localization in `_zero_row` (`:503-529`, raising `FinalAssistantMaskError`).
+`prepare_data.py` (`SpeculatorsTrainingRowRenderer.render_rows` in
+`src/speedlm/training/backends/eagle3.py`), with validation via
+`--require-nonzero-loss-mask` and offender localization in `_zero_row` (raising
+`FinalAssistantMaskError`).
 
 A provenance-based path that derives the mask from capture metadata exists —
 `prepare_training_row` at `src/speedlm/training/rows.py:289-340`, using
@@ -944,7 +949,12 @@ which is precisely the silent-empty-data shape of bug #1 in Section 6.0. Any
 integration must convert that warning into a hard failure on our side, and must
 assert `len(loss_mask) == captured_row_count` per row before training starts.
 
-### 6.7 Control tokens in user content — the two legs do not share a renderer
+### 6.7 Prospective tokenization skew — the two legs do not share a renderer
+
+**Status: prospective, not a current production-training cause.** The renderer
+difference below is measured, but today's EAGLE-3 training flow does not join
+serving-rendered activations to separately offline-rendered rows. It therefore
+does not currently introduce tokenization skew into the training alignment.
 
 Measured 2026-07-31 on the Stage 0 four-prompt matrix. The `template_divergent`
 case failed on `openai/gpt-oss-20b` under **both** runner generations, identically
@@ -971,6 +981,12 @@ The prompt body contained `<|endoftext|>` as ordinary user text.
   tokens for the user turn, plus the four the conversation renderer appends for
   the assistant turn (`<|channel|>final<|message|><|return|>`) — **124** rows.
 
+The branch is runtime-detectable. In the pinned vLLM 0.25.1 environment,
+`V/entrypoints/openai/chat_completion/serving.py:152` passes
+`is_harmony=self.model_config.hf_config.model_type == "gpt_oss"` to the parser
+manager; Responses serving uses the same model-type predicate. It is not a
+model-name allowlist.
+
 Both counts are correct for the renderer that produced them. They can only
 disagree when user content contains a string that *is* a control token, so this
 is a template-injection input rather than a capture defect, and the assertion
@@ -982,11 +998,13 @@ was retained as `control_token_injection`, selectable with
 `SPEEDLM_E2E_PROMPT_SET=injection`, with the expected failure documented on it
 (`tests/e2e/test_serving_activation_capture.py`). A pre-flight guard,
 `_assert_prompts_free_of_control_tokens`, now checks every standard prompt body
-against the verifier's own vocabulary before an engine is started.
+against the verifier's own vocabulary before an engine is started. This is a
+description of the harness code path, not a claim that a definitive tuning run
+observed the guard firing.
 
 **Downstream, in production.** The eagle3 flow writes captured trace text to a
-`conversations` JSONL (`_speculators_record`,
-`src/speedlm/training/backends/eagle3.py:1094-1163`) and hands it to
+`conversations` JSONL (`_speculators_record` in
+`src/speedlm/training/backends/eagle3.py`) and hands it to
 `prepare_data.py`. That flow re-derives both the hidden states and the training
 rows from the *same* prepared dataset, so it is self-consistent: this divergence
 does **not** misalign production training rows today. It would begin to matter
@@ -1015,7 +1033,7 @@ mitigation is proposed in this document.
 | 6.4 | Prefill/decode numerics | Medium (pre-existing) | Measure first; `VLLM_BATCH_INVARIANT=1` if warranted | Equivalence harness across batch sizes; publish the spread |
 | 6.5 | CUDA-graph padding | Medium (stale, plausible values) | Slice to `total_num_scheduled_tokens` | Row count == scheduled tokens, in-process; stale-row spot check |
 | 6.6 | Loss mask provenance | Medium (blocks the simplification) | Capture token IDs, or promote `rows.py` path | Hard-fail the alignment guard; `len(mask) == rows` |
-| 6.7 | Control tokens in user content render differently on the two legs — **confirmed empirically**, gpt-oss-20b, both runners (6.7) | Low today (production re-derives both sides from one render); **High** if serving captures are ever joined to offline-rendered rows | Do not compare such prompts across legs; strip or escape control tokens if the 6.6 simplification lands | `_assert_prompts_free_of_control_tokens` pre-flight; `align_prompt_rows` row-count guard |
+| 6.7 | Prospective tokenization skew when serving-rendered activations are joined to offline-rendered rows; renderer difference **confirmed empirically**, gpt-oss-20b, both runners | None in today's self-consistent EAGLE-3 preparation; **High** if the Section 6.6 join lands | Preserve token IDs with captures, or make the join use one renderer; strip or escape control tokens if the simplification lands | Runtime predicate `hf_config.model_type == "gpt_oss"`; `_assert_prompts_free_of_control_tokens`; `align_prompt_rows` |
 
 ---
 
@@ -1038,7 +1056,7 @@ At 3 aux layers that is 16.875 KiB/token; at 4 (Section 6.2) it is 22.5 KiB/toke
 
 | Serving rate | 3 layers | 4 layers |
 | --- | --- | --- |
-| ~77 tok/s (measured replay throughput, `README.md:147-148`) | ~1.3 MB/s | ~1.7 MB/s |
+| ~77 tok/s (historical planning assumption; not a valid tuned-head benchmark) | ~1.3 MB/s | ~1.7 MB/s |
 | 2000 tok/s (hypothetical high load) | ~34 MB/s | ~45 MB/s |
 
 Against PCIe Gen4 x16 (~32 GB/s theoretical), the high-load case is roughly 0.14%
@@ -1080,9 +1098,9 @@ Do not inherit the trace retention policy. The activation cache needs its own:
   should meet that bar from day one.
 - **Store on the same volume policy as `exchanges/`.** Activations derived from
   user traffic are user data. `exchanges/` is already private-0700 because raw
-  bodies can carry credentials (`README.md:51`). The activation cache inherits
-  that sensitivity class — an activation is a lossy but real function of the
-  prompt. Treat it as such by default.
+  bodies can carry credentials (README, **How it is structured**). The
+  activation cache inherits that sensitivity class — an activation is a lossy
+  but real function of the prompt. Treat it as such by default.
 
 **Detector:** an assertion that the cache's on-disk size stays under its
 configured cap, checked on every write, with the retention pass recorded as an
@@ -1110,12 +1128,11 @@ during serving removes that need entirely.
 Today the cycle requires that the verifier fit in GPU memory **twice,
 sequentially** — the serving engine must fully release before the extraction
 engine can allocate. That is enforced as a precondition:
-`src/speedlm/tuner/composition.py:330` passes
-`required_fraction=pipeline.gpu_memory_utilization` (default 0.80 at
-`src/speedlm/training/backends/eagle3.py:188`; `composition.py:294` does not
-override it), and `src/speedlm/gateway/control.py:270` computes
-`int(device.total_bytes * self.required_fraction)`, compared against free memory
-at `:277`.
+`create_production_tuner` in `src/speedlm/tuner/composition.py` passes
+`required_fraction=pipeline.gpu_memory_utilization` (default 0.80 in
+`SpeculatorsPipelineConfig`), and `GPUMemoryPrecondition` in
+`src/speedlm/gateway/control.py` computes the required bytes from device-total
+memory and compares that value against free memory.
 
 **Correction to the common summary.** This is *"0.80 of device **total** must be
 **free**"*, not "0.80 of free memory." The phrase "0.80 × device-total free" is
@@ -1142,10 +1159,10 @@ stage.
 **This repository documents no consumer-GPU or VRAM target anywhere.** A search
 across code, docs, and config returns zero hits for RTX / GeForce / 4090 / 3090 /
 5090 / "consumer" / "gaming" / 24GB. The documented targeting is the opposite:
-`README.md:204` describes the live E2E test as an **H100** test, `DEMO.md:346`
+README **Project status** describes the live E2E test as an **H100** test, `DEMO.md:346`
 places runs on an H100 in a SLURM partition, and `DEMO.md:321` explicitly rules
-out laptop-local execution. `README.md:178-190` pins the GPU host stack but names
-no GPU model or VRAM size. Every one of the 25 GPU-identifying records in
+out laptop-local execution. README **GPU runtime stack** pins the GPU host stack
+but names no GPU model or VRAM size. Every one of the 25 GPU-identifying records in
 `log_artifacts/` is an NVIDIA H100 80GB HBM3.
 
 So "this unlocks low-VRAM deployment" is not a claim this proposal should make.
@@ -1302,7 +1319,7 @@ the loss-mask join (6.6).
 **Exit:** a training run from cached activations produces a candidate whose gate
 metrics are statistically indistinguishable from a candidate trained via the
 current extraction path on the same traces. Same-or-better, measured against the
-existing thresholds (`README.md:117-163`).
+existing thresholds (README, **Promotion thresholds**).
 
 ### Stage 4 — Delete the extraction stage
 

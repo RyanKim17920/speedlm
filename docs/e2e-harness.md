@@ -7,12 +7,11 @@ harness **is**, not what it should be.
 **Audience:** anyone about to burn GPU hours on a `tests/e2e/` run, or trying to
 read the artifacts one left behind.
 
-**Citation convention.** Every technical claim carries a `file:line` reference
-relative to `/admin/home/ryan.kim/speedlm-fr` unless the path is absolute. Line
-numbers are pinned to commit `1c8f5c0` and will drift. Anything not confirmed
-against a source or a measurement is labelled **[unverified]**. Keep that
-discipline when editing this file — a confidently wrong line here costs a GPU
-job.
+**Citation convention.** Technical claims carry a source or artifact reference
+relative to `/admin/home/ryan.kim/speedlm-fr` unless the path is absolute.
+Symbol references are preferred because line anchors drift. Untouched historical
+line anchors remain pinned to commit `1c8f5c0`, as stated above. Anything not
+confirmed against a source or a measurement is labelled **[unverified]**.
 
 ---
 
@@ -216,7 +215,8 @@ Related: the *drafter* must also be a resolved **directory**, not a repo id —
 `pkg.mod.Class`, never `pkg.mod:Class`. vLLM resolves it with
 `resolve_obj_by_qualname`, which does `qualname.rsplit(".", 1)` then `getattr` —
 so the colon form tries to import `pkg` and look up an attribute literally named
-`mod:Class`. Constant and reasoning: `src/speedlm/tuner/composition.py:65-71`;
+`mod:Class`. Constant and reasoning: `DRAFT_SWAP_WORKER_EXTENSION_CLS` in
+`src/speedlm/tuner/composition.py`;
 test-side constant `test_serving_draft_hot_swap.py:100-102`, flag constructed at
 `:663-664`. Also noted at `src/speedlm/gateway/draft_swap.py:12-14` and
 `src/speedlm/activation_capture/hook.py:26,94`.
@@ -350,7 +350,7 @@ banners.
 
 The promotion verdict. Written by `write_decision`
 (`src/speedlm/tuner/orchestrator.py:121-147`, called from `:817-833` via `:664`);
-payload is exactly `Decision.to_dict()` (`src/speedlm/gate/decide.py:904-1025`).
+payload is exactly `Decision.to_dict()` (`src/speedlm/gate/decide.py`).
 It refuses to persist when `num_repeats != len(per_repeat)` (`:135-140`).
 
 Top-level keys include `verdict`, `reason`, `acceptance_delta_pp`,
@@ -364,15 +364,17 @@ summary. The gate promotes on `accepted_length_delta >= min_accepted_length_delt
 (not on `acceptance_delta_pp`; see `GATING_ACCEPTANCE_CRITERION` in
 `src/speedlm/gate/decide.py`).
 
-`per_repeat[]` rows (`decide.py:917-930`): `repeat_index, stock_tok_per_sec,
+`per_repeat[]` rows (`RepeatResult.to_dict` in `decide.py`): `repeat_index, stock_tok_per_sec,
 candidate_tok_per_sec, stock_acceptance_rate, candidate_acceptance_rate,
 invalid_rate, output_mismatches, stock_accepted_length, candidate_accepted_length`.
-`output_divergences[]` rows (`:418-427`): `context_hash, repeat_index,
-first_divergence_index, basis` (`"token"` or `"character"`, `:386-387`),
+`output_divergences[]` rows (`ContextDivergence.to_dict` in `decide.py`):
+`context_hash, repeat_index, first_divergence_index, basis` (`"token"` or
+`"character"`),
 `stock_length, candidate_length, early`.
 
 **Which number gates:** `throughput_delta_pct`. `prometheus_throughput_delta_pct`
-is explicitly diagnostic and **never gates** (`decide.py:487-491,513-518`) — do
+is explicitly diagnostic and **never gates** (`Decision` and `decide` in
+`src/speedlm/gate/decide.py`) — do
 not quote it as the result.
 
 ### `gate-metrics/*.prom.gz` — `<run_dir>/gate-metrics/`
@@ -383,11 +385,12 @@ gzipped with `mtime=0` for reproducibility, one file per scrape label
 (`:180-185`). Labels must match `^[A-Za-z0-9][A-Za-z0-9._-]*$` or the write is
 refused (`:54,176-179`).
 
-Labels emitted by the gate runner (`src/speedlm/gate/runner.py:1086-1109`):
-`<arm>-before`, `<arm>-after-repeat-<i>` for every repeat but the last, and
-`<arm>-after` for the final one, where arm ∈ {stock, candidate}. The raw
+Labels emitted by `_measure_block` in `src/speedlm/gate/runner.py` are
+`<arm>-before` / `<arm>-after` when a block spans the whole arm, or
+`<arm>-before-repeat-<i>` / `<arm>-after-repeat-<i>` for interleaved blocks,
+where arm ∈ {stock, candidate}. The raw
 exposition is kept because acceptance is a **counter delta** and the reported
-rates must stay reconcilable (`runner.py:748-752`). The metrics of interest are
+rates must stay reconcilable (`_measure_block`). The metrics of interest are
 vLLM's `vllm:spec_decode_*` counters plus decode throughput.
 
 ```bash

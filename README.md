@@ -4,8 +4,8 @@ SpeedLM is a near-drop-in wrapper around `vllm serve`. It launches vLLM behind
 a streaming gateway, proxies OpenAI-compatible traffic, and captures completed
 requests inline. Its adaptation pipeline is designed to use idle GPU periods to
 personalize a speculative draft head from that traffic, then promote the
-candidate only when a held-out gate measures improvements in both draft
-acceptance and throughput.
+candidate only when a held-out gate measures the required increase in mean
+accepted length and the candidate stays above the throughput regression floor.
 
 SpeedLM is a warm-start adaptation system, not a draft-model trainer from
 scratch. Training always starts from an existing public draft head—for example,
@@ -32,9 +32,11 @@ by a particular deployment. The tuner explicitly refuses a missing
   restored on failure.
 - **Gate** — a frozen held-out suite is replayed against the stock and candidate
   drafts. The decision is fail-closed: unavailable acceptance metrics, counter
-  resets, invalid responses, output mismatches, or either improvement threshold
-  being missed all reject the candidate. Only a candidate with **measurably
-  improved acceptance** and no throughput regression is promoted — see
+  resets, invalid responses, excessive output divergence relative to the
+  stock-stock control, a missed mean-accepted-length threshold, or a breached
+  throughput floor rejects the candidate. Only a candidate with the required
+  **mean accepted length** increase and no material throughput regression is
+  promoted — see
   [Promotion thresholds](#promotion-thresholds).
 - **Doctor** — `speedlm.doctor` implements read-only checks for Python, GPU,
   CUDA, pinned packages, disk, memory, and verifier/draft compatibility, and
@@ -126,21 +128,20 @@ training and artifact contract is validated.
 }
 ```
 
-The knobs are not symmetric, and the defaults are derived from the measured
-dispersion of live gate runs rather than picked round.
+The knobs are not symmetric. The accepted-length threshold is the promotion
+criterion, the acceptance-rate threshold is retained only as a reported legacy
+field, and the throughput threshold is a regression floor.
 
 `min_accepted_length_delta` is the **promotion criterion**. It measures mean
 accepted length in tokens per verifier step (`1 + accepted_tokens / num_drafts`),
 which is directly proportional to throughput at fixed step cost. Unlike the
 acceptance rate (`(mean_accepted_length - 1) / k`), it does not divide by the
 draft depth and is comparable across different `k` values. The 0.05 default is
-the old 1.0 pp bar re-expressed at `k=5`, so no archived rejection can flip to
-a promotion. Acceptance comes from vLLM's `spec_decode` counters over a
-deterministic greedy replay of a frozen suite, so it carries no timing
-component: on job 368670 the two arms produced byte-identical counters (1155
-drafted, 730 accepted, delta exactly 0.0 pp). The noise floor is therefore the
-counter quantum itself, making the 0.05 bar approximately a 2% relative lift in
-accepted length.
+the old 1.0 pp bar re-expressed at `k=5`. Acceptance comes from vLLM's
+`spec_decode` counter deltas over deterministic greedy replay; it has no timing
+component, but that does not make every archived counter comparison valid.
+Several early runs produced identical substantive counters for both arms and
+are voided in the [benchmark evidence record](docs/benchmark-evidence.md).
 
 `min_acceptance_delta_pp` is **recorded, not gated**. The acceptance-rate delta
 is still computed and published for backward compatibility, but it carries the
@@ -152,29 +153,26 @@ purpose: it asks only that the candidate not be visibly slower. The gate
 compares the **replay** statistic (`replay_per_repeat_mean`), so every number
 below is replay-derived unless labelled Prometheus; the Prometheus decode rate
 is recorded alongside for diagnosis but is not what the gate reads. Throughput
-is timing, and timing is noisy. Across job 368670's scored repeats the
-within-arm replay standard deviation was 1.80 tok/s (stock) and 0.58 tok/s
-(candidate) on a ~76.7 tok/s mean, giving a 1.43% standard error on the
-arm-to-arm delta at three repeats and 1.10% at the default five. A *positive*
-throughput bar below the one-sided 95% minimum detectable effect (~3.0% at three
-repeats, ~2.1% at five) cannot be earned on merit — it is cleared by whichever
-way the noise fell. Job 368670 is the worked example: its replay delta was
-+0.96% (the Prometheus delta coincidentally agreed at +0.96%), and the same data
-reads −0.78% if you drop its first scored repeat. −2.0% sits ~1.8 standard
-errors below zero at five repeats, so ordinary jitter does not trip it, while
-the real regression this gate has already caught — job 368648's un-warmed
-candidate arm at −17.5% replay (−19.2% on the Prometheus decode rate) — is
-~16 standard errors past it.
+is timing, so the decision records a standard error and uses interleaved arm
+blocks to expose lifecycle effects. The first trustworthy measurements at
+commit `8b72d9a` show no throughput improvement on either supported model:
+Qwen is +0.48% ± 1.11% (0.43 sigma, noise), while gpt-oss is −5.57% ± 1.15%
+(4.8 sigma, a regression that breaches the −2% floor). The independent gpt-oss
+Prometheus decode counter agrees at −5.69%. Both candidates had already failed
+the k-invariant criterion: accepted-length deltas +0.024 and −0.163 versus the
+required +0.05. See the [benchmark evidence record](docs/benchmark-evidence.md)
+for exact artifact paths and the voided archive.
 
-Both values are configurable. Setting them to `0.0` / `0.0` reduces the gate to
-"not measurably worse", which promotes on noise indefinitely; that is the exact
-failure mode this gate exists to prevent, and it is not a supported production
-configuration.
+The two gating thresholds are configurable. Setting
+`min_accepted_length_delta` / `min_throughput_delta_pct` to `0.0` / `0.0`
+reduces the gate to "not measurably worse", which promotes on noise
+indefinitely; that is the exact failure mode this gate exists to prevent, and it
+is not a supported production configuration.
 
 `benchmark_repeats` defaults to 5 (floor 3). Each extra repeat is one more
-held-out suite pass per arm — roughly 8s each on job 368670's hardware, against
-a ~275s benchmark phase dominated by vLLM engine restarts — so precision here
-is cheap.
+held-out suite pass per arm. Repeats improve precision but do not repair a
+confounded arm lifecycle, a non-discriminating metric scrape, or a semantically
+degenerate held-out suite.
 
 The managed child is launched with vLLM sleep support on a private loopback
 port. Once the gateway is idle, it atomically closes admission, drains accepted
@@ -214,13 +212,13 @@ The live H100 E2E test launches a real vLLM process and exercises the gateway
 against it. It is an infrastructure test and is intentionally excluded from
 CPU-only CI.
 
-The CPU/injected lifecycle suite is not a substitute for the final literal GPU
-milestone. A real adaptation run must still demonstrate: live vLLM
-sleep/wake, real Speculators extraction and training, candidate restart,
-held-out gate rejection or promotion, request-driven preemption, and restart
-recovery. Earlier measurements came from a prototype under confounded
-conditions; they are not SpeedLM benchmark results and are intentionally not
-presented here.
+The CPU/injected lifecycle suite is not a substitute for literal GPU evidence.
+The definitive `8b72d9a` runs reached live sleep, extraction, training,
+candidate start, benchmarking, rejection, rollback, and wake. Real-run evidence
+is still required for promotion, request-driven preemption, and restart
+recovery. Earlier positive measurements came from a prototype under confounded
+conditions and are void. The current honest result and exact artifact paths are
+recorded in [Benchmark evidence](docs/benchmark-evidence.md).
 
 ## Contributing
 
