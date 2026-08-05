@@ -507,6 +507,18 @@ class SpeculatorsPipelineConfig:
     #: Only consulted when the filter actually removed rows; a corpus that is
     #: small for its own reasons is not this check's business.
     min_rendered_rows: int = 32
+    #: Accept assistant turns that carry no ``provenance_tag`` as this
+    #: verifier's own output.
+    #:
+    #: Off by default and deliberately: the gateway tags every message it
+    #: captures, so an untagged assistant turn means the corpus predates
+    #: tagging, and "predates tagging" is not evidence of authorship.  Mirrors
+    #: ``trust_untagged_assistant_messages`` in
+    #: :func:`speedlm.training.rows.training_row_from_trace`, which made the
+    #: same call for the same reason.  It exists so an operator with a trusted
+    #: offline corpus has a named opt-in rather than a corpus the authorship
+    #: filter empties with no way back.
+    trust_untagged_assistant_messages: bool = False
     #: Fail the cycle when the final epoch does not improve on the first.
     #:
     #: Measured on :data:`ACCEPTANCE_METRIC` and not on the loss, because the
@@ -607,6 +619,8 @@ class SpeculatorsPipelineConfig:
             raise ValueError("truncated_row_policy must be a TruncatedRowPolicy")
         if not isinstance(self.require_accuracy_improvement, bool):
             raise ValueError("require_accuracy_improvement must be a bool")
+        if not isinstance(self.trust_untagged_assistant_messages, bool):
+            raise ValueError("trust_untagged_assistant_messages must be a bool")
         if not isinstance(self.mask_policy, MaskPolicy):
             raise ValueError("mask_policy must be a MaskPolicy")
         if self.mask_policy is not MaskPolicy.ALL_ASSISTANT_TURNS:
@@ -908,6 +922,9 @@ class SpeculatorsTrainingRowRenderer:
                 timeout=timeout_seconds,
                 policy=self.config.truncated_row_policy,
                 minimum_rows=self.config.min_rendered_rows,
+                trust_untagged_assistant_messages=(
+                    self.config.trust_untagged_assistant_messages
+                ),
             )
             self.state.rendered_rows = counts.to_dict()
             row_count = self.config.row_count or counts.written
@@ -1638,6 +1655,15 @@ def _speculators_turn(turn: object) -> dict[str, Any] | None:
     if isinstance(reasoning, str) and reasoning:
         converted["thinking"] = reasoning
         converted["reasoning_content"] = reasoning
+    # Carried, not merely consulted -- the same argument as ``finish_reason``
+    # below.  ``_normalize_conversation`` in the Speculators loader rebuilds
+    # each turn from a fixed key set (role/content/tool_calls/tool_call_id/
+    # thinking/reasoning_content), so this key is inert there; it exists so the
+    # rendered artifact records *why* a row was admitted rather than only this
+    # process's logs.
+    provenance = turn.get("provenance_tag")
+    if isinstance(provenance, str) and provenance:
+        converted["provenance_tag"] = provenance
     return converted
 
 
@@ -1674,6 +1700,66 @@ def _speculators_record(record: Mapping[str, Any]) -> dict[str, Any] | None:
     return converted_record
 
 
+def _assistant_authorship(
+    turn: Mapping[str, Any],
+    *,
+    trust_untagged: bool,
+) -> bool:
+    """Whether *this* deployment's verifier demonstrably produced *turn*.
+
+    Only the exact tag ``"generated"`` establishes provider authorship; the
+    gateway writes it on the response it assembled and ``"client_supplied"`` on
+    everything that arrived in the request (``gateway/capture.py``).  An absent
+    tag is *not* evidence of authorship -- it is a corpus that predates the tag
+    -- so it fails closed unless an operator opts in.
+
+    A prefill continuation is folded into one assistant turn carrying the
+    generated tag, with ``prefill_prefix_chars`` recording how much of the
+    merged content the *client* wrote (``traces/normalize.py``).  That prefix
+    renders inside the assistant span the loss mask covers, so a non-zero (or
+    unknown) prefix is not fully owned either.
+    """
+    tag = turn.get("provenance_tag")
+    if tag is None:
+        if not trust_untagged:
+            return False
+    elif tag != "generated":
+        return False
+    if "prefill_prefix_chars" not in turn:
+        return True
+    prefix = turn.get("prefill_prefix_chars")
+    return isinstance(prefix, int) and not isinstance(prefix, bool) and prefix == 0
+
+
+def _unowned_assistant_turns(
+    record: Mapping[str, Any],
+    *,
+    trust_untagged: bool,
+) -> int:
+    """Count assistant turns in *record* that the verifier did not produce.
+
+    Reads the *captured* messages rather than the converted ones so the answer
+    does not depend on the conversion keeping any particular key.
+    """
+    turns = record.get("conversations")
+    if not isinstance(turns, (list, tuple)):
+        turns = record.get("messages")
+    if not isinstance(turns, (list, tuple)):
+        return 0
+    unowned = 0
+    for turn in turns:
+        if not isinstance(turn, Mapping):
+            continue
+        raw_role = turn.get("from", turn.get("role"))
+        if not isinstance(raw_role, str):
+            continue
+        if _SPECULATORS_ROLES.get(raw_role) != "assistant":
+            continue
+        if not _assistant_authorship(turn, trust_untagged=trust_untagged):
+            unowned += 1
+    return unowned
+
+
 def _is_truncated(record: Mapping[str, Any]) -> bool:
     """Whether *record*'s completion was cut off rather than finished."""
     value = record.get("finish_reason")
@@ -1690,6 +1776,10 @@ class RenderedRowCounts:
     dropped_truncated: int
     truncated_seen: int
     policy: TruncatedRowPolicy
+    #: Rows dropped because an assistant turn was not this verifier's output.
+    dropped_client_supplied: int = 0
+    #: Assistant turns that were not this verifier's output, across all rows.
+    client_supplied_turns_seen: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -1699,6 +1789,8 @@ class RenderedRowCounts:
             "dropped_truncated": self.dropped_truncated,
             "truncated_seen": self.truncated_seen,
             "truncated_row_policy": self.policy.value,
+            "dropped_client_supplied": self.dropped_client_supplied,
+            "client_supplied_turns_seen": self.client_supplied_turns_seen,
         }
 
 
@@ -1721,6 +1813,26 @@ class TruncationFilteredCorpusError(Eagle3Error):
         )
 
 
+class ClientSupervisedCorpusError(Eagle3Error):
+    """The client-authorship filter left too few rows to train on."""
+
+    def __init__(self, source: Path, counts: RenderedRowCounts, minimum: int) -> None:
+        self.counts = counts
+        self.minimum = minimum
+        super().__init__(
+            f"dropping rows with client-supplied assistant turns left "
+            f"{counts.written} trainable rows from {source}, below the floor of "
+            f"{minimum}: {counts.dropped_client_supplied} of {counts.read} rows "
+            f"carried an assistant turn this verifier did not produce "
+            f"({counts.client_supplied_turns_seen} such turns in total). "
+            "Supervising those turns would teach the draft head to predict "
+            "another model's outputs. If the corpus predates per-message "
+            "provenance tagging and every assistant turn in it is known to be "
+            "this verifier's own output, set "
+            "trust_untagged_assistant_messages to accept untagged turns."
+        )
+
+
 def _render_speculators_dataset(
     snapshot: TraceSnapshot,
     destination: Path,
@@ -1730,6 +1842,7 @@ def _render_speculators_dataset(
     timeout: float,
     policy: TruncatedRowPolicy = TruncatedRowPolicy.KEEP,
     minimum_rows: int = 1,
+    trust_untagged_assistant_messages: bool = False,
 ) -> RenderedRowCounts:
     """Rewrite a leased trace snapshot into the Speculators loader contract.
 
@@ -1745,12 +1858,23 @@ def _render_speculators_dataset(
     only when that filter actually removed something, so it bounds the damage
     this filter can do without imposing a floor on corpora that are small for
     unrelated reasons.
+
+    Rows carrying an assistant turn this verifier did not produce are dropped
+    outright.  The Speculators loader builds its loss mask by matching assistant
+    spans in the *rendered* text and has no per-turn input, so there is no way
+    to render a client-supplied assistant turn as context while withholding loss
+    from it -- and the turn cannot simply be deleted either, because it is part
+    of the prompt the verifier actually saw.  Dropping the row is therefore the
+    only representable answer, and it is fail-closed.  *minimum_rows* bounds
+    this filter's damage the same way it bounds the truncation filter's.
     """
     read = 0
     written = 0
     dropped_untrainable = 0
     dropped_truncated = 0
     truncated_seen = 0
+    dropped_client_supplied = 0
+    client_supplied_turns_seen = 0
     try:
         with (
             snapshot.path.open("r", encoding="utf-8") as source,
@@ -1773,6 +1897,13 @@ def _render_speculators_dataset(
                 if converted is None:
                     dropped_untrainable += 1
                     continue
+                unowned = _unowned_assistant_turns(
+                    record, trust_untagged=trust_untagged_assistant_messages
+                )
+                if unowned:
+                    client_supplied_turns_seen += unowned
+                    dropped_client_supplied += 1
+                    continue
                 if _is_truncated(record):
                     truncated_seen += 1
                     if policy is TruncatedRowPolicy.DROP:
@@ -1791,15 +1922,20 @@ def _render_speculators_dataset(
         dropped_truncated=dropped_truncated,
         truncated_seen=truncated_seen,
         policy=policy,
+        dropped_client_supplied=dropped_client_supplied,
+        client_supplied_turns_seen=client_supplied_turns_seen,
     )
     logger.info(
         "rendered %d of %d captured rows (%d untrainable, %d truncated dropped, "
-        "%d truncated seen, policy=%s)",
+        "%d truncated seen, %d client-supplied dropped, %d client-supplied turns, "
+        "policy=%s)",
         written,
         read,
         dropped_untrainable,
         dropped_truncated,
         truncated_seen,
+        dropped_client_supplied,
+        client_supplied_turns_seen,
         policy.value,
     )
     # Checked before the empty-dataset error so a corpus this filter emptied is
@@ -1807,6 +1943,8 @@ def _render_speculators_dataset(
     # converted" that predates the filter and names the wrong cause.
     if dropped_truncated and written < minimum_rows:
         raise TruncationFilteredCorpusError(snapshot.path, counts, minimum_rows)
+    if dropped_client_supplied and written < minimum_rows:
+        raise ClientSupervisedCorpusError(snapshot.path, counts, minimum_rows)
     if not written:
         raise EmptySpeculatorsDatasetError(snapshot.path)
     return counts

@@ -25,6 +25,7 @@ from speedlm.training.backends.eagle3 import (
     ACCEPTANCE_METRIC,
     TRUNCATED_FINISH_REASONS,
     AccuracyRegressionError,
+    ClientSupervisedCorpusError,
     Eagle3Error,
     EmptySpeculatorsDatasetError,
     RenderedRowCounts,
@@ -594,8 +595,10 @@ def _row(index: int, finish_reason: object = ...) -> dict[str, object]:
     record: dict[str, object] = {
         "id": f"row-{index}",
         "messages": [
-            {"role": "user", "content": "q"},
-            {"role": "assistant", "content": "a"},
+            # Tagged as the gateway tags them: the request body is
+            # ``client_supplied``, the assembled response is ``generated``.
+            {"role": "user", "content": "q", "provenance_tag": "client_supplied"},
+            {"role": "assistant", "content": "a", "provenance_tag": "generated"},
         ],
     }
     if finish_reason is not ...:
@@ -610,6 +613,7 @@ def _render(
     policy: TruncatedRowPolicy = TruncatedRowPolicy.KEEP,
     minimum_rows: int = 1,
     name: str = "out.jsonl",
+    trust_untagged: bool = False,
 ) -> tuple[RenderedRowCounts, list[dict[str, object]]]:
     snapshot = _snapshot(tmp_path / f"snap-{name}", records)
     destination = tmp_path / name
@@ -621,6 +625,7 @@ def _render(
         timeout=60.0,
         policy=policy,
         minimum_rows=minimum_rows,
+        trust_untagged_assistant_messages=trust_untagged,
     )
     written = [
         json.loads(line)
@@ -813,6 +818,330 @@ def test_config_rejects_a_non_boolean_accuracy_gate() -> None:
             warm_start_model="w",
             require_accuracy_improvement="yes",  # type: ignore[arg-type]
         )
+
+
+# ===========================================================================
+# FIX 4 -- only turns this verifier produced may be supervised
+#
+# The gateway tags every inbound message ``client_supplied`` and only the
+# response it assembled ``generated`` (``gateway/capture.py``).  The Speculators
+# loader masks assistant spans by matching the *rendered* text, so it has no
+# per-turn input: a client-supplied assistant turn cannot be rendered as
+# context while being withheld from the loss.  These tests pin the only
+# representable answer -- drop the row -- and pin that the tag reaches the
+# decision at all, which it previously did not.
+# ===========================================================================
+
+
+def _turn(role: str, content: str, **extra: object) -> dict[str, object]:
+    return {"role": role, "content": content, **extra}
+
+
+def _conversation_row(
+    index: int,
+    turns: Sequence[Mapping[str, object]],
+    finish_reason: object = ...,
+) -> dict[str, object]:
+    record: dict[str, object] = {"id": f"row-{index}", "messages": list(turns)}
+    if finish_reason is not ...:
+        record["finish_reason"] = finish_reason
+    return record
+
+
+def _generated(index: int, **extra: object) -> dict[str, object]:
+    """A single-turn exchange exactly as the gateway writes it."""
+    return _conversation_row(
+        index,
+        [
+            _turn("user", "q", provenance_tag="client_supplied"),
+            _turn("assistant", "a", provenance_tag="generated", **extra),
+        ],
+    )
+
+
+def _replayed(index: int) -> dict[str, object]:
+    """A multi-turn request: the client replayed an assistant turn as history.
+
+    Only the trailing turn is this verifier's; the middle one arrived in the
+    request body and may have come from any model at all.
+    """
+    return _conversation_row(
+        index,
+        [
+            _turn("user", "q1", provenance_tag="client_supplied"),
+            _turn("assistant", "history", provenance_tag="client_supplied"),
+            _turn("user", "q2", provenance_tag="client_supplied"),
+            _turn("assistant", "a", provenance_tag="generated"),
+        ],
+    )
+
+
+def test_the_provenance_tag_reaches_the_rendered_row() -> None:
+    """It is captured, validated and leased; it was dropped only here."""
+    converted = _speculators_record(_generated(0))
+
+    assert converted is not None
+    turns = converted["conversations"]
+    assert [turn.get("provenance_tag") for turn in turns] == [  # type: ignore[union-attr]
+        "client_supplied",
+        "generated",
+    ]
+
+
+def test_a_client_supplied_assistant_turn_is_never_supervised(
+    tmp_path: Path,
+) -> None:
+    """The draft head must not be taught to predict another model's outputs."""
+    records = [_generated(0), _replayed(1), _generated(2)]
+
+    counts, written = _render(tmp_path, records)
+
+    assert [row["id"] for row in written] == ["row-0", "row-2"]
+    assert counts.dropped_client_supplied == 1
+    assert counts.client_supplied_turns_seen == 1
+    assert counts.written == 2
+    assert counts.to_dict()["dropped_client_supplied"] == 1
+
+
+def test_every_client_supplied_turn_in_a_row_is_counted(tmp_path: Path) -> None:
+    """One row, two foreign turns -- the evidence must say two, not one."""
+    records = [
+        _conversation_row(
+            0,
+            [
+                _turn("user", "q1", provenance_tag="client_supplied"),
+                _turn("assistant", "h1", provenance_tag="client_supplied"),
+                _turn("assistant", "h2", provenance_tag="client_supplied"),
+                _turn("assistant", "a", provenance_tag="generated"),
+            ],
+        ),
+        _generated(1),
+    ]
+
+    counts, _ = _render(tmp_path, records)
+
+    assert counts.dropped_client_supplied == 1
+    assert counts.client_supplied_turns_seen == 2
+
+
+def test_an_untagged_assistant_turn_fails_closed(tmp_path: Path) -> None:
+    """An absent tag means "corpus predates tagging", not "we wrote it"."""
+    records = [_conversation_row(0, [_turn("user", "q"), _turn("assistant", "a")])]
+
+    with pytest.raises(ClientSupervisedCorpusError):
+        _render(tmp_path, records)
+
+
+def test_the_named_opt_in_admits_a_trusted_untagged_corpus(tmp_path: Path) -> None:
+    """Fail-closed must leave a way back, or the failure is unrecoverable."""
+    records = [_conversation_row(0, [_turn("user", "q"), _turn("assistant", "a")])]
+
+    counts, written = _render(tmp_path, records, trust_untagged=True)
+
+    assert counts.written == 1
+    assert counts.dropped_client_supplied == 0
+    assert [row["id"] for row in written] == ["row-0"]
+
+
+def test_the_opt_in_does_not_admit_an_explicitly_foreign_turn(
+    tmp_path: Path,
+) -> None:
+    """It relabels *untagged* turns only; a known-foreign tag still fails."""
+    with pytest.raises(ClientSupervisedCorpusError):
+        _render(tmp_path, [_replayed(0)], trust_untagged=True)
+
+
+def test_a_prefilled_assistant_turn_is_not_wholly_this_verifiers(
+    tmp_path: Path,
+) -> None:
+    """A prefill continuation is one turn tagged ``generated`` whose *prefix*
+    the client wrote; that prefix renders inside the masked assistant span."""
+    records = [
+        _generated(0, prefill_prefix_chars=7),
+        _generated(1, prefill_prefix_chars=0),
+    ]
+
+    counts, written = _render(tmp_path, records)
+
+    assert [row["id"] for row in written] == ["row-1"]
+    assert counts.dropped_client_supplied == 1
+
+
+def test_an_unmeasurable_prefill_prefix_is_not_assumed_empty(
+    tmp_path: Path,
+) -> None:
+    """``normalize.py`` writes ``None`` when it could not measure the split."""
+    with pytest.raises(ClientSupervisedCorpusError):
+        _render(tmp_path, [_generated(0, prefill_prefix_chars=None)])
+
+
+def test_the_authorship_filter_emptying_the_corpus_is_a_loud_named_failure(
+    tmp_path: Path,
+) -> None:
+    """A silently tiny corpus produces a checkpoint that looks like any other."""
+    records = [_replayed(index) for index in range(9)] + [_generated(9)]
+
+    with pytest.raises(ClientSupervisedCorpusError) as caught:
+        _render(tmp_path, records, minimum_rows=4)
+
+    message = str(caught.value)
+    assert "1 trainable rows" in message
+    assert "below the floor of 4" in message
+    assert "9 of 10 rows" in message
+    assert "trust_untagged_assistant_messages" in message
+
+
+def test_the_authorship_floor_does_not_fire_on_a_merely_small_corpus(
+    tmp_path: Path,
+) -> None:
+    """The floor bounds this filter's damage, not the corpus's own size."""
+    counts, written = _render(tmp_path, [_generated(0)], minimum_rows=100)
+
+    assert counts.written == 1
+    assert len(written) == 1
+
+
+def test_the_two_row_filters_report_their_own_causes(tmp_path: Path) -> None:
+    """Each filter names itself; neither is attributed to the other."""
+    records = [_generated(0, ), _replayed(1), _generated(2)]
+    records[0]["finish_reason"] = "length"
+    records[2]["finish_reason"] = "stop"
+
+    counts, written = _render(tmp_path, records, policy=TruncatedRowPolicy.DROP)
+
+    assert [row["id"] for row in written] == ["row-2"]
+    assert counts.dropped_truncated == 1
+    assert counts.dropped_client_supplied == 1
+
+
+def _authorship_renderer(
+    tmp_path: Path,
+    **config_kwargs: object,
+) -> tuple[object, _RecordingRunner, _State]:
+    from speedlm.training.backends.eagle3 import SpeculatorsTrainingRowRenderer
+
+    config = SpeculatorsPipelineConfig(
+        prepared_validator_script=tmp_path / "check.py",
+        speculators_repo=tmp_path / "speculators",
+        training_python=tmp_path / "python",
+        verifier_model=str(_verifier(tmp_path / "verifier", 36)),
+        warm_start_model=str(tmp_path / "warm"),
+        min_rendered_rows=1,
+        **config_kwargs,  # type: ignore[arg-type]
+    )
+    runner = _RecordingRunner()
+    state = _State()
+    state.verifier = config.verifier_model
+    renderer = SpeculatorsTrainingRowRenderer(
+        config, runner, _Resolver(config, runner, state), state
+    )
+    return renderer, runner, state
+
+
+def test_the_authorship_filter_runs_in_the_real_render_stage(
+    tmp_path: Path,
+) -> None:
+    """Through ``render_rows`` and the real config, not by calling the helper.
+
+    Otherwise nothing proves the stage that owns the filter passes the operator
+    setting through, and the filter could be permanently inert in production.
+    """
+    renderer, runner, state = _authorship_renderer(tmp_path)
+    work = tmp_path / "work"
+    work.mkdir()
+    snapshot = _snapshot(
+        work / "snap.jsonl", [_generated(0), _replayed(1), _generated(2)]
+    )
+
+    renderer.render_rows(  # type: ignore[attr-defined]
+        snapshot,
+        work / "training-rows",
+        timeout_seconds=60.0,
+        should_abort=lambda: False,
+    )
+
+    assert state.rendered_rows is not None
+    assert state.rendered_rows["dropped_client_supplied"] == 1
+    assert state.rendered_rows["written"] == 2
+    # The row count handed to the prepared-dataset validator must be the
+    # post-filter count, or the validator asserts a size the corpus no longer has.
+    assert state.row_count == 2
+    prepare = next(
+        call for call in runner.run_calls if "prepare_data.py" in " ".join(call)
+    )
+    # Every assistant span the loader finds receives loss, because nothing here
+    # narrows it to the final one.  That is exactly why the filter above must
+    # guarantee that every span it leaves behind is this verifier's own output.
+    assert "--final-assistant-only-loss-mask" not in prepare
+
+
+def test_the_render_stage_refuses_untagged_turns_by_default(tmp_path: Path) -> None:
+    """The stage must carry the *configured* setting, not a hardcoded one.
+
+    Its companion below proves the opt-in reaches the filter; this proves the
+    default does too, which a stage that always opted in would pass.
+    """
+    renderer, _, state = _authorship_renderer(tmp_path)
+    work = tmp_path / "work"
+    work.mkdir()
+    snapshot = _snapshot(
+        work / "snap.jsonl",
+        [
+            _conversation_row(0, [_turn("user", "q"), _turn("assistant", "a")]),
+            _generated(1),
+        ],
+    )
+
+    renderer.render_rows(  # type: ignore[attr-defined]
+        snapshot,
+        work / "training-rows",
+        timeout_seconds=60.0,
+        should_abort=lambda: False,
+    )
+
+    assert state.rendered_rows is not None
+    assert state.rendered_rows["dropped_client_supplied"] == 1
+    assert state.rendered_rows["written"] == 1
+
+
+def test_the_render_stage_honours_the_untagged_opt_in(tmp_path: Path) -> None:
+    """The knob is useless if the stage that owns the filter never reads it."""
+    renderer, _, state = _authorship_renderer(
+        tmp_path, trust_untagged_assistant_messages=True
+    )
+    work = tmp_path / "work"
+    work.mkdir()
+    snapshot = _snapshot(
+        work / "snap.jsonl",
+        [_conversation_row(0, [_turn("user", "q"), _turn("assistant", "a")])],
+    )
+
+    renderer.render_rows(  # type: ignore[attr-defined]
+        snapshot,
+        work / "training-rows",
+        timeout_seconds=60.0,
+        should_abort=lambda: False,
+    )
+
+    assert state.rendered_rows is not None
+    assert state.rendered_rows["written"] == 1
+
+
+def test_the_untagged_opt_in_must_be_a_bool() -> None:
+    with pytest.raises(ValueError, match="trust_untagged_assistant_messages"):
+        SpeculatorsPipelineConfig(
+            prepared_validator_script=Path("check.py"),
+            speculators_repo=Path("speculators"),
+            training_python=Path("python"),
+            verifier_model="v",
+            warm_start_model="w",
+            trust_untagged_assistant_messages="yes",  # type: ignore[arg-type]
+        )
+
+
+def test_the_authorship_failure_is_catchable_as_an_eagle3_error() -> None:
+    """Orchestration catches Eagle3Error; a new failure outside it escapes."""
+    assert issubclass(ClientSupervisedCorpusError, Eagle3Error)
 
 
 # ===========================================================================

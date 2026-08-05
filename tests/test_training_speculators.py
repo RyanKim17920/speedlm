@@ -200,7 +200,19 @@ def _backend(
 ) -> tuple[Eagle3Backend, Path]:
     traces = tmp_path / "traces.jsonl"
     if records is None:
-        records = [{"messages": [{"role": "assistant", "content": "ok"}]}]
+        records = [
+            {
+                "messages": [
+                    {
+                        "role": "assistant",
+                        "content": "ok",
+                        # As the gateway tags the response it assembled. An
+                        # untagged assistant turn is refused for supervision.
+                        "provenance_tag": "generated",
+                    }
+                ]
+            }
+        ]
     traces.write_text(
         "".join(json.dumps(record) + "\n" for record in records),
         encoding="utf-8",
@@ -819,7 +831,11 @@ def test_prepare_renders_top_level_conversations_instead_of_messages(
                 "id": "trace-1",
                 "messages": [
                     {"role": "user", "content": "hi"},
-                    {"role": "assistant", "content": "ok"},
+                    {
+                        "role": "assistant",
+                        "content": "ok",
+                        "provenance_tag": "generated",
+                    },
                 ],
             }
         ],
@@ -832,7 +848,9 @@ def test_prepare_renders_top_level_conversations_instead_of_messages(
     assert "messages" not in rendered[0]
     assert rendered[0]["conversations"] == [
         {"role": "user", "content": "hi"},
-        {"role": "assistant", "content": "ok"},
+        # The provenance tag rides into the artifact so the admission decision
+        # is auditable from the rendered corpus, not only from process logs.
+        {"role": "assistant", "content": "ok", "provenance_tag": "generated"},
     ]
 
 
@@ -873,9 +891,14 @@ def test_prepare_preserves_tools_tool_calls_and_reasoning(
                         "content": None,
                         "reasoning_content": "consider the tool",
                         "tool_calls": tool_calls,
+                        "provenance_tag": "generated",
                     },
                     {"role": "tool", "tool_call_id": "call-1", "content": "found"},
-                    {"role": "assistant", "content": "done"},
+                    {
+                        "role": "assistant",
+                        "content": "done",
+                        "provenance_tag": "generated",
+                    },
                 ],
             }
         ],
