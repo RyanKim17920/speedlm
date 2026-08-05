@@ -1201,6 +1201,49 @@ def test_activating_a_different_draft_restarts_and_tells_the_controller() -> Non
     assert runtime.notified == ["stock"]
 
 
+def test_reuse_is_refused_when_the_caller_forbids_it() -> None:
+    """A measurement block after the first must restart even mid-arm.
+
+    Mirrored rounds schedule the same arm twice in a row at the round
+    boundary, and there the short-circuit above is not a saving: it leaves one
+    block of one arm scoring an engine that has been serving since the previous
+    block while every other block scores a freshly restarted one.
+    """
+    runtime = _FakeRuntimeView(running=Path("/artifacts/candidate"))
+    endpoint, process, http = _endpoint(runtime)
+
+    restarted = endpoint.activate(  # type: ignore[attr-defined]
+        Path("/artifacts/candidate"),
+        timeout_seconds=30.0,
+        should_abort=lambda: False,
+        allow_engine_reuse=False,
+    )
+
+    assert restarted is True
+    assert process.restarts == [Path("/artifacts/candidate")]
+    assert http.ready_calls == 1
+    assert runtime.notified == [Path("/artifacts/candidate")]
+
+
+def test_activate_reports_whether_it_restarted() -> None:
+    """The gate checks the answer, not the request, so it has to be truthful."""
+    runtime = _FakeRuntimeView(running="stock")
+    endpoint, _, _ = _endpoint(runtime)
+
+    assert (
+        endpoint.activate(  # type: ignore[attr-defined]
+            "stock", timeout_seconds=30.0, should_abort=lambda: False
+        )
+        is False
+    )
+    assert (
+        endpoint.activate(  # type: ignore[attr-defined]
+            "candidate", timeout_seconds=30.0, should_abort=lambda: False
+        )
+        is True
+    )
+
+
 def test_an_endpoint_without_a_controller_always_restarts() -> None:
     endpoint, process, _ = _endpoint(None)
 

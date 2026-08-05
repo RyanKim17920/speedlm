@@ -140,16 +140,17 @@ class SimulatedDraftEndpoint:
         *,
         timeout_seconds: float,
         should_abort: AbortCheck,
-    ) -> None:
+        allow_engine_reuse: bool = True,
+    ) -> bool:
         if should_abort():
             raise ControlAborted("draft activation aborted")
         self.requested.append(str(draft))
-        if self.runtime.matches_running_draft(draft):
+        if allow_engine_reuse and self.runtime.matches_running_draft(draft):
             self.http.wait_ready(
                 timeout_seconds=timeout_seconds,
                 should_abort=should_abort,
             )
-            return
+            return False
         self.process.restart(draft, timeout_seconds=timeout_seconds)
         self.restarted.append(str(draft))
         self.http.wait_ready(
@@ -157,6 +158,7 @@ class SimulatedDraftEndpoint:
             should_abort=should_abort,
         )
         self.runtime.note_external_restart(draft)
+        return True
 
 
 @dataclass

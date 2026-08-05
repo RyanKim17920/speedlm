@@ -38,8 +38,10 @@ from speedlm.gate.decide import (
     ContextDivergence,
     Decision,
     DispersionBasis,
+    MeasurementBlock,
     Reason,
     RepeatSummary,
+    ThroughputStationarity,
     Verdict,
 )
 from speedlm.profiles import ModelProfile, ProfileError, resolve_profile
@@ -1133,7 +1135,67 @@ def parse_decision(record: Mapping[str, Any], *, source: Path) -> Decision:
         suite_hash=_optional_str(record.get("suite_hash")),
         num_contexts=_optional_int(record.get("num_contexts")),
         stock_draft=_optional_str(record.get("stock_draft")),
+        # How the measurement was taken.  Optional in both directions: a record
+        # written before the schedule was persisted has no blocks and no
+        # stationarity verdict, and reads back as "not recorded" -- never as
+        # "one block" or "stationary", either of which would invent evidence.
+        arm_blocks=_optional_int(record.get("arm_blocks")),
+        block_schedule=_parse_block_schedule(record, source),
+        throughput_stationarity=_parse_stationarity(record, source),
         **_parse_throughput_statistic(record, source, measured=measured),
+    )
+
+
+def _parse_block_schedule(
+    record: Mapping[str, Any], source: Path
+) -> tuple[MeasurementBlock, ...]:
+    """Recover the realized block order from a persisted decision."""
+    raw = record.get("block_schedule", [])
+    if not isinstance(raw, list):
+        raise ReportError(f"{source}: 'block_schedule' must be a list")
+    blocks: list[MeasurementBlock] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            raise ReportError(f"{source}: each 'block_schedule' entry must be an object")
+        blocks.append(
+            MeasurementBlock(
+                arm=_require_str(item, "arm", source),
+                repeats=_require_int(item, "repeats", source),
+                # A block whose record does not say it restarted did not: the
+                # absent key is the un-restarted case, which is the one worth
+                # noticing.
+                restarted=bool(item.get("restarted", False)),
+            )
+        )
+    return tuple(blocks)
+
+
+def _parse_stationarity(
+    record: Mapping[str, Any], source: Path
+) -> ThroughputStationarity | None:
+    """Recover the stationarity verdict, or ``None`` when none was recorded."""
+    raw = record.get("throughput_stationarity")
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise ReportError(f"{source}: 'throughput_stationarity' must be an object")
+    return ThroughputStationarity(
+        testable=bool(raw.get("testable", False)),
+        stationary=bool(raw.get("stationary", False)),
+        required_for_promotion=bool(raw.get("required_for_promotion", False)),
+        min_repeats=_require_int(raw, "min_repeats", source),
+        delta_shift_pct=_optional_float(raw.get("delta_shift_pct")),
+        delta_shift_t_statistic=_optional_float(raw.get("delta_shift_t_statistic")),
+        min_shift_t_statistic=_require_float(raw, "min_shift_t_statistic", source),
+        materiality_pct=_require_float(raw, "materiality_pct", source),
+        stock_flat_from_repeat=_optional_int(raw.get("stock_flat_from_repeat")),
+        candidate_flat_from_repeat=_optional_int(raw.get("candidate_flat_from_repeat")),
+        stock_trend_pct_per_repeat=_optional_float(
+            raw.get("stock_trend_pct_per_repeat")
+        ),
+        candidate_trend_pct_per_repeat=_optional_float(
+            raw.get("candidate_trend_pct_per_repeat")
+        ),
     )
 
 

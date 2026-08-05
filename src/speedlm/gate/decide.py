@@ -467,6 +467,79 @@ class RepeatSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class MeasurementBlock:
+    """One contiguous measurement block, as it was actually run.
+
+    Persisted so a decision record says how its two arms were interleaved
+    without anybody having to reconstruct the order from an engine log.  The
+    order of ``Decision.block_schedule`` *is* the order the blocks ran in.
+    """
+
+    #: ``"stock"`` or ``"candidate"``.
+    arm: str
+    #: Scored repeats this block contributed.
+    repeats: int
+    #: Whether opening this block cost an engine restart.  Only the benchmark's
+    #: very first block may legitimately read ``False`` -- it may reuse an
+    #: engine the cycle already launched for that arm -- and every later block
+    #: must restart, or its measurement window did not open from the same
+    #: engine-lifecycle state as its neighbours.  See
+    #: :data:`speedlm.gate.runner.DEFAULT_ARM_BLOCKS`.
+    restarted: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "arm": self.arm,
+            "repeats": self.repeats,
+            "restarted": self.restarted,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class ThroughputStationarity:
+    """Whether the arm-to-arm throughput delta held still during the run.
+
+    Computed by :func:`speedlm.gate.runner._stationarity`, which owns the
+    reasoning; this type exists so the answer survives onto disk.  It used to
+    be published only on ``GateResult.metrics``, which nothing persists, so a
+    run could not be asked afterwards whether its veto was live.
+    """
+
+    #: False when there were too few scored repeats to test at all, in which
+    #: case ``stationary`` is True by default and vetoed nothing.
+    testable: bool
+    stationary: bool
+    required_for_promotion: bool
+    min_repeats: int
+    #: Percentage points the paired delta column moved at its best split, and
+    #: the studentised size of that move.  ``None`` when untestable.
+    delta_shift_pct: float | None
+    delta_shift_t_statistic: float | None
+    min_shift_t_statistic: float
+    materiality_pct: float
+    stock_flat_from_repeat: int | None
+    candidate_flat_from_repeat: int | None
+    stock_trend_pct_per_repeat: float | None
+    candidate_trend_pct_per_repeat: float | None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "testable": self.testable,
+            "min_repeats": self.min_repeats,
+            "delta_shift_pct": self.delta_shift_pct,
+            "delta_shift_t_statistic": self.delta_shift_t_statistic,
+            "min_shift_t_statistic": self.min_shift_t_statistic,
+            "materiality_pct": self.materiality_pct,
+            "stock_flat_from_repeat": self.stock_flat_from_repeat,
+            "candidate_flat_from_repeat": self.candidate_flat_from_repeat,
+            "stock_trend_pct_per_repeat": self.stock_trend_pct_per_repeat,
+            "candidate_trend_pct_per_repeat": self.candidate_trend_pct_per_repeat,
+            "stationary": self.stationary,
+            "required_for_promotion": self.required_for_promotion,
+        }
+
+
+@dataclass(frozen=True, slots=True)
 class Decision:
     """The promotion decision with full reporting."""
 
@@ -688,6 +761,23 @@ class Decision:
     engine_enable_chunked_prefill: bool | None = None
     engine_enable_prefix_caching: bool | None = None
     engine_max_num_seqs: int | None = None
+
+    # -- how the measurement was taken --------------------------------------
+    # Attached by the runner after the numbers are in, because both are
+    # properties of the *schedule* rather than of the comparison.  They were
+    # published on ``GateResult.metrics``, which nothing persists; a record
+    # that cannot say whether it interleaved, or whether the stationarity veto
+    # was live, forces the next diagnosis back through the vLLM log.
+
+    #: Blocks each arm's scored repeats were split into.  ``1`` is the
+    #: sequential design (all of one arm, then all of the other); ``None`` on
+    #: records written before the schedule was persisted.
+    arm_blocks: int | None = None
+    #: The realized block order, one entry per block, in the order run.
+    block_schedule: tuple[MeasurementBlock, ...] = ()
+    #: Whether the columns this decision was computed from had stopped moving.
+    #: ``None`` means the record predates the test, never "it was stationary".
+    throughput_stationarity: ThroughputStationarity | None = None
 
     # -- dispersion of the gated statistics ---------------------------------
     # Derived from ``per_repeat`` rather than stored, so an archived decision
@@ -1022,6 +1112,15 @@ class Decision:
             "engine_enable_chunked_prefill": self.engine_enable_chunked_prefill,
             "engine_enable_prefix_caching": self.engine_enable_prefix_caching,
             "engine_max_num_seqs": self.engine_max_num_seqs,
+            # How the measurement was taken: the interleaving, whether each
+            # block paid for its own engine, and whether the delta held still.
+            "arm_blocks": self.arm_blocks,
+            "block_schedule": [block.to_dict() for block in self.block_schedule],
+            "throughput_stationarity": (
+                None
+                if self.throughput_stationarity is None
+                else self.throughput_stationarity.to_dict()
+            ),
         }
 
 

@@ -394,12 +394,16 @@ class EngineEndpoint:
         *,
         timeout_seconds: float,
         should_abort: Callable[[], bool],
-    ) -> None:
+        allow_engine_reuse: bool = True,
+    ) -> bool:
         assert timeout_seconds > 0
         self.activations.append(str(draft))
         self.engine.activate(draft)
         if self.engine.faults.never_ready:
             raise RuntimeError(f"engine never became ready for {draft}")
+        # This endpoint knows nothing about what is already running, so it
+        # restarts unconditionally -- which is what it has always done.
+        return True
 
 
 @dataclass

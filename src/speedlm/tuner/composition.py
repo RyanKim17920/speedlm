@@ -1029,7 +1029,15 @@ class _DraftEndpoint:
         *,
         timeout_seconds: float,
         should_abort: AbortCheck,
-    ) -> None:
+        allow_engine_reuse: bool = True,
+    ) -> bool:
+        """Serve *draft*; return True if that cost an engine restart.
+
+        See :meth:`speedlm.gate.runner.DraftEndpoint.activate`.  The endpoint
+        knows what is running but not why it is being asked, so whether reusing
+        a running engine is a saving or a confound is the caller's to say:
+        *allow_engine_reuse* is how it says it.
+        """
         if should_abort():
             raise ControlAborted("draft activation aborted")
         # The benchmark's first arm asks for a draft the cycle has *already*
@@ -1038,13 +1046,24 @@ class _DraftEndpoint:
         # launch for the identical configuration.  Readiness is still confirmed
         # on the cheap path, so the arm never begins against an engine that
         # cannot answer.
-        if self.runtime is not None and self.runtime.matches_running_draft(draft):
+        #
+        # Only there, though.  At a measurement-block boundary the same
+        # short-circuit means one block of one arm scores on an engine that has
+        # been serving since the previous block while every other block scores
+        # on a fresh one, which manufactures precisely the drift artifact the
+        # interleaved schedule exists to remove.  The gate clears the flag for
+        # every block after its first.
+        if (
+            allow_engine_reuse
+            and self.runtime is not None
+            and self.runtime.matches_running_draft(draft)
+        ):
             self.http.wait_ready(
                 timeout_seconds=timeout_seconds,
                 should_abort=should_abort,
             )
             logger.info("draft %s is already serving; skipping engine restart", draft)
-            return
+            return False
         self.process.restart(draft, timeout_seconds=timeout_seconds)
         self.http.wait_ready(
             timeout_seconds=timeout_seconds,
@@ -1054,6 +1073,7 @@ class _DraftEndpoint:
         # not be recorded as the engine's identity.
         if self.runtime is not None:
             self.runtime.note_external_restart(draft)
+        return True
 
 
 class _MetricsSource:

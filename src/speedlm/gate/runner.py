@@ -12,7 +12,7 @@ import math
 import time
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Final, Protocol, TypeVar
 
@@ -21,6 +21,8 @@ from speedlm.gate.decide import (
     UNRECORDED_EXECUTION_MODE,
     Decision,
     EngineExecution,
+    MeasurementBlock,
+    ThroughputStationarity,
     Verdict,
     decide_promotion,
 )
@@ -398,7 +400,24 @@ class DraftEndpoint(Protocol):
         *,
         timeout_seconds: float,
         should_abort: AbortCheck,
-    ) -> None: ...
+        allow_engine_reuse: bool = True,
+    ) -> bool:
+        """Make *draft* the served draft, and report whether that cost a restart.
+
+        An endpoint that can tell what is already running may satisfy the call
+        without restarting -- but only when *allow_engine_reuse* is set.  The
+        gate clears it for every measurement block after the first, because a
+        block that opens on an engine that has been serving since the previous
+        block did not open from the same lifecycle state as its neighbours, and
+        the difference lands on whichever arm the schedule happened to repeat.
+        See :data:`DEFAULT_ARM_BLOCKS`.
+
+        Returns:
+            True if the engine was restarted, False if a running engine was
+            reused.  The gate checks this rather than trusting the flag: the
+            invariant is a property of what happened, not of what was asked.
+        """
+        ...
 
 
 class MetricsSource(Protocol):
@@ -767,13 +786,19 @@ class BenchmarkGateRunner:
                 lambda _timeout: self._check_suite_leakage(suite),
             )
 
-            def activate(arm: str, draft: DraftReference) -> None:
-                stage(
+            def activate(
+                arm: str,
+                draft: DraftReference,
+                *,
+                allow_engine_reuse: bool = True,
+            ) -> bool:
+                return stage(
                     f"{arm} activation",
                     lambda available: self._endpoint.activate(
                         draft,
                         timeout_seconds=available,
                         should_abort=should_abort,
+                        allow_engine_reuse=allow_engine_reuse,
                     ),
                 )
 
@@ -801,9 +826,40 @@ class BenchmarkGateRunner:
                 "stock": _ArmBuilder(),
                 "candidate": _ArmBuilder(),
             }
-            for arm, block_repeats in schedule:
+            blocks_run: list[MeasurementBlock] = []
+            for block_index, (arm, block_repeats) in enumerate(schedule):
                 builder = arms[arm]
-                activate(arm, drafts[arm])
+                # Reuse of an already-serving engine is a saving exactly once:
+                # the benchmark's first block, whose arm the cycle's
+                # CANDIDATE_STARTING phase already launched.  At every later
+                # block it is a defect.  Mirrored rounds put the same arm back
+                # to back at the round boundary -- candidate, stock, stock,
+                # candidate -- so without this the second of that pair would be
+                # the one block in the gate that did *not* restart, while every
+                # other block did, and the step that produces lands on one arm.
+                # Run 1c8f5c0 recorded exactly that: stock repeats 259.4,
+                # 259.3, 260.8, 265.9, 266.2 tok/s, a 2.5% step at the block-0
+                # to block-1 boundary, against a flat candidate -- enough to
+                # trip the stationarity veto on an artifact the harness made.
+                restarted = activate(
+                    arm, drafts[arm], allow_engine_reuse=block_index == 0
+                )
+                # Checked, not assumed.  The flag is a request to the endpoint;
+                # this is the endpoint's answer, and the invariant is a
+                # property of the answer.  Fail-closed: the benchmark yields no
+                # decision rather than a decision whose arms were measured
+                # under different engine lifecycles.
+                if block_index > 0 and not restarted:
+                    raise BenchmarkAborted(
+                        f"{arm} block {block_index} opened on an engine it did "
+                        "not restart: every measurement window after the first "
+                        "must open from activate, warm, then score"
+                    )
+                blocks_run.append(
+                    MeasurementBlock(
+                        arm=arm, repeats=block_repeats, restarted=restarted
+                    )
+                )
                 # Warm the freshly restarted engine before the measurement
                 # window opens.  Activation restarts vLLM, so the first suite
                 # pass pays one-time JIT compilation of the speculative-decoding
@@ -874,9 +930,19 @@ class BenchmarkGateRunner:
             stationarity = _stationarity(
                 decision, abs(self._config.promotion.min_throughput_delta_pct)
             )
+            # Onto the decision, which is the only thing written to disk.  Both
+            # are properties of how the measurement was taken rather than of
+            # the comparison, so they are attached here rather than passed
+            # through ``decide_promotion`` -- and the stationarity verdict is
+            # computed *from* the decision, so it could not be.
+            decision = replace(
+                decision,
+                arm_blocks=self._arm_blocks,
+                block_schedule=tuple(blocks_run),
+                throughput_stationarity=stationarity,
+            )
             promoted = decision.verdict is Verdict.PROMOTE and (
-                stationarity["stationary"] is True
-                or not PROMOTION_REQUIRES_STATIONARITY
+                stationarity.stationary or not PROMOTION_REQUIRES_STATIONARITY
             )
 
             # The last block of the schedule leaves *its* arm serving.  A
@@ -977,14 +1043,12 @@ class BenchmarkGateRunner:
                 # one that never faced a drift.
                 "schedule": {
                     "arm_blocks": self._arm_blocks,
-                    "blocks": [
-                        {"arm": arm, "repeats": count} for arm, count in schedule
-                    ],
+                    "blocks": [block.to_dict() for block in blocks_run],
                 },
                 # Whether the columns the delta came from had stopped moving,
                 # and whether that was allowed to matter.  See
                 # :data:`PROMOTION_REQUIRES_STATIONARITY`.
-                "throughput_stationarity": stationarity,
+                "throughput_stationarity": stationarity.to_dict(),
                 "stock": _delta_dict(stock_arm.pooled_delta),
                 "candidate": _delta_dict(candidate_arm.pooled_delta),
                 # Per-repeat windows, published beside the pooled one so the
@@ -1360,7 +1424,9 @@ def _pool_chains(
     )
 
 
-def _stationarity(decision: Decision, materiality_pct: float) -> dict[str, object]:
+def _stationarity(
+    decision: Decision, materiality_pct: float
+) -> ThroughputStationarity:
     """Whether the arm-to-arm throughput delta held still during the run.
 
     The column tested is the *paired* per-repeat delta, ``100 x (candidate -
@@ -1403,30 +1469,30 @@ def _stationarity(decision: Decision, materiality_pct: float) -> dict[str, objec
         and statistic >= STATIONARITY_SPLIT_T_STATISTIC
         and abs(shift) >= materiality_pct
     )
-    return {
-        "testable": testable,
-        "min_repeats": MIN_STATIONARITY_REPEATS,
+    return ThroughputStationarity(
+        testable=testable,
+        min_repeats=MIN_STATIONARITY_REPEATS,
         # Percentage points the arm-to-arm delta moved between the run's leading
         # and trailing repeats, at the split that separates them best.
-        "delta_shift_pct": shift,
-        "delta_shift_t_statistic": statistic,
-        "min_shift_t_statistic": STATIONARITY_SPLIT_T_STATISTIC,
-        "materiality_pct": materiality_pct,
+        delta_shift_pct=shift,
+        delta_shift_t_statistic=statistic,
+        min_shift_t_statistic=STATIONARITY_SPLIT_T_STATISTIC,
+        materiality_pct=materiality_pct,
         # Kept beside the verdict because they answer the warmup question that
         # the paired column deliberately cancels out of itself.
-        "stock_flat_from_repeat": decision.stock_throughput_flat_from_repeat,
-        "candidate_flat_from_repeat": (
+        stock_flat_from_repeat=decision.stock_throughput_flat_from_repeat,
+        candidate_flat_from_repeat=(
             decision.candidate_throughput_flat_from_repeat
         ),
-        "stock_trend_pct_per_repeat": (
+        stock_trend_pct_per_repeat=(
             decision.stock_throughput_trend_pct_per_repeat
         ),
-        "candidate_trend_pct_per_repeat": (
+        candidate_trend_pct_per_repeat=(
             decision.candidate_throughput_trend_pct_per_repeat
         ),
-        "stationary": not drifted,
-        "required_for_promotion": PROMOTION_REQUIRES_STATIONARITY,
-    }
+        stationary=not drifted,
+        required_for_promotion=PROMOTION_REQUIRES_STATIONARITY,
+    )
 
 
 def _reset_delta(before: MetricsSnapshot, after: MetricsSnapshot) -> MetricsDelta:

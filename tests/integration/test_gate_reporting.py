@@ -147,9 +147,11 @@ class _Endpoint:
         *,
         timeout_seconds: float,
         should_abort: Callable[[], bool],
-    ) -> None:
+        allow_engine_reuse: bool = True,
+    ) -> bool:
         assert timeout_seconds > 0 and not should_abort()
         self.activations.append(draft)
+        return True
 
 
 @dataclass

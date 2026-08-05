@@ -52,8 +52,23 @@ class FakeTraceSource:
 
 @dataclass
 class FakeEndpoint:
+    """An endpoint that declines to restart, exactly as production's does.
+
+    ``speedlm.tuner.composition._DraftEndpoint`` skips the restart when the
+    requested draft is already serving, so a fake that restarts
+    unconditionally cannot see anything the block schedule does wrong at a
+    boundary where the same arm runs twice in a row.  This one models the
+    short-circuit and its ``allow_engine_reuse`` override, and records the
+    restarts separately from the requests.
+    """
+
     url: str = "http://not-used.test/"
+    #: Every draft the gate asked for, whether or not it cost a restart.
     activations: list[Path | str] = field(default_factory=list)
+    #: The subset that actually cost one.
+    restarts: list[Path | str] = field(default_factory=list)
+    #: What the engine is serving, or ``None`` before anything is activated.
+    serving: Path | str | None = None
 
     def activate(
         self,
@@ -61,9 +76,15 @@ class FakeEndpoint:
         *,
         timeout_seconds: float,
         should_abort: Callable[[], bool],
-    ) -> None:
+        allow_engine_reuse: bool = True,
+    ) -> bool:
         assert timeout_seconds > 0
         self.activations.append(draft)
+        if allow_engine_reuse and self.serving is not None and self.serving == draft:
+            return False
+        self.serving = draft
+        self.restarts.append(draft)
+        return True
 
 
 @dataclass
@@ -1892,10 +1913,11 @@ def _blocked_runner(
     candidate_arm_first: bool = True,
     run_latencies: list[float] | None = None,
     events: list[str] | None = None,
+    endpoint: FakeEndpoint | None = None,
 ) -> tuple[BenchmarkGateRunner, FakeEndpoint, FakeReplayExecutor]:
     first = "candidate" if candidate_arm_first else "stock"
     schedule = _block_schedule(first, blocks=arm_blocks, repeats=repeats)
-    endpoint = FakeEndpoint()
+    endpoint = FakeEndpoint() if endpoint is None else endpoint
     replay = FakeReplayExecutor(run_latencies=run_latencies, events=events)
     runner = BenchmarkGateRunner(
         config=SpeedLMConfig(model="model"),
@@ -2110,12 +2132,114 @@ def test_the_record_says_how_the_arms_were_interleaved(tmp_path: Path) -> None:
     assert result.metrics["schedule"] == {
         "arm_blocks": 2,
         "blocks": [
-            {"arm": "candidate", "repeats": 2},
-            {"arm": "stock", "repeats": 2},
-            {"arm": "stock", "repeats": 2},
-            {"arm": "candidate", "repeats": 2},
+            {"arm": "candidate", "repeats": 2, "restarted": True},
+            {"arm": "stock", "repeats": 2, "restarted": True},
+            {"arm": "stock", "repeats": 2, "restarted": True},
+            {"arm": "candidate", "repeats": 2, "restarted": True},
         ],
     }
+    # And the same thing on the only object that reaches disk.
+    assert result.decision is not None
+    assert result.decision.arm_blocks == 2
+    assert [
+        (block.arm, block.repeats, block.restarted)
+        for block in result.decision.block_schedule
+    ] == [
+        ("candidate", 2, True),
+        ("stock", 2, True),
+        ("stock", 2, True),
+        ("candidate", 2, True),
+    ]
+
+
+def test_the_same_arm_twice_in_a_row_still_restarts_between_the_blocks(
+    tmp_path: Path,
+) -> None:
+    # The regression this test exists for.  Mirrored rounds schedule
+    # candidate, stock, stock, candidate: the two stock blocks are adjacent, so
+    # an endpoint that skips the restart when the requested draft is already
+    # serving leaves exactly one block of exactly one arm measuring an engine
+    # that has been up since the previous block.  Every other block opens on a
+    # fresh one.  That is a per-arm step the harness itself manufactured, and
+    # run 1c8f5c0 published it as a 2.5% jump in the stock column.
+    runner, endpoint, _ = _blocked_runner(tmp_path, arm_blocks=2)
+
+    result = runner.benchmark(
+        tmp_path / "candidate", timeout_seconds=30, should_abort=lambda: False
+    )
+
+    # Requested four times, restarted four times -- including the stock-to-stock
+    # boundary, where the draft did not change.
+    assert endpoint.activations == [
+        tmp_path / "candidate",
+        "stock",
+        "stock",
+        tmp_path / "candidate",
+    ]
+    assert endpoint.restarts == endpoint.activations
+    assert result.decision is not None
+    assert all(block.restarted for block in result.decision.block_schedule)
+
+
+def test_only_the_first_block_may_reuse_the_engine_that_is_already_serving(
+    tmp_path: Path,
+) -> None:
+    # The saving the short-circuit was added for: CANDIDATE_STARTING has
+    # already launched the candidate, and the benchmark's first block is
+    # allowed to measure it rather than pay a second launch for an identical
+    # configuration.  That licence stops after the first block, and the record
+    # says which block used it.
+    runner, endpoint, _ = _blocked_runner(tmp_path, arm_blocks=2)
+    endpoint.serving = tmp_path / "candidate"
+
+    result = runner.benchmark(
+        tmp_path / "candidate", timeout_seconds=30, should_abort=lambda: False
+    )
+
+    assert endpoint.restarts == ["stock", "stock", tmp_path / "candidate"]
+    assert result.decision is not None
+    assert [block.restarted for block in result.decision.block_schedule] == [
+        False,
+        True,
+        True,
+        True,
+    ]
+
+
+def test_a_scored_block_that_did_not_restart_fails_the_gate(tmp_path: Path) -> None:
+    # The invariant is enforced against what the endpoint *did*, not against
+    # what it was asked.  An endpoint that ignores ``allow_engine_reuse`` and
+    # keeps its engine anyway must not be able to produce a promotion.
+    runner, _, _ = _blocked_runner(
+        tmp_path, arm_blocks=2, endpoint=_ReusingEndpoint()
+    )
+
+    result = runner.benchmark(
+        tmp_path / "candidate", timeout_seconds=30, should_abort=lambda: False
+    )
+
+    assert result.passed is False
+    assert result.decision is None
+    assert "did not restart" in result.reason
+
+
+@dataclass
+class _ReusingEndpoint(FakeEndpoint):
+    """An endpoint that reuses its engine whatever it is told."""
+
+    def activate(
+        self,
+        draft: Path | str,
+        *,
+        timeout_seconds: float,
+        should_abort: Callable[[], bool],
+        allow_engine_reuse: bool = True,
+    ) -> bool:
+        del allow_engine_reuse
+        super().activate(
+            draft, timeout_seconds=timeout_seconds, should_abort=should_abort
+        )
+        return self.activations.count(draft) <= 1
 
 
 def test_the_deadline_covers_every_blocks_warmup(tmp_path: Path) -> None:
@@ -2181,6 +2305,13 @@ def test_a_drift_that_landed_on_one_arm_cannot_promote(tmp_path: Path) -> None:
     assert stationarity["stationary"] is False
     assert stationarity["testable"] is True
     assert stationarity["delta_shift_pct"] == pytest.approx(-100.0)
+    # And on the decision, which is the only thing that reaches disk: a run
+    # that was vetoed has to be able to say so without a re-read of the engine
+    # log.  ``GateResult.metrics`` is not persisted by anything.
+    persisted = result.decision.throughput_stationarity
+    assert persisted is not None
+    assert persisted.to_dict() == stationarity
+    assert persisted.required_for_promotion is True
 
 
 def test_a_vetoed_promotion_leaves_the_candidate_off_the_endpoint(

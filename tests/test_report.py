@@ -1525,6 +1525,73 @@ def test_parse_decision_round_trips_the_divergence_noise_floor() -> None:
     assert decision.control_divergences[0].first_divergence_index == 4
 
 
+def test_parse_decision_round_trips_the_schedule_and_the_stationarity_verdict() -> None:
+    """How the measurement was taken has to survive onto disk and back.
+
+    ``parse_decision`` rebuilds a Decision field by explicit field, so a field
+    the gate persists but the parser does not name is a field ``speedlm gain``
+    and every archived-record reader silently loses.
+    """
+    payload = _decision_dict()
+    payload["arm_blocks"] = 2
+    payload["block_schedule"] = [
+        {"arm": "candidate", "repeats": 3, "restarted": False},
+        {"arm": "stock", "repeats": 3, "restarted": True},
+        {"arm": "stock", "repeats": 2, "restarted": True},
+        {"arm": "candidate", "repeats": 2, "restarted": True},
+    ]
+    payload["throughput_stationarity"] = {
+        "testable": True,
+        "min_repeats": 4,
+        "delta_shift_pct": 2.5,
+        "delta_shift_t_statistic": 9.75,
+        "min_shift_t_statistic": 4.0,
+        "materiality_pct": 2.0,
+        "stock_flat_from_repeat": 0,
+        "candidate_flat_from_repeat": None,
+        "stock_trend_pct_per_repeat": 1.25,
+        "candidate_trend_pct_per_repeat": None,
+        "stationary": False,
+        "required_for_promotion": True,
+    }
+
+    decision = parse_decision(payload, source=Path("d.json"))
+
+    assert decision.arm_blocks == 2
+    # The realized order, not a re-derivation of it: ABBA, and the one block
+    # that reused a running engine was the first.
+    assert [b.arm for b in decision.block_schedule] == [
+        "candidate",
+        "stock",
+        "stock",
+        "candidate",
+    ]
+    assert [b.restarted for b in decision.block_schedule] == [False, True, True, True]
+    assert [b.repeats for b in decision.block_schedule] == [3, 3, 2, 2]
+    stationarity = decision.throughput_stationarity
+    assert stationarity is not None
+    assert stationarity.stationary is False
+    assert stationarity.testable is True
+    assert stationarity.delta_shift_pct == pytest.approx(2.5)
+    assert stationarity.delta_shift_t_statistic == pytest.approx(9.75)
+    assert stationarity.materiality_pct == pytest.approx(2.0)
+    assert stationarity.candidate_flat_from_repeat is None
+    # Re-serialising is a fixed point, which is what makes the record readable
+    # by the next parse rather than only by this one.
+    assert parse_decision(decision.to_dict(), source=Path("d.json")).to_dict() == (
+        decision.to_dict()
+    )
+
+
+def test_a_record_without_a_schedule_never_reads_as_a_measured_one() -> None:
+    """Absence is "not recorded", not "one block, stationary"."""
+    decision = parse_decision(_decision_dict(), source=Path("d.json"))
+
+    assert decision.arm_blocks is None
+    assert decision.block_schedule == ()
+    assert decision.throughput_stationarity is None
+
+
 def test_absent_divergence_control_never_reads_as_a_measured_zero() -> None:
     """A record predating the control must come back saying "no control ran",
     not "the engine diverged zero times"."""

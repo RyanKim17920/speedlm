@@ -64,8 +64,9 @@ CORPUS=/data/ryan.kim/speedlm-corpora/ultrachat-prompts.jsonl
 
 # The gateway flavors default SPEEDLM_*_VLLM_ARGS to "[]", i.e. no bounds at
 # all, which on a shared GPU lets vLLM size its KV cache for the whole card.
-# These are the args tests/e2e/run_overhead_bench.sh:24 has always passed.
-DEFAULT_GATEWAY_VLLM_ARGS='[ "--max-model-len", "4096", "--gpu-memory-utilization", "0.85", "--enforce-eager" ]'
+# Keep enough headroom for the gpt-oss-20b verifier plus its eagle3 drafter;
+# 0.75 completed the full idle-tuning run while the unbounded launch OOMed.
+DEFAULT_GATEWAY_VLLM_ARGS='[ "--max-model-len", "4096", "--gpu-memory-utilization", "0.75", "--enforce-eager" ]'
 
 usage() {
     cat <<'EOF'
@@ -584,6 +585,7 @@ EOF
 
 case "$flavor" in
     idle-tuning)
+        : "${vllm_args:=$DEFAULT_GATEWAY_VLLM_ARGS}"
         cat <<EOF
 export SPEEDLM_E2E_TUNING_CONFIG="$tuning_config"
 EOF
@@ -667,6 +669,9 @@ esac
 
 if [[ -n "$vllm_args" ]]; then
     echo "export $vllm_args_var='$vllm_args'"
+fi
+if [[ "$flavor" == "idle-tuning" ]]; then
+    echo 'echo "vllm_args=$SPEEDLM_E2E_VLLM_ARGS"'
 fi
 
 # Without -k the whole test file runs, i.e. Stage 0 and the prefix-cache test
