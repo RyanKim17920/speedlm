@@ -108,7 +108,14 @@ def test_tool_argument_json_stays_valid_after_redaction(
 
     assert isinstance(decoded, dict)
     assert secret not in encoded
-    assert decoded["value"] == value
+    # ``value`` is arbitrary JSON, so hypothesis is free to generate a payload
+    # that is itself redactable -- a key literally named ``PRIVATE_KEY``, say.
+    # Redacting that is correct behavior, not a round-trip violation, so the
+    # byte-for-byte guarantee is asserted only for payloads the redactor has
+    # nothing to say about. Everything above this line is asserted for all
+    # payloads, redactable or not.
+    if Redactor().redact(value)[1].total == 0:
+        assert decoded["value"] == value
 
 
 @given(SECRETS)

@@ -30,6 +30,14 @@ _AUTHORIZATION_RE = re.compile(
 _BEARER_RE = re.compile(
     r"(?i)\b(?P<prefix>bearer\s+)(?P<value>[A-Za-z0-9+/_.=-]{8,})"
 )
+#: Unquoted assignment values stop at whitespace, at a value separator, and at
+#: any *closing* delimiter. Closing delimiters must terminate the value because
+#: no credential alphabet in existence contains one: provider tokens, hex, JWTs
+#: and both base64 alphabets are drawn from ``[A-Za-z0-9+/_.=~-]``. Letting the
+#: value run through them does not catch a single extra secret -- it only eats
+#: the caller's syntax, turning ``f(token=SECRET)`` into an unclosed call and
+#: ``Password:</label>`` into an unclosed tag. Values are still allowed to
+#: *begin* with ``<`` so that ``password=<literal>`` keeps its secret redacted.
 _ASSIGNMENT_RE = re.compile(
     r"""(?ix)
     (?P<prefix>
@@ -38,20 +46,35 @@ _ASSIGNMENT_RE = re.compile(
             access[_-]?token|refresh[_-]?token|id[_-]?token|token|
             client[_-]?secret|secret
         )\b
-        ["']?\s*[:=]\s*
+        ["']?
+        # An annotated parameter -- ``token: str = "SECRET"`` in Python, or
+        # ``api_key: string = "SECRET"`` in TypeScript -- puts a *type* where
+        # this pattern expects a value. Stepping over it is strictly safer, not
+        # a narrowing: without it the redactor replaced the type name and left
+        # the actual default literal on disk in plaintext. Only accepted when an
+        # ``=`` follows, so a plain ``x-api-key: VALUE`` header is untouched.
+        (?:\s*:\s*[A-Za-z_][A-Za-z0-9_.\[\]]*(?=\s*=))?
+        \s*[:=]\s*
     )
     (?:
         (?P<quote>["'])(?P<quoted>[^"'\r\n]+)(?P=quote)
         |
-        (?P<plain>[^\s,;}\]]+)
+        (?P<plain>[^\s,;)}\]>]+)
     )
     """
 )
 _HOME_PATH_RE = re.compile(
     r"(?<![\w.-])(?:/admin/home|/home|/Users)/[A-Za-z0-9._-]+"
 )
+#: The trailing guard must reject a *label* continuation (``a@b.co`` inside
+#: ``a@b.co.uk``) without rejecting sentence punctuation. A bare ``(?![\w.-])``
+#: conflates the two: it makes any address that ends a sentence unmatchable,
+#: because the address is followed by a period. That is an under-redaction, and
+#: it put 10 distinct real addresses into 67 captured records. Splitting the
+#: guard -- no word character may follow, and no ``.`` that itself starts
+#: another label -- keeps multi-label TLDs whole and still matches at a period.
 _EMAIL_RE = re.compile(
-    r"(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,63}(?![\w.-])",
+    r"(?<![\w.+-])[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,63}(?![\w-])(?!\.[\w-])",
     re.IGNORECASE,
 )
 _IPV4_CANDIDATE_RE = re.compile(r"(?<![\w.])(?:\d{1,3}\.){3}\d{1,3}(?![\w.])")
@@ -63,9 +86,15 @@ _INTERNAL_HOST_RE = re.compile(
     r"(?![\w.-])",
     re.IGNORECASE,
 )
+#: A JWT's first segment is base64url of a JSON *object*, so it always begins
+#: with the encoding of ``{"`` -- ``eyJ``. Anchoring on that is not a narrowing:
+#: every JWS/JWE compact serialization has a JSON header. Without the anchor the
+#: pattern is just "three dotted identifier-ish runs", which is also the shape of
+#: a Java or Python import, and it shredded ``import java.util.Scanner`` in
+#: captured assistant output.
 _JWT_RE = re.compile(
     r"(?<![A-Za-z0-9_-])"
-    r"[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{10,}"
+    r"eyJ[A-Za-z0-9_-]{2,}\.[A-Za-z0-9_-]{5,}\.[A-Za-z0-9_-]{10,}"
     r"(?![A-Za-z0-9_-])"
 )
 _HEX_RE = re.compile(r"(?<![A-Fa-f0-9])[A-Fa-f0-9]{32,}(?![A-Fa-f0-9])")
@@ -378,6 +407,25 @@ class Redactor:
         return self._placeholder(value, category, context)
 
     @staticmethod
+    def _is_credential_shaped(value: str) -> bool:
+        """Reject unquoted assignment values that cannot be a credential.
+
+        Two shapes only, both chosen so that nothing of credential length is
+        excluded:
+
+        * A run of one or two characters with no alphanumeric in it. That is the
+          tail of an operator -- ``token == ''`` offers the regex the second
+          ``=`` as its "value" -- never a credential. A longer symbol run (an
+          all-punctuation password) still passes.
+        * A value opening ``</``. That is an XML/HTML closing tag, which is what
+          ``<label>Password:</label>`` presents after the colon. ``password=<x>``
+          does not open with ``</`` and is still redacted.
+        """
+        if value.startswith("</"):
+            return False
+        return len(value) > 2 or any(char.isalnum() for char in value)
+
+    @staticmethod
     def _sensitive_field_category(field_name: str | None) -> str | None:
         if field_name is None:
             return None
@@ -467,6 +515,8 @@ class Redactor:
         for match in _ASSIGNMENT_RE.finditer(view.text):
             group = "quoted" if match.group("quoted") is not None else "plain"
             secret = match.group(group)
+            if group == "plain" and not self._is_credential_shaped(secret):
+                continue
             fallback = self._sensitive_field_category(match.group("name")) or "secret"
             add(
                 match,

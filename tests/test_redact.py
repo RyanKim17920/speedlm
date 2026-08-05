@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import base64
 import json
 import time
@@ -356,3 +357,197 @@ def test_large_message_performance_is_sane() -> None:
 def test_invalid_policy_values(kwargs: dict[str, Any], error: type[Exception]) -> None:
     with pytest.raises(error):
         RedactionPolicy(**kwargs)
+
+
+# ── Corpus-preserving redaction ─────────────────────────────────────────────
+#
+# Every test below pairs the two directions the security argument needs: the
+# secret must still be gone, AND the surrounding syntax must survive. A test
+# that only asserted one direction would pass for a redactor that either leaks
+# everything or destroys everything.
+
+
+@pytest.mark.parametrize(
+    ("text", "closer"),
+    [
+        ("call(secret=hunter2secretvalue)", ")"),
+        ("login(user, password=hunter2xyzvalue)", ")"),
+        ("fn(api_key=ABCDEF123456);", ")"),
+        ("lookup[token=ABCDEF123456]", "]"),
+        ("{token=ABCDEF123456}", "}"),
+    ],
+)
+def test_assignment_value_stops_at_a_closing_delimiter(
+    text: str, closer: str
+) -> None:
+    """Both directions: the credential goes, the caller's delimiter stays."""
+    redacted, report = Redactor().redact_text(text)
+
+    assert report.total == 1
+    # Direction 1: the secret is still redacted.
+    assert text.split("=", 1)[1].rstrip(")];") not in redacted
+    # Direction 2: the closing delimiter survived.
+    assert redacted.count(closer) == text.count(closer)
+    assert redacted.endswith(text[text.index(closer) :])
+
+
+def test_nested_call_keeps_every_closing_delimiter_balanced() -> None:
+    """Nested closers compound: the old pattern ate the whole ``))`` tail."""
+    text = "authorize(build(api_key=SECRETVALUE123))"
+
+    redacted, report = Redactor().redact_text(text)
+
+    assert "SECRETVALUE123" not in redacted
+    assert report.total == 1
+    assert redacted == "authorize(build(api_key=<REDACTED:api_key>))"
+    for opener, closer in (("(", ")"), ("[", "]"), ("{", "}")):
+        assert redacted.count(opener) == redacted.count(closer)
+
+
+def test_annotated_parameter_default_is_redacted_and_still_parses() -> None:
+    """The annotation is a type, not a value; the default literal is the secret."""
+    source = 'def handler(api_key: str = "SECRETVALUE123") -> None:\n    return None\n'
+
+    redacted, report = Redactor().redact_text(source)
+
+    assert "SECRETVALUE123" not in redacted
+    assert report.total == 1
+    # The type annotation must survive: replacing it is what broke parsing.
+    assert "api_key: str = " in redacted
+    ast.parse(redacted)
+
+
+def test_typescript_annotated_parameter_keeps_its_signature() -> None:
+    source = 'function auth(token: string = "SECRETVALUE123") { return token; }'
+
+    redacted, report = Redactor().redact_text(source)
+
+    assert "SECRETVALUE123" not in redacted
+    assert report.total == 1
+    assert "token: string = " in redacted
+    assert redacted.endswith(') { return token; }')
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "if token == '':\n    pass\n",
+        "while password == other:\n    pass\n",
+        "assert secret == expected\n",
+    ],
+)
+def test_equality_comparison_is_not_mistaken_for_an_assignment(source: str) -> None:
+    """``token == x`` offers the regex a bare ``=`` as its value; reject it."""
+    redacted, report = Redactor().redact_text(source)
+
+    assert redacted == source
+    assert report.total == 0
+    ast.parse(redacted)
+
+
+def test_html_closing_tag_after_a_password_label_survives() -> None:
+    markup = (
+        '<div class="password-wrapper">\n'
+        '  <label for="pwd">Password:</label>\n'
+        '  <input type="password" id="pwd">\n'
+        "</div>"
+    )
+
+    redacted, report = Redactor().redact_text(markup)
+
+    assert redacted == markup
+    assert report.total == 0
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "import java.util.Scanner\n",
+        "import java.io.FileReader\n",
+        "from speedlm.traces.redact import Redactor\n",
+        "org.apache.commons.lang3.StringUtils\n",
+    ],
+)
+def test_dotted_import_paths_are_not_treated_as_jwts(source: str) -> None:
+    redacted, report = Redactor().redact_text(source)
+
+    assert redacted == source
+    assert report.total == 0
+
+
+@pytest.mark.parametrize(
+    "jwt",
+    [
+        "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0"
+        ".dBjftJeZ4CVPmB92K27uhbUJU1p1r_wW1gFWFOEjXk",
+        "eyJhbGciOiJub25lIn0.eyJhIjoxfQ.aaaaaaaaaaaaaaa",
+    ],
+)
+def test_real_jwts_are_still_redacted(jwt: str) -> None:
+    """The ``eyJ`` anchor is the JSON header, so no real JWT is excluded."""
+    redacted, report = Redactor().redact_text(f"Authorization: Bearer {jwt}")
+
+    assert jwt not in redacted
+    assert report["jwt"] == 1
+
+
+@pytest.mark.parametrize(
+    ("text", "address", "expected"),
+    [
+        (
+            "So the contact email is kelsei.etchison@mga.edu. The address is",
+            "kelsei.etchison@mga.edu",
+            "So the contact email is <REDACTED:email>. The address is",
+        ),
+        (
+            "Reach him at kenthomas@envisorco.com.",
+            "kenthomas@envisorco.com",
+            "Reach him at <REDACTED:email>.",
+        ),
+        (
+            "Write to bob.smith@example.co.uk. Then call.",
+            "bob.smith@example.co.uk",
+            "Write to <REDACTED:email>. Then call.",
+        ),
+        (
+            "Write to bob.smith@example.co.uk, then call.",
+            "bob.smith@example.co.uk",
+            "Write to <REDACTED:email>, then call.",
+        ),
+        (
+            "Write to bob.smith@example.co.uk and wait",
+            "bob.smith@example.co.uk",
+            "Write to <REDACTED:email> and wait",
+        ),
+    ],
+)
+def test_sentence_final_email_addresses_are_redacted(
+    text: str, address: str, expected: str
+) -> None:
+    """A trailing period must not make an address unmatchable."""
+    redacted, report = Redactor().redact_text(text)
+
+    # Direction 1: the address is gone, whole -- no ``.uk`` tail left behind.
+    assert address not in redacted
+    assert ".uk" not in redacted
+    assert report["email"] == 1
+    # Direction 2: every surrounding character, punctuation included, survives.
+    assert redacted == expected
+
+
+def test_email_is_not_truncated_before_its_final_label() -> None:
+    redacted, _ = Redactor().redact_text("mail ops@a.co.uk now")
+
+    assert redacted == "mail <REDACTED:email> now"
+
+
+@pytest.mark.parametrize(
+    "secret",
+    ["P@ssw0rdValue", "!@#$%^&*()_+", "hunter2", "ABCDEF1234567890"],
+)
+def test_unquoted_credentials_are_still_redacted(secret: str) -> None:
+    """Guardrail against the closing-delimiter fix narrowing coverage."""
+    redacted, report = Redactor().redact_text(f"password={secret}")
+
+    assert secret not in redacted
+    assert report["password"] == 1
