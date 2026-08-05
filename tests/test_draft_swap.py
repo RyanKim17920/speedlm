@@ -345,11 +345,16 @@ class _FakeTensor:
     """Minimal tensor-like object: shape, dtype, and a device we can flip."""
 
     def __init__(
-        self, shape: tuple[int, ...], dtype: str = "float32", device: str = "cuda"
+        self,
+        shape: tuple[int, ...],
+        dtype: str = "float32",
+        device: str = "cuda",
+        values: list[int] | None = None,
     ) -> None:
         self._shape = shape
         self._dtype = dtype
         self.device = _FakeDevice(device)
+        self._values = values
 
     @property
     def shape(self) -> tuple[int, ...]:
@@ -358,6 +363,63 @@ class _FakeTensor:
     @property
     def dtype(self) -> str:
         return self._dtype
+
+    def tolist(self) -> list[int]:
+        """Only index maps carry values; anything else has none to give.
+
+        Deliberately raises rather than synthesizing zeros: an all-zeros
+        ``d2t`` is a *corruption* the validator must reject, so a fake that
+        invented one would make every vocab-mapping test a test of the fake.
+        """
+        if self._values is None:
+            raise TypeError(f"_FakeTensor{self._shape} carries no values")
+        return list(self._values)
+
+
+#: Draft/verifier vocabulary sizes the fakes in this module agree on.
+#: ``_FakeHFConfig`` declares them and ``DRAFT_CONFIG`` repeats them, so the
+#: index maps built below are the ones a real candidate for this fake server
+#: would carry.
+_FAKE_DRAFT_VOCAB = 32_000
+_FAKE_VERIFIER_VOCAB = 151_936
+
+
+def _valid_d2t(
+    draft_vocab: int = _FAKE_DRAFT_VOCAB, stride: int = 4
+) -> list[int]:
+    """A well-formed ``d2t``: draft id ``i`` maps to target ``i * stride``.
+
+    Stored as the *delta* ``i * stride - i``, which is the on-disk convention
+    (``speculators/train/vocab_mapping.py``:
+    ``draft_to_target = selected_ids - arange(draft_vocab_size)``).  Strided
+    rather than identity so the map is a genuine reduction with a non-zero
+    delta -- an identity map is a state the validator must reject.
+    """
+    return [index * stride - index for index in range(draft_vocab)]
+
+
+def _valid_t2d(
+    draft_vocab: int = _FAKE_DRAFT_VOCAB,
+    verifier_vocab: int = _FAKE_VERIFIER_VOCAB,
+    stride: int = 4,
+) -> list[int]:
+    """The ``t2d`` mask matching :func:`_valid_d2t`: true at each target id."""
+    mask = [0] * verifier_vocab
+    for index in range(draft_vocab):
+        mask[index * stride] = 1
+    return mask
+
+
+def _vocab_map_tensors(
+    d2t: list[int] | None = None, t2d: list[int] | None = None
+) -> dict[str, _FakeTensor]:
+    """The two index-map entries of a candidate checkpoint."""
+    d2t = _valid_d2t() if d2t is None else d2t
+    t2d = _valid_t2d() if t2d is None else t2d
+    return {
+        "d2t": _FakeTensor((len(d2t),), dtype="int64", values=d2t),
+        "t2d": _FakeTensor((len(t2d),), dtype="bool", values=t2d),
+    }
 
 
 class _FakeModule:
@@ -831,8 +893,7 @@ class TestCompatibilityValidation:
         "midlayer.self_attn.v_proj.weight": _FakeTensor((1024, 4096)),
         "midlayer.mlp.gate_proj.weight": _FakeTensor((12288, 4096)),
         "midlayer.mlp.up_proj.weight": _FakeTensor((12288, 4096)),
-        "d2t": _FakeTensor((32000,)),
-        "t2d": _FakeTensor((151936,)),
+        **_vocab_map_tensors(),
     }
 
     def test_split_vs_fused_names_are_accepted(
@@ -911,6 +972,141 @@ class TestCompatibilityValidation:
             k: v for k, v in self.HF_CHECKPOINT.items() if k not in {"d2t", "t2d"}
         }
         ext._validate_compatibility(drafter, weights, directory)
+
+    # -- vocab mapping *contents*, not merely presence ----------------------
+    #
+    # The check above establishes that d2t/t2d exist.  That was the only check
+    # this repo had, and it is satisfied by a d2t holding anything at all --
+    # including all zeros, which is the identity map vLLM silently falls back
+    # to when d2t is missing entirely (llama_eagle3.py:304-307, :419-420).
+    # vLLM applies the map as base + d2t with no clamp and no assert
+    # (:347-357), where a negative target wraps under PyTorch advanced
+    # indexing rather than raising, so nothing downstream catches either case.
+
+    def _swap_with(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        d2t: list[int] | None = None,
+        t2d: list[int] | None = None,
+        hf_config=None,
+        model_config: object = None,
+    ) -> None:
+        directory = _write_draft_dir(tmp_path, config=DRAFT_CONFIG)
+        drafter = self._drafter(with_mapping=True)
+        ext = _make_extension(monkeypatch, drafter=drafter, hf_config=hf_config)
+        if model_config is not None:
+            object.__setattr__(ext.vllm_config, "model_config", model_config)
+        weights = dict(self.HF_CHECKPOINT) | _vocab_map_tensors(d2t=d2t, t2d=t2d)
+        ext._validate_compatibility(drafter, weights, directory)
+
+    def test_negative_d2t_target_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The silent case: a negative index wraps instead of raising."""
+        d2t = _valid_d2t()
+        d2t[7] = -100  # draft id 7 -> target -93
+        #: Both halves are load-bearing.  "map outside" pins *which* check
+        #: fired: a negative target also trips the t2d cross-check further
+        #: down (a negative index reads t2d from the end), so matching only on
+        #: the offending entry would let a disabled bound check still pass.
+        with pytest.raises(ValueError, match=r"map outside.*d2t\[7\]=-100 -> -93"):
+            self._swap_with(tmp_path, monkeypatch, d2t=d2t)
+
+    def test_oversized_d2t_target_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        d2t = _valid_d2t()
+        d2t[9] = _FAKE_VERIFIER_VOCAB
+        with pytest.raises(ValueError, match="map outside"):
+            self._swap_with(tmp_path, monkeypatch, d2t=d2t)
+
+    def test_all_zeros_d2t_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Zeroing every d2t entry left the whole suite green before this."""
+        with pytest.raises(ValueError, match="identity map"):
+            self._swap_with(
+                tmp_path,
+                monkeypatch,
+                d2t=[0] * _FAKE_DRAFT_VOCAB,
+                t2d=[1] * _FAKE_DRAFT_VOCAB + [0] * (_FAKE_VERIFIER_VOCAB - _FAKE_DRAFT_VOCAB),
+            )
+
+    def test_t2d_disagreeing_with_d2t_rejected(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Popcount-preserving disagreement: one of the two maps is stale."""
+        t2d = _valid_t2d()
+        t2d[0] = 0
+        t2d[1] = 1
+        with pytest.raises(ValueError, match="not marked draftable"):
+            self._swap_with(tmp_path, monkeypatch, t2d=t2d)
+
+    def test_a_valid_mapping_is_accepted(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The negative control: the guard must not reject a good candidate."""
+        self._swap_with(tmp_path, monkeypatch)
+
+    def test_the_verifier_vocab_comes_from_the_running_verifiers_config(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``model_config.hf_config`` wins over the drafter's copy of the fact.
+
+        The drafter's ``vocab_size`` is what it believed about the verifier
+        when it was *built*.  The bound must be the verifier actually running,
+        or the check validates the map against itself.  Here the drafter still
+        claims 151,936 while the live verifier declares 40,000, and a d2t
+        target of 45,000 must be rejected on the smaller, real bound.
+        """
+        #: 45,001 rather than a round number: it is out of range against the
+        #: live 40,000 verifier, but *in* range against the drafter's stale
+        #: 151,936 -- and it is deliberately not a multiple of the fixture's
+        #: stride, so falling back to the stale bound produces a different
+        #: message (a t2d disagreement) rather than the same one by accident.
+        #: Matching on "map outside" is what makes this test able to fail.
+        d2t = _valid_d2t()
+        d2t[10] = 45_001 - 10
+        with pytest.raises(ValueError, match=r"map outside.*-> 45001"):
+            self._swap_with(
+                tmp_path,
+                monkeypatch,
+                d2t=d2t,
+                model_config=types.SimpleNamespace(
+                    hf_config=types.SimpleNamespace(vocab_size=40_000)
+                ),
+            )
+
+    def test_a_multimodal_verifier_config_is_unwrapped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``text_config.vocab_size`` is the text vocabulary d2t indexes."""
+        d2t = _valid_d2t()
+        d2t[10] = 45_001 - 10
+        with pytest.raises(ValueError, match=r"map outside.*-> 45001"):
+            self._swap_with(
+                tmp_path,
+                monkeypatch,
+                d2t=d2t,
+                model_config=types.SimpleNamespace(
+                    hf_config=types.SimpleNamespace(
+                        vocab_size=999_999,
+                        text_config=types.SimpleNamespace(vocab_size=40_000),
+                    )
+                ),
+            )
+
+    def test_an_undecodable_d2t_is_rejected_not_skipped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        directory = _write_draft_dir(tmp_path, config=DRAFT_CONFIG)
+        drafter = self._drafter(with_mapping=True)
+        ext = _make_extension(monkeypatch, drafter=drafter)
+        weights = dict(self.HF_CHECKPOINT) | {"d2t": object()}
+        with pytest.raises(ValueError, match="not a readable tensor"):
+            ext._validate_compatibility(drafter, weights, directory)
 
     def test_missing_config_json_rejected(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1179,8 +1375,7 @@ class TestHotSwapDraftRPC:
                     "midlayer.self_attn.q_proj.weight": _FakeTensor((4096, 4096)),
                     "midlayer.self_attn.k_proj.weight": _FakeTensor((1024, 4096)),
                     "midlayer.mlp.gate_proj.weight": _FakeTensor((12288, 4096)),
-                    "d2t": _FakeTensor((32000,)),
-                    "t2d": _FakeTensor((151936,)),
+                    **_vocab_map_tensors(),
                 }
             },
         )
@@ -1351,8 +1546,11 @@ class TestReportedTopology:
             monkeypatch,
             {
                 "model.safetensors": {
-                    name: _FakeTensor((4096, 4096)) for name in CANDIDATE_TENSORS
+                    name: _FakeTensor((4096, 4096))
+                    for name in CANDIDATE_TENSORS
+                    if name not in _vocab_map_tensors()
                 }
+                | _vocab_map_tensors()
             },
         )
         _install_fake_vllm_reload(monkeypatch)

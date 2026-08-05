@@ -22,7 +22,11 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from draft_weights import write_draft_config, write_draft_weights
+from draft_weights import (
+    write_draft_config,
+    write_draft_weights,
+    write_verifier_config,
+)
 
 from simulation.engine import DraftProfile, SimulatedEngine, running_engine
 from simulation.harness import (
@@ -203,8 +207,14 @@ class TestTheTrainedWeightsReachThePublication:
 
     def _adapter(self, stock: Path) -> Eagle3Adapter:
         adapter = object.__new__(Eagle3Adapter)
+        #: A real verifier snapshot on disk, because the publish guard now
+        #: also bound-checks the draft's d2t against the verifier's declared
+        #: vocab_size -- read from the verifier's own config.json rather than
+        #: from a constant, so a bare repo id it cannot resolve is a failure.
+        verifier = stock.parent / "verifier"
+        write_verifier_config(verifier)
         adapter.config = Eagle3Config(
-            verifier_model="sim/verifier-8b",
+            verifier_model=str(verifier),
             draft_model=str(stock),
             from_pretrained=str(stock),
             mask_policy=MaskPolicy.ALL_ASSISTANT_TURNS,

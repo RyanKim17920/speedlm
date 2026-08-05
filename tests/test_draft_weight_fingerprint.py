@@ -16,7 +16,12 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from draft_weights import draft_payloads, safetensors_bytes, write_draft_weights
+from draft_weights import (
+    draft_payloads,
+    safetensors_bytes,
+    write_draft_weights,
+    write_verifier_config,
+)
 
 from speedlm.training.masking import MaskPolicy
 from speedlm.tuner.artifacts import ArtifactRegistry, ArtifactSpec, hash_directory
@@ -42,8 +47,16 @@ def _adapter(
     depth: int = 3,
 ) -> Eagle3Adapter:
     adapter = object.__new__(Eagle3Adapter)
+    #: A real on-disk verifier snapshot, not the bare repo id these tests used
+    #: to pass.  ``assert_published_weights`` now reads the verifier's
+    #: ``vocab_size`` from its own ``config.json`` in order to bound-check the
+    #: draft's ``d2t``, and ``cached_snapshot_dir`` accepts a directory path
+    #: verbatim -- so this makes the fixture supply the runtime fact rather
+    #: than letting the check degrade to a constant.
+    verifier = tmp_path / "verifier"
+    write_verifier_config(verifier)
     adapter.config = Eagle3Config(
-        verifier_model="acme/verifier",
+        verifier_model=str(verifier),
         draft_model=draft_model,
         from_pretrained=draft_model,
         num_speculative_steps=depth,
@@ -51,7 +64,6 @@ def _adapter(
     )
     if warm_start is not None:
         adapter._resolved_warm_start = warm_start
-    del tmp_path
     return adapter
 
 

@@ -128,6 +128,38 @@ def _as_int(value: object) -> int | None:
         return None
 
 
+def _index_map_values(
+    tensor: Any, name: str, directory: Path
+) -> list[int] | None:
+    """Flatten a 1-D index-map tensor to a list of Python ints.
+
+    ``None`` in, ``None`` out, so an absent ``t2d`` stays "not checked" rather
+    than becoming an empty map that would fail every cross-check.  Anything
+    else that cannot be read as a flat sequence of integers is an error and
+    not a skip: a ``d2t`` this cannot decode is a ``d2t`` nothing downstream
+    can validate, and silently waving it through is how the presence-only
+    check came to be the only check.
+    """
+    if tensor is None:
+        return None
+    tolist = getattr(tensor, "tolist", None)
+    if not callable(tolist):
+        raise ValueError(
+            f"candidate {name!r} is not a readable tensor "
+            f"({type(tensor).__name__}); its vocabulary mapping cannot be "
+            f"validated ({directory})"
+        )
+    values = tolist()
+    if not isinstance(values, list) or any(
+        isinstance(value, (list, tuple)) for value in values
+    ):
+        raise ValueError(
+            f"candidate {name!r} must be a 1-D index map, got a nested "
+            f"sequence ({directory})"
+        )
+    return [int(value) for value in values]
+
+
 def _normalize_dtype(value: object) -> str | None:
     """Reduce ``torch.bfloat16`` / ``"bfloat16"`` / ``torch.dtype`` to a name."""
     if value is None:
@@ -615,6 +647,98 @@ class DraftSwapExtension:
                     f"drafter has a draft_id_to_target_id buffer and needs them "
                     f"({directory})"
                 )
+            self._validate_vocab_mapping(new_weights, directory, current)
+
+    def _verifier_vocab_size(self, current: DraftConfigSummary) -> int:
+        """Return the running *verifier's* vocabulary size.
+
+        Read from ``vllm_config.model_config.hf_config`` -- the verifier's own
+        ``config.json`` as the running server loaded it -- and never from a
+        constant, because the failure being guarded is precisely a map
+        calibrated against one vocabulary being applied to another.
+
+        Falls back to the drafter's ``vocab_size``, which speculators
+        populates from the verifier's config at build time
+        (``model.py:47`` ``self.verifier_vocab_size = tl_config.vocab_size``).
+        That is a weaker witness -- it is the drafter's *copy* of the fact --
+        but it is still a config-derived runtime value, and having it means a
+        vLLM build that does not expose ``model_config`` degrades to a real
+        check rather than to no check.
+
+        Raises:
+            ValueError: if neither source yields a usable size.  An unknown
+                verifier vocabulary is not permission to swap unvalidated
+                index maps into a running server.
+        """
+        config = getattr(self, "vllm_config", None)
+        model_config = getattr(config, "model_config", None)
+        hf_config = getattr(model_config, "hf_config", None)
+        text_config = getattr(hf_config, "text_config", None)
+        for candidate in (text_config, hf_config):
+            size = _as_int(getattr(candidate, "vocab_size", None))
+            if size is not None and size > 0:
+                return size
+        if current.vocab_size is not None and current.vocab_size > 0:
+            return current.vocab_size
+        raise ValueError(
+            "cannot read the verifier's vocab_size from "
+            "vllm_config.model_config.hf_config or from the running drafter's "
+            "config; refusing to swap in an unvalidated draft vocab mapping"
+        )
+
+    def _validate_vocab_mapping(
+        self,
+        new_weights: Mapping[str, Any],
+        directory: Path,
+        current: DraftConfigSummary,
+    ) -> None:
+        """Raise unless every ``i + d2t[i]`` lands inside the verifier's vocab.
+
+        The presence check above only established that ``d2t``/``t2d`` exist.
+        That is the check this repo shipped, and it is satisfied by a d2t of
+        the right shape holding anything at all -- including all zeros, the
+        identity map that mistranslates every drafted token.  vLLM will not
+        catch it either: it applies the map as ``base + d2t`` with no clamp and
+        no assert (``llama_eagle3.py:347-357``), where a *negative* target
+        wraps silently under PyTorch advanced indexing rather than raising.
+
+        The rule itself lives in :func:`speedlm.tuner.eagle3.check_vocab_mapping`
+        so the swap-time and publish-time checks cannot drift apart.  Imported
+        lazily: the tuner module is login-node code and has no business in the
+        worker's import graph until a swap actually happens.
+        """
+        from speedlm.tuner.eagle3 import DraftVocabMappingError, check_vocab_mapping
+
+        d2t = _index_map_values(new_weights["d2t"], "d2t", directory)
+        if d2t is None:
+            # The key is present (checked above) but holds ``None``.  Not a
+            # shape this pipeline produces, and not a reason to skip: an
+            # absent d2t is the identity-map corruption in another costume.
+            raise ValueError(f"candidate draft's d2t is None ({directory})")
+        t2d = _index_map_values(new_weights.get("t2d"), "t2d", directory)
+        try:
+            report = check_vocab_mapping(
+                d2t,
+                t2d,
+                verifier_vocab_size=self._verifier_vocab_size(current),
+                source=str(directory),
+            )
+        except DraftVocabMappingError as exc:
+            # Re-raised as ValueError so it joins the other pre-mutation
+            # rejections in this method: ``hot_swap_draft`` documents
+            # ValueError as "candidate is incompatible, nothing was touched",
+            # and a caller should not have to import a tuner exception to
+            # handle a rejected swap.
+            raise ValueError(str(exc)) from exc
+        logger.info(
+            "Candidate draft vocab mapping validated: %d draft ids -> targets "
+            "[%d, %d] within verifier vocab_size %d (%s)",
+            report["draft_vocab_size"],
+            report["min_target"],
+            report["max_target"],
+            report["verifier_vocab_size"],
+            directory,
+        )
 
     # -- apply --
 

@@ -31,22 +31,83 @@ _F32_ITEMSIZE = 4
 #: reads the payload's magnitudes, only its structure.
 _FIXTURE_AUX_COUNT = 3
 
+#: The reduced vocabulary the fixture draft claims, matching the
+#: ``draft_vocab_size`` in :func:`speculators_config_payload`.
+FIXTURE_DRAFT_VOCAB = 8
+
+#: The verifier vocabulary the fixture draft is validated against, written by
+#: :func:`write_verifier_config`.  Twice the draft vocabulary, so the fixture
+#: exercises a genuine *reduction* -- an equal-sized one would make the
+#: identity map legal and the all-zeros check vacuous.
+FIXTURE_VERIFIER_VOCAB = 16
+
+#: Draft id ``i`` maps to target id ``i * _FIXTURE_VOCAB_STRIDE``.
+_FIXTURE_VOCAB_STRIDE = 2
+
+
+def fixture_d2t(
+    draft_vocab: int = FIXTURE_DRAFT_VOCAB, stride: int = _FIXTURE_VOCAB_STRIDE
+) -> list[int]:
+    """A well-formed ``d2t``, stored as the on-disk *delta* to the target id."""
+    return [index * stride - index for index in range(draft_vocab)]
+
+
+def fixture_t2d(
+    draft_vocab: int = FIXTURE_DRAFT_VOCAB,
+    verifier_vocab: int = FIXTURE_VERIFIER_VOCAB,
+    stride: int = _FIXTURE_VOCAB_STRIDE,
+) -> list[int]:
+    """The ``t2d`` mask matching :func:`fixture_d2t`."""
+    mask = [0] * verifier_vocab
+    for index in range(draft_vocab):
+        mask[index * stride] = 1
+    return mask
+
+
+def d2t_bytes(values: Sequence[int]) -> bytes:
+    """Pack *values* as little-endian ``I64``, the dtype ``d2t`` ships as."""
+    return b"".join(int(value).to_bytes(8, "little", signed=True) for value in values)
+
+
+def t2d_bytes(values: Sequence[int]) -> bytes:
+    """Pack *values* as safetensors ``BOOL`` -- one byte per element."""
+    return bytes(1 if value else 0 for value in values)
+
+
+#: How the two index maps are declared, since they are not ``F32``.
+#:
+#: ``d2t`` is ``I64`` and ``t2d`` is ``BOOL`` in every real checkpoint, and
+#: production now decodes both for real (``speedlm.tuner.eagle3``
+#: ``assert_draft_vocab_mapping``).  A fixture that declared them ``F32``
+#: would be rejected as "not an integer index map", so the writer states the
+#: true dtypes and emits payloads that are actually a valid mapping.
+_VOCAB_MAP_DECLARATIONS: dict[str, tuple[str, int]] = {"d2t": ("I64", 8), "t2d": ("BOOL", 1)}
+
 
 def safetensors_bytes(payloads: Mapping[str, bytes]) -> bytes:
     """Serialize *payloads* as a safetensors file body.
 
-    Each entry is declared ``F32`` with a one-dimensional shape derived from
-    its byte length, which is all the fingerprint reads.
+    Entries are declared ``F32`` with a one-dimensional shape derived from
+    their byte length, which is all the fingerprint reads -- except the two
+    vocabulary index maps, which carry their real dtypes (see
+    :data:`_VOCAB_MAP_DECLARATIONS`).
     """
     header: dict[str, object] = {}
     offset = 0
     for name in sorted(payloads):
         blob = payloads[name]
-        if len(blob) % _F32_ITEMSIZE:
-            raise ValueError(f"payload for {name!r} is not a whole number of F32 values")
-        count = len(blob) // _F32_ITEMSIZE
+        declaration = _VOCAB_MAP_DECLARATIONS.get(name)
+        if declaration is not None:
+            dtype, itemsize = declaration
+        else:
+            dtype, itemsize = "F32", _F32_ITEMSIZE
+        if len(blob) % itemsize:
+            raise ValueError(
+                f"payload for {name!r} is not a whole number of {dtype} values"
+            )
+        count = len(blob) // itemsize
         header[name] = {
-            "dtype": "F32",
+            "dtype": dtype,
             # Only ``fc.weight`` is shaped, and only because its shape is read.
             "shape": (
                 [count // _FIXTURE_AUX_COUNT, _FIXTURE_AUX_COUNT]
@@ -61,6 +122,22 @@ def safetensors_bytes(payloads: Mapping[str, bytes]) -> bytes:
     return len(raw).to_bytes(8, "little") + raw + body
 
 
+def write_verifier_config(
+    directory: Path, *, vocab_size: int = FIXTURE_VERIFIER_VOCAB
+) -> Path:
+    """Write a minimal verifier snapshot declaring *vocab_size*.
+
+    Production reads the verifier's vocabulary from its own ``config.json``
+    via :func:`speedlm.profiles.cached_snapshot_dir`, which returns an on-disk
+    path unchanged.  Passing this directory as ``verifier_model`` therefore
+    gives tests a real runtime fact to validate against instead of a constant.
+    """
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / "config.json"
+    path.write_text(json.dumps({"vocab_size": vocab_size}), encoding="utf-8")
+    return path
+
+
 def draft_payloads(
     *,
     seed: int = 0,
@@ -70,20 +147,34 @@ def draft_payloads(
 
     One ``F32`` value each, except ``fc.weight``, which carries
     :data:`_FIXTURE_AUX_COUNT` so its declared shape is ``(1, 3)``.
+
+    ``d2t``/``t2d`` are the exception to the exception: they are *index maps*,
+    not weights, and production validates their contents.  They therefore
+    carry the canonical valid mapping and do **not** vary with *seed* -- a
+    seed-dithered index map would be an out-of-range or self-inconsistent one,
+    which is precisely the state these fixtures must not accidentally be in.
+    Fingerprint tests that need two distinguishable drafts still get them:
+    every other tensor still varies.
     """
-    return {
-        name: bytes(
+    payloads: dict[str, bytes] = {}
+    for index, name in enumerate(sorted(names)):
+        if name == "d2t":
+            payloads[name] = d2t_bytes(fixture_d2t())
+            continue
+        if name == "t2d":
+            payloads[name] = t2d_bytes(fixture_t2d())
+            continue
+        payloads[name] = bytes(
             ((seed + index + position) % 256)
             for position in range(
                 _F32_ITEMSIZE * (_FIXTURE_AUX_COUNT if name == "fc.weight" else 1)
             )
         )
-        for index, name in enumerate(sorted(names))
-    }
+    return payloads
 
 
 #: Bytes per element of every dtype these helpers can emit.
-DTYPE_ITEMSIZE: dict[str, int] = {"BF16": 2, "F16": 2, "F32": 4, "I64": 8}
+DTYPE_ITEMSIZE: dict[str, int] = {"BOOL": 1, "BF16": 2, "F16": 2, "F32": 4, "I64": 8}
 
 
 def typed_safetensors_bytes(

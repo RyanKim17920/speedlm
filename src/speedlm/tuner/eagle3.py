@@ -15,8 +15,10 @@ import math
 import operator
 import os
 import struct
+import sys
 import time
-from collections.abc import Callable, Iterator, Mapping
+from array import array
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Final, Protocol
@@ -199,6 +201,51 @@ class DeclaredDepthError(Eagle3Error):
 
 class DraftWeightsError(Eagle3Error):
     """A materialized or published draft does not carry usable trained weights."""
+
+
+class DraftVocabMappingError(DraftWeightsError):
+    """The draft's reduced-vocabulary index maps cannot be applied safely.
+
+    EAGLE-3 draft heads here run a *reduced* vocabulary -- 64,000 of the
+    verifier's 201,088 for gpt-oss -- and carry two index maps that translate
+    between the two spaces:
+
+    * ``d2t``: an ``int64`` tensor of length ``draft_vocab_size`` holding a
+      **delta**, so draft id ``i`` means target id ``i + d2t[i]``.
+    * ``t2d``: a ``bool`` tensor of length ``verifier_vocab_size``, true
+      exactly at the target ids the draft vocabulary covers.
+
+    vLLM applies ``d2t`` with neither a clamp nor an assert
+    (``llama_eagle3.py:347-357``)::
+
+        base = torch.arange(self.config.draft_vocab_size, device=logits.device)
+        targets = base + self.draft_id_to_target_id
+        logits_new = logits.new_full((logits.shape[0], self.config.vocab_size), -inf)
+        logits_new[:, targets] = logits
+
+    Because ``d2t`` is a delta rather than an absolute id, a **negative**
+    target is not an error to PyTorch -- advanced indexing wraps it Python
+    style, so the draft's logits land on some unrelated high token id and the
+    model drafts nonsense with no diagnostic anywhere.  Verified directly:
+    with ``vocab_size=32`` and a target of ``-7``, ``logits_new[:, targets] =
+    logits`` writes column 25 and raises nothing.  (An *oversized* target does
+    raise ``IndexError`` on CPU, and a device-side assert on CUDA; the
+    silently-wrong direction is the negative one, which is exactly the
+    direction a delta map can drift in.)
+
+    A **missing** ``d2t`` is worse still.  vLLM constructs
+    ``draft_id_to_target_id`` as an all-zeros parameter unconditionally
+    (``llama_eagle3.py:304-307``) and, when the checkpoint carries no ``d2t``,
+    adds it to ``skip_substrs`` so the loader leaves the zeros in place
+    (``llama_eagle3.py:419-420``).  ``targets`` is then ``base + 0`` -- the
+    identity -- and every drafted token is mistranslated.  The
+    ``if self.draft_id_to_target_id is None`` guard at ``:340`` cannot catch
+    this: the parameter is always constructed, so it is never ``None``.
+
+    Hence an all-zeros ``d2t`` on a genuinely reduced vocabulary is a
+    corruption and not a valid state, and is raised as this error rather than
+    tolerated.
+    """
 
 
 class StockIdenticalDraftError(DraftWeightsError):
@@ -610,6 +657,395 @@ def drafter_aux_count(directory: Path) -> int:
             f"not an aux-layer count: {directory}"
         )
     return fused // hidden
+
+
+#: safetensors integer dtypes the vocab-map reader understands, as
+#: :mod:`array` typecodes.  ``d2t`` is published as ``I64`` by both stock
+#: drafters and by ``build_vocab_mappings_from_distribution``
+#: (``speculators/train/vocab_mapping.py``, ``dtype=torch.long``); the narrower
+#: codes are accepted because a re-exported artifact may legitimately narrow
+#: them and the index arithmetic is identical either way.
+_INT_TYPECODES: Final[dict[str, str]] = {"I64": "q", "I32": "i", "I16": "h", "I8": "b"}
+
+#: How many offending entries an index-map failure quotes before eliding.
+#:
+#: Enough to show a pattern (one bad entry vs a whole shifted block) without
+#: turning a 64,000-element map into an unreadable exception message.
+_VOCAB_MAP_REPORT_LIMIT: Final = 5
+
+
+def _tensor_payload(name: str, location: _TensorLocation) -> bytes:
+    """Read one tensor's raw payload bytes out of its shard."""
+    length = location.end - location.start
+    try:
+        with location.path.open("rb") as stream:
+            stream.seek(location.start)
+            raw = stream.read(length)
+    except OSError as exc:
+        raise DraftVocabMappingError(
+            f"cannot read tensor {name!r}: {location.path}"
+        ) from exc
+    if len(raw) != length:
+        raise DraftVocabMappingError(f"tensor {name!r} is truncated in {location.path}")
+    return raw
+
+
+def _decode_int_tensor(name: str, location: _TensorLocation) -> array[int]:
+    """Decode a 1-D integer tensor into a native :mod:`array` of Python ints.
+
+    Stays stdlib-only for the same reason :func:`_safetensors_tensors` does:
+    the tuner must remain importable on a login node with neither torch nor
+    numpy.  ``d2t`` is 64,000 ``int64`` -- 512 KB -- so reading it whole costs
+    nothing worth optimising, and :meth:`array.array.frombytes` decodes it at
+    C speed.
+    """
+    typecode = _INT_TYPECODES.get(location.dtype)
+    if typecode is None:
+        raise DraftVocabMappingError(
+            f"tensor {name!r} has dtype {location.dtype!r}, which is not an "
+            f"integer index map: {location.path}"
+        )
+    if len(location.shape) != 1:
+        raise DraftVocabMappingError(
+            f"tensor {name!r} must be 1-D to be an index map, got shape "
+            f"{list(location.shape)}: {location.path}"
+        )
+    values: array[int] = array(typecode)
+    raw = _tensor_payload(name, location)
+    if len(raw) % values.itemsize:
+        raise DraftVocabMappingError(
+            f"tensor {name!r} payload of {len(raw)} bytes is not a whole number "
+            f"of {location.dtype} elements: {location.path}"
+        )
+    values.frombytes(raw)
+    if sys.byteorder != "little":
+        # safetensors payloads are always little-endian; ``frombytes`` decodes
+        # in host order, so a big-endian host has to swap.  Untested here (no
+        # such host exists in this fleet) but wrong-by-default otherwise.
+        values.byteswap()
+    if len(values) != location.shape[0]:
+        raise DraftVocabMappingError(
+            f"tensor {name!r} declares shape {list(location.shape)} but its "
+            f"payload holds {len(values)} elements: {location.path}"
+        )
+    return values
+
+
+def _decode_bool_tensor(name: str, location: _TensorLocation) -> bytes:
+    """Decode a 1-D ``BOOL`` tensor into one byte per element, 0 or 1."""
+    if location.dtype != "BOOL":
+        raise DraftVocabMappingError(
+            f"tensor {name!r} has dtype {location.dtype!r}, expected BOOL: "
+            f"{location.path}"
+        )
+    if len(location.shape) != 1:
+        raise DraftVocabMappingError(
+            f"tensor {name!r} must be 1-D to be a vocabulary mask, got shape "
+            f"{list(location.shape)}: {location.path}"
+        )
+    raw = _tensor_payload(name, location)
+    if len(raw) != location.shape[0]:
+        raise DraftVocabMappingError(
+            f"tensor {name!r} declares shape {list(location.shape)} but its "
+            f"payload holds {len(raw)} bytes: {location.path}"
+        )
+    return raw
+
+
+def check_vocab_mapping(
+    d2t: Sequence[int],
+    t2d: Sequence[int] | None,
+    *,
+    verifier_vocab_size: int,
+    source: str,
+) -> dict[str, int]:
+    """Validate a draft<->target vocabulary mapping; raise if it is unsafe.
+
+    The single definition of the rule, shared by the publish-time check in
+    :meth:`Eagle3Adapter.assert_published_weights` and the swap-time check in
+    :meth:`speedlm.gateway.draft_swap.DraftSwapExtension._validate_compatibility`,
+    so the two can never drift.  Pure index arithmetic over plain integers:
+    no torch, no numpy, no filesystem.
+
+    *verifier_vocab_size* must come from the verifier's own ``config.json``
+    -- a runtime fact -- and never from a constant: the whole failure mode
+    being guarded is a map calibrated against one vocabulary being applied to
+    another.
+
+    *t2d* is optional (vLLM discards it, ``llama_eagle3.py:386-387``) but is
+    checked whenever present, because it is an independent witness: it is
+    built from the same selected-id list as ``d2t``
+    (``speculators/train/vocab_mapping.py``
+    ``build_vocab_mappings_from_distribution``), so ``t2d`` disagreeing with
+    ``d2t`` means one of the two was regenerated without the other.
+
+    Rejects, in order:
+
+    1. ``d2t`` longer than the verifier vocabulary -- not a reduction.
+    2. Any ``i + d2t[i]`` outside ``[0, verifier_vocab_size)``.  Negative is
+       the silent case; see :class:`DraftVocabMappingError`.
+    3. Two draft ids mapping to the same target id.  ``logits_new[:, targets]
+       = logits`` would keep only the last write, so one of the two draft
+       tokens can never be proposed and the other carries the wrong logit.
+    4. An all-zeros ``d2t`` on a genuinely reduced vocabulary -- the identity
+       map vLLM falls back to when ``d2t`` is missing entirely.  On a
+       *full*-vocabulary head (``len(d2t) == verifier_vocab_size``) the
+       identity is the correct map and is accepted.
+    5. ``t2d`` of the wrong length, all-false, with a popcount other than
+       ``len(d2t)``, or false at a target ``d2t`` maps to.
+
+    Returns:
+        A small report: ``draft_vocab_size``, ``verifier_vocab_size``,
+        ``min_target``, ``max_target``.  Callers log it so a *passing* check
+        still leaves evidence of what it read.
+
+    Raises:
+        DraftVocabMappingError: on any of the above.
+    """
+    draft_vocab_size = len(d2t)
+    if draft_vocab_size == 0:
+        raise DraftVocabMappingError(f"d2t is empty: {source}")
+    if verifier_vocab_size <= 0:
+        raise DraftVocabMappingError(
+            f"verifier vocab_size {verifier_vocab_size} is not a vocabulary size: "
+            f"{source}"
+        )
+    if draft_vocab_size > verifier_vocab_size:
+        raise DraftVocabMappingError(
+            f"draft vocabulary ({draft_vocab_size}) is larger than the verifier's "
+            f"({verifier_vocab_size}); d2t cannot be a reduction of it: {source}"
+        )
+
+    reduced = draft_vocab_size < verifier_vocab_size
+    if reduced and not any(d2t):
+        raise DraftVocabMappingError(
+            f"d2t is all zeros, i.e. the identity map, but the draft vocabulary "
+            f"({draft_vocab_size}) is a strict reduction of the verifier's "
+            f"({verifier_vocab_size}); this is exactly the state vLLM lands in "
+            f"when d2t is missing from the checkpoint (llama_eagle3.py:304-307, "
+            f":419-420), and it mistranslates every drafted token: {source}"
+        )
+
+    seen = bytearray(verifier_vocab_size)
+    out_of_range: list[str] = []
+    out_of_range_count = 0
+    duplicates: list[str] = []
+    duplicate_count = 0
+    min_target = verifier_vocab_size
+    max_target = -1
+    for draft_id, delta in enumerate(d2t):
+        target = draft_id + delta
+        if target < 0 or target >= verifier_vocab_size:
+            out_of_range_count += 1
+            if len(out_of_range) < _VOCAB_MAP_REPORT_LIMIT:
+                out_of_range.append(f"d2t[{draft_id}]={delta} -> {target}")
+            continue
+        if seen[target]:
+            duplicate_count += 1
+            if len(duplicates) < _VOCAB_MAP_REPORT_LIMIT:
+                duplicates.append(f"d2t[{draft_id}]={delta} -> {target}")
+        seen[target] = 1
+        min_target = min(min_target, target)
+        max_target = max(max_target, target)
+
+    if out_of_range_count:
+        raise DraftVocabMappingError(
+            f"{out_of_range_count} of {draft_vocab_size} d2t entries map outside "
+            f"the verifier vocabulary [0, {verifier_vocab_size}): "
+            f"{', '.join(out_of_range)}"
+            f"{', ...' if out_of_range_count > len(out_of_range) else ''}. "
+            f"vLLM applies this as base + d2t with no clamp and no assert "
+            f"(llama_eagle3.py:347-357), so a negative target wraps silently "
+            f"onto an unrelated token instead of failing: {source}"
+        )
+    if duplicate_count:
+        raise DraftVocabMappingError(
+            f"{duplicate_count} of {draft_vocab_size} d2t entries collide on a "
+            f"target id already claimed by a lower draft id: "
+            f"{', '.join(duplicates)}"
+            f"{', ...' if duplicate_count > len(duplicates) else ''}. "
+            f"logits_new[:, targets] = logits keeps only the last write, so the "
+            f"colliding draft tokens cannot both be proposed: {source}"
+        )
+
+    if t2d is not None:
+        if len(t2d) != verifier_vocab_size:
+            raise DraftVocabMappingError(
+                f"t2d has length {len(t2d)} but the verifier vocabulary is "
+                f"{verifier_vocab_size}; it cannot be a mask over it: {source}"
+            )
+        covered = sum(1 for value in t2d if value)
+        if covered == 0:
+            raise DraftVocabMappingError(
+                f"t2d marks no target token as draftable at all; the draft head "
+                f"would have no reachable vocabulary: {source}"
+            )
+        if covered != draft_vocab_size:
+            raise DraftVocabMappingError(
+                f"t2d marks {covered} draftable target ids but d2t has "
+                f"{draft_vocab_size} entries; the two maps were not built from "
+                f"the same selected-token list: {source}"
+            )
+        disagreements: list[str] = []
+        disagreement_count = 0
+        for draft_id, delta in enumerate(d2t):
+            target = draft_id + delta
+            if not t2d[target]:
+                disagreement_count += 1
+                if len(disagreements) < _VOCAB_MAP_REPORT_LIMIT:
+                    disagreements.append(f"d2t[{draft_id}]={delta} -> {target}")
+        if disagreement_count:
+            raise DraftVocabMappingError(
+                f"{disagreement_count} of {draft_vocab_size} d2t targets are not "
+                f"marked draftable by t2d: {', '.join(disagreements)}"
+                f"{', ...' if disagreement_count > len(disagreements) else ''}. "
+                f"The forward and reverse maps disagree, so one of them is "
+                f"stale: {source}"
+            )
+
+    return {
+        "draft_vocab_size": draft_vocab_size,
+        "verifier_vocab_size": verifier_vocab_size,
+        "min_target": min_target,
+        "max_target": max_target,
+    }
+
+
+def verifier_vocab_size(model: str) -> int:
+    """Return *model*'s vocabulary size, read from its own ``config.json``.
+
+    Deliberately not a constant and not the draft's own
+    ``transformer_layer_config.vocab_size``: the draft config is a *copy* of
+    what the drafter believed about the verifier when it was built, and a
+    mapping validated against that copy would still be validated against
+    itself.  This reads the verifier snapshot on disk -- the same bytes vLLM
+    will load -- via :func:`speedlm.profiles.cached_snapshot_dir`, which is
+    stdlib-only and therefore login-node safe.
+
+    Multimodal verifiers nest the text vocabulary under ``text_config``; the
+    same unwrapping speculators does (``vocab_mapping.get_target_vocab_size``)
+    is applied here.
+
+    Raises:
+        DraftVocabMappingError: if the snapshot, the config, or the field
+            cannot be found.  An unreadable verifier is not permission to skip
+            the check -- it is the reason the check exists.
+    """
+    directory = cached_snapshot_dir(model)
+    if directory is None:
+        raise DraftVocabMappingError(
+            f"no local snapshot for verifier {model!r}, so its vocabulary size "
+            f"cannot be read; refusing to validate a draft vocab mapping against "
+            f"an assumed size"
+        )
+    path = directory / _DRAFT_CONFIG_NAME
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except OSError as exc:
+        raise DraftVocabMappingError(f"cannot read verifier config: {path}") from exc
+    except json.JSONDecodeError as exc:
+        raise DraftVocabMappingError(
+            f"verifier config is not valid JSON: {path}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise DraftVocabMappingError(f"verifier config is not a JSON object: {path}")
+    text_config = payload.get("text_config")
+    if isinstance(text_config, dict) and "vocab_size" in text_config:
+        payload = text_config
+    size = payload.get("vocab_size")
+    if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+        raise DraftVocabMappingError(
+            f"verifier config declares vocab_size={size!r}, which is not a "
+            f"vocabulary size: {path}"
+        )
+    return size
+
+
+def assert_draft_vocab_mapping(directory: Path, verifier_model: str) -> dict[str, int]:
+    """Validate *directory*'s ``d2t``/``t2d`` against *verifier_model*'s vocab.
+
+    The publish-side entry point.  Only the safetensors header plus the two
+    small index tensors are read -- ~700 KB for a gpt-oss head, against the
+    1.7 GB the fingerprint pass already walks -- so this is free relative to
+    the publish it guards, and it runs on the login node before any GPU is
+    involved.
+
+    **Do not "fix" a failure here by passing ``--draft-vocab-size`` to
+    speculators' trainer.**  SpeedLM passes neither ``--draft-vocab-size`` nor
+    ``--d2t-path``, so ``parse_vocab_mappings`` (``speculators/scripts/train.py:228``)
+    falls through to its warning branch at ``:271-275`` and the maps stay
+    exactly as the vendor shipped them.  Setting ``--draft-vocab-size`` does
+    *not* re-derive the shipped map -- it fires the branch at ``:246-271``,
+    which rebuilds ``d2t``/``t2d`` from a token-frequency file and then loads
+    them over the warm-start head with
+    ``self.load_state_dict({"t2d": t2d, "d2t": d2t}, strict=False)``
+    (``speculators/src/speculators/model.py:122``).
+
+    On a warm start that leaves the model in a *three-way* inconsistent state.
+    ``load_verifier_weights`` (``model.py:124-177``) slices the verifier's
+    ``lm_head`` rows with the **new** ``t2d`` at ``:161-168``, then:
+
+    * ``self.lm_head`` is guarded by ``if self.lm_head.weight.isnan().any()``
+      (``:170``).  On ``--from-pretrained`` the warm-start checkpoint already
+      populated it, so the guard is false and it **keeps the stock ordering**.
+    * ``self.verifier_lm_head`` is loaded unconditionally at ``:174-177``, so
+      it **takes the new ordering**.
+    * ``d2t``/``t2d`` also take the new ordering.
+
+    So the trained head's row ``i`` would be labelled with a target id chosen
+    by a different ranking than the one that produced row ``i``, *and* would be
+    distilled against a differently-ordered teacher.  Every token would be
+    mistranslated, and this check would not catch it: the rebuilt map is
+    perfectly in range and perfectly self-consistent -- it is just attached to
+    the wrong head.  A genuine rebuild has to retrain the head with the new
+    ordering, not relabel a frozen one.
+    """
+    tensors = _collect_draft_tensors(directory)
+    d2t_location = tensors.get("d2t")
+    if d2t_location is None:
+        raise DraftVocabMappingError(
+            f"draft directory publishes no d2t, so vLLM would fall back to the "
+            f"all-zeros identity map and mistranslate every drafted token "
+            f"(llama_eagle3.py:304-307, :419-420): {directory}"
+        )
+    d2t = _decode_int_tensor("d2t", d2t_location)
+    t2d_location = tensors.get("t2d")
+    t2d = None if t2d_location is None else _decode_bool_tensor("t2d", t2d_location)
+
+    declared = read_draft_config_draft_vocab_size(directory)
+    if declared is not None and declared != len(d2t):
+        raise DraftVocabMappingError(
+            f"draft config declares draft_vocab_size={declared} but d2t has "
+            f"{len(d2t)} entries; the artifact misdescribes its own vocabulary: "
+            f"{directory}"
+        )
+
+    return check_vocab_mapping(
+        d2t,
+        t2d,
+        verifier_vocab_size=verifier_vocab_size(verifier_model),
+        source=str(directory),
+    )
+
+
+def read_draft_config_draft_vocab_size(directory: Path) -> int | None:
+    """Return *directory*'s declared ``draft_vocab_size``, or ``None``.
+
+    ``None`` for an absent, unreadable or non-integer declaration: that is no
+    evidence about the vocabulary, and :func:`check_vocab_mapping` still runs
+    against the tensor itself either way.
+    """
+    path = directory / _DRAFT_CONFIG_NAME
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("draft_vocab_size")
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value
 
 
 #: Relative spacing of the bf16 grid, i.e. one ULP as a fraction of the value.
@@ -1128,6 +1564,14 @@ class Eagle3Adapter:
     #: test assembled without ``__init__``.
     _draft_weight_fingerprint: str | None = None
 
+    #: What the publish-time vocabulary-mapping check read, or ``None`` before
+    #: :meth:`assert_published_weights` has run.  Recorded rather than logged
+    #: (this module has no logger) so a *passing* check still leaves evidence
+    #: in the manifest: a guard whose only observable output is an exception
+    #: is indistinguishable from a guard that never ran, which is how the
+    #: presence-only d2t validator survived every cycle it should have failed.
+    _draft_vocab_mapping: dict[str, int] | None = None
+
     #: What :meth:`materialize` compared that fingerprint against, and the
     #: baseline's own fingerprint.  Both are ``None`` when no baseline could be
     #: resolved to local weights.  They are recorded either way: an artifact
@@ -1210,6 +1654,10 @@ class Eagle3Adapter:
         # re-checked against the artifact tree by
         # :meth:`assert_published_weights` before the publish commits.
         params["draft_weight_fingerprint"] = self._draft_weight_fingerprint
+        # What the reduced-vocabulary index maps were validated against.  The
+        # maps are never rebuilt, so this records the verifier vocabulary they
+        # were last proven applicable to.
+        params["draft_vocab_mapping"] = self._draft_vocab_mapping
         params["draft_weight_baseline"] = self._draft_weight_baseline
         params["draft_weight_baseline_fingerprint"] = (
             self._draft_weight_baseline_fingerprint
@@ -1597,6 +2045,32 @@ class Eagle3Adapter:
                 f"expected fingerprint {expected}, got {actual} (path: {published})"
             )
         self._assert_published_depth(published)
+        self._assert_published_vocab_mapping(published)
+
+    def _assert_published_vocab_mapping(self, published: Path) -> None:
+        """Fail the publish unless the reduced-vocabulary maps are applicable.
+
+        The fingerprint above proves the artifact holds the weights we
+        trained; it says nothing about whether the two *index maps* travelling
+        with them can be applied to the verifier this cycle targets.  Those
+        maps are never rebuilt -- see
+        :func:`assert_draft_vocab_mapping` for why they must not be -- so they
+        ride through every warm start unchanged, and the one thing that can
+        change underneath them is the verifier.
+
+        Checked here rather than only at swap time because a publish is
+        revocable and a swap is a running server.  The swap-side check
+        (``DraftSwapExtension._validate_compatibility``) remains, because the
+        artifact can also be handed to a server whose verifier is not the one
+        it was published against.
+
+        The report is logged on success, not only on failure: a check whose
+        only observable output is an exception is indistinguishable from a
+        check that never ran.
+        """
+        self._draft_vocab_mapping = assert_draft_vocab_mapping(
+            published, self.config.verifier_model
+        )
 
     def _assert_published_depth(self, published: Path) -> None:
         """Fail the publish unless the artifact declares its trained depth.
