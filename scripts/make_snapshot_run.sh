@@ -76,7 +76,7 @@ Required:
   --flavor F            idle-tuning | activation-capture | capture-overhead
                         | hot-swap | live-vllm | proxy-overhead
                         | token-fidelity | model-matrix | capture-matrix
-                        | agent-harness
+                        | agent-harness | config-matrix
 
 Optional:
   --commit REF          commit/ref to snapshot            (default: HEAD)
@@ -93,8 +93,11 @@ Optional:
   --tuning-profile PATH SPEEDLM_E2E_TUNING_PROFILE        (idle-tuning, optional)
   --verifier ID         SPEEDLM_E2E_VERIFIER_MODEL        (capture/capture-
                         overhead/hot-swap)
-  --drafter ID          SPEEDLM_E2E_DRAFTER_MODEL         (capture/capture-
-                        overhead/hot-swap)
+  --drafter ID          reference draft (config-matrix), or
+                        SPEEDLM_E2E_DRAFTER_MODEL (capture/capture-overhead/
+                        hot-swap)
+  --candidate-drafter ID
+                        candidate draft for config-matrix (required)
   --inject-ms MS        SPEEDLM_E2E_CAPTURE_OVERHEAD_INJECT_MS
                         (capture-overhead only, optional).  Adds MS
                         milliseconds to every capture-ON request, so the
@@ -102,6 +105,11 @@ Optional:
                         regression on real hardware.  A value above the test's
                         100 ms TTFT bound MUST make the run fail; if it does
                         not, the measurement is not measuring.
+  --inject-percent P    SPEEDLM_CONFIG_MATRIX_INJECT_SLOWDOWN_PERCENT
+                        (config-matrix only, optional). Applies a synthetic P%
+                        candidate slowdown to the regression decision while
+                        preserving raw measurements; a value above the 5%
+                        default budget proves that the harness can fail.
   --drafter-dir PATH    SPEEDLM_E2E_DRAFTER_DIR           (hot-swap, optional)
   --runner R            auto | v1 | v2                    (default: auto)
                         v1/v2 force VLLM_USE_V2_MODEL_RUNNER=0/1; auto lets
@@ -114,7 +122,7 @@ Optional:
   --pytest-k EXPR       pytest -k EXPR                    (optional; without it
                         the whole test file runs, i.e. Stage 0 AND the
                         prefix-cache test together)
-  --corpus PATH         SPEEDLM_E2E_PROMPT_CORPUS         (idle-tuning)
+  --corpus PATH         SPEEDLM_E2E_PROMPT_CORPUS         (idle-tuning/config-matrix)
   --no-corpus           omit the corpus; test falls back to synthetic prompts
   --model ID            served model                      (default: per flavor)
   --matrix-cell NAME    SPEEDLM_MATRIX_CELL               (model-matrix only, required)
@@ -179,8 +187,10 @@ tuning_config=""
 tuning_profile=""
 verifier=""
 drafter=""
+candidate_drafter=""
 drafter_dir=""
 inject_ms=""
+inject_percent=""
 runner="auto"
 prompt_set=""
 target_layer_ids=""
@@ -209,8 +219,10 @@ while [[ $# -gt 0 ]]; do
         --tuning-profile) tuning_profile="$2"; shift 2 ;;
         --verifier)       verifier="$2"; shift 2 ;;
         --drafter)        drafter="$2"; shift 2 ;;
+        --candidate-drafter) candidate_drafter="$2"; shift 2 ;;
         --drafter-dir)    drafter_dir="$2"; shift 2 ;;
         --inject-ms)      inject_ms="$2"; shift 2 ;;
+        --inject-percent) inject_percent="$2"; shift 2 ;;
         --runner)         runner="$2"; shift 2 ;;
         --prompt-set)     prompt_set="$2"; shift 2 ;;
         --target-layer-ids) target_layer_ids="$2"; shift 2 ;;
@@ -246,6 +258,22 @@ if [[ -n "$inject_ms" ]]; then
     }
     [[ "$inject_ms" =~ ^[0-9]+$ ]] || {
         echo "error: --inject-ms must be a non-negative integer number of milliseconds" >&2
+        exit 2
+    }
+fi
+
+if [[ -n "$candidate_drafter" && "$flavor" != "config-matrix" ]]; then
+    echo "error: --candidate-drafter is valid only for --flavor config-matrix" >&2
+    exit 2
+fi
+
+if [[ -n "$inject_percent" ]]; then
+    [[ "$flavor" == "config-matrix" ]] || {
+        echo "error: --inject-percent is valid only for --flavor config-matrix" >&2
+        exit 2
+    }
+    [[ "$inject_percent" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] || {
+        echo "error: --inject-percent must be a non-negative number" >&2
         exit 2
     }
 fi
@@ -436,8 +464,31 @@ case "$flavor" in
         : "${model:=openai/gpt-oss-20b}"
         corpus=""
         ;;
+    config-matrix)
+        test_path="tests/e2e/test_inference_configuration_matrix.py"
+        gate_var="SPEEDLM_E2E_CONFIG_MATRIX"
+        interpreter="$REPO/.venv/bin/python"
+        extra_pythonpath=""
+        extra_path=":$REPO/.venv/bin"
+        artifact_var="SPEEDLM_CONFIG_MATRIX_ARTIFACT_DIR"
+        job_suffix="configmatrix"
+        # Twelve cells and four fresh engine lifecycles per cell. Startup time
+        # dominates, and the long-context/concurrency-32 cells are intentionally
+        # substantial enough to exercise graph capture and KV-cache pressure.
+        default_time="12:00:00"
+        : "${model:=Qwen/Qwen3-8B}"
+        : "${drafter:=RedHatAI/Qwen3-8B-speculator.eagle3}"
+        [[ -n "$candidate_drafter" ]] || {
+            echo "error: --candidate-drafter is required for --flavor config-matrix" >&2
+            exit 2
+        }
+        [[ -n "$corpus" ]] || {
+            echo "error: config-matrix requires --corpus (do not use --no-corpus)" >&2
+            exit 2
+        }
+        ;;
     *)
-        echo "error: unknown flavor '$flavor' (want idle-tuning|activation-capture|capture-overhead|hot-swap|live-vllm|proxy-overhead|token-fidelity|model-matrix|capture-matrix|agent-harness)" >&2
+        echo "error: unknown flavor '$flavor' (want idle-tuning|activation-capture|capture-overhead|hot-swap|live-vllm|proxy-overhead|token-fidelity|model-matrix|capture-matrix|agent-harness|config-matrix)" >&2
         exit 2
         ;;
 esac
@@ -735,6 +786,17 @@ EOF
         echo "export SPEEDLM_AGENT_SUBPROCESS_TIMEOUT=420"
         # test_agent_harness.py:209 builds per-model defaults already.
         vllm_args_var="SPEEDLM_AGENT_VLLM_ARGS"
+        ;;
+    config-matrix)
+        echo "export SPEEDLM_CONFIG_MATRIX_MODEL=$model"
+        echo "export SPEEDLM_CONFIG_MATRIX_REFERENCE_DRAFT=$drafter"
+        echo "export SPEEDLM_CONFIG_MATRIX_CANDIDATE_DRAFT=$candidate_drafter"
+        echo "export SPEEDLM_E2E_PROMPT_CORPUS=$corpus"
+        echo "export SPEEDLM_CONFIG_MATRIX_STARTUP_TIMEOUT=1800"
+        echo "export SPEEDLM_CONFIG_MATRIX_REQUEST_TIMEOUT=600"
+        if [[ -n "$inject_percent" ]]; then
+            echo "export SPEEDLM_CONFIG_MATRIX_INJECT_SLOWDOWN_PERCENT=$inject_percent"
+        fi
         ;;
 esac
 
