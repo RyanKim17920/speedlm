@@ -1675,7 +1675,11 @@ def test_stage0_activation_capture() -> None:
             "512",
             "--max-num-seqs",
             "8",
-            "--enforce-eager",
+            #: Deliberately use vLLM's default compiled/CUDA-graphed execution.
+            #: The extension declares all four aux layers before compilation;
+            #: arming after readiness must capture from that baked graph.  The
+            #: transport and independent fp32 fidelity assertions below remain
+            #: unchanged and therefore validate the graph-produced tensors.
             "--gpu-memory-utilization",
             "0.5",
             "--no-enable-prefix-caching",
@@ -2172,7 +2176,8 @@ def test_prefix_cache_coverage() -> None:
             "512",
             "--max-num-seqs",
             "8",
-            "--enforce-eager",
+            #: Keep graph mode here too: both cold and prefix-cache-hit captures
+            #: must replay the graph baked with the full aux-layer set.
             "--gpu-memory-utilization",
             "0.5",
             # Prefix caching ENABLED (default)

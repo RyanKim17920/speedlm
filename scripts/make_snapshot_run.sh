@@ -121,7 +121,8 @@ Optional:
   --strict-verdict 0|1  SPEEDLM_E2E_STRICT_VERDICT        (capture, optional)
   --pytest-k EXPR       pytest -k EXPR                    (optional; without it
                         the whole test file runs, i.e. Stage 0 AND the
-                        prefix-cache test together)
+                        prefix-cache test together).  For config-matrix this
+                        is required and must be one exact matrix cell name.
   --corpus PATH         SPEEDLM_E2E_PROMPT_CORPUS         (idle-tuning/config-matrix)
   --no-corpus           omit the corpus; test falls back to synthetic prompts
   --model ID            served model                      (default: per flavor)
@@ -197,6 +198,7 @@ target_layer_ids=""
 hf_reference=""
 strict_verdict=""
 pytest_k=""
+config_matrix_cell=""
 corpus="$CORPUS"
 model=""
 matrix_cell=""
@@ -486,6 +488,24 @@ case "$flavor" in
             echo "error: config-matrix requires --corpus (do not use --no-corpus)" >&2
             exit 2
         }
+        [[ -n "$pytest_k" ]] || {
+            echo "error: config-matrix requires --pytest-k with one exact cell name" >&2
+            exit 2
+        }
+        case "$pytest_k" in
+            eager-c1-short|eager-c1-long|eager-c8-short|eager-c8-long|eager-c32-short|eager-c32-long|cuda_graphs-c1-short|cuda_graphs-c1-long|cuda_graphs-c8-short|cuda_graphs-c8-long|cuda_graphs-c32-short|cuda_graphs-c32-long)
+                config_matrix_cell="$pytest_k"
+                ;;
+            *)
+                echo "error: invalid config-matrix --pytest-k cell '$pytest_k'" >&2
+                echo "       want {eager,cuda_graphs}-c{1,8,32}-{short,long}" >&2
+                exit 2
+                ;;
+        esac
+        # Hyphens are operators in pytest's -k expression language.  The
+        # collection plugin below adds this underscore spelling as a keyword
+        # to the one live test item after narrowing its MATRIX global.
+        pytest_k="${config_matrix_cell//-/_}"
         ;;
     *)
         echo "error: unknown flavor '$flavor' (want idle-tuning|activation-capture|capture-overhead|hot-swap|live-vllm|proxy-overhead|token-fidelity|model-matrix|capture-matrix|agent-harness|config-matrix)" >&2
@@ -614,6 +634,42 @@ fi
 
 mkdir -p "$run_dir/results"
 
+# The configuration matrix is implemented as one live pytest item that loops
+# over MATRIX, so pytest -k cannot select an internal cell by itself.  Keep the
+# test immutable and add a run-local collection plugin that narrows MATRIX
+# before the test executes, then tags the item with the keyword derived from
+# --pytest-k.  The launcher that generates this plugin is in the pinned
+# snapshot, and the plugin itself lives with the run outputs.
+if [[ -n "$config_matrix_cell" ]]; then
+    cat > "$run_dir/speedlm_config_matrix_cell.py" <<'PYEOF'
+import os
+
+import pytest
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(items):
+    cell_name = os.environ["SPEEDLM_CONFIG_MATRIX_CELL"]
+    keyword = cell_name.replace("-", "_")
+    matched = 0
+    for item in items:
+        if item.name != "test_speculative_inference_configuration_matrix":
+            continue
+        selected = tuple(cell for cell in item.module.MATRIX if cell.name == cell_name)
+        if len(selected) != 1:
+            raise pytest.UsageError(
+                f"configuration matrix cell {cell_name!r} matched {len(selected)} cells"
+            )
+        item.module.MATRIX = selected
+        item.extra_keyword_matches.add(keyword)
+        matched += 1
+    if matched != 1:
+        raise pytest.UsageError(
+            f"configuration matrix selector found {matched} live test items"
+        )
+PYEOF
+fi
+
 cat > "$run_dir/snapshot-provenance.txt" <<EOF
 snapshot_commit=$sha
 snapshot_source_ref=$commit_ref
@@ -632,6 +688,11 @@ EOF
 # --------------------------------------------------------------------------
 sbatch_path="$run_dir/job.sbatch"
 pythonpath="$snapshot/src${extra_pythonpath}"
+pytest_plugin_arg=""
+if [[ -n "$config_matrix_cell" ]]; then
+    pythonpath="$run_dir:$pythonpath"
+    pytest_plugin_arg=" -p speedlm_config_matrix_cell"
+fi
 
 {
 cat <<EOF
@@ -794,6 +855,7 @@ EOF
         echo "export SPEEDLM_E2E_PROMPT_CORPUS=$corpus"
         echo "export SPEEDLM_CONFIG_MATRIX_STARTUP_TIMEOUT=1800"
         echo "export SPEEDLM_CONFIG_MATRIX_REQUEST_TIMEOUT=600"
+        echo "export SPEEDLM_CONFIG_MATRIX_CELL=$config_matrix_cell"
         if [[ -n "$inject_percent" ]]; then
             echo "export SPEEDLM_CONFIG_MATRIX_INJECT_SLOWDOWN_PERCENT=$inject_percent"
         fi
@@ -850,7 +912,7 @@ if not actual.is_relative_to(snapshot):
 print("provenance OK: imports resolve to the snapshot")
 PYEOF
 
-"\$interpreter" -m pytest -o addopts='' -p no:cacheprovider -q -ra -s \\
+"\$interpreter" -m pytest -o addopts='' -p no:cacheprovider$pytest_plugin_arg -q -ra -s \\
     "\$snapshot/$test_path"$pytest_k_arg
 
 echo "finished_at=\$(date -u +%Y-%m-%dT%H:%M:%SZ)"

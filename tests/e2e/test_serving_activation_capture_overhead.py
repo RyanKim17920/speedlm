@@ -53,8 +53,9 @@ own first-touch cost.
 Engine flags that are load-bearing here
 ---------------------------------------
 
-* ``--enforce-eager`` **is** passed, and it is now a measurement choice rather
-  than a necessity.  It was a necessity: ``activate_capture`` used to extend
+* The eager-only execution pin **is not** passed.  The engine therefore uses
+  vLLM's production-default compilation and CUDA graphs.  Eager used to be
+  necessary: ``activate_capture`` extended
   ``aux_hidden_state_layers`` at runtime, but the forward that reads that tuple
   (``EagleModelMixin._maybe_add_hidden_state``) is traced and CUDA-graph
   captured once at startup and never re-traced, so the replayed graph kept
@@ -65,11 +66,9 @@ Engine flags that are load-bearing here
   arming changes no shape (see the ``hook.py`` module docstring, and
   ``TestCaptureOnAGraphedEngine`` in ``tests/test_activation_capture.py``,
   which drives a forward whose aux count is fixed at capture time).
-  **Consequence for reading these numbers:** what this file measures is still
-  eager-mode capture overhead, because the pin has not yet been flipped and
-  re-run.  Dropping ``--enforce-eager`` here is the graphed-engine measurement
-  this file was originally trying to take; it needs a GPU run to land, not a
-  code change.
+  This run is the real-hardware proof that the resulting graph can be replayed
+  while capture is repeatedly armed and disarmed, as well as the overhead
+  measurement for the production execution mode.
 * ``--no-enable-prefix-caching`` **is** passed.  The same prompts are replayed
   ~40 times each; with prefix caching on, every repetition after the first would
   skip the prefill and TTFT would measure a cache lookup rather than the work
@@ -816,30 +815,10 @@ def test_activation_capture_serving_overhead() -> None:
             #: prefill entirely and TTFT would measure a cache hit rather than
             #: the forward pass that capture actually taxes.
             "--no-enable-prefix-caching",
-            #: --enforce-eager USED TO BE required, and is now only what this
-            #: particular measurement was taken under.  ``activate_capture``
-            #: used to call ``set_aux_hidden_state_layers`` on the live model,
-            #: and the model consults that tuple inside its own forward --
-            #: ``EagleModelMixin._maybe_add_hidden_state`` does a plain
-            #: ``if layer_idx in self.aux_hidden_state_layers`` (vLLM
-            #: model_executor/models/interfaces.py:1336).  Without this flag
-            #: vLLM compiles (CompilationMode.VLLM_COMPILE) and CUDA-graph
-            #: captures that forward ONCE at startup, with the three default
-            #: eagle3 aux layers baked in, and never re-traces.  Arming capture
-            #: afterwards then moves the *attribute* to four layers while the
-            #: replayed graph keeps emitting three, and the very first forward
-            #: dies in ``_buffer_aux``:
-            #:
-            #:   RuntimeError: the model reported 4 aux layers (2, 18, 33, 36)
-            #:   but the forward produced 3 aux hidden states; the layer
-            #:   labelling cannot be trusted
-            #:
-            #: killing EngineCore (observed: SLURM 370798).  So a graph-capturing
-            #: engine cannot be capture-toggled at all today, and the overhead
-            #: measured here is therefore eager-mode overhead.  Read it as the
-            #: cost of capture in the only configuration capture currently runs
-            #: in -- NOT as the cost it would have in a graphed engine.
-            "--enforce-eager",
+            #: Deliberately use the default graphed mode: startup must capture
+            #: the forward with the full aux-layer set declared by the worker
+            #: extension, then every ON/OFF block replays that same graph while
+            #: arming toggles only host-side buffering.
         ],
         stdout=log_handle,
         stderr=subprocess.STDOUT,
@@ -964,7 +943,7 @@ def test_activation_capture_serving_overhead() -> None:
         "prompts": [label for label, _ in PROMPTS],
         "shared_warmup_passes": SHARED_WARMUP_PASSES,
         "per_block_warmup_passes": PER_BLOCK_WARMUP_PASSES,
-        "enforce_eager": True,
+        "enforce_eager": False,
         "prefix_caching": False,
         "inject_delay_ms": inject_delay * 1000.0,
         "armed_blocks": armed_blocks,
