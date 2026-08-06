@@ -51,9 +51,19 @@ own first-touch cost.
 Engine flags that are load-bearing here
 ---------------------------------------
 
-* ``--enforce-eager`` is **not** passed.  ``test_serving_activation_capture.py``
-  passes it because it compares tensors, not time; without CUDA graphs the
-  latency numbers would not describe production.
+* ``--enforce-eager`` **is** passed, and not by preference.  An earlier revision
+  of this file deliberately omitted it, on the theory that CUDA graphs are on in
+  production so measuring without them would not describe production.  That
+  configuration cannot run at all: ``activate_capture`` extends the model's
+  ``aux_hidden_state_layers`` at runtime, but the forward that reads that tuple
+  (``EagleModelMixin._maybe_add_hidden_state``) is traced and CUDA-graph captured
+  once at startup and never re-traced, so the replayed graph keeps emitting the
+  three default eagle3 aux states while the attribute claims four.  The hook's
+  own labelling guard then kills EngineCore on the first captured forward
+  (SLURM 370798).  **Consequence for reading these numbers:** activation capture
+  is today usable only on an eager engine, so what this file measures is the
+  cost of capture in eager mode.  It is not, and cannot yet be, the cost of
+  capture in a graph-capturing engine.
 * ``--no-enable-prefix-caching`` **is** passed.  The same prompts are replayed
   ~40 times each; with prefix caching on, every repetition after the first would
   skip the prefill and TTFT would measure a cache lookup rather than the work
@@ -800,8 +810,31 @@ def test_activation_capture_serving_overhead() -> None:
             #: prefill entirely and TTFT would measure a cache hit rather than
             #: the forward pass that capture actually taxes.
             "--no-enable-prefix-caching",
-            #: NOTE: --enforce-eager is deliberately ABSENT.  CUDA graphs are on
-            #: in production; without them these numbers would not describe it.
+            #: --enforce-eager is REQUIRED, and this is a limitation of the hook
+            #: rather than a preference of this test.  ``activate_capture``
+            #: works by calling ``set_aux_hidden_state_layers`` on the live
+            #: model (hook.py:_extend_aux_layers), and the model consults that
+            #: tuple inside its own forward -- ``EagleModelMixin.
+            #: _maybe_add_hidden_state`` does a plain ``if layer_idx in
+            #: self.aux_hidden_state_layers`` (vLLM
+            #: model_executor/models/interfaces.py:1336).  Without this flag
+            #: vLLM compiles (CompilationMode.VLLM_COMPILE) and CUDA-graph
+            #: captures that forward ONCE at startup, with the three default
+            #: eagle3 aux layers baked in, and never re-traces.  Arming capture
+            #: afterwards then moves the *attribute* to four layers while the
+            #: replayed graph keeps emitting three, and the very first forward
+            #: dies in ``_buffer_aux``:
+            #:
+            #:   RuntimeError: the model reported 4 aux layers (2, 18, 33, 36)
+            #:   but the forward produced 3 aux hidden states; the layer
+            #:   labelling cannot be trusted
+            #:
+            #: killing EngineCore (observed: SLURM 370798).  So a graph-capturing
+            #: engine cannot be capture-toggled at all today, and the overhead
+            #: measured here is therefore eager-mode overhead.  Read it as the
+            #: cost of capture in the only configuration capture currently runs
+            #: in -- NOT as the cost it would have in a graphed engine.
+            "--enforce-eager",
         ],
         stdout=log_handle,
         stderr=subprocess.STDOUT,
@@ -925,7 +958,7 @@ def test_activation_capture_serving_overhead() -> None:
         "prompts": [label for label, _ in PROMPTS],
         "shared_warmup_passes": SHARED_WARMUP_PASSES,
         "per_block_warmup_passes": PER_BLOCK_WARMUP_PASSES,
-        "enforce_eager": False,
+        "enforce_eager": True,
         "prefix_caching": False,
         "inject_delay_ms": inject_delay * 1000.0,
         "armed_blocks": armed_blocks,

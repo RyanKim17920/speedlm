@@ -313,11 +313,15 @@ case "$flavor" in
         # vars (exported by the shared case arm below), same vLLM-venv
         # interpreter + PYLIBS_PYTEST.  It takes NO vLLM args from the launcher
         # for the same reason activation-capture takes none -- the test spawns
-        # the engine itself and hardcodes its own bounds, and the gateway
-        # defaults (which include --enforce-eager) would be actively wrong here:
-        # measuring without CUDA graphs would not describe production.
+        # the engine itself and hardcodes its own argv and its own bounds, so
+        # the gateway defaults would not reach the engine anyway.  That argv
+        # includes --enforce-eager: capture arms by mutating the model's
+        # aux_hidden_state_layers at runtime, which a compiled/CUDA-graphed
+        # forward ignores, and the resulting 4-vs-3 mismatch kills EngineCore
+        # (SLURM 370798).  See the module docstring for what that costs the
+        # interpretation of the numbers.
         #
-        # ~163 streaming requests at 128 output tokens on top of one model load.
+        # ~246 streaming requests at 128 output tokens on top of one model load.
         test_path="tests/e2e/test_serving_activation_capture_overhead.py"
         gate_var="SPEEDLM_E2E_CAPTURE_OVERHEAD"
         interpreter="$VLLM_ENV/bin/python"
