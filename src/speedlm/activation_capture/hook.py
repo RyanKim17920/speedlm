@@ -112,7 +112,8 @@ import json
 import logging
 import os
 import threading
-from typing import TYPE_CHECKING, Any
+from collections import deque
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 if TYPE_CHECKING:
     # Only executed by static type checkers. mypy has per-module overrides for
@@ -272,6 +273,16 @@ def _extract_aux(runner: Any, attr: str, result: Any) -> Any:
     return getattr(state, "aux_hidden_states", None)
 
 
+class _AsyncTransfer(NamedTuple):
+    """One fused activation batch moving into a pinned host buffer."""
+
+    layer_indices: tuple[int, ...]
+    host: Any
+    ready: Any
+    source: Any
+    pool_key: tuple[Any, ...]
+
+
 class _CaptureSession:
     """Process-wide capture state.
 
@@ -289,10 +300,29 @@ class _CaptureSession:
 
     def reset(self) -> None:
         """Return to a pristine, un-bootstrapped state (tests only)."""
+        #: ``reset_session`` is test-only, but an async transfer may still be
+        #: writing into a pinned slot when teardown reaches it.  Wait before
+        #: dropping the queue and its last references; otherwise CUDA can keep
+        #: writing into storage Python believes is reclaimable.
+        lock = getattr(self, "lock", None)
+        transfers = getattr(self, "transfers", None)
+        if lock is not None and transfers:
+            with lock:
+                self.drain_transfers(wait=True)
+
         self.active = False
         self.capture_dir: str | None = None
         self.pending: dict[int, list] | None = None
         self.lock: threading.Lock | None = None
+        #: CUDA transfers awaiting an event before their pinned buffers may be
+        #: read.  FIFO order is the capture row order.
+        self.transfers: deque[_AsyncTransfer] | None = None
+        #: Recycled pinned destinations, keyed by fused shape and dtype.  The
+        #: pool grows only to the maximum number of overlapping transfers, not
+        #: to the number of captured forwards.
+        self.pinned_pool: dict[tuple[Any, ...], list[Any]] | None = None
+        self.transfer_streams: dict[Any, Any] | None = None
+        self.async_transfer_disabled = False
 
         #: Declaration state, all set inside ``load_model``.
         self.declared = False
@@ -316,6 +346,12 @@ class _CaptureSession:
             self.lock = threading.Lock()
         if self.pending is None:
             self.pending = {}
+        if self.transfers is None:
+            self.transfers = deque()
+        if self.pinned_pool is None:
+            self.pinned_pool = {}
+        if self.transfer_streams is None:
+            self.transfer_streams = {}
 
     # -- declaration (runs inside load_model, before compile) --
 
@@ -484,6 +520,130 @@ class _CaptureSession:
         logger.error("%s", reason)
         self.unavailable = reason
 
+    def _append_host_locked(
+        self, layer_indices: tuple[int, ...], host_tensors: list[Tensor]
+    ) -> None:
+        """Append one completed forward while preserving its live labels."""
+        assert self.pending is not None
+        for layer_idx, tensor in zip(layer_indices, host_tensors, strict=True):
+            self.pending.setdefault(layer_idx, []).append(tensor)
+
+    def _finalize_transfer_locked(self, transfer: _AsyncTransfer) -> None:
+        """Move a completed pinned slot into ordinary, durable host memory."""
+        import torch
+
+        #: The pinned slot is a ring resource and will be overwritten.  Clone it
+        #: only after its event has completed, then retain unbound views of the
+        #: pageable clone in ``pending``.  The views keep their shared base alive.
+        pageable = transfer.host.clone()
+        host_tensors = list(torch.unbind(pageable))
+        if len(host_tensors) != len(transfer.layer_indices):
+            raise RuntimeError(
+                "completed activation transfer changed the number of aux "
+                "tensors; refusing to buffer rows with ambiguous labels"
+            )
+        self._append_host_locked(transfer.layer_indices, host_tensors)
+        assert self.pinned_pool is not None
+        self.pinned_pool.setdefault(transfer.pool_key, []).append(transfer.host)
+
+    def drain_transfers(self, *, wait: bool) -> None:
+        """Finalize ready CUDA transfers, optionally waiting for every one.
+
+        The caller holds :attr:`lock`.  Non-waiting drains run on the serving
+        path and only recycle already-complete ring slots.  Waiting drains are
+        reserved for flush/reset/deactivation, where host access is required.
+        """
+        assert self.transfers is not None
+        while self.transfers:
+            transfer = self.transfers[0]
+            if wait:
+                transfer.ready.synchronize()
+            elif not transfer.ready.query():
+                break
+            self._finalize_transfer_locked(transfer)
+            self.transfers.popleft()
+
+    def _try_async_transfer(
+        self,
+        layer_indices: tuple[int, ...],
+        aux_hidden_states: list[Tensor],
+    ) -> bool:
+        """Enqueue one fused D2H copy without synchronizing the serving thread."""
+        first = aux_hidden_states[0]
+        device = getattr(first, "device", None)
+        if (
+            self.async_transfer_disabled
+            or getattr(device, "type", None) != "cuda"
+            or len(aux_hidden_states) < 2
+            or not _is_fusable(aux_hidden_states)
+        ):
+            return False
+
+        import torch
+
+        assert self.transfers is not None
+        assert self.pinned_pool is not None
+        assert self.transfer_streams is not None
+
+        stream = None
+        host = None
+        pool_key: tuple[Any, ...] | None = None
+        submitted = False
+        try:
+            #: ``stack`` snapshots vLLM's graph-owned output buffers on the
+            #: current compute stream.  The independent allocation is essential:
+            #: the next graph replay may overwrite those static outputs while the
+            #: copy stream is still draining this step.
+            fused = torch.stack(aux_hidden_states).detach()
+            pool_key = (tuple(fused.shape), fused.dtype)
+            slots = self.pinned_pool.setdefault(pool_key, [])
+            host = (
+                slots.pop()
+                if slots
+                else torch.empty_like(fused, device="cpu", pin_memory=True)
+            )
+
+            stream = self.transfer_streams.get(device)
+            if stream is None:
+                stream = torch.cuda.Stream(device=device)
+                self.transfer_streams[device] = stream
+
+            ready = torch.cuda.Event()
+            current_stream = torch.cuda.current_stream(device=device)
+            stream.wait_stream(current_stream)
+            with torch.cuda.stream(stream):
+                host.copy_(fused, non_blocking=True)
+                submitted = True
+                ready.record(stream)
+
+            self.transfers.append(
+                _AsyncTransfer(layer_indices, host, ready, fused, pool_key)
+            )
+            return True
+        except Exception as exc:
+            #: Before submission, a pinned allocation/stream setup failure can
+            #: safely degrade to the synchronous path.  After submission, first
+            #: finish the DMA: releasing a destination that CUDA may still write
+            #: would trade performance for silent corruption.
+            if submitted:
+                try:
+                    assert stream is not None
+                    stream.synchronize()
+                except Exception as sync_exc:
+                    raise RuntimeError(
+                        "asynchronous activation transfer failed after DMA was "
+                        "submitted and its completion could not be established"
+                    ) from sync_exc
+            if host is not None and pool_key is not None:
+                self.pinned_pool.setdefault(pool_key, []).append(host)
+            self.async_transfer_disabled = True
+            logger.warning(
+                "asynchronous pinned activation transfer failed; using "
+                "synchronous host copies for the rest of this capture",
+                exc_info=exc,
+            )
+            return False
+
     def buffer(self, runner: Any, aux_hidden_states: list[Tensor]) -> None:
         """Buffer aux hidden states into the pending dict, keyed by layer index.
 
@@ -529,13 +689,13 @@ class _CaptureSession:
                 f"labelling cannot be trusted"
             )
 
-        host_tensors = _to_host(aux_hidden_states)
-
         assert self.lock is not None and self.pending is not None
         with self.lock:
-            pending = self.pending
-            for i, tensor in enumerate(host_tensors):
-                pending.setdefault(layer_indices[i], []).append(tensor)
+            assert self.transfers is not None
+            self.drain_transfers(wait=False)
+            if self._try_async_transfer(layer_indices, aux_hidden_states):
+                return
+            self._append_host_locked(layer_indices, _to_host(aux_hidden_states))
 
     # -- patch installation --
 
@@ -803,10 +963,12 @@ class ActivationCaptureExtension:
         return _SESSION.lock
 
     def _get_pending(self) -> dict[int, list]:
-        """Return the session's pending dict, initializing it lazily."""
+        """Return all captured rows after pending CUDA transfers complete."""
         _SESSION.ensure_init()
-        assert _SESSION.pending is not None
-        return _SESSION.pending
+        with self._get_lock():
+            _SESSION.drain_transfers(wait=True)
+            assert _SESSION.pending is not None
+            return _SESSION.pending
 
     # -- collective_rpc handlers --
 
@@ -842,7 +1004,9 @@ class ActivationCaptureExtension:
             logger.warning("capture already active; resetting")
 
         with self._get_lock():
+            _SESSION.drain_transfers(wait=True)
             _SESSION.pending = {}
+            _SESSION.async_transfer_disabled = False
 
         _SESSION.capture_dir = capture_dir
         os.makedirs(capture_dir, exist_ok=True)
@@ -868,7 +1032,12 @@ class ActivationCaptureExtension:
             raise RuntimeError("capture is not active")
 
         with self._get_lock():
-            pending = self._get_pending()
+            #: This is the only serving operation that must wait for capture
+            #: DMA.  Until here, CUDA events are queried but never synchronized
+            #: on the request thread.
+            _SESSION.drain_transfers(wait=True)
+            assert _SESSION.pending is not None
+            pending = _SESSION.pending
             _SESSION.pending = {}
 
         if not pending:
@@ -1030,6 +1199,10 @@ class ActivationCaptureExtension:
         _SESSION.ensure_init()
         _SESSION.active = False
         with self._get_lock():
+            #: A pinned ring slot cannot be released or reused while CUDA may
+            #: still be writing it.  Deactivation is off the serving hot path,
+            #: so finish outstanding work before discarding captured rows.
+            _SESSION.drain_transfers(wait=True)
             _SESSION.pending = {}
         _SESSION.capture_dir = None
         logger.info("Activation capture disarmed")

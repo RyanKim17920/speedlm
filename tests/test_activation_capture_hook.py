@@ -307,8 +307,14 @@ class _FakeTensor:
 
 
 class _FakeStacked(_FakeTensor):
-    def __init__(self, parts: list, counters: dict) -> None:
-        super().__init__(("stacked", tuple(p.tag for p in parts)), counters)
+    def __init__(self, parts: list, counters: dict, *, device: object = "cuda:0") -> None:
+        shape = (len(parts), *parts[0].shape)
+        super().__init__(
+            ("stacked", tuple(p.tag for p in parts)),
+            counters,
+            shape=shape,
+            device=device,
+        )
         self.parts = list(parts)
 
     def cpu(self) -> _FakeStacked:
@@ -318,7 +324,7 @@ class _FakeStacked(_FakeTensor):
                         device="cpu")
             for p in self.parts
         ]
-        return _FakeStacked(moved, self.counters)
+        return _FakeStacked(moved, self.counters, device="cpu")
 
 
 def _install_stub_torch(monkeypatch, counters: dict) -> None:
@@ -336,6 +342,147 @@ def _install_stub_torch(monkeypatch, counters: dict) -> None:
 
     module.stack = stack  # type: ignore[attr-defined]
     module.unbind = unbind  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "torch", module)
+
+
+class _FakeDevice:
+    def __init__(self, device_type: str) -> None:
+        self.type = device_type
+
+
+class _FakeCudaEvent:
+    def __init__(self, counters: dict) -> None:
+        self.counters = counters
+        self.query_ready = False
+        self.complete = False
+        self.host: _FakePinned | None = None
+
+    def record(self, stream: _FakeCudaStream) -> None:
+        self.host = stream.last_host
+        assert self.host is not None
+        self.host.ready = self
+
+    def query(self) -> bool:
+        self.counters["queries"] = self.counters.get("queries", 0) + 1
+        if self.query_ready:
+            self.complete = True
+        return self.complete
+
+    def synchronize(self) -> None:
+        self.counters["synchronizations"] = (
+            self.counters.get("synchronizations", 0) + 1
+        )
+        self.complete = True
+
+
+class _FakeCudaStream:
+    def __init__(self, counters: dict) -> None:
+        self.counters = counters
+        self.last_host: _FakePinned | None = None
+
+    def wait_stream(self, stream: _FakeCudaStream) -> None:
+        self.counters["stream_waits"] = self.counters.get("stream_waits", 0) + 1
+
+    def synchronize(self) -> None:
+        self.counters["stream_synchronizations"] = (
+            self.counters.get("stream_synchronizations", 0) + 1
+        )
+
+
+class _FakeStreamContext:
+    def __init__(self, counters: dict, stream: _FakeCudaStream) -> None:
+        self.counters = counters
+        self.stream = stream
+
+    def __enter__(self) -> None:
+        self.counters["active_stream"] = self.stream
+
+    def __exit__(self, *args: object) -> None:
+        self.counters.pop("active_stream", None)
+
+
+class _FakePinned(_FakeTensor):
+    def __init__(self, source: _FakeStacked, counters: dict) -> None:
+        super().__init__(
+            "pinned",
+            counters,
+            shape=source.shape,
+            dtype=source.dtype,
+            device=_FakeDevice("cpu"),
+        )
+        self.parts: list[_FakeTensor] = []
+        self.ready: _FakeCudaEvent | None = None
+
+    def copy_(self, source: _FakeStacked, *, non_blocking: bool) -> _FakePinned:
+        assert non_blocking is True
+        self.counters["non_blocking_copies"] = (
+            self.counters.get("non_blocking_copies", 0) + 1
+        )
+        self.parts = list(source.parts)
+        stream = self.counters["active_stream"]
+        stream.last_host = self
+        self.ready = None
+        return self
+
+    def clone(self) -> _FakeStacked:
+        assert self.ready is not None and self.ready.complete, (
+            "pinned activation read before its CUDA event completed"
+        )
+        copied = [
+            _FakeTensor(
+                part.tag,
+                self.counters,
+                shape=part.shape,
+                dtype=part.dtype,
+                device="cpu",
+            )
+            for part in self.parts
+        ]
+        return _FakeStacked(copied, self.counters, device="cpu")
+
+
+def _install_async_stub_torch(monkeypatch, counters: dict) -> None:
+    import sys
+    import types
+
+    module = types.ModuleType("torch")
+    current = _FakeCudaStream(counters)
+    events: list[_FakeCudaEvent] = []
+
+    def stack(tensors, *args, **kwargs):
+        counters["stacks"] = counters.get("stacks", 0) + 1
+        parts = list(tensors)
+        return _FakeStacked(parts, counters, device=parts[0].device)
+
+    def empty_like(tensor, *args, **kwargs):
+        assert kwargs == {"device": "cpu", "pin_memory": True}
+        counters["pinned_allocations"] = counters.get("pinned_allocations", 0) + 1
+        return _FakePinned(tensor, counters)
+
+    def unbind(tensor, *args, **kwargs):
+        return tuple(tensor.parts)
+
+    cuda = types.SimpleNamespace()
+
+    def make_stream(*, device):
+        assert device.type == "cuda"
+        counters["streams"] = counters.get("streams", 0) + 1
+        return _FakeCudaStream(counters)
+
+    def make_event():
+        event = _FakeCudaEvent(counters)
+        events.append(event)
+        return event
+
+    cuda.Stream = make_stream
+    cuda.Event = make_event
+    cuda.current_stream = lambda *, device: current
+    cuda.stream = lambda stream: _FakeStreamContext(counters, stream)
+    module.stack = stack  # type: ignore[attr-defined]
+    module.empty_like = empty_like  # type: ignore[attr-defined]
+    module.unbind = unbind  # type: ignore[attr-defined]
+    module.cuda = cuda  # type: ignore[attr-defined]
+    counters["events"] = events
     monkeypatch.setitem(sys.modules, "torch", module)
 
 
@@ -438,6 +585,100 @@ class TestHotPathTransferCount:
         assert [pending[layer][0].tag for layer in layers] == [
             (0, layer) for layer in layers
         ]
+
+
+class TestAsyncPinnedTransfer:
+    """CUDA capture defers synchronization without weakening row identity."""
+
+    def test_hot_path_enqueues_pinned_copy_without_synchronizing(
+        self, monkeypatch
+    ) -> None:
+        counters: dict = {}
+        _install_async_stub_torch(monkeypatch, counters)
+        layers = (2, 18, 33, 36)
+        ext, _, _ = _active_extension(layers)
+        device = _FakeDevice("cuda")
+
+        ext._buffer_aux([
+            _FakeTensor((0, layer), counters, device=device) for layer in layers
+        ])
+
+        assert counters["non_blocking_copies"] == 1
+        assert counters.get("synchronizations", 0) == 0
+        assert counters.get("transfers", 0) == 0, "hot path fell back to .cpu()"
+        assert ext._pending == {}, "an incomplete pinned slot became host-visible"
+
+        pending = ext._get_pending()
+
+        assert counters["synchronizations"] == 1
+        assert [pending[layer][0].tag for layer in layers] == [
+            (0, layer) for layer in layers
+        ]
+
+    def test_completed_slot_is_recycled_without_overwrite_or_relabelling(
+        self, monkeypatch
+    ) -> None:
+        from speedlm.activation_capture.hook import get_session
+
+        counters: dict = {}
+        _install_async_stub_torch(monkeypatch, counters)
+        first_layers = (2, 18, 33, 36)
+        second_layers = (5, 19, 34, 37)
+        ext, _, inner = _active_extension(first_layers)
+        device = _FakeDevice("cuda")
+
+        ext._buffer_aux([
+            _FakeTensor(("first", layer), counters, device=device)
+            for layer in first_layers
+        ])
+        counters["events"][0].query_ready = True
+        inner.aux_hidden_state_layers = second_layers
+        ext._buffer_aux([
+            _FakeTensor(("second", layer), counters, device=device)
+            for layer in second_layers
+        ])
+
+        assert counters["pinned_allocations"] == 1, (
+            "a completed pinned slot was not recycled"
+        )
+        assert ext._pending is not None
+        assert [ext._pending[layer][0].tag for layer in first_layers] == [
+            ("first", layer) for layer in first_layers
+        ], "reusing the pinned slot overwrote the first captured row"
+
+        session = get_session()
+        with ext._get_lock():
+            session.drain_transfers(wait=True)
+
+        assert sorted(ext._pending) == sorted((*first_layers, *second_layers))
+        assert [ext._pending[layer][0].tag for layer in second_layers] == [
+            ("second", layer) for layer in second_layers
+        ], "a deferred transfer was labelled with a later layer tuple"
+
+    def test_reset_waits_before_discarding_an_inflight_slot(
+        self, monkeypatch
+    ) -> None:
+        from speedlm.activation_capture.hook import get_session, reset_session
+
+        counters: dict = {}
+        _install_async_stub_torch(monkeypatch, counters)
+        layers = (2, 18, 33, 36)
+        ext, _, _ = _active_extension(layers)
+        device = _FakeDevice("cuda")
+
+        ext._buffer_aux([
+            _FakeTensor((0, layer), counters, device=device) for layer in layers
+        ])
+        assert counters.get("synchronizations", 0) == 0
+
+        reset_session()
+
+        assert counters.get("synchronizations", 0) == 1, (
+            "reset discarded a pinned slot while its CUDA transfer was in flight"
+        )
+        session = get_session()
+        assert session.transfers is None
+        assert session.pending is None
 
 
 class TestModelResolutionIsNotPerStep:
