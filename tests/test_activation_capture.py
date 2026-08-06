@@ -790,7 +790,7 @@ class TestSerialization:
 
 
 # ---------------------------------------------------------------------------
-# Runner-topology hook installation (hook.py)
+# Declare-before-compile bootstrap (hook.py)
 # ---------------------------------------------------------------------------
 
 
@@ -798,8 +798,9 @@ class TestSerialization:
 #: between them on ``vllm_config.use_v2_model_runner``, and the interception
 #: point differs: V1 ``gpu_model_runner.GPUModelRunner`` has ``_model_forward``
 #: (``:3783``); V2 ``gpu.model_runner.GPUModelRunner`` has NO ``_model_forward``
-#: and reads the aux list back off ``execute_model_state`` inside
-#: ``sample_tokens`` (``gpu/model_runner.py:1358-1369``).
+#: and parks the aux list on ``execute_model_state`` inside ``execute_model``
+#: (``gpu/model_runner.py:1341-1348``), where BOTH ``sample_tokens`` (``:1369``)
+#: and ``_dummy_run`` (``:577``) read it back.
 #:
 #: Fakes must model *one* of these at a time.  A fake carrying both would let a
 #: hook hard-coded to one generation pass, which is exactly how the V1-only
@@ -813,6 +814,8 @@ RUNNER_GENERATIONS: tuple[str, ...] = ("v1", "v2")
 #: three of them, so the extension appends index 36 as the 4th.
 _NUM_HIDDEN_LAYERS = 36
 _CANONICAL_AUX_LAYERS = (2, 18, 34)
+
+_HOOK_ATTR = {"v1": "_model_forward", "v2": "execute_model"}
 
 
 class _FakeAuxTensor:
@@ -860,8 +863,15 @@ class _FakeVllmConfig:
 def _make_runner_cls(generation: str) -> type:
     """Build a FRESH runner class for one generation.
 
-    Fresh per call on purpose: the hook patches the runner *class*, so a shared
-    class would leak a monkeypatch across tests.
+    Fresh per call on purpose: the bootstrap patches the runner *class*, so a
+    shared class would leak a monkeypatch across tests.
+
+    The fake models the property that made the shipped hook non-functional in
+    production: once ``capture_model`` has run, the forward emits a FIXED
+    number of aux states regardless of what ``aux_hidden_state_layers`` says
+    afterwards.  That is precisely what a replayed CUDA graph does -- the
+    membership test at ``interfaces.py:1336`` was traced once and is never
+    re-evaluated.
     """
     if generation not in RUNNER_GENERATIONS:
         raise ValueError(f"unknown runner generation {generation!r}")
@@ -870,198 +880,368 @@ def _make_runner_cls(generation: str) -> type:
         def __init__(self) -> None:
             self.model = _FakeTargetModel()
             self.vllm_config = _FakeVllmConfig()
+            self.use_aux_hidden_state_outputs = True
             #: How many aux entries the drafter actually received.
             self.drafter_saw: int | None = None
+            self.load_model_calls = 0
+            #: ``None`` until graph capture; the count the graph baked in.
+            self.baked_aux_count: int | None = None
+
+        def load_model(self) -> None:
+            self.load_model_calls += 1
+
+        def capture_model(self) -> None:
+            """Freeze the aux count the way CUDA-graph capture does."""
+            self.baked_aux_count = len(self.model.model.aux_hidden_state_layers)
+
+        def _emit_aux(self) -> list:
+            count = self.baked_aux_count
+            if count is None:  # eager: re-read the attribute every forward
+                count = len(self.model.model.aux_hidden_state_layers)
+            return [_FakeAuxTensor(f"layer{i}") for i in range(count)]
 
     if generation == "v1":
 
         class _FakeV1Runner(_Base):
             """V1: aux list is element 1 of ``_model_forward``'s return."""
 
-            def _model_forward(self, aux: list) -> tuple:
-                return ("hidden", aux)
+            def _model_forward(self) -> tuple:
+                return ("hidden", self._emit_aux())
 
-            def drive(self, aux: list) -> None:
-                _, returned = self._model_forward(aux)
+            def drive(self) -> None:
+                _, returned = self._model_forward()
                 self.drafter_saw = len(returned)
 
         return _FakeV1Runner
 
     class _FakeV2Runner(_Base):
-        """V2: no ``_model_forward``; aux arrives via ``execute_model_state``."""
+        """V2: no ``_model_forward``; aux is parked on ``execute_model_state``."""
 
         def __init__(self) -> None:
             super().__init__()
             self.execute_model_state: object | None = None
+
+        def execute_model(self) -> None:
+            self.execute_model_state = types.SimpleNamespace(
+                aux_hidden_states=self._emit_aux()
+            )
 
         def sample_tokens(self) -> None:
             #: Stands in for ``speculator.propose(..., aux_hidden_states, ...)``.
             state = self.execute_model_state
             self.drafter_saw = len(state.aux_hidden_states)  # type: ignore[union-attr]
 
-        def drive(self, aux: list) -> None:
-            self.execute_model_state = types.SimpleNamespace(aux_hidden_states=aux)
+        def drive(self) -> None:
+            self.execute_model()
             self.sample_tokens()
 
     return _FakeV2Runner
 
 
-def _make_capture_extension(runner: object):
+def _make_capture_extension(runner: object, *, reset: bool = True):
     """Build an ActivationCaptureExtension bound to a fake runner.
 
     Mirrors how vLLM injects the class: ``__init__`` is never called, the
     extension is mixed into the worker and reaches the runner via
     ``self.model_runner``.
-    """
-    from speedlm.activation_capture.hook import ActivationCaptureExtension
 
+    ``reset=False`` for an extension attached to an already-booted engine: the
+    session carries the declaration made inside ``load_model``, and clearing it
+    would erase the very state under test.
+    """
+    from speedlm.activation_capture.hook import ActivationCaptureExtension, reset_session
+
+    if reset:
+        reset_session()
     ext = object.__new__(ActivationCaptureExtension)
     object.__setattr__(ext, "model_runner", runner)
-    #: Class-level defaults are shared across instances; reset the ones the
-    #: hook mutates so tests cannot bleed into each other.
-    for attr, value in (
-        ("_capture_active", False),
-        ("_capture_dir", None),
-        ("_original_model_forward", None),
-        ("_final_layer_idx", None),
-        ("_original_aux_layers", ()),
-        ("_patched_class", None),
-        ("_patched_attr", None),
-        ("_installed_wrapper", None),
-        ("_pending", None),
-        ("_lock", None),
-    ):
-        object.__setattr__(ext, attr, value)
     return ext
 
 
-def _aux_batch(count: int) -> list:
-    return [_FakeAuxTensor(f"layer{i}") for i in range(count)]
+def _boot_engine(generation: str, *, graphed: bool = True):
+    """Drive the real worker start-up order against a fake runner.
+
+    import (bootstrap installs) -> load_model (declaration) -> graph capture.
+    That order is the fix: everything the graph bakes in is decided before
+    ``capture_model`` runs, so arming later cannot desynchronise them.
+    """
+    from speedlm.activation_capture import hook
+
+    hook.reset_session()
+    runner_cls = _make_runner_cls(generation)
+    hook.install_bootstrap([runner_cls])
+
+    runner = runner_cls()
+    runner.load_model()
+    if graphed:
+        runner.capture_model()
+
+    return runner_cls, runner, _make_capture_extension(runner, reset=False)
+
+
+@pytest.fixture(autouse=True, scope="module")
+def _clean_capture_session():
+    """Leave no patched runner class behind for the rest of the suite."""
+    yield
+    from speedlm.activation_capture.hook import reset_session
+
+    reset_session()
 
 
 @pytest.mark.no_torch
-class TestRunnerTopologyHook:
-    """The hook must land on whichever runner generation is actually live."""
+class TestDeclareBeforeCompile:
+    """The aux-layer set must be final before the engine compiles."""
 
     @pytest.mark.parametrize("generation", RUNNER_GENERATIONS)
-    def test_hook_lands_on_the_live_runner_class(
-        self, generation: str, tmp_path: Path
-    ) -> None:
-        """Resolution is against ``type(self.model_runner)``, not an import."""
+    def test_bootstrap_lands_on_the_live_runner_class(self, generation: str) -> None:
+        """Resolution is against the class handed in, not an import."""
+        from speedlm.activation_capture import hook
+
+        hook.reset_session()
         runner_cls = _make_runner_cls(generation)
-        runner = runner_cls()
-        ext = _make_capture_extension(runner)
 
-        ext.activate_capture(str(tmp_path / "cap"))
-
-        assert ext._patched_class is runner_cls
-        assert ext._patched_attr == (
-            "_model_forward" if generation == "v1" else "sample_tokens"
-        )
+        assert hook.install_bootstrap([runner_cls]) == [_HOOK_ATTR[generation]]
+        assert hook.get_session().patched_class is runner_cls
 
     @pytest.mark.parametrize("generation", RUNNER_GENERATIONS)
-    def test_drafter_sees_only_canonical_aux_layers(
-        self, generation: str, tmp_path: Path
-    ) -> None:
-        """The appended final layer is buffered, then stripped before the fc.
+    def test_declaration_happens_inside_load_model(self, generation: str) -> None:
+        """``load_model`` is the last point that precedes compile and capture.
 
-        This is the regression: on V2 the strip never ran, so the drafter's
-        ``fc`` received 4*H against a 3*H weight and the engine died with
-        ``mat1 and mat2 shapes cannot be multiplied``.
+        ``Worker.load_model`` (``gpu_worker.py:406``) runs before
+        ``determine_available_memory``'s profile forward, before
+        ``initialize_from_config`` and before ``compile_or_warm_up_model``
+        (``:724``), which is where ``capture_model`` (``:762``) traces the
+        forward.  If the fourth layer is not declared by the time ``load_model``
+        returns, it is not in the graph.
         """
-        runner = _make_runner_cls(generation)()
-        ext = _make_capture_extension(runner)
-        ext.activate_capture(str(tmp_path / "cap"))
+        _, runner, _ = _boot_engine(generation, graphed=False)
 
-        # The engine now collects one extra layer.
+        assert runner.load_model_calls == 1
+        assert runner.model.model.aux_hidden_state_layers == (
+            *_CANONICAL_AUX_LAYERS,
+            _NUM_HIDDEN_LAYERS,
+        )
+        assert runner.baked_aux_count is None, "the fake compiled too early"
+
+    @pytest.mark.parametrize("generation", RUNNER_GENERATIONS)
+    def test_the_graph_bakes_in_the_full_aux_count(self, generation: str) -> None:
+        """Capture therefore traces four aux states, not three."""
+        _, runner, _ = _boot_engine(generation)
+
+        assert runner.baked_aux_count == len(_CANONICAL_AUX_LAYERS) + 1
+
+    @pytest.mark.parametrize("generation", RUNNER_GENERATIONS)
+    def test_declaration_is_not_repeated_on_a_second_load(
+        self, generation: str
+    ) -> None:
+        """A second ``load_model`` must not append the final layer twice."""
+        _, runner, _ = _boot_engine(generation, graphed=False)
+        runner.load_model()
+
         assert runner.model.model.aux_hidden_state_layers == (
             *_CANONICAL_AUX_LAYERS,
             _NUM_HIDDEN_LAYERS,
         )
 
-        runner.drive(_aux_batch(4))
+    def test_unknown_runner_topology_is_a_hard_error(self) -> None:
+        """A third runner generation must fail loudly, not install nothing."""
+        from speedlm.activation_capture import hook
 
-        assert runner.drafter_saw == len(_CANONICAL_AUX_LAYERS)
-        # All four -- including the appended final layer -- were buffered.
+        hook.reset_session()
+
+        class _FutureRunner:
+            def load_model(self) -> None:
+                pass
+
+        with pytest.raises(RuntimeError, match="exposes none of"):
+            hook.install_bootstrap([_FutureRunner])
+
+
+@pytest.mark.no_torch
+class TestCaptureOnAGraphedEngine:
+    """The blocking defect: arming a CUDA-graph-capturing engine.
+
+    Job 370798 died three minutes in with "the model reported 4 aux layers
+    (2, 18, 33, 36) but the forward produced 3 aux hidden states", because
+    arming moved the attribute while the replayed graph kept emitting three.
+    The fake below reproduces exactly that property -- a forward whose aux
+    count is FIXED at capture time -- so these tests fail against any design
+    that changes the layer set at arm time.
+    """
+
+    @pytest.mark.parametrize("generation", RUNNER_GENERATIONS)
+    def test_arming_a_graphed_engine_captures_all_four_layers(
+        self, generation: str, tmp_path: Path
+    ) -> None:
+        _, runner, ext = _boot_engine(generation)
+
+        ext.activate_capture(str(tmp_path / "cap"))
+        runner.drive()
+
         assert sorted(ext._get_pending()) == [
             *_CANONICAL_AUX_LAYERS,
             _NUM_HIDDEN_LAYERS,
         ]
+        assert runner.drafter_saw == len(_CANONICAL_AUX_LAYERS)
 
     @pytest.mark.parametrize("generation", RUNNER_GENERATIONS)
-    def test_deactivate_restores_runner_and_aux_layers(
+    def test_eager_and_graphed_engines_capture_identically(
         self, generation: str, tmp_path: Path
     ) -> None:
-        """Deactivation must leave the engine exactly as it found it."""
-        runner_cls = _make_runner_cls(generation)
-        runner = runner_cls()
-        attr = "_model_forward" if generation == "v1" else "sample_tokens"
-        pristine = getattr(runner_cls, attr)
-        ext = _make_capture_extension(runner)
+        """"Works in eager only" is what made this non-functional in prod."""
+        captured = {}
+        for mode in ("eager", "graphed"):
+            _, runner, ext = _boot_engine(generation, graphed=(mode == "graphed"))
+            ext.activate_capture(str(tmp_path / mode))
+            runner.drive()
+            captured[mode] = (sorted(ext._get_pending()), runner.drafter_saw)
+
+        assert captured["eager"] == captured["graphed"]
+        assert captured["graphed"] == (
+            [*_CANONICAL_AUX_LAYERS, _NUM_HIDDEN_LAYERS],
+            len(_CANONICAL_AUX_LAYERS),
+        )
+
+    @pytest.mark.parametrize("generation", RUNNER_GENERATIONS)
+    def test_arm_and_disarm_without_restarting_the_engine(
+        self, generation: str, tmp_path: Path
+    ) -> None:
+        """Repeated arm/disarm must neither change shapes nor lose rows."""
+        _, runner, ext = _boot_engine(generation)
+        declared = runner.model.model.aux_hidden_state_layers
+
+        for cycle in range(3):
+            ext.activate_capture(str(tmp_path / f"cap{cycle}"))
+            runner.drive()
+            assert sorted(ext._get_pending()) == [
+                *_CANONICAL_AUX_LAYERS,
+                _NUM_HIDDEN_LAYERS,
+            ]
+            assert runner.drafter_saw == len(_CANONICAL_AUX_LAYERS)
+
+            ext.deactivate_capture()
+            runner.drive()
+            assert ext._get_pending() == {}, "a disarmed capture buffered a row"
+            assert runner.drafter_saw == len(_CANONICAL_AUX_LAYERS)
+            assert runner.model.model.aux_hidden_state_layers == declared, (
+                "arming or disarming changed the aux layer set, which the "
+                "captured graph cannot follow"
+            )
+
+    @pytest.mark.parametrize("generation", RUNNER_GENERATIONS)
+    def test_disarmed_engine_still_protects_the_drafter(
+        self, generation: str
+    ) -> None:
+        """The strip is unconditional because the declaration is.
+
+        The extra aux state is emitted from warm-up onwards whether or not
+        anyone ever arms capture, and the runner concatenates the whole list
+        into a drafter ``fc`` sized for three (``gpu_model_runner.py:5118``,
+        ``llama_eagle3.py:187``).  A strip gated on ``active`` would crash an
+        engine that merely loaded the extension.
+        """
+        _, runner, ext = _boot_engine(generation)
+
+        assert ext.capture_info()["armed"] is False
+        runner.drive()
+
+        assert runner.drafter_saw == len(_CANONICAL_AUX_LAYERS)
+        assert ext._pending is None, "a disarmed capture allocated its buffers"
+
+    @pytest.mark.parametrize("generation", RUNNER_GENERATIONS)
+    def test_labelling_guard_still_refuses_a_genuine_mismatch(
+        self, generation: str, tmp_path: Path
+    ) -> None:
+        """The guard that killed job 370798 must still be able to fire.
+
+        Simulated by baking the graph at the OLD three-layer count while the
+        model advertises four -- i.e. the pre-fix state.  Refusing is correct:
+        the alternative is keying four buffers off three tensors and writing
+        mislabelled rows into a training cache.
+        """
+        _, runner, ext = _boot_engine(generation)
+        runner.baked_aux_count = len(_CANONICAL_AUX_LAYERS)  # graph is stale
 
         ext.activate_capture(str(tmp_path / "cap"))
-        assert getattr(runner_cls, attr) is not pristine
 
-        ext.deactivate_capture()
-
-        assert getattr(runner_cls, attr) is pristine
-        assert runner.model.model.aux_hidden_state_layers == _CANONICAL_AUX_LAYERS
+        with pytest.raises(RuntimeError, match="labelling cannot be trusted"):
+            runner.drive()
 
     @pytest.mark.parametrize("generation", RUNNER_GENERATIONS)
-    def test_reactivation_does_not_double_extend(
+    def test_arming_without_a_declaration_refuses(
         self, generation: str, tmp_path: Path
     ) -> None:
-        """activate -> deactivate -> activate must still strip correctly.
+        """No bootstrap means the graph has three layers; arming must refuse.
 
-        Without the rollback, the second activation would see the final layer
-        already present, record the EXTENDED tuple as "original", and stop
-        stripping -- reintroducing the 4*H crash on a re-armed capture.
+        Capturing three layers while believing four is the mislabelling the
+        guard exists to prevent, and it would only surface at flush time.
         """
         runner = _make_runner_cls(generation)()
         ext = _make_capture_extension(runner)
 
-        ext.activate_capture(str(tmp_path / "cap"))
-        ext.deactivate_capture()
-        ext.activate_capture(str(tmp_path / "cap2"))
-
-        assert runner.model.model.aux_hidden_state_layers == (
-            *_CANONICAL_AUX_LAYERS,
-            _NUM_HIDDEN_LAYERS,
-        )
-        assert ext._original_aux_layers == _CANONICAL_AUX_LAYERS
-
-        runner.drive(_aux_batch(4))
-        assert runner.drafter_saw == len(_CANONICAL_AUX_LAYERS)
+        with pytest.raises(RuntimeError, match="never declared the aux"):
+            ext.activate_capture(str(tmp_path / "cap"))
 
     @pytest.mark.parametrize("generation", RUNNER_GENERATIONS)
-    def test_activate_twice_without_deactivate_is_idempotent(
+    def test_engine_without_eagle3_refuses_instead_of_breaking_itself(
         self, generation: str, tmp_path: Path
     ) -> None:
-        """A second activate_capture resets rather than compounding."""
-        runner = _make_runner_cls(generation)()
-        ext = _make_capture_extension(runner)
+        """Declaring aux layers on a non-eagle3 engine would break serving.
 
-        ext.activate_capture(str(tmp_path / "cap"))
-        ext.activate_capture(str(tmp_path / "cap"))
+        ``use_aux_hidden_state_outputs`` gates the whole aux path
+        (``gpu_model_runner.py:5384``); without it the model returns a bare
+        tensor the runner asserts on.
+        """
+        from speedlm.activation_capture import hook
 
-        assert runner.model.model.aux_hidden_state_layers == (
+        hook.reset_session()
+        runner_cls = _make_runner_cls(generation)
+        hook.install_bootstrap([runner_cls])
+        runner = runner_cls()
+        runner.use_aux_hidden_state_outputs = False
+        runner.load_model()
+
+        assert runner.model.model.aux_hidden_state_layers == _CANONICAL_AUX_LAYERS
+
+        ext = _make_capture_extension(runner, reset=False)
+        with pytest.raises(RuntimeError, match="unavailable"):
+            ext.activate_capture(str(tmp_path / "cap"))
+
+    @pytest.mark.parametrize("generation", RUNNER_GENERATIONS)
+    def test_config_declared_final_layer_is_never_stripped(
+        self, generation: str, tmp_path: Path
+    ) -> None:
+        """An engine configured for four aux layers has a four-wide drafter.
+
+        ``llama_eagle3.py:187`` sizes ``fc`` from
+        ``len(eagle_aux_hidden_state_layer_ids)``, so when the config already
+        names the final layer the drafter genuinely consumes all four and
+        stripping one would starve it.
+        """
+        from speedlm.activation_capture import hook
+
+        hook.reset_session()
+        runner_cls = _make_runner_cls(generation)
+        hook.install_bootstrap([runner_cls])
+        runner = runner_cls()
+        runner.model.model.aux_hidden_state_layers = (
             *_CANONICAL_AUX_LAYERS,
             _NUM_HIDDEN_LAYERS,
         )
-        runner.drive(_aux_batch(4))
-        assert runner.drafter_saw == len(_CANONICAL_AUX_LAYERS)
+        runner.load_model()
+        runner.capture_model()
 
-    def test_unknown_runner_topology_is_a_hard_error(self, tmp_path: Path) -> None:
-        """A third runner generation must fail loudly, not install nothing."""
+        ext = _make_capture_extension(runner, reset=False)
+        assert ext.capture_info()["final_layer_idx"] is None
 
-        class _FutureRunner:
-            def __init__(self) -> None:
-                self.model = _FakeTargetModel()
-                self.vllm_config = _FakeVllmConfig()
+        ext.activate_capture(str(tmp_path / "cap"))
+        runner.drive()
 
-        ext = _make_capture_extension(_FutureRunner())
-        with pytest.raises(RuntimeError, match="exposes none of"):
-            ext.activate_capture(str(tmp_path / "cap"))
+        assert runner.drafter_saw == len(_CANONICAL_AUX_LAYERS) + 1
+        assert sorted(ext._get_pending()) == [
+            *_CANONICAL_AUX_LAYERS,
+            _NUM_HIDDEN_LAYERS,
+        ]
 
 
 # ---------------------------------------------------------------------------
@@ -1092,9 +1272,8 @@ class TestRunnerInfo:
         assert info["generation"] == generation
         #: The discriminator is the interception point, because that is the
         #: axis the capture hook actually depends on: ``_model_forward`` is
-        #: V1-only while ``sample_tokens`` exists on both.
-        expected_hook = "_model_forward" if generation == "v1" else "sample_tokens"
-        assert info["hook_point"] == expected_hook
+        #: V1-only while ``execute_model`` exists on both.
+        assert info["hook_point"] == _HOOK_ATTR[generation]
         assert runner_cls.__qualname__ in info["runner_class"]
 
     def test_generation_is_reported_before_activation(self) -> None:
@@ -1109,7 +1288,7 @@ class TestRunnerInfo:
     def test_unknown_topology_is_reported_not_guessed(self) -> None:
         """A runner with no known hook point reports ``unknown``, never a guess.
 
-        ``activate_capture`` raises on this shape.  ``runner_info`` instead has
+        ``install_bootstrap`` raises on this shape.  ``runner_info`` instead has
         to answer, because the harness calls it to *decide* whether the run is
         sound -- so the one thing it must not do is pick a plausible-looking
         generation for a runner it does not recognise.

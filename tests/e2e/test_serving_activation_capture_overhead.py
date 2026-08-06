@@ -20,14 +20,16 @@ This file measures the missing quantity.
 Design
 ------
 
-**One engine, no restart.**  ``ActivationCaptureExtension.deactivate_capture``
-genuinely tears down: it restores the original method on the *live* runner class
-(``hook.py:_deactivate_impl``) and restores the aux-layer list
-(``hook.py:_restore_aux_layers``).  The monkeypatch is installed only inside
-``activate_capture``, so a loaded-but-unarmed extension costs nothing on the
-forward path.  That makes a valid A/B possible on a single engine, which removes
-the engine-lifecycle confound entirely — the confound that biased an earlier
-measurement in this project by ~2 percentage points.
+**One engine, no restart.**  ``activate_capture`` / ``deactivate_capture`` are
+pure buffering switches (``hook.py``): the aux-layer set is declared once inside
+``load_model``, before the engine compiles, and neither arming nor disarming
+touches it afterwards.  A disarmed engine still emits the extra aux state and
+still strips it before the drafter, so the OFF arm is not a zero-cost baseline —
+it carries one surplus ``hidden + residual`` add per forward plus a list
+truncation, which is exactly what "disarmed cost" means and what the OFF blocks
+below measure.  That makes a valid A/B possible on a single engine, which
+removes the engine-lifecycle confound entirely — the confound that biased an
+earlier measurement in this project by ~2 percentage points.
 
 **ABBA interleaving.**  Each cycle runs four blocks in the order OFF, ON, ON,
 OFF.  The first half pairs (OFF, ON) and the second half pairs (ON, OFF), so the
@@ -51,19 +53,23 @@ own first-touch cost.
 Engine flags that are load-bearing here
 ---------------------------------------
 
-* ``--enforce-eager`` **is** passed, and not by preference.  An earlier revision
-  of this file deliberately omitted it, on the theory that CUDA graphs are on in
-  production so measuring without them would not describe production.  That
-  configuration cannot run at all: ``activate_capture`` extends the model's
+* ``--enforce-eager`` **is** passed, and it is now a measurement choice rather
+  than a necessity.  It was a necessity: ``activate_capture`` used to extend
   ``aux_hidden_state_layers`` at runtime, but the forward that reads that tuple
-  (``EagleModelMixin._maybe_add_hidden_state``) is traced and CUDA-graph captured
-  once at startup and never re-traced, so the replayed graph keeps emitting the
-  three default eagle3 aux states while the attribute claims four.  The hook's
-  own labelling guard then kills EngineCore on the first captured forward
-  (SLURM 370798).  **Consequence for reading these numbers:** activation capture
-  is today usable only on an eager engine, so what this file measures is the
-  cost of capture in eager mode.  It is not, and cannot yet be, the cost of
-  capture in a graph-capturing engine.
+  (``EagleModelMixin._maybe_add_hidden_state``) is traced and CUDA-graph
+  captured once at startup and never re-traced, so the replayed graph kept
+  emitting three aux states while the attribute claimed four and the hook's
+  labelling guard killed EngineCore on the first captured forward (SLURM
+  370798).  That is fixed: the aux-layer set is now declared inside
+  ``load_model``, before compilation, so the graph bakes in the final count and
+  arming changes no shape (see the ``hook.py`` module docstring, and
+  ``TestCaptureOnAGraphedEngine`` in ``tests/test_activation_capture.py``,
+  which drives a forward whose aux count is fixed at capture time).
+  **Consequence for reading these numbers:** what this file measures is still
+  eager-mode capture overhead, because the pin has not yet been flipped and
+  re-run.  Dropping ``--enforce-eager`` here is the graphed-engine measurement
+  this file was originally trying to take; it needs a GPU run to land, not a
+  code change.
 * ``--no-enable-prefix-caching`` **is** passed.  The same prompts are replayed
   ~40 times each; with prefix caching on, every repetition after the first would
   skip the prefill and TTFT would measure a cache lookup rather than the work
@@ -726,7 +732,7 @@ def _assert_capture_disarmed(port: int, block: str) -> None:
     """Prove the OFF arm really was unarmed.
 
     ``flush_capture`` raises ``RuntimeError("capture is not active")``
-    (``hook.py:196-197``) when the extension is not armed, so a successful flush
+    (``hook.py`` ``flush_capture``) when the extension is not armed, so a flush
     here would mean the "OFF" arm was silently still capturing and the whole
     measurement collapses to zero.  Checked outside every timed region.
     """
@@ -810,13 +816,12 @@ def test_activation_capture_serving_overhead() -> None:
             #: prefill entirely and TTFT would measure a cache hit rather than
             #: the forward pass that capture actually taxes.
             "--no-enable-prefix-caching",
-            #: --enforce-eager is REQUIRED, and this is a limitation of the hook
-            #: rather than a preference of this test.  ``activate_capture``
-            #: works by calling ``set_aux_hidden_state_layers`` on the live
-            #: model (hook.py:_extend_aux_layers), and the model consults that
-            #: tuple inside its own forward -- ``EagleModelMixin.
-            #: _maybe_add_hidden_state`` does a plain ``if layer_idx in
-            #: self.aux_hidden_state_layers`` (vLLM
+            #: --enforce-eager USED TO BE required, and is now only what this
+            #: particular measurement was taken under.  ``activate_capture``
+            #: used to call ``set_aux_hidden_state_layers`` on the live model,
+            #: and the model consults that tuple inside its own forward --
+            #: ``EagleModelMixin._maybe_add_hidden_state`` does a plain
+            #: ``if layer_idx in self.aux_hidden_state_layers`` (vLLM
             #: model_executor/models/interfaces.py:1336).  Without this flag
             #: vLLM compiles (CompilationMode.VLLM_COMPILE) and CUDA-graph
             #: captures that forward ONCE at startup, with the three default
@@ -853,9 +858,10 @@ def test_activation_capture_serving_overhead() -> None:
         served_model_id = _get_served_model_id(url)
 
         #: Start from a known-disarmed engine.  ``deactivate_capture`` is safe
-        #: on a never-armed extension: ``_deactivate_impl`` no-ops when nothing
-        #: was patched and ``_restore_aux_layers`` returns early while
-        #: ``_final_layer_idx`` is None (hook.py:510-511).
+        #: on a never-armed extension: it clears the buffer and the armed flag
+        #: and deliberately leaves the declared aux-layer set alone, because
+        #: restoring it would desynchronise the attribute from the graph that
+        #: was captured with the full count.
         _collective_rpc(port, "deactivate_capture")
 
         with httpx.Client(

@@ -16,9 +16,26 @@ from speedlm.gateway.control import (
     RuntimeController,
 )
 
+
+@pytest.fixture(autouse=True)
+def _isolated_capture_session():
+    """Capture state is process-wide, so tests must clear it themselves.
+
+    See ``test_activation_capture_state_is_one_session_per_process`` for why it
+    is process-wide.  Unreset process-wide state bleeds, and buffered rows
+    bleeding between tests is exactly the mislabelling these tests guard.
+    """
+    from speedlm.activation_capture.hook import reset_session
+
+    reset_session()
+    yield
+    reset_session()
+
+
 # ---------------------------------------------------------------------------
 # Fakes
 # ---------------------------------------------------------------------------
+
 
 @dataclass
 class FakeClock:
@@ -32,6 +49,7 @@ class FakeClock:
         self.now += seconds
         if self.sleep_hook is not None:
             self.sleep_hook()
+
 
 
 @dataclass
@@ -1765,7 +1783,7 @@ def test_combined_extension_no_attribute_conflicts() -> None:
     """No public method names are shared between the two extension sets."""
     capture_methods = {
         "activate_capture", "flush_capture", "deactivate_capture",
-        "_install_hook", "_deactivate_impl", "_buffer_aux",
+        "_intercept_aux", "_declare_aux_layers", "_buffer_aux",
     }
     draft_swap_methods = {
         "hot_swap_draft", "draft_info",
@@ -1861,7 +1879,7 @@ def test_activation_capture_extension_without_init() -> None:
     # Class-level defaults should be accessible
     assert ext._capture_active is False
     assert ext._capture_dir is None
-    assert ext._original_model_forward is None
+    assert ext._declared is False
     assert ext._final_layer_idx is None
     assert ext._original_aux_layers == ()
 
@@ -1882,7 +1900,7 @@ def test_combined_extension_without_init() -> None:
     # Class-level defaults should be accessible
     assert ext._capture_active is False
     assert ext._capture_dir is None
-    assert ext._original_model_forward is None
+    assert ext._declared is False
 
     # _ensure_init should create mutable state
     ext._ensure_init()
@@ -1900,7 +1918,7 @@ def test_extension_methods_callable_after_ensure_init() -> None:
     ext._ensure_init()
 
     # deactivate_capture should not raise AttributeError
-    # (it calls _deactivate_impl which accesses _original_model_forward)
+    # (it clears the session buffer, which _ensure_init has to have created)
     # Note: _deactivate_impl will raise ImportError for vllm, but that's fine
     # — we're checking it doesn't raise AttributeError for missing state
     try:
@@ -1972,44 +1990,53 @@ def test_no_collision_combined_extension() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_activation_capture_extension_no_shared_state() -> None:
-    """Two ActivationCaptureExtension instances created via object.__new__
-    do not share their _pending dicts or _lock instances."""
+#: Capture state is deliberately PROCESS-wide, not per-instance.
+#:
+#: It used to be per-instance, and that was fine while everything ran on the
+#: extension: arming installed the hook and extended the aux layers, so one
+#: object owned the whole lifecycle.  It stopped being fine when the aux-layer
+#: set had to be declared before the engine compiles.  That declaration runs
+#: inside ``load_model``, from a wrapper installed at module import -- long
+#: before any extension instance exists and with only the runner in hand.  A
+#: per-instance buffer would leave that wrapper writing into state the armed
+#: extension never reads, and capture would silently produce nothing.
+#:
+#: There is exactly one worker per process (TP fans out across processes), so
+#: one session per process is also the truthful model of the runtime.
+def _capture_instances(cls, count: int = 2) -> list:
+    return [object.__new__(cls) for _ in range(count)]
+
+
+def test_activation_capture_state_is_one_session_per_process() -> None:
     from speedlm.activation_capture.hook import ActivationCaptureExtension
 
-    ext_a = object.__new__(ActivationCaptureExtension)
-    ext_b = object.__new__(ActivationCaptureExtension)
+    ext_a, ext_b = _capture_instances(ActivationCaptureExtension)
 
     ext_a._ensure_init()
     ext_b._ensure_init()
 
-    # Each instance has its own lock
-    assert ext_a._lock is not ext_b._lock
-    # Each instance has its own pending dict
-    assert ext_a._pending is not ext_b._pending
-    # And they are both empty (not sharing a class-level dict)
+    assert ext_a._lock is ext_b._lock
+    assert ext_a._pending is ext_b._pending
     assert ext_a._pending == {}
-    assert ext_b._pending == {}
+
+    #: The point of sharing: a write through one view is visible through the
+    #: other, which is what lets the import-time ``load_model`` wrapper and the
+    #: armed extension agree on what was declared.
+    ext_a._original_aux_layers = (2, 18, 33)
+    assert ext_b._original_aux_layers == (2, 18, 33)
 
 
-def test_combined_extension_no_shared_state() -> None:
-    """Two CombinedWorkerExtension instances created via object.__new__
-    do not share their _pending dicts or _lock instances."""
+def test_combined_extension_shares_the_same_session() -> None:
     from speedlm.gateway.draft_swap import CombinedWorkerExtension
 
-    ext_a = object.__new__(CombinedWorkerExtension)
-    ext_b = object.__new__(CombinedWorkerExtension)
+    ext_a, ext_b = _capture_instances(CombinedWorkerExtension)
 
     ext_a._ensure_init()
     ext_b._ensure_init()
 
-    # Each instance has its own lock
-    assert ext_a._lock is not ext_b._lock
-    # Each instance has its own pending dict
-    assert ext_a._pending is not ext_b._pending
-    # And they are both empty (not sharing a class-level dict)
+    assert ext_a._lock is ext_b._lock
+    assert ext_a._pending is ext_b._pending
     assert ext_a._pending == {}
-    assert ext_b._pending == {}
 
 
 # ---------------------------------------------------------------------------
@@ -2129,9 +2156,9 @@ _CAPTURE_METHODS = (
     "flush_capture",
     "deactivate_capture",
     "capture_info",
-    "_install_hook",
-    "_deactivate_impl",
-    "_extend_aux_layers",
+    "runner_info",
+    "_intercept_aux",
+    "_declare_aux_layers",
     "_buffer_aux",
     "_ensure_init",
     "_get_lock",
@@ -2143,9 +2170,9 @@ def test_capture_methods_are_inherited_not_reimplemented() -> None:
     """Every capture method on the composite IS ActivationCaptureExtension's.
 
     This is the anti-drift guard: previously the composite carried a
-    hand-copied copy that had already lost ``capture_info``,
-    ``_extend_aux_layers``, the ``.meta.json`` sidecar write, the aux-list
-    truncation and the empty-list guard.
+    hand-copied copy that had already lost ``capture_info``, the aux-layer
+    declaration, the ``.meta.json`` sidecar write, the aux-list truncation and
+    the empty-list guard.
     """
     from speedlm.activation_capture.hook import ActivationCaptureExtension
     from speedlm.gateway.draft_swap import CombinedWorkerExtension
@@ -2163,7 +2190,7 @@ def test_capture_class_defaults_are_inherited() -> None:
     ext = object.__new__(CombinedWorkerExtension)
     assert ext._capture_active is False
     assert ext._capture_dir is None
-    assert ext._original_model_forward is None
+    assert ext._declared is False
     assert ext._final_layer_idx is None
     assert ext._original_aux_layers == ()
 
@@ -2183,6 +2210,9 @@ def test_capture_info_present_and_matches_base() -> None:
     assert combined.capture_info() == {
         "final_layer_idx": 36,
         "original_aux_layers": [2, 18, 33],
+        "declared": False,
+        "armed": False,
+        "unavailable": None,
     }
 
 
@@ -2236,14 +2266,14 @@ def test_buffer_aux_keys_by_true_layer_id() -> None:
     assert keyed["CombinedWorkerExtension"] == keyed["ActivationCaptureExtension"]
 
 
-def test_extend_aux_layers_available_on_combined() -> None:
+def test_declare_aux_layers_available_on_combined() -> None:
     from speedlm.gateway.draft_swap import CombinedWorkerExtension
 
     ext = object.__new__(CombinedWorkerExtension)
     ext._ensure_init()
     ext.model_runner = _aux_runner((2, 18, 33), num_hidden_layers=36)
 
-    ext._extend_aux_layers()
+    ext._declare_aux_layers()
 
     assert ext._original_aux_layers == (2, 18, 33)
     assert ext._final_layer_idx == 36
@@ -2262,21 +2292,19 @@ def test_flush_capture_writes_meta_sidecar_source_is_shared() -> None:
     assert ".meta.json" in source
 
 
-def test_install_hook_keeps_truncation_and_empty_guard() -> None:
+def test_interception_keeps_truncation_and_empty_guard() -> None:
     """The copy dropped both; they must survive in the shared source.
 
-    Asserted behaviourally rather than by bytecode introspection: the previous
+    Asserted behaviourally rather than by bytecode introspection: an earlier
     version scanned ``_install_hook.__code__`` for the guard's message, which
     pinned the truncation to one particular *location* instead of its effect,
-    and went red the moment the shared logic moved into ``_intercept_aux`` to
-    serve both runner generations.
+    and went red the moment the shared logic moved -- first into
+    ``_intercept_aux`` to serve both runner generations, then onto the session
+    so the import-time wrapper could reach it.
     """
     from speedlm.activation_capture.hook import ActivationCaptureExtension
     from speedlm.gateway.draft_swap import CombinedWorkerExtension
 
-    assert (
-        CombinedWorkerExtension._install_hook is ActivationCaptureExtension._install_hook
-    )
     assert (
         CombinedWorkerExtension._intercept_aux
         is ActivationCaptureExtension._intercept_aux
@@ -2284,9 +2312,9 @@ def test_install_hook_keeps_truncation_and_empty_guard() -> None:
 
     ext = object.__new__(CombinedWorkerExtension)
     ext._ensure_init()
-    ext._capture_active = True
     ext.model_runner = _aux_runner((2, 18, 33), num_hidden_layers=36)
-    ext._extend_aux_layers()
+    ext._declare_aux_layers()
+    ext._capture_active = True
 
     # Truncation: the appended 4th entry is buffered, then removed in place.
     aux = [_AuxTensor(t) for t in ("a", "b", "c", "final")]

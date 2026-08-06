@@ -17,9 +17,10 @@ site-packages/vllm``:
   ``value = hidden_states + residual``, appended by
   ``EagleModelMixin._maybe_add_hidden_state`` (``:1329``).  The runner unpacks
   that list at ``v1/worker/gpu_model_runner.py:4364``.
-* The serving capture wraps ``_model_forward`` and takes ``result[1]`` —
-  literally the same list object (``hook.py`` ``_install_hook`` /
-  ``_intercept_aux``) — then ``.detach().cpu()`` and ``save_file``.
+* The serving capture wraps the runner's interception point and takes the
+  aux list — literally the same list object (``hook.py``
+  ``_CaptureSession.install`` / ``_extract_aux`` / ``intercept``) — then
+  ``.detach().cpu()`` and ``save_file``.
 * The offline path reads the *same variable* one branch later at
   ``gpu_model_runner.py:5035``
   (``[h[:num_scheduled_tokens] for h in aux_hidden_states]``) and transports

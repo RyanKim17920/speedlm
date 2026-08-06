@@ -1709,10 +1709,10 @@ def test_stage0_activation_capture() -> None:
             capture_dir.mkdir(exist_ok=True)
 
             #: No deactivate RPC between prompts: ``activate_capture`` already
-            #: resets an active capture itself — ``hook.py:162-164`` logs
-            #: "capture already active; resetting" and calls
-            #: ``_deactivate_impl`` before re-arming — so the second and later
-            #: prompts start from the same clean state as the first.
+            #: resets an active capture itself — ``hook.py`` logs "capture
+            #: already active; resetting" and clears the pending buffer before
+            #: re-arming — so the second and later prompts start from the same
+            #: clean state as the first.
             _collective_rpc(
                 vllm_proc, port, "activate_capture", str(capture_dir)
             )

@@ -9,6 +9,25 @@ from __future__ import annotations
 
 import pytest
 
+
+@pytest.fixture(autouse=True)
+def _isolated_capture_session():
+    """Every test gets a pristine session.
+
+    The capture session is process-wide by necessity -- the declare-before-
+    compile bootstrap installs its patches at module import, long before any
+    extension instance exists, so there is nowhere else for the state to live
+    (see ``hook._CaptureSession``).  Process-wide state that tests do not reset
+    is state that bleeds, and buffered rows bleeding between tests is exactly
+    the kind of mislabelling these tests exist to catch.
+    """
+    from speedlm.activation_capture.hook import reset_session
+
+    reset_session()
+    yield
+    reset_session()
+
+
 # ---------------------------------------------------------------------------
 # Hook: aux-layer inner model resolution (no GPU needed)
 # ---------------------------------------------------------------------------
@@ -52,7 +71,7 @@ class TestAuxLayerInnerModelResolution:
         ext.model_runner = runner  # type: ignore[attr-defined]
 
         # Should succeed without AttributeError
-        ext._extend_aux_layers()
+        ext._declare_aux_layers()
 
         # Should have stored original (4, 12, 20) and added final layer 24
         assert ext._original_aux_layers == (4, 12, 20)
@@ -83,7 +102,7 @@ class TestAuxLayerInnerModelResolution:
         ext = ext_cls()
         ext.model_runner = runner  # type: ignore[attr-defined]
 
-        ext._extend_aux_layers()
+        ext._declare_aux_layers()
         assert ext._original_aux_layers == (2, 8, 14)
         assert ext._final_layer_idx == 16
 
@@ -151,7 +170,7 @@ class TestExtensionFailureSurfacesAsError:
         ext.model_runner = runner  # type: ignore[attr-defined]
 
         with pytest.raises((AttributeError, RuntimeError)):
-            ext._extend_aux_layers()
+            ext._declare_aux_layers()
 
     def test_missing_num_layers_raises(self) -> None:
         """If num_hidden_layers is absent, raise (not warn-and-return)."""
@@ -174,7 +193,7 @@ class TestExtensionFailureSurfacesAsError:
         ext.model_runner = runner  # type: ignore[attr-defined]
 
         with pytest.raises(RuntimeError, match="num_hidden_layers"):
-            ext._extend_aux_layers()
+            ext._declare_aux_layers()
 
 # ---------------------------------------------------------------------------
 # Hot-path cost: the capture must not tax the live serving path

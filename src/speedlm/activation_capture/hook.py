@@ -3,57 +3,106 @@
 This module provides a vLLM worker extension that captures aux hidden states
 from a live EAGLE-3 serving engine without modifying vLLM source files.
 
-**Chosen mechanism: runtime monkeypatch of ``_model_forward`` via
-``worker_extension_cls``.**
+**Chosen mechanism: declare the final aux-layer set before the engine
+compiles, then arm/disarm only the buffering.**
 
-Why this approach:
+Why it has to be this way
+-------------------------
 
-1. **``worker_extension_cls`` is a supported entry point.** It is a documented
-   ``vllm serve`` flag that injects custom methods into the worker class at
-   runtime. No vLLM files on disk are modified.
+The obvious design -- extend ``aux_hidden_state_layers`` from three layers to
+four at *arm* time -- is only correct on an eager engine, and eager is not the
+production default.
 
-2. **Monkeypatching the runner runs inside the worker process**, where
-   ``aux_hidden_states`` is directly available after the model forward. This
-   avoids the need to reconstruct the runner's row-slicing semantics at the
-   layer level (a layer-level forward hook sees the padded buffer, not the
-   ``num_scheduled_tokens`` slice).
+``EagleModelMixin._maybe_add_hidden_state`` decides what to emit with a plain
+membership test (``interfaces.py:1336``)::
 
-3. **The capture point is after the model unpacks aux_hidden_states**
-   (V1 ``gpu_model_runner.py:4362-4368``, V2 ``gpu/model_runner.py:1327-1349``),
-   so the slicing to ``num_scheduled_tokens`` is already handled by the runner.
+    if layer_idx in self.aux_hidden_state_layers:
+        aux_hidden_states.append(hidden_states + residual)
 
-4. **No vLLM patch required.** The extension is a standalone class that the
-   caller registers via ``--worker-extension-cls``. It only touches private
-   vLLM attributes at runtime (inevitable given vLLM exposes no supported hook
-   for this).
+That test is traced once.  vLLM compiles and CUDA-graph-captures the target
+forward during ``Worker.compile_or_warm_up_model`` (``gpu_worker.py:724``,
+``capture_model`` at ``:762``) and then only ever *replays* it.  Mutating the
+tuple afterwards changes the attribute but not the captured graph, so the
+model advertises four aux layers while the replayed forward keeps emitting
+three.  The labelling guard in :meth:`_buffer_aux` then -- correctly -- refuses
+to key four buffers off three tensors, ``collective_rpc`` propagates the
+error, and ``EngineCore`` dies.  Reproduced on GPU as job 370798.
 
-**Final-layer pre-norm capture.** The extension CAN collect the final decoder
-layer as a 4th aux layer by calling ``set_aux_hidden_state_layers`` with an
-extended tuple. The drafter's ``fc`` width is fixed from the drafter's own
-config at construction time (``llama_eagle3.py:176-187``) and is unaffected.
-However, the concatenation at ``gpu_model_runner.py:5119-5121`` would produce
-a 4*H tensor for a 3*H drafter. The extension therefore removes the extra
-entry from the ``aux_hidden_states`` list AFTER buffering it, so the drafter
-sees only the 3 canonical layers.
+So the aux-layer set is declared **once, before compilation**, and arming
+toggles only whether the states are buffered.  Arming changes no shape and no
+graph, works identically under CUDA graphs and eager, and needs no restart.
 
-**Two runner generations.** ``gpu_worker.py:384-398`` picks the runner class on
-``vllm_config.use_v2_model_runner``, and the two generations expose different
-interception points:
+Where "before compilation" is
+-----------------------------
 
-* V1 ``vllm.v1.worker.gpu_model_runner.GPUModelRunner`` has ``_model_forward``
-  (``:3783``), which returns ``(hidden_states, aux_hidden_states)``.
-* V2 ``vllm.v1.worker.gpu.model_runner.GPUModelRunner`` has NO
-  ``_model_forward`` at all.  It unpacks the model output inline
-  (``gpu/model_runner.py:1327-1330``), parks it on ``execute_model_state``
-  (``:1341-1349``), and ``sample_tokens`` (``:1358``) reads it back
-  (``:1369``) and hands it straight to ``speculator.propose`` (``:1466``).
+vLLM never calls a worker extension's ``__init__``; it appends the class to
+the worker class's ``__bases__`` (``worker_base.py:279``) and asserts that the
+extension defines *no* attribute the worker already has (``:271``).  Overriding
+``Worker.load_model`` or ``Worker.init_device`` from the extension is
+therefore impossible by construction -- an appended base cannot win the MRO,
+and merely declaring the name aborts worker start-up.
 
-The hook therefore resolves the interception point from the *live* runner
-object (``type(self.model_runner)``) rather than importing a hard-coded class.
-Importing the V1 module always succeeds -- both modules ship side by side --
-so a hard-coded V1 patch installs silently, buffers nothing, and (fatally)
-never strips the appended 4th entry, which reaches the drafter's ``fc`` as
+The one thing that does run early is the **import**.  vLLM resolves
+``--worker-extension-cls`` with ``resolve_obj_by_qualname`` at
+``worker_base.py:262``, inside ``init_worker`` -- before ``init_device``
+(``gpu_worker.py:279``), before ``load_model`` (``:406``), and long before
+``compile_or_warm_up_model`` (``:724``).  Importing this module therefore
+happens strictly earlier than any compilation, and :func:`install_bootstrap`
+runs at import to wrap the runner class:
+
+* ``load_model`` -- after vLLM sets the eagle3 default tuple
+  (``gpu_model_runner.py:5402`` / ``gpu/spec_decode/eagle/eagle3_utils.py:32``)
+  we append the final decoder layer.  Still inside ``load_model``, so it
+  precedes ``determine_available_memory``'s profile forward, the warm-up and
+  the graph capture.
+* the interception point -- installed permanently so the extra aux entry is
+  stripped on *every* forward, armed or not.
+
+The strip is not optional
+-------------------------
+
+The runner concatenates the *entire* aux list before the drafter's ``fc``
+(``gpu_model_runner.py:5118-5121``,
+``gpu/spec_decode/autoregressive/speculator.py:168-172``)::
+
+    target_hidden_states = torch.cat(
+        [h[:num_scheduled_tokens] for h in aux_hidden_states], dim=-1)
+
+There is no slice, no length check and no positional unpack anywhere on that
+path, and the drafter's ``fc`` width is frozen at construction from its own
+config (``llama_eagle3.py:175-214``, defaulting to three aux states).  A
+four-entry list is therefore not "harmlessly ignored" -- it is a hard
 ``RuntimeError: mat1 and mat2 shapes cannot be multiplied (N x 4H and 3H x H)``.
+The extension buffers all four entries and then truncates the *same list
+object* back to the canonical three, so the drafter is bit-for-bit unaffected.
+
+Because the declaration now happens before warm-up, the strip has to be in
+place before warm-up too -- V2's ``_dummy_run`` really does call
+``speculator.propose(..., aux_hidden_states=...)``
+(``gpu/model_runner.py:577-619``), so an unstripped list would crash during
+graph capture rather than on the first request.
+
+Two runner generations
+----------------------
+
+``gpu_worker.py:384-398`` picks the runner class on
+``vllm_config.use_v2_model_runner``, and the interception point differs:
+
+* V1 ``vllm.v1.worker.gpu_model_runner.GPUModelRunner`` returns
+  ``(hidden_states, aux_hidden_states)`` from ``_model_forward`` (``:3783``),
+  which the runner unpacks at ``:4364``.
+* V2 ``vllm.v1.worker.gpu.model_runner.GPUModelRunner`` has **no**
+  ``_model_forward``.  It unpacks inline in ``execute_model``
+  (``gpu/model_runner.py:1325-1331``) and parks the list on
+  ``execute_model_state`` (``:1341-1348``).  Two different consumers read it
+  back: ``sample_tokens`` (``:1369``) on the serving path and ``_dummy_run``
+  (``:577``) during warm-up.  Intercepting ``execute_model`` covers both;
+  intercepting ``sample_tokens`` -- as this hook used to -- misses warm-up
+  entirely, which only became fatal once the declaration moved before capture.
+
+Both interception points are resolved from the *live* runner class rather than
+an import, because both modules ship side by side and a hard-coded V1 patch
+installs silently on a V2 build.
 """
 
 from __future__ import annotations
@@ -75,17 +124,511 @@ logger = logging.getLogger(__name__)
 
 
 #: Runner methods that see ``aux_hidden_states`` before the drafter consumes
-#: them, in resolution order.  ``sample_tokens`` exists on BOTH generations, so
+#: them, in resolution order.  ``execute_model`` exists on BOTH generations, so
 #: the V1-only ``_model_forward`` must be probed first or a V1 runner would be
 #: hooked through the V2 path.  The order is load-bearing; see the module
 #: docstring for the line references.
-HOOK_POINTS: tuple[str, ...] = ("_model_forward", "sample_tokens")
+HOOK_POINTS: tuple[str, ...] = ("_model_forward", "execute_model")
 
+#: Set to ``1`` to keep importing this module from patching vLLM's runner
+#: classes.  Only useful for tests that import the module in a process where
+#: vLLM happens to be importable but no engine will ever run.
+BOOTSTRAP_OPT_OUT_ENV = "SPEEDLM_CAPTURE_NO_BOOTSTRAP"
+
+#: The runner classes to patch, newest first.  Each is optional: the two
+#: generations ship side by side, but a given vLLM build may drop either.
+_RUNNER_TARGETS: tuple[tuple[str, str], ...] = (
+    ("vllm.v1.worker.gpu_model_runner", "GPUModelRunner"),
+    ("vllm.v1.worker.gpu.model_runner", "GPUModelRunner"),
+)
+
+
+def _resolve_inner_model(model: Any) -> Any:
+    """Resolve the model that carries ``aux_hidden_state_layers``.
+
+    The attribute lives on the *inner* model (the one inheriting
+    ``EagleModelMixin``), not the top-level ``...ForCausalLM``.  Resolved the
+    same way vLLM does in ``SupportsEagle3.set_aux_hidden_state_layers``
+    (``interfaces.py:1387-1400``): try ``get_language_model()`` /
+    ``.language_model``, then access ``.model``.
+    """
+    parent_ref = model
+    if hasattr(model, "get_language_model"):
+        parent_ref = model.get_language_model()
+    elif hasattr(model, "language_model"):
+        parent_ref = model.language_model
+    return parent_ref.model
+
+
+def _resolve_hook_point(runner_cls: Any) -> str:
+    """Return the interception attribute to wrap on ``runner_cls``.
+
+    Raises:
+        RuntimeError: if the class exposes no known interception point.
+    """
+    for name in HOOK_POINTS:
+        if hasattr(runner_cls, name):
+            return name
+    raise RuntimeError(
+        f"model runner {runner_cls.__module__}.{runner_cls.__qualname__} "
+        f"exposes none of {HOOK_POINTS}; activation capture cannot "
+        f"intercept aux_hidden_states on this vLLM build"
+    )
+
+
+def _extract_aux(runner: Any, attr: str, result: Any) -> Any:
+    """Pull the aux list out of an intercepted call.
+
+    The list is found in a different place per generation but is in both cases
+    the *same object* the drafter will later concatenate, so truncating it here
+    is visible downstream.
+    """
+    if attr == "_model_forward":
+        #: V1: second element of the return value (unpacked at
+        #: ``gpu_model_runner.py:4364``).
+        if isinstance(result, tuple) and len(result) >= 2:
+            return result[1]
+        return None
+    #: V2: parked on ``execute_model_state`` (``gpu/model_runner.py:1341-1348``)
+    #: and read back by both ``sample_tokens`` (``:1369``) and ``_dummy_run``
+    #: (``:577``).
+    state = getattr(runner, "execute_model_state", None)
+    return getattr(state, "aux_hidden_states", None)
+
+
+class _CaptureSession:
+    """Process-wide capture state.
+
+    Module scope rather than instance state because the three pieces that must
+    agree are created at three different times in three different scopes: the
+    runner-class patches are installed at *import* (before ``load_model``), the
+    aux-layer declaration happens *inside* ``load_model`` with only the runner
+    in hand, and arming arrives much later over ``collective_rpc`` on the
+    worker instance.  vLLM never calls the extension's ``__init__``, so there
+    is no instance to hang shared state off anyway.
+    """
+
+    def __init__(self) -> None:
+        self.reset()
+
+    def reset(self) -> None:
+        """Return to a pristine, un-bootstrapped state (tests only)."""
+        self.active = False
+        self.capture_dir: str | None = None
+        self.pending: dict[int, list] | None = None
+        self.lock: threading.Lock | None = None
+
+        #: Declaration state, all set inside ``load_model``.
+        self.declared = False
+        self.runner: Any = None
+        self.inner_model: Any = None
+        self.final_layer_idx: int | None = None
+        self.original_aux_layers: tuple[int, ...] = ()
+        #: Why capture is impossible on this engine, when it is.
+        self.unavailable: str | None = None
+
+        #: Installed patches, for symmetry and for tests: (cls, attr, original).
+        self.patches: list[tuple[Any, str, Any]] = []
+        self.patched_class: Any = None
+        self.patched_attr: str | None = None
+        self.installed_wrapper: Any = None
+
+    # -- lazy mutable state --
+
+    def ensure_init(self) -> None:
+        if self.lock is None:
+            self.lock = threading.Lock()
+        if self.pending is None:
+            self.pending = {}
+
+    # -- declaration (runs inside load_model, before compile) --
+
+    def declare(self, runner: Any, *, force: bool = False) -> None:
+        """Declare the FULL aux-layer set on the live model.
+
+        Called from the ``load_model`` wrapper, i.e. after vLLM has installed
+        the eagle3 default tuple and before any compilation, memory profiling
+        or graph capture.  Appending here means the traced forward bakes in the
+        final count, so arming later cannot desynchronise the graph from the
+        attribute.
+
+        Args:
+            runner: the live model runner.
+            force: re-declare even if a declaration already happened.  Only
+                used by tests driving the declaration by hand.
+
+        Raises:
+            RuntimeError: if the layer count cannot be determined.  A silent
+                skip would leave a graph baked with three layers and no way to
+                capture the final one, which is the defect this replaces.
+        """
+        if self.declared and not force:
+            return
+
+        #: ``use_aux_hidden_state_outputs`` gates the whole aux path
+        #: (``gpu_model_runner.py:5384``).  Without eagle3 the model returns a
+        #: bare tensor and the runner asserts on it, so declaring layers would
+        #: break a perfectly good engine rather than enable capture.
+        if getattr(runner, "use_aux_hidden_state_outputs", True) is False:
+            self.unavailable = (
+                "the engine is not collecting eagle3 aux hidden states "
+                "(use_aux_hidden_state_outputs is False), so there is nothing "
+                "to capture"
+            )
+            self.declared = True
+            return
+
+        model = runner.model
+        inner_model = _resolve_inner_model(model)
+        current_layers = tuple(inner_model.aux_hidden_state_layers)
+
+        hf_config = runner.vllm_config.model_config.hf_config
+        num_layers = getattr(hf_config, "num_hidden_layers", None)
+        if num_layers is None:
+            raise RuntimeError(
+                "could not determine num_hidden_layers; "
+                "cannot extend aux layers for final-layer capture"
+            )
+
+        self.runner = runner
+        self.inner_model = inner_model
+        final_idx = num_layers  # 1-based index used by vLLM's aux collection
+
+        if final_idx in current_layers:
+            #: The engine was configured this way itself -- offline extraction
+            #: sets ``eagle_aux_hidden_state_layer_ids`` and the drafter's
+            #: ``fc`` is sized for all of them (``llama_eagle3.py:187`` reads
+            #: ``len(layer_ids)``).  The drafter genuinely consumes every
+            #: entry, so nothing may be stripped.
+            self.original_aux_layers = current_layers
+            self.final_layer_idx = None
+            self.declared = True
+            logger.info(
+                "Aux layers %s already include final layer %d; "
+                "declaring nothing and stripping nothing",
+                current_layers, final_idx,
+            )
+            return
+
+        self.original_aux_layers = current_layers
+        self.final_layer_idx = final_idx
+        extended = current_layers + (final_idx,)
+        model.set_aux_hidden_state_layers(extended)
+        self.declared = True
+        logger.info(
+            "Declared aux layers %s -> %s (added final layer %d) before "
+            "compilation; the drafter will still be handed %d",
+            current_layers, extended, final_idx, len(current_layers),
+        )
+
+    # -- interception (every forward, armed or not) --
+
+    def intercept(self, runner: Any, aux_hidden_states: Any) -> None:
+        """Buffer ``aux_hidden_states`` then strip the declared final layer.
+
+        Args:
+            runner: the live runner, used only as a fallback when the
+                declaration did not cache the inner model.
+            aux_hidden_states: the runner's aux list, or any non-list value
+                (``None`` on non-last PP ranks / non-eagle steps), ignored.
+        """
+        if not isinstance(aux_hidden_states, list):
+            return
+
+        expected = len(self.original_aux_layers)
+
+        if len(aux_hidden_states) == 0:
+            #: Hard guard: the drafter will crash on an empty list (torch.cat
+            #: of nothing).  Only *our* problem once we declared the extra aux
+            #: layer -- an engine that was already collecting nothing is not
+            #: something the capture extension broke, so leave it to the runner.
+            if expected > 0:
+                raise RuntimeError(
+                    "aux_hidden_states is empty before drafter; "
+                    "activation capture extension left the "
+                    "engine in a broken state"
+                )
+            return
+
+        if self.active:
+            self.buffer(runner, aux_hidden_states)
+
+        #: Truncate AFTER buffering so the drafter sees exactly the layers its
+        #: ``fc`` was built for.  Unconditional -- not gated on ``active`` --
+        #: because the declaration is unconditional: the forward emits the
+        #: extra state on every pass from warm-up onwards.
+        if expected > 0 and len(aux_hidden_states) > expected:
+            del aux_hidden_states[expected:]
+
+    def buffer(self, runner: Any, aux_hidden_states: list[Tensor]) -> None:
+        """Buffer aux hidden states into the pending dict, keyed by layer index.
+
+        Each tensor has shape ``(num_scheduled_tokens, H)``.
+        """
+        self.ensure_init()
+
+        # Use actual layer indices from the model's aux_hidden_state_layers.
+        # These are the indices the runner configured via
+        # set_aux_hidden_state_layers (interfaces.py:1326-1327).
+        #: There used to be a ``except Exception:`` here that fell back to
+        #: ``range(len(aux_hidden_states))``.  That fallback is not a
+        #: degradation, it is a silent corruption: for aux layers
+        #: ``(2, 18, 33, 36)`` it would key the buffer ``0, 1, 2, 3``, and every
+        #: downstream consumer -- the bf16 tolerance, which is
+        #: ``2^-8 * (layer_id + 4)``, and the residual-stream depth the capture
+        #: is compared against -- would then be reading the wrong layer with no
+        #: signal at all.  Capture is opt-in and only reaches here while active,
+        #: so failing the request is strictly better than writing mislabelled
+        #: activations into a training cache.
+        try:
+            inner_model = self.inner_model
+            if inner_model is None:
+                inner_model = _resolve_inner_model(runner.model)
+                self.inner_model = inner_model
+            layer_indices: tuple[int, ...] = inner_model.aux_hidden_state_layers
+        except Exception as exc:
+            raise RuntimeError(
+                "cannot read aux_hidden_state_layers from the running model, "
+                "so captured activations cannot be labelled with their true "
+                "layer indices; refusing to buffer positionally-keyed rows"
+            ) from exc
+
+        #: The guard the whole redesign exists to keep satisfiable.  It still
+        #: refuses on a genuine mismatch -- a graph baked with a different
+        #: count than the model advertises means the rows cannot be labelled,
+        #: and mislabelled training rows are worse than a failed request.
+        if len(layer_indices) != len(aux_hidden_states):
+            raise RuntimeError(
+                f"the model reported {len(layer_indices)} aux layers "
+                f"{layer_indices} but the forward produced "
+                f"{len(aux_hidden_states)} aux hidden states; the layer "
+                f"labelling cannot be trusted"
+            )
+
+        host_tensors = _to_host(aux_hidden_states)
+
+        assert self.lock is not None and self.pending is not None
+        with self.lock:
+            pending = self.pending
+            for i, tensor in enumerate(host_tensors):
+                pending.setdefault(layer_indices[i], []).append(tensor)
+
+    # -- patch installation --
+
+    def install(self, runner_cls: Any) -> str:
+        """Wrap ``load_model`` and the interception point on ``runner_cls``.
+
+        Idempotent per class: re-installing would nest wrappers and strip
+        twice.
+
+        Returns:
+            The interception attribute that was wrapped.
+        """
+        attr = _resolve_hook_point(runner_cls)
+        session = self
+
+        for patched_cls, patched_attr, _ in self.patches:
+            if patched_cls is runner_cls and patched_attr == attr:
+                return attr
+
+        original_load = runner_cls.load_model
+
+        def _wrapped_load_model(self_ref: Any, *args: Any, **kwargs: Any) -> Any:
+            result = original_load(self_ref, *args, **kwargs)
+            #: Declaration must not be swallowed: a load that "succeeded" while
+            #: leaving three layers baked into the graph is exactly the state
+            #: that made capture unarmable.
+            session.declare(self_ref)
+            return result
+
+        original_intercept = getattr(runner_cls, attr)
+
+        def _wrapped_intercept(self_ref: Any, *args: Any, **kwargs: Any) -> Any:
+            result = original_intercept(self_ref, *args, **kwargs)
+            session.intercept(self_ref, _extract_aux(self_ref, attr, result))
+            return result
+
+        runner_cls.load_model = _wrapped_load_model
+        setattr(runner_cls, attr, _wrapped_intercept)
+        self.patches.append((runner_cls, "load_model", original_load))
+        self.patches.append((runner_cls, attr, original_intercept))
+        self.patched_class = runner_cls
+        self.patched_attr = attr
+        self.installed_wrapper = _wrapped_intercept
+        logger.info(
+            "Installed activation-capture bootstrap on %s.%s "
+            "(declaration in load_model, interception in %s)",
+            runner_cls.__module__, runner_cls.__qualname__, attr,
+        )
+        return attr
+
+    def uninstall(self) -> None:
+        """Remove every patch this session installed (tests / teardown)."""
+        for runner_cls, attr, original in reversed(self.patches):
+            try:
+                setattr(runner_cls, attr, original)
+            except Exception:  # noqa: BLE001 -- teardown must not mask errors
+                logger.exception("Error restoring %s.%s", runner_cls, attr)
+        self.patches = []
+        self.patched_class = None
+        self.patched_attr = None
+        self.installed_wrapper = None
+
+
+#: The one session per worker process.
+_SESSION = _CaptureSession()
+
+
+def get_session() -> _CaptureSession:
+    """Return the process-wide capture session."""
+    return _SESSION
+
+
+def reset_session() -> None:
+    """Uninstall patches and clear all capture state.  Tests only."""
+    _SESSION.uninstall()
+    _SESSION.reset()
+
+
+def install_bootstrap(runner_classes: Any = None) -> list[str]:
+    """Declare-before-compile bootstrap: patch the vLLM runner classes.
+
+    Called at import, which vLLM performs inside ``init_worker``
+    (``worker_base.py:262``) -- strictly before ``init_device``, ``load_model``
+    and ``compile_or_warm_up_model``.  That ordering is the whole point: it is
+    the earliest moment code of ours can run in the worker process, and it is
+    the only one available, because an appended worker-extension base can
+    neither override ``Worker.load_model`` nor even declare the name
+    (``worker_base.py:271`` asserts the extension shares no attribute with the
+    worker).
+
+    Args:
+        runner_classes: explicit classes to patch.  Defaults to whichever of
+            vLLM's two runner generations import successfully.
+
+    Returns:
+        The interception attribute wrapped on each class, in order.
+    """
+    if runner_classes is None:
+        runner_classes = []
+        for module_name, cls_name in _RUNNER_TARGETS:
+            try:
+                module = __import__(module_name, fromlist=[cls_name])
+            except Exception:  # noqa: BLE001 -- generation may not ship
+                logger.debug("runner module %s not importable", module_name)
+                continue
+            runner_cls = getattr(module, cls_name, None)
+            if runner_cls is not None:
+                runner_classes.append(runner_cls)
+
+    installed = []
+    for runner_cls in runner_classes:
+        installed.append(_SESSION.install(runner_cls))
+    return installed
+
+
+def _bootstrap_on_import() -> None:
+    """Run :func:`install_bootstrap` at import, best-effort.
+
+    An import failure here means vLLM is not installed (the project venv runs
+    the unit tests), which is not an error.  A *patch* failure is logged rather
+    than raised so that importing the module never breaks an engine that was
+    not going to capture anything -- ``activate_capture`` refuses loudly later.
+    """
+    if os.environ.get(BOOTSTRAP_OPT_OUT_ENV) == "1":
+        logger.info("%s=1; skipping capture bootstrap", BOOTSTRAP_OPT_OUT_ENV)
+        return
+    try:
+        install_bootstrap()
+    except Exception:  # noqa: BLE001
+        logger.exception("activation-capture bootstrap failed")
+
+
+# -- device-to-host transfer ------------------------------------------------
+
+
+def _is_fusable(aux_hidden_states: list[Tensor]) -> bool:
+    """True when all aux tensors can go home in a single stacked copy."""
+    first = aux_hidden_states[0]
+    shape = first.shape
+    dtype = first.dtype
+    device = first.device
+    return all(
+        tensor.shape == shape
+        and tensor.dtype == dtype
+        and tensor.device == device
+        for tensor in aux_hidden_states[1:]
+    )
+
+
+def _to_host(aux_hidden_states: list[Tensor]) -> list[Tensor]:
+    """Copy one forward pass' aux states to the host in ONE transfer.
+
+    ``Tensor.cpu()`` enqueues a ``cudaMemcpyAsync`` and then drains the
+    stream, so calling it per aux layer costs four pipeline stalls per
+    forward pass -- on the serving path, once for every decode step.  The
+    four aux tensors always share a shape (``num_scheduled_tokens``, H),
+    a dtype and a device, so stacking them on-device first turns those
+    four stalls into one.  The device-side stack is a copy at HBM
+    bandwidth of a buffer far smaller than the forward's own transient
+    activations; the host-side byte count is unchanged.
+
+    Slicing the fused host tensor back out per layer costs nothing (the
+    slices are views) and drops the per-step host allocations from four
+    to one.
+
+    Falls back to the per-layer copy whenever the tensors are not uniform
+    or the stack is refused: a slower capture is always preferable to a
+    lost or mislabelled row.
+    """
+    try:
+        if len(aux_hidden_states) > 1 and _is_fusable(aux_hidden_states):
+            import torch
+
+            # One ``detach`` on the stacked result rather than one per
+            # layer: stacking cannot smuggle in a graph that detaching
+            # afterwards would not drop.
+            fused = torch.stack(aux_hidden_states).detach().cpu()
+            return list(torch.unbind(fused))
+    except Exception:
+        logger.warning(
+            "fused device-to-host capture copy failed; falling back "
+            "to one transfer per aux layer",
+            exc_info=True,
+        )
+    return [tensor.detach().cpu() for tensor in aux_hidden_states]
 
 
 # ---------------------------------------------------------------------------
 # Worker extension
 # ---------------------------------------------------------------------------
+
+
+class _SessionAttr:
+    """Expose one :class:`_CaptureSession` field as an extension attribute.
+
+    A *data* descriptor on purpose.  vLLM mixes this class into the worker by
+    appending it to ``__bases__``, so the extension sits last in the MRO -- but
+    a data descriptor found anywhere on the MRO still beats the instance
+    ``__dict__``.  Without that, ``self._capture_active = True`` inside
+    ``activate_capture`` would write a worker-instance attribute that shadowed
+    the session the import-time wrappers actually read, and arming would appear
+    to succeed while buffering nothing.
+    """
+
+    def __init__(self, field: str) -> None:
+        self.field = field
+
+    def __set_name__(self, owner: type, name: str) -> None:
+        self.name = name
+
+    def __get__(self, obj: Any, objtype: type | None = None) -> Any:
+        if obj is None:
+            return self
+        return getattr(_SESSION, self.field)
+
+    def __set__(self, obj: Any, value: Any) -> None:
+        setattr(_SESSION, self.field, value)
 
 
 class ActivationCaptureExtension:
@@ -94,97 +637,93 @@ class ActivationCaptureExtension:
     Register via ``--worker-extension-cls
     speedlm.activation_capture.hook.ActivationCaptureExtension``.
 
-    The extension monkeypatches the model runner's ``_model_forward`` method
-    after the model is loaded, intercepting ``aux_hidden_states`` before they
-    are consumed by the drafter.
+    Registering it is what imports this module inside the worker, which is what
+    installs the declare-before-compile bootstrap (see the module docstring).
+    By the time any of the methods below are reachable over ``collective_rpc``
+    the engine has already compiled and captured graphs with the final aux
+    count baked in, so arming and disarming are pure buffering switches: no
+    shape changes, no re-tracing, no restart.
 
-    **Important:** the extension's public methods are called via ``collective_rpc``
-    from the driver process. They are NOT regular worker methods.
+    **Important:** the extension's public methods are called via
+    ``collective_rpc`` from the driver process.  They are NOT regular worker
+    methods.
 
     **Note:** vLLM injects this class via ``worker_class.__bases__`` injection
-    and NEVER calls ``__init__``.  All instance state uses class-level defaults
-    or lazy initialization (via ``_ensure_init``) to function without ``__init__``.
+    and NEVER calls ``__init__``.  Every mutable field below is a
+    :class:`_SessionAttr` view onto the process-wide session, so the class
+    functions without ``__init__`` *and* without the instance/import-time split
+    that instance attributes would create.
     """
 
-    # Class-level defaults — safe because they are the initial "no capture"
-    # state and immutable types.  Mutable state is lazy-initialized below.
-    _capture_active = False
-    _capture_dir: str | None = None
-    _original_model_forward: Any = None
-    _final_layer_idx: int | None = None
-    _original_aux_layers: tuple[int, ...] = ()
-
-    #: Where the monkeypatch actually landed.  Recorded so ``_deactivate_impl``
-    #: restores the same attribute on the same class it patched, instead of
-    #: guessing at a hard-coded one.
-    _patched_class: Any = None
-    _patched_attr: str | None = None
-    _installed_wrapper: Any = None
-
-    #: Resolved once per activation instead of once per forward pass.  Only the
-    #: *object* is cached; ``aux_hidden_state_layers`` is still re-read on every
-    #: buffer call, because that tuple is what labels the rows and the engine
-    #: may change it under us.
-    _inner_model: Any = None
-
-    # These must be per-instance (mutable) — lazy-initialized on first use.
-    _pending: dict[int, list] | None = None
-    _lock: threading.Lock | None = None
+    _capture_active = _SessionAttr("active")
+    _capture_dir = _SessionAttr("capture_dir")
+    _final_layer_idx = _SessionAttr("final_layer_idx")
+    _original_aux_layers = _SessionAttr("original_aux_layers")
+    _inner_model = _SessionAttr("inner_model")
+    _pending = _SessionAttr("pending")
+    _lock = _SessionAttr("lock")
+    _patched_class = _SessionAttr("patched_class")
+    _patched_attr = _SessionAttr("patched_attr")
+    _installed_wrapper = _SessionAttr("installed_wrapper")
+    _declared = _SessionAttr("declared")
+    _unavailable = _SessionAttr("unavailable")
 
     def _ensure_init(self) -> None:
-        """Lazy initialization for mutable per-instance state.
-
-        vLLM never calls ``__init__`` (it appends the class to the worker's
-        base tuple).  This method guarantees the mutable defaults exist.
-        """
-        if self._lock is None:
-            self._lock = threading.Lock()
-        if self._pending is None:
-            self._pending = {}
+        """Lazy initialization for the session's mutable state."""
+        _SESSION.ensure_init()
 
     def _get_lock(self) -> threading.Lock:
-        """Return the per-instance lock, initializing it lazily."""
-        self._ensure_init()
-        assert self._lock is not None  # guaranteed by _ensure_init
-        return self._lock
+        """Return the session lock, initializing it lazily."""
+        _SESSION.ensure_init()
+        assert _SESSION.lock is not None
+        return _SESSION.lock
 
     def _get_pending(self) -> dict[int, list]:
-        """Return the per-instance pending dict, initializing it lazily."""
-        self._ensure_init()
-        assert self._pending is not None  # guaranteed by _ensure_init
-        return self._pending
+        """Return the session's pending dict, initializing it lazily."""
+        _SESSION.ensure_init()
+        assert _SESSION.pending is not None
+        return _SESSION.pending
 
     # -- collective_rpc handlers --
 
     def activate_capture(self, capture_dir: str) -> None:
-        """Enable capture and install the monkeypatch.
+        """Arm buffering.  Called via collective_rpc from the driver process.
 
-        Called via collective_rpc from the driver process.
+        Deliberately does *not* touch ``aux_hidden_state_layers`` and does not
+        install anything: both happened before the engine compiled.  Arming is
+        therefore safe on a CUDA-graph-capturing engine, which is the
+        production default and which the previous arm-time-extension design
+        could not survive.
 
-        Also adds the final decoder layer to the aux collection list so that
-        its pre-norm output is captured alongside the canonical EAGLE-3 aux
-        layers. The extra entry is sliced off before reaching the drafter.
+        Raises:
+            RuntimeError: if the declare-before-compile bootstrap never ran, or
+                ran and found nothing to capture.  Arming a capture that would
+                silently miss the final layer is worse than refusing.
         """
-        self._ensure_init()
-        if self._capture_active:
+        if not _SESSION.declared:
+            raise RuntimeError(
+                "the activation-capture bootstrap never declared the aux "
+                "layers, so the compiled forward does not produce the final "
+                "layer and arming would capture the wrong thing; the "
+                "extension module must be imported before the worker loads "
+                "the model (which --worker-extension-cls guarantees)"
+            )
+        if _SESSION.unavailable is not None:
+            raise RuntimeError(
+                f"activation capture is unavailable: {_SESSION.unavailable}"
+            )
+
+        _SESSION.ensure_init()
+        if _SESSION.active:
             logger.warning("capture already active; resetting")
-            self._deactivate_impl()
 
-        # A fresh session must re-resolve the model: the cached inner model
-        # from a previous activation is not safe to carry over.
-        self._inner_model = None
+        with self._get_lock():
+            _SESSION.pending = {}
 
-        self._capture_active = True
-        self._capture_dir = capture_dir
+        _SESSION.capture_dir = capture_dir
         os.makedirs(capture_dir, exist_ok=True)
-
-        # Add the final decoder layer to aux collection.
-        # self is mixed into the worker class, so we have model_runner.
-        self._extend_aux_layers()
-
-        # Install monkeypatch on _model_forward
-        self._install_hook()
-        logger.info("Activation capture activated, output dir: %s", capture_dir)
+        _SESSION.active = True
+        logger.info("Activation capture armed, output dir: %s", capture_dir)
 
     def flush_capture(self) -> str:
         """Flush buffered activations to disk.
@@ -193,12 +732,12 @@ class ActivationCaptureExtension:
         Returns the path to the written safetensors file.
         """
         self._ensure_init()
-        if not self._capture_active or self._capture_dir is None:
+        if not _SESSION.active or _SESSION.capture_dir is None:
             raise RuntimeError("capture is not active")
 
         with self._get_lock():
             pending = self._get_pending()
-            self._pending = {}
+            _SESSION.pending = {}
 
         if not pending:
             logger.warning("flush_capture called with no buffered data")
@@ -216,7 +755,7 @@ class ActivationCaptureExtension:
             saved[f"layer_{lidx}"] = stacked
 
         # Write to safetensors with flock for async safety
-        path = os.path.join(self._capture_dir, "captured.safetensors")
+        path = os.path.join(_SESSION.capture_dir, "captured.safetensors")
         lock_path = path + ".lock"
 
         # Create lock file before writing
@@ -237,8 +776,8 @@ class ActivationCaptureExtension:
         # distinguish drafter-input layers from the appended final layer.
         meta_path = path + ".meta.json"
         meta = {
-            "final_layer_idx": self._final_layer_idx,
-            "original_aux_layers": list(self._original_aux_layers),
+            "final_layer_idx": _SESSION.final_layer_idx,
+            "original_aux_layers": list(_SESSION.original_aux_layers),
         }
         with open(meta_path, "w") as mf:
             json.dump(meta, mf)
@@ -281,7 +820,6 @@ class ActivationCaptureExtension:
             ``runner_class`` (str), ``hook_point`` (str or None) and
             ``config_use_v2`` (bool or None).
         """
-        self._ensure_init()
         runner = self.model_runner  # type: ignore[attr-defined]
         runner_cls = type(runner)
 
@@ -291,7 +829,7 @@ class ActivationCaptureExtension:
                 hook_point = name
                 break
 
-        #: ``_model_forward`` is V1-only; ``sample_tokens`` exists on both, so
+        #: ``_model_forward`` is V1-only; ``execute_model`` exists on both, so
         #: resolving in HOOK_POINTS order makes this an exact discriminator.
         if hook_point == "_model_forward":
             generation = "v1"
@@ -323,371 +861,90 @@ class ActivationCaptureExtension:
         }
 
     def capture_info(self) -> dict:
-        """Return metadata about the active capture session.
+        """Return metadata about the capture session.
 
         Called via collective_rpc from the driver process.  Returns the final
-        layer index and the original (pre-extension) aux layer tuple so the
-        caller can correctly split drafter-input layers from the appended
-        final regression-target layer.
+        layer index and the drafter-visible (pre-declaration) aux layer tuple
+        so the caller can correctly split drafter-input layers from the
+        appended final regression-target layer.
+
+        ``declared``/``armed`` are reported too: on a graph-capturing engine
+        the declaration is the thing that had to happen before compile, and a
+        caller that cannot see it would be back to guessing.
 
         Returns:
-            Dict with keys ``final_layer_idx`` (int or None) and
-            ``original_aux_layers`` (list[int]).
+            Dict with keys ``final_layer_idx`` (int or None),
+            ``original_aux_layers`` (list[int]), ``declared`` (bool),
+            ``armed`` (bool) and ``unavailable`` (str or None).
         """
-        self._ensure_init()
         return {
-            "final_layer_idx": self._final_layer_idx,
-            "original_aux_layers": list(self._original_aux_layers),
+            "final_layer_idx": _SESSION.final_layer_idx,
+            "original_aux_layers": list(_SESSION.original_aux_layers),
+            "declared": _SESSION.declared,
+            "armed": _SESSION.active,
+            "unavailable": _SESSION.unavailable,
         }
 
     def deactivate_capture(self) -> None:
-        """Deactivate capture and remove hooks.
+        """Disarm buffering.  Called via collective_rpc from the driver.
 
-        Called via collective_rpc from the driver process.
+        Deliberately leaves the declared aux-layer set and the interception
+        wrappers in place.  Restoring the three-layer tuple would desynchronise
+        the attribute from the already-captured four-layer graph -- the exact
+        failure this design removes -- and re-arming would then be impossible
+        without an engine restart.  Disarmed cost is one surplus
+        ``hidden + residual`` add per forward plus a list truncation.
         """
-        self._ensure_init()
-        self._capture_active = False
-        self._deactivate_impl()
-        self._inner_model = None
-        logger.info("Activation capture deactivated")
+        _SESSION.ensure_init()
+        _SESSION.active = False
+        with self._get_lock():
+            _SESSION.pending = {}
+        _SESSION.capture_dir = None
+        logger.info("Activation capture disarmed")
 
-    # -- internal --
-
-    def _intercept_aux(self, aux_hidden_states: Any) -> None:
-        """Buffer ``aux_hidden_states`` then strip the appended final layer.
-
-        Shared by both runner generations: whatever the interception point,
-        the list object handed to the drafter is the same object we mutate
-        here, so the truncation is visible downstream.
-
-        Args:
-            aux_hidden_states: the runner's aux list, or any non-list value
-                (``None`` on non-last PP ranks / non-eagle steps), which is
-                ignored.
-        """
-        if not isinstance(aux_hidden_states, list):
-            return
-
-        # Only strip when the extension actually succeeded (detected by
-        # _original_aux_layers being non-empty).
-        expected = len(self._original_aux_layers)
-
-        if len(aux_hidden_states) == 0:
-            # Hard guard: the drafter will crash on an empty list (torch.cat
-            # of nothing).  Only *our* problem once we extended the aux list —
-            # an engine that was already collecting nothing is not something
-            # the capture extension broke, so leave it to the runner.
-            if expected > 0:
-                raise RuntimeError(
-                    "aux_hidden_states is empty before drafter; "
-                    "activation capture extension left the "
-                    "engine in a broken state"
-                )
-            return
-
-        self._buffer_aux(aux_hidden_states)
-
-        # Remove the extra entry AFTER buffering so the drafter sees exactly
-        # the canonical layers.  The drafter's fc expects num_aux * H (the
-        # runner concatenates all entries -- V1 gpu_model_runner.py:5119-5121,
-        # V2 via speculator.propose).
-        if expected > 0 and len(aux_hidden_states) > expected:
-            del aux_hidden_states[expected:]
-
-    def _resolve_hook_point(self) -> tuple[Any, str]:
-        """Resolve the runner class to patch and which method to wrap.
-
-        Resolution is against the *live* runner object, never an imported
-        class: both runner modules ship side by side, so importing the V1 one
-        succeeds even when the engine is running V2 and the patch would land
-        on a class nobody instantiates.
-
-        Returns:
-            ``(runner_class, method_name)``.
-
-        Raises:
-            RuntimeError: if the runner exposes no known interception point.
-        """
-        runner = self.model_runner  # type: ignore[attr-defined]
-        runner_cls = type(runner)
-        for name in HOOK_POINTS:
-            if hasattr(runner_cls, name):
-                return runner_cls, name
-        raise RuntimeError(
-            f"model runner {runner_cls.__module__}.{runner_cls.__qualname__} "
-            f"exposes none of {HOOK_POINTS}; activation capture cannot "
-            f"intercept aux_hidden_states on this vLLM build"
-        )
-
-    def _install_hook(self) -> None:
-        """Monkeypatch the live runner class to intercept aux hidden states."""
-        try:
-            runner_cls, attr = self._resolve_hook_point()
-            original = getattr(runner_cls, attr)
-            ext = self  # capture extension self for closure
-
-            if attr == "_model_forward":
-                #: V1: the aux list is the second element of the return value
-                #: (gpu_model_runner.py:4362-4368 unpacks it right after).
-                def _wrapped(self_ref: Any, *args: Any, **kwargs: Any) -> Any:
-                    result = original(self_ref, *args, **kwargs)
-                    if isinstance(result, tuple) and len(result) >= 2:
-                        ext._intercept_aux(result[1])
-                    return result
-            else:
-                #: V2: ``execute_model`` already parked the aux list on
-                #: ``execute_model_state`` (gpu/model_runner.py:1341-1349) and
-                #: ``sample_tokens`` reads it back (:1369) before handing it to
-                #: ``speculator.propose`` (:1466).  Intercept on the way IN, so
-                #: the truncation is in place before propose() sees the list.
-                def _wrapped(self_ref: Any, *args: Any, **kwargs: Any) -> Any:
-                    state = getattr(self_ref, "execute_model_state", None)
-                    if state is not None:
-                        ext._intercept_aux(getattr(state, "aux_hidden_states", None))
-                    return original(self_ref, *args, **kwargs)
-
-            self._original_model_forward = original
-            self._patched_class = runner_cls
-            self._patched_attr = attr
-            self._installed_wrapper = _wrapped
-            setattr(runner_cls, attr, _wrapped)
-            logger.info(
-                "Installed activation-capture hook on %s.%s",
-                runner_cls.__qualname__, attr,
-            )
-        except Exception:
-            logger.exception("Failed to install activation capture hook")
-            raise
-
-    def _deactivate_impl(self) -> None:
-        """Remove the monkeypatch and undo the aux-layer extension."""
-        try:
-            runner_cls = self._patched_class
-            attr = self._patched_attr
-            if runner_cls is not None and attr is not None:
-                current = getattr(runner_cls, attr, None)
-                if (current is not None
-                        and self._installed_wrapper is not None
-                        and current is self._installed_wrapper
-                        and self._original_model_forward is not None):
-                    setattr(runner_cls, attr, self._original_model_forward)
-        except Exception:
-            logger.exception("Error removing activation capture hook")
-        finally:
-            self._patched_class = None
-            self._patched_attr = None
-            self._installed_wrapper = None
-            self._original_model_forward = None
-
-        self._restore_aux_layers()
+    # -- internal (kept as methods: exercised directly by the unit tests) --
 
     @staticmethod
     def _resolve_inner_model(model: Any) -> Any:
-        """Resolve the model that carries ``aux_hidden_state_layers``.
-
-        The attribute lives on the *inner* model (the one inheriting
-        ``EagleModelMixin``), not the top-level ``...ForCausalLM``.  Resolved
-        the same way vLLM does in ``SupportsEagle3.set_aux_hidden_state_layers``
-        (``interfaces.py:1395-1406``): try ``get_language_model()`` /
-        ``.language_model``, then access ``.model``.
-        """
-        parent_ref = model
-        if hasattr(model, "get_language_model"):
-            parent_ref = model.get_language_model()
-        elif hasattr(model, "language_model"):
-            parent_ref = model.language_model
-        return parent_ref.model
-
-    def _restore_aux_layers(self) -> None:
-        """Undo :meth:`_extend_aux_layers`, if it extended anything.
-
-        Deactivation has to put the aux list back or a later
-        ``activate_capture`` would extend an already-extended list.  Idempotent
-        and best-effort: a failure here must not mask the caller's own error,
-        and the engine is still serviceable (the strip is driven by
-        ``_original_aux_layers``, which is re-derived on the next activation).
-        """
-        if self._final_layer_idx is None:
-            return
-        try:
-            runner = self.model_runner  # type: ignore[attr-defined]
-            runner.model.set_aux_hidden_state_layers(self._original_aux_layers)
-            logger.info(
-                "Restored aux layers to %s (removed final layer %d)",
-                self._original_aux_layers, self._final_layer_idx,
-            )
-        except Exception:
-            logger.exception("Error restoring aux hidden state layers")
-        finally:
-            self._final_layer_idx = None
-
-    def _extend_aux_layers(self) -> None:
-        """Add the final decoder layer to the aux collection list.
-
-        This lets the serving engine capture the final layer's pre-norm
-        output as a 4th aux entry.  The runner's ``aux_hidden_state_layers``
-        is set by ``set_aux_hidden_state_layers`` (gpu_model_runner.py:5402)
-        landing on the model's ``EagleModelMixin`` (interfaces.py:1326-1327).
-
-        The ``aux_hidden_state_layers`` attribute lives on the *inner* model
-        (the one that inherits ``EagleModelMixin``), not the top-level model
-        (e.g. ``GptOssForCausalLM``).  We resolve the inner model the same
-        way vLLM does in ``SupportsEagle3.set_aux_hidden_state_layers``
-        (interfaces.py:1395-1406): try ``get_language_model()`` /
-        ``.language_model``, then access ``.model``.
-
-        The drafter's ``fc`` width is fixed from the drafter's own config at
-        construction time (``llama_eagle3.py:176-187``) and is unaffected.
-        We remove the extra entry after buffering (in the _model_forward hook)
-        so the concatenation at ``gpu_model_runner.py:5119-5121`` produces a
-        3*H tensor for the 3*H drafter fc.
-
-        Raises:
-            RuntimeError: if the inner model cannot be resolved or lacks the
-                aux_hidden_state_layers attribute.  The caller
-                (``activate_capture``) should NOT catch this — a failed
-                extension means the pre-norm capture is broken and serving
-                must not proceed.
-        """
-        runner = self.model_runner  # type: ignore[attr-defined]
-        model = runner.model
-        inner_model = self._resolve_inner_model(model)
-
-        current_layers = inner_model.aux_hidden_state_layers
-
-        # Read the total layer count from the model config
-        hf_config = runner.vllm_config.model_config.hf_config
-        num_layers = getattr(hf_config, "num_hidden_layers", None)
-        if num_layers is None:
-            raise RuntimeError(
-                "could not determine num_hidden_layers; "
-                "cannot extend aux layers for final-layer capture"
-            )
-
-        final_idx = num_layers  # 1-based index used by vLLM's aux collection
-        if final_idx in current_layers:
-            #: Already present.  Two very different causes, and conflating them
-            #: is fatal: either the engine was configured that way (offline
-            #: extraction -- the drafter genuinely consumes all of them), or a
-            #: prior activation already extended and was not rolled back.  In
-            #: the latter case recording the EXTENDED tuple as "original" makes
-            #: ``_intercept_aux`` stop stripping, and the drafter's fc gets
-            #: 4*H.  ``_final_layer_idx`` distinguishes the two.
-            if self._final_layer_idx != final_idx:
-                self._original_aux_layers = current_layers
-            return
-
-        self._original_aux_layers = current_layers
-        self._final_layer_idx = final_idx
-        extended = current_layers + (final_idx,)
-        model.set_aux_hidden_state_layers(extended)
-        logger.info(
-            "Extended aux layers from %s to %s (added final layer %d)",
-            current_layers, extended, final_idx,
-        )
-
-    def _buffer_aux(self, aux_hidden_states: list[Tensor]) -> None:
-        """Buffer aux hidden states into the pending dict.
-
-        aux_hidden_states is a list of tensors, one per collected layer,
-        in layer-index order. Each tensor has shape (num_scheduled_tokens, H).
-        """
-        if not self._capture_active:
-            return
-        self._ensure_init()
-
-        # Use actual layer indices from the model's aux_hidden_state_layers.
-        # These are the indices the runner configured via
-        # set_aux_hidden_state_layers (interfaces.py:1326-1327).
-        #: There used to be a ``except Exception:`` here that fell back to
-        #: ``range(len(aux_hidden_states))``.  That fallback is not a
-        #: degradation, it is a silent corruption: for aux layers
-        #: ``(2, 18, 33, 36)`` it would key the buffer ``0, 1, 2, 3``, and every
-        #: downstream consumer -- the bf16 tolerance, which is
-        #: ``2^-8 * (layer_id + 4)``, and the residual-stream depth the capture
-        #: is compared against -- would then be reading the wrong layer with no
-        #: signal at all.  Capture is opt-in and only reaches here while active,
-        #: so failing the request is strictly better than writing mislabelled
-        #: activations into a training cache.
-        try:
-            inner_model = self._inner_model
-            if inner_model is None:
-                runner = self.model_runner  # type: ignore[attr-defined]
-                inner_model = self._resolve_inner_model(runner.model)
-                self._inner_model = inner_model
-            layer_indices: tuple[int, ...] = inner_model.aux_hidden_state_layers
-        except Exception as exc:
-            raise RuntimeError(
-                "cannot read aux_hidden_state_layers from the running model, "
-                "so captured activations cannot be labelled with their true "
-                "layer indices; refusing to buffer positionally-keyed rows"
-            ) from exc
-
-        if len(layer_indices) != len(aux_hidden_states):
-            raise RuntimeError(
-                f"the model reported {len(layer_indices)} aux layers "
-                f"{layer_indices} but the forward produced "
-                f"{len(aux_hidden_states)} aux hidden states; the layer "
-                f"labelling cannot be trusted"
-            )
-
-        host_tensors = self._to_host(aux_hidden_states)
-
-        assert self._lock is not None and self._pending is not None
-        with self._lock:
-            pending = self._pending
-            for i, tensor in enumerate(host_tensors):
-                pending.setdefault(layer_indices[i], []).append(tensor)
-
-    # -- device-to-host transfer --
-
-    def _to_host(self, aux_hidden_states: list[Tensor]) -> list[Tensor]:
-        """Copy one forward pass' aux states to the host in ONE transfer.
-
-        ``Tensor.cpu()`` enqueues a ``cudaMemcpyAsync`` and then drains the
-        stream, so calling it per aux layer costs four pipeline stalls per
-        forward pass -- on the serving path, once for every decode step.  The
-        four aux tensors always share a shape (``num_scheduled_tokens``, H),
-        a dtype and a device, so stacking them on-device first turns those
-        four stalls into one.  The device-side stack is a copy at HBM
-        bandwidth of a buffer far smaller than the forward's own transient
-        activations; the host-side byte count is unchanged.
-
-        Slicing the fused host tensor back out per layer costs nothing (the
-        slices are views) and drops the per-step host allocations from four
-        to one.
-
-        Falls back to the per-layer copy whenever the tensors are not uniform
-        or the stack is refused: a slower capture is always preferable to a
-        lost or mislabelled row.
-        """
-        try:
-            if len(aux_hidden_states) > 1 and self._is_fusable(aux_hidden_states):
-                import torch
-
-                # One ``detach`` on the stacked result rather than one per
-                # layer: stacking cannot smuggle in a graph that detaching
-                # afterwards would not drop.
-                fused = torch.stack(aux_hidden_states).detach().cpu()
-                return list(torch.unbind(fused))
-        except Exception:
-            logger.warning(
-                "fused device-to-host capture copy failed; falling back "
-                "to one transfer per aux layer",
-                exc_info=True,
-            )
-        return [tensor.detach().cpu() for tensor in aux_hidden_states]
+        """See :func:`_resolve_inner_model`."""
+        return _resolve_inner_model(model)
 
     @staticmethod
     def _is_fusable(aux_hidden_states: list[Tensor]) -> bool:
-        """True when all aux tensors can go home in a single stacked copy."""
-        first = aux_hidden_states[0]
-        shape = first.shape
-        dtype = first.dtype
-        device = first.device
-        return all(
-            tensor.shape == shape
-            and tensor.dtype == dtype
-            and tensor.device == device
-            for tensor in aux_hidden_states[1:]
+        """See :func:`_is_fusable`."""
+        return _is_fusable(aux_hidden_states)
+
+    def _to_host(self, aux_hidden_states: list[Tensor]) -> list[Tensor]:
+        """See :func:`_to_host`."""
+        return _to_host(aux_hidden_states)
+
+    def _resolve_hook_point(self) -> tuple[Any, str]:
+        """Resolve the runner class to patch and which method to wrap."""
+        runner_cls = type(self.model_runner)  # type: ignore[attr-defined]
+        return runner_cls, _resolve_hook_point(runner_cls)
+
+    def _declare_aux_layers(self) -> None:
+        """Declare the full aux-layer set against ``self.model_runner``.
+
+        The production path never calls this -- the ``load_model`` wrapper
+        does, before compilation.  It exists so a caller holding only the
+        worker can drive the declaration explicitly.
+        """
+        _SESSION.declare(self.model_runner, force=True)  # type: ignore[attr-defined]
+
+    def _intercept_aux(self, aux_hidden_states: Any) -> None:
+        """See :meth:`_CaptureSession.intercept`."""
+        _SESSION.intercept(
+            getattr(self, "model_runner", None), aux_hidden_states
         )
+
+    def _buffer_aux(self, aux_hidden_states: list[Tensor]) -> None:
+        """Buffer aux hidden states, if armed."""
+        if not _SESSION.active:
+            return
+        _SESSION.buffer(
+            getattr(self, "model_runner", None), aux_hidden_states
+        )
+
+
+_bootstrap_on_import()
