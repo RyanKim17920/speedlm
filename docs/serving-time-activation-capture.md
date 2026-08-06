@@ -194,7 +194,7 @@ needs the verifier at all — it needs only the cache and the draft head.
 | --- | --- | --- |
 | Detect idle, drain, close admission | unchanged | unchanged |
 | Snapshot traces | unchanged | unchanged |
-| Prepare training rows | subprocess to `prepare_data.py` (`training/backends/eagle3.py:452-474`) | still needed for token IDs + loss mask, unless Section 6.6 is resolved |
+| Prepare training rows | subprocess to `prepare_data.py` (`SpeculatorsTrainingRowRenderer.render_rows` in `src/speedlm/training/backends/eagle3.py`) | still needed for token IDs + loss mask, unless Section 6.6 is resolved |
 | **Sleep serving engine** | ~6.4 s | ~6.4 s |
 | **`EXTRACTING`** | **~200 s: start a second vLLM engine, reload verifier weights, re-run ~1500 already-served tokens, dump hidden states, tear down** | **deleted** |
 | `TRAINING` | ~180-220 s | unchanged |
@@ -437,14 +437,16 @@ in production paths:
    guard that now makes it loud is `EmptySpeculatorsDatasetError`, raised when
    `written == 0` in `_render_speculators_dataset` in
    `src/speedlm/training/backends/eagle3.py`, pinned by
-   `tests/test_training_speculators.py:750`.
+   `test_prepare_without_convertible_records_raises_named_error` in
+   `tests/test_training_speculators.py`.
 2. **Silently zero-sample gate.** The gate could return a favorable decision from
    an empty replay. Fixed in commits `6779110` and `20231d3`. The guard is the
    `Reason.TOO_FEW_REPEATS` rejection in `decide` in
    `src/speedlm/gate/decide.py`, pinned by
-   `tests/test_gate_decide.py:450` (empty replay plus favorable metrics must still
-   REJECT) and asserted end-to-end at
-   `tests/e2e/test_live_idle_tuning.py:330-344`.
+   `test_zero_sample_benchmark_can_never_promote` in
+   `tests/test_gate_decide.py` (empty replay plus favorable metrics must still
+   REJECT) and asserted end-to-end by `_assert_gate_measured_something` in
+   `tests/e2e/test_live_idle_tuning.py`.
 
 A third case is often cited as "silently all-zeros batch on stale cache." **That
 bug does not exist in this repository's history.** What does exist is
@@ -607,8 +609,8 @@ is biased, not merely incomplete.
 `captured_row_count == prompt_token_count + generated_token_count`, per request,
 at write time. Record the shortfall as a first-class metric. A cycle whose
 capture coverage is below a configured floor must fail closed the way the empty
-dataset now does (`training/backends/eagle3.py:1070` is the precedent), not
-proceed on partial data.
+dataset and post-filter row floors now do in `_render_speculators_dataset` in
+`src/speedlm/training/backends/eagle3.py`, not proceed on partial data.
 
 ### 6.2 Pre-norm versus post-norm regression target
 
@@ -673,8 +675,8 @@ pinned checkout:
   `EagleModelMixin._maybe_add_hidden_state` (`:1329`) and unpacked by the runner
   at `V/v1/worker/gpu_model_runner.py:4364`.
 - The serving capture wraps `_model_forward` and takes `result[1]` — the same
-  list object — then `.detach().cpu()` (`hook.py:530`) and `save_file`
-  (`hook.py:222`).
+  list object — then copies it through `_to_host` and writes it from
+  `flush_capture` in `src/speedlm/activation_capture/hook.py`.
 - The offline path reads the *identical variable* one branch later at
   `V/v1/worker/gpu_model_runner.py:5035` and copies it: `torch.stack`
   (`V/v1/spec_decode/extract_hidden_states.py:132`) → assignment into a
@@ -920,26 +922,28 @@ and is joined by integer row index: `S/src/speculators/train/data.py:388`,
 that warns and returns `None` when the loaded token ids do not match
 `self.data[index]["input_ids"]`.
 
-In this repository, serving-side capture stores **no token IDs at all** — the
-trace store's record structure (`src/speedlm/traces/store.py:69-141`) has no
-token-id field. The mask is instead re-derived by shelling out to Speculators'
+In this repository, serving-side capture stores **no token IDs at all** —
+`TraceRecord` in `src/speedlm/traces/store.py` has no token-id field. The mask
+is instead re-derived by shelling out to Speculators'
 `prepare_data.py` (`SpeculatorsTrainingRowRenderer.render_rows` in
 `src/speedlm/training/backends/eagle3.py`), with validation via
 `--require-nonzero-loss-mask` and offender localization in `_zero_row` (raising
 `FinalAssistantMaskError`).
 
-A provenance-based path that derives the mask from capture metadata exists —
-`prepare_training_row` at `src/speedlm/training/rows.py:289-340`, using
-`_generated_assistant_spans` (`:306`) and `loss_mask_from_offsets`
-(`:326`, defined `src/speedlm/training/masking.py:64-88`) — but it is **dead in
-production**: every caller outside `training/__init__.py`'s re-export
-(`:14`, `:27`) is a test
-(`tests/integration/test_trace_pipeline.py`, `tests/e2e/test_agent_harness.py`,
-`tests/security/test_training_integrity.py`, `tests/test_training_templates.py`).
+This repository does retain pieces of an alternative provenance-based path:
+`training_row_from_trace` and `_generated_assistant_spans` in
+`src/speedlm/training/rows.py`, plus `loss_mask_from_offsets` in
+`src/speedlm/training/masking.py`. It does **not** retain a complete path that
+tokenizes a row and combines those pieces into a prepared row. The former
+`prepare_training_row` function was deleted in commit `110c528`, and none of
+these helpers is the production renderer. Production still uses
+`SpeculatorsTrainingRowRenderer.render_rows` in
+`src/speedlm/training/backends/eagle3.py` and shells out to `prepare_data.py`.
 
 **Consequence:** capturing activations does not by itself let us drop
 `prepare_data.py`. Token IDs must be captured alongside activations, or the
-provenance path must be promoted to production, before the pipeline is genuinely
+provenance-based preparation path must be rebuilt and wired into production
+before the pipeline is genuinely
 simplified. If neither happens, we save the `EXTRACTING` engine but keep the
 subprocess.
 
@@ -973,7 +977,8 @@ The prompt body contained `<|endoftext|>` as ordinary user text.
   `<|endoftext|>` stays literal text and costs seven tokens — **125** prompt
   tokens, which is what `usage.prompt_tokens` reported.
 * The **offline** leg renders through Speculators' `prepare_data.py`
-  (driven from `src/speedlm/activation_capture/offline_extract.py:205-227`),
+  (driven from `extract` in
+  `src/speedlm/activation_capture/offline_extract.py`),
   which reaches `_get_input_ids_loss_mask`
   (`S/src/speculators/data_generation/preprocessing.py:515-624`) and applies the
   **HF** chat template. HF's tokenizer parses special tokens out of ordinary
@@ -1063,12 +1068,21 @@ Against PCIe Gen4 x16 (~32 GB/s theoretical), the high-load case is roughly 0.14
 of link bandwidth. **[unverified: the actual host link generation and width on the
 target machine has not been read from `lspci`; the ratio assumes Gen4 x16.]**
 
-**Latency.** The copy pattern to imitate introduces no synchronization point in
-the decode path — dedicated copy stream and `non_blocking=True` into pinned
-memory (`example_hidden_states_connector.py:351-431`), completion detected by
-event polling (`:570-575`). Steady-state serving impact should be near zero.
-**[unverified: not measured. "Should be near zero" is a design intent, and
-measuring it is a prototype exit criterion, not an assumption.]**
+**Latency.** The current Stage 0 hook stacks the four uniform aux tensors on the
+device and then calls `.cpu()` once. In-process counted-tensor instrumentation
+therefore measures one device-to-host transfer per forward pass instead of four;
+the non-uniform fallback still makes four. This is a transfer-count measurement,
+not a GPU serving benchmark (`_to_host` in
+`src/speedlm/activation_capture/hook.py`; `TestHotPathTransferCount` in
+`tests/test_activation_capture_hook.py`). TTFT and tokens per second have never
+been measured on a GPU with capture enabled, so no serving-latency improvement
+is claimed.
+
+The connector pattern proposed for a production implementation is different:
+it uses a dedicated copy stream and `non_blocking=True` into pinned memory
+(`example_hidden_states_connector.py:351-431`), with completion detected by
+event polling (`:570-575`). Its latency remains unmeasured and is a prototype
+exit criterion.
 
 **Maintenance.** An owned dependency on vLLM internals, re-validated on every
 upgrade (Section 5.5).
@@ -1079,7 +1093,8 @@ is not optional.
 ### 7.3 Storage and retention must be designed, not inherited
 
 At 22.5 KiB/token, the current trace buffer default of
-`max_tokens: int = 8_000_000` (`src/speedlm/config.py:192`) would imply about
+`max_tokens: int = 8_000_000` (`TraceBufferConfig.max_tokens` in
+`src/speedlm/config.py`) would imply about
 **184 GB** of activations. The current cycle trains on roughly 1500 tokens, or
 ~34 MB — five orders of magnitude less.
 

@@ -53,19 +53,24 @@ The terminal decision says `promote`, +6.83 percentage points acceptance and
   `This is idle-tuning seed request N/512. Reply with one short sentence.`; the
   remaining row is a preemption prompt. Exact message hashes differ because the
   number differs, so exact-hash deduplication did not detect the semantic
-  duplication.
+  duplication. The trace snapshot used for training has 409 records and uses
+  the same numbered seed-request template, so the held-out suite is not a
+  distinct template distribution.
 - The run persisted aggregate `output_mismatches: 0` counts, but no response
   bodies, token sequences, pair identities, or divergence records in the
   decision. The run log identifies source commit `6d996ac`; `decide.py` at that
   commit did perform an exact stock/candidate `response_text` comparison. The
   archive does not preserve enough evidence to audit that comparison or
-  establish output equivalence after the fact.
+  establish output equivalence after the fact. It is therefore incorrect to
+  say that the gate omitted an output-equality check; the void finding is that
+  the archive cannot independently demonstrate what that check compared.
 
 Artifacts:
 
 - `/data/ryan.kim/speedlm-runs/multicycle-20260731T190000Z/results/live-idle-tuning/terminal-decision.json`
 - `/data/ryan.kim/speedlm-runs/multicycle-20260731T190000Z/results/live-idle-tuning/speedlm_home/runs/50d9a0702c16429a9f13388c89d635c8/decision.json`
 - `/data/ryan.kim/speedlm-runs/multicycle-20260731T190000Z/results/live-idle-tuning/speedlm_home/runs/50d9a0702c16429a9f13388c89d635c8/held-out/suite_contexts.jsonl`
+- `/data/ryan.kim/speedlm-runs/multicycle-20260731T190000Z/results/live-idle-tuning/speedlm_home/runs/1aa30d827f334cb097a04b338865d0a1/trace-snapshot/traces.jsonl`
 - `/data/ryan.kim/speedlm-runs/multicycle-20260731T190000Z/slurm-368906.out`
 
 ### July 30 live-idle runs: VOID
@@ -77,7 +82,11 @@ same stock and candidate deltas. The only differences in the raw
 not literally byte-identical. The acceptance evidence is non-discriminating and
 cannot support a promotion. The warmup deltas are 1,155 drafted and 549 accepted
 in each arm; the threshold and validate5 deltas are 1,925 drafted and 915
-accepted in each arm, including identical per-position totals.
+accepted in each arm, including identical per-position totals. Unrelated scrape
+lines differ, and the logs identify separate stock and candidate engine
+lifecycles with different draft arguments; the artifacts do not establish that
+both arms scraped one engine. What they establish is that the speculative-decode
+acceptance counters measured no arm effect.
 
 The warmup run promoted with a 0.0 percentage-point acceptance delta because
 its run configuration explicitly set `min_acceptance_delta_pp` to 0.0. The
@@ -128,5 +137,11 @@ Code-level fail-closed checks must not be described as exercised merely because
 they exist. Several guards have not been observed firing in a real run. In
 particular, neither definitive run produced an observable **publish-time**
 vocabulary-bound-check result: both candidates were rejected before the publish
-path ran. The absence of that output is not evidence that the guard passed or
-that publication was validated.
+path ran, and both terminal decisions have null `artifact_id`, `candidate_draft`,
+and `draft_vocab_mapping` fields. The guard's own docstring says why a successful
+report must be recorded: a check whose only output is an exception is
+indistinguishable from a check that never ran. Here there is no such report. The
+absence of output is not evidence that the guard passed or that publication was
+validated. The implementation is
+`Eagle3Adapter._assert_published_vocab_mapping` in
+`src/speedlm/tuner/eagle3.py`.
