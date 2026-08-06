@@ -73,9 +73,10 @@ usage() {
 make_snapshot_run.sh -- pin a GPU run to an immutable snapshot of the repo.
 
 Required:
-  --flavor F            idle-tuning | activation-capture | hot-swap
-                        | live-vllm | proxy-overhead | token-fidelity
-                        | model-matrix | capture-matrix | agent-harness
+  --flavor F            idle-tuning | activation-capture | capture-overhead
+                        | hot-swap | live-vllm | proxy-overhead
+                        | token-fidelity | model-matrix | capture-matrix
+                        | agent-harness
 
 Optional:
   --commit REF          commit/ref to snapshot            (default: HEAD)
@@ -90,8 +91,17 @@ Optional:
   --cpus N              SBATCH --cpus-per-task            (default: 16)
   --tuning-config PATH  SPEEDLM_E2E_TUNING_CONFIG         (idle-tuning only, required)
   --tuning-profile PATH SPEEDLM_E2E_TUNING_PROFILE        (idle-tuning, optional)
-  --verifier ID         SPEEDLM_E2E_VERIFIER_MODEL        (capture/hot-swap)
-  --drafter ID          SPEEDLM_E2E_DRAFTER_MODEL         (capture/hot-swap)
+  --verifier ID         SPEEDLM_E2E_VERIFIER_MODEL        (capture/capture-
+                        overhead/hot-swap)
+  --drafter ID          SPEEDLM_E2E_DRAFTER_MODEL         (capture/capture-
+                        overhead/hot-swap)
+  --inject-ms MS        SPEEDLM_E2E_CAPTURE_OVERHEAD_INJECT_MS
+                        (capture-overhead only, optional).  Adds MS
+                        milliseconds to every capture-ON request, so the
+                        paired-difference machinery can be shown to detect a
+                        regression on real hardware.  A value above the test's
+                        100 ms TTFT bound MUST make the run fail; if it does
+                        not, the measurement is not measuring.
   --drafter-dir PATH    SPEEDLM_E2E_DRAFTER_DIR           (hot-swap, optional)
   --runner R            auto | v1 | v2                    (default: auto)
                         v1/v2 force VLLM_USE_V2_MODEL_RUNNER=0/1; auto lets
@@ -170,6 +180,7 @@ tuning_profile=""
 verifier=""
 drafter=""
 drafter_dir=""
+inject_ms=""
 runner="auto"
 prompt_set=""
 target_layer_ids=""
@@ -199,6 +210,7 @@ while [[ $# -gt 0 ]]; do
         --verifier)       verifier="$2"; shift 2 ;;
         --drafter)        drafter="$2"; shift 2 ;;
         --drafter-dir)    drafter_dir="$2"; shift 2 ;;
+        --inject-ms)      inject_ms="$2"; shift 2 ;;
         --runner)         runner="$2"; shift 2 ;;
         --prompt-set)     prompt_set="$2"; shift 2 ;;
         --target-layer-ids) target_layer_ids="$2"; shift 2 ;;
@@ -223,6 +235,20 @@ case "$runner" in
     auto|v1|v2) ;;
     *) echo "error: invalid --runner '$runner' (want auto|v1|v2)" >&2; exit 2 ;;
 esac
+
+# --inject-ms is a fault injection into ONE test's ON arm.  Reject it anywhere
+# else rather than exporting a variable nothing reads: a silently-ignored
+# fault injection would look like "the harness cannot detect this regression".
+if [[ -n "$inject_ms" ]]; then
+    [[ "$flavor" == "capture-overhead" ]] || {
+        echo "error: --inject-ms is valid only for --flavor capture-overhead" >&2
+        exit 2
+    }
+    [[ "$inject_ms" =~ ^[0-9]+$ ]] || {
+        echo "error: --inject-ms must be a non-negative integer number of milliseconds" >&2
+        exit 2
+    }
+fi
 
 # --------------------------------------------------------------------------
 # Per-flavor wiring.
@@ -276,6 +302,28 @@ case "$flavor" in
         extra_pythonpath=":$PYLIBS_PYTEST"
         job_suffix="capture"
         default_time="03:00:00"
+        : "${verifier:=Qwen/Qwen3-8B}"
+        : "${drafter:=RedHatAI/Qwen3-8B-speculator.eagle3}"
+        corpus=""   # this flavor does not read SPEEDLM_E2E_PROMPT_CORPUS
+        ;;
+    capture-overhead)
+        # Measures what activation capture costs the serving path (TTFT, tok/s)
+        # by toggling the hook on ONE engine.  Wired exactly like
+        # activation-capture: same worker extension, same verifier/drafter env
+        # vars (exported by the shared case arm below), same vLLM-venv
+        # interpreter + PYLIBS_PYTEST.  It takes NO vLLM args from the launcher
+        # for the same reason activation-capture takes none -- the test spawns
+        # the engine itself and hardcodes its own bounds, and the gateway
+        # defaults (which include --enforce-eager) would be actively wrong here:
+        # measuring without CUDA graphs would not describe production.
+        #
+        # ~163 streaming requests at 128 output tokens on top of one model load.
+        test_path="tests/e2e/test_serving_activation_capture_overhead.py"
+        gate_var="SPEEDLM_E2E_CAPTURE_OVERHEAD"
+        interpreter="$VLLM_ENV/bin/python"
+        extra_pythonpath=":$PYLIBS_PYTEST"
+        job_suffix="capoverhead"
+        default_time="02:00:00"
         : "${verifier:=Qwen/Qwen3-8B}"
         : "${drafter:=RedHatAI/Qwen3-8B-speculator.eagle3}"
         corpus=""   # this flavor does not read SPEEDLM_E2E_PROMPT_CORPUS
@@ -385,7 +433,7 @@ case "$flavor" in
         corpus=""
         ;;
     *)
-        echo "error: unknown flavor '$flavor' (want idle-tuning|activation-capture|hot-swap|live-vllm|proxy-overhead|token-fidelity|model-matrix|capture-matrix|agent-harness)" >&2
+        echo "error: unknown flavor '$flavor' (want idle-tuning|activation-capture|capture-overhead|hot-swap|live-vllm|proxy-overhead|token-fidelity|model-matrix|capture-matrix|agent-harness)" >&2
         exit 2
         ;;
 esac
@@ -596,6 +644,25 @@ export SPEEDLM_E2E_READY_TIMEOUT=1800
 export SPEEDLM_E2E_TUNING_TIMEOUT=$tuning_timeout
 export SPEEDLM_E2E_REQUEST_TIMEOUT=1800
 EOF
+        ;;
+    capture-overhead)
+        # Only the model pair and the readiness timeout.  The Stage 0 matrix
+        # knobs (prompt set, target layer ids, HF reference, strict verdict) and
+        # the runner override belong to the correctness test and are NOT emitted
+        # here: this test reads none of them, and exporting variables a test
+        # ignores is how a run ends up believed to be configured in a way it
+        # was not.
+        cat <<EOF
+export SPEEDLM_E2E_VERIFIER_MODEL=$verifier
+export SPEEDLM_E2E_DRAFTER_MODEL=$drafter
+EOF
+        echo "export SPEEDLM_E2E_READY_TIMEOUT=1800"
+        # Fault injection, in milliseconds, into the ON arm only.  Emitted only
+        # when asked for; this is how the paired-difference machinery is proven
+        # able to fail on real hardware.
+        if [[ -n "$inject_ms" ]]; then
+            echo "export SPEEDLM_E2E_CAPTURE_OVERHEAD_INJECT_MS=$inject_ms"
+        fi
         ;;
     activation-capture|hot-swap)
         cat <<EOF
