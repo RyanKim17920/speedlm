@@ -344,12 +344,10 @@ case "$flavor" in
         # interpreter + PYLIBS_PYTEST.  It takes NO vLLM args from the launcher
         # for the same reason activation-capture takes none -- the test spawns
         # the engine itself and hardcodes its own argv and its own bounds, so
-        # the gateway defaults would not reach the engine anyway.  That argv
-        # includes --enforce-eager: capture arms by mutating the model's
-        # aux_hidden_state_layers at runtime, which a compiled/CUDA-graphed
-        # forward ignores, and the resulting 4-vs-3 mismatch kills EngineCore
-        # (SLURM 370798).  See the module docstring for what that costs the
-        # interpretation of the numbers.
+        # the gateway defaults would not reach the engine anyway.  Capture
+        # works under CUDA graphs as of aa02ab8, and this test deliberately
+        # runs graphed (the production default).  SLURM 370798 is the
+        # historical graphed-engine failure that motivated that fix.
         #
         # ~246 streaming requests at 128 output tokens on top of one model load.
         test_path="tests/e2e/test_serving_activation_capture_overhead.py"

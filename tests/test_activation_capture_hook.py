@@ -7,6 +7,8 @@ they run in the project venv.
 
 from __future__ import annotations
 
+from types import MappingProxyType
+
 import pytest
 
 
@@ -105,6 +107,76 @@ class TestAuxLayerInnerModelResolution:
         ext._declare_aux_layers()
         assert ext._original_aux_layers == (2, 8, 14)
         assert ext._final_layer_idx == 16
+
+
+def _declaration_runner(
+    layers: tuple[int, ...], *, additional_config: object = None
+) -> object:
+    """Build the smallest runner that exercises the real declaration path."""
+
+    class Inner:
+        def __init__(self) -> None:
+            self.aux_hidden_state_layers = layers
+
+    class Top:
+        def __init__(self) -> None:
+            self.model = Inner()
+
+        def set_aux_hidden_state_layers(self, declared: tuple[int, ...]) -> None:
+            self.model.aux_hidden_state_layers = tuple(declared)
+
+    hf_config = type("HFConfig", (), {"num_hidden_layers": 16})()
+    model_config = type("ModelConfig", (), {"hf_config": hf_config})()
+    vllm_config = type("VLLMConfig", (), {"model_config": model_config})()
+    if additional_config is not None:
+        vllm_config.additional_config = additional_config
+    return type("Runner", (), {"model": Top(), "vllm_config": vllm_config})()
+
+
+class TestCompileCacheFactor:
+    """Declaration must participate in vLLM's compiled-graph cache key."""
+
+    def test_declare_records_the_actual_declared_layers(self) -> None:
+        """The factor follows the live tuple instead of encoding four layers."""
+        from speedlm.activation_capture import hook
+
+        additional = {"keep": "existing config"}
+        runner = _declaration_runner((1, 7, 11), additional_config=additional)
+        ext = hook.ActivationCaptureExtension()
+        ext.model_runner = runner  # type: ignore[attr-defined]
+
+        ext._declare_aux_layers()
+
+        assert additional == {
+            "keep": "existing config",
+            hook.COMPILE_CACHE_FACTOR_KEY: [1, 7, 11, 16],
+        }
+
+    @pytest.mark.parametrize(
+        "additional_config",
+        [None, MappingProxyType({"owned": "elsewhere"})],
+        ids=["absent", "not-mutable"],
+    )
+    def test_declare_warns_and_continues_without_a_plain_dict(
+        self, additional_config: object, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Unsupported additional_config shapes must not prevent declaration."""
+        from speedlm.activation_capture import hook
+
+        runner = _declaration_runner(
+            (3, 9, 12), additional_config=additional_config
+        )
+        ext = hook.ActivationCaptureExtension()
+        ext.model_runner = runner  # type: ignore[attr-defined]
+
+        with caplog.at_level("WARNING"):
+            ext._declare_aux_layers()
+
+        assert runner.model.model.aux_hidden_state_layers == (3, 9, 12, 16)
+        assert ext.capture_info()["declared"] is True
+        assert "cannot record the declared aux layers" in caplog.text
+        if isinstance(additional_config, MappingProxyType):
+            assert dict(additional_config) == {"owned": "elsewhere"}
 
 
 class TestSliceGuard:

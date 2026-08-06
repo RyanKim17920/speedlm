@@ -854,6 +854,30 @@ def test_activation_capture_serving_overhead() -> None:
                     client, url, served_model_id, inject_delay_seconds=0.0
                 )
 
+            #: Preflight, after the first real forwards and before any measured
+            #: block: prove the declaration actually reached the *graph*, not
+            #: just the attribute.  Job 370927 declared the fourth aux layer at
+            #: the right moment and still ran a three-layer forward, because
+            #: vLLM replayed a compile-cache entry traced by the pre-fix run;
+            #: the mismatch only surfaced at the first ARMED forward, where it
+            #: killed EngineCore and destroyed the measurement.  The hook now
+            #: detects it on the first forward and reports it here instead.
+            infos = _collective_rpc_results(port, "capture_info")
+            assert infos, "capture_info returned no per-worker result"
+            info = infos[0]
+            assert info["declared"], (
+                "the capture bootstrap never declared the aux layers; the "
+                f"compiled forward cannot contain the final layer: {info}"
+            )
+            assert info["unavailable"] is None, (
+                "the engine cannot capture, so there is no overhead to "
+                f"measure: {info['unavailable']}"
+            )
+            assert info["final_layer_idx"] is not None, (
+                "no final aux layer was declared, so an armed engine would "
+                f"capture only the drafter's own layers: {info}"
+            )
+
             #: ABBA.  Half 0 runs (OFF, ON); half 1 runs (ON, OFF).  Opposite
             #: orderings in the two halves is what makes linear drift cancel
             #: rather than land on one arm.

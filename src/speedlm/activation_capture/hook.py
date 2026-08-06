@@ -120,7 +120,17 @@ if TYPE_CHECKING:
     # this does not require torch to be installed in the project venv.
     from torch import Tensor
 
-logger = logging.getLogger(__name__)
+try:
+    #: Inside a worker only vLLM's own logger tree has handlers and an INFO
+    #: level; a bare ``speedlm.*`` logger drops every record on the floor.  Job
+    #: 370927 was diagnosed without a single line from this module in
+    #: ``vllm.log`` for exactly that reason -- whether the declaration ran at
+    #: all had to be inferred.  Route through vLLM's logger when there is one.
+    from vllm.logger import init_logger as _init_logger
+
+    logger = _init_logger(__name__)
+except Exception:  # noqa: BLE001 -- the project venv has no vLLM
+    logger = logging.getLogger(__name__)
 
 
 #: Runner methods that see ``aux_hidden_states`` before the drafter consumes
@@ -158,6 +168,72 @@ def _resolve_inner_model(model: Any) -> Any:
     elif hasattr(model, "language_model"):
         parent_ref = model.language_model
     return parent_ref.model
+
+
+#: Key under which the declared aux-layer set is recorded in vLLM's
+#: ``additional_config``.  See :func:`_register_compile_cache_factor`.
+COMPILE_CACHE_FACTOR_KEY = "speedlm_capture_aux_hidden_state_layers"
+
+
+def _register_compile_cache_factor(runner: Any, declared: tuple[int, ...]) -> bool:
+    """Fold ``declared`` into vLLM's torch.compile cache key.
+
+    Declaring the extra aux layer before compilation is necessary but NOT
+    sufficient, and job 370927 is the proof: the declaration landed at the
+    right moment and the engine still ran a three-aux-layer forward, because
+    vLLM never compiled anything.  It found a cache hit and loaded a graph
+    compiled ninety minutes earlier by the *pre-fix* run (job 370798), which
+    had traced three aux layers.  The attribute said four, the replayed graph
+    emitted three, and the labelling guard refused -- the original production
+    error, reproduced verbatim by a fix that was itself correct.
+
+    The cause is that the compile cache key is
+    ``[env_hash, config_hash, code_hash, compiler_hash]``
+    (``vllm/compilation/backends.py:1054-1063``) and *none* of the four depends
+    on the live ``aux_hidden_state_layers`` tuple.  vLLM hashes only the
+    config-declared ``eagle_aux_hidden_state_layer_ids``
+    (``vllm/config/speculative.py:298-317``) -- precisely because the layer set
+    "affects the computation graph".  Our layer is appended imperatively, so it
+    is invisible to that hash and to the AOT key derived from the same
+    ``config_hash`` (``vllm/compilation/caching.py:565-581``).
+
+    Recording the set in ``additional_config``, which *is* hashed
+    (``vllm/config/vllm.py:473-483``), gives a four-layer engine its own cache
+    namespace.  A graph traced with three aux layers can then never be replayed
+    by an engine that declared four, in either direction.
+
+    Called from :meth:`_CaptureSession.declare`, i.e. inside ``load_model`` and
+    therefore before the first ``compute_hash`` call, which happens at the
+    first compile.
+
+    Returns:
+        True if the factor was registered.  False means the hazard is still
+        live -- ``additional_config`` was not a plain dict, or no config was
+        reachable -- and the caller must rely on the runtime stale-graph guard
+        in :meth:`_CaptureSession.intercept`.
+    """
+    vllm_config = getattr(runner, "vllm_config", None)
+    additional = getattr(vllm_config, "additional_config", None)
+    #: Only a plain dict may be mutated: the field is typed
+    #: ``dict | SupportsHash`` and a SupportsHash object computes its own hash
+    #: from fields we must not invent.
+    if not isinstance(additional, dict):
+        logger.warning(
+            "cannot record the declared aux layers %s in additional_config "
+            "(got %r); vLLM's torch.compile cache key will not distinguish "
+            "this engine from one compiled without the final aux layer, so a "
+            "warm cache may replay a stale graph",
+            declared, type(additional).__name__,
+        )
+        return False
+
+    additional[COMPILE_CACHE_FACTOR_KEY] = list(declared)
+    logger.info(
+        "Recorded declared aux layers %s under additional_config[%r] so the "
+        "torch.compile cache key distinguishes this graph",
+        declared, COMPILE_CACHE_FACTOR_KEY,
+    )
+    return True
 
 
 def _resolve_hook_point(runner_cls: Any) -> str:
@@ -314,6 +390,10 @@ class _CaptureSession:
         self.final_layer_idx = final_idx
         extended = current_layers + (final_idx,)
         model.set_aux_hidden_state_layers(extended)
+        #: Before the first compile, and therefore before the first
+        #: ``VllmConfig.compute_hash()``: declaring the layers is worthless if
+        #: vLLM then replays a cached graph traced with a different set.
+        _register_compile_cache_factor(runner, extended)
         self.declared = True
         logger.info(
             "Declared aux layers %s -> %s (added final layer %d) before "
@@ -350,6 +430,24 @@ class _CaptureSession:
                 )
             return
 
+        #: Stale-graph detection.  We declared one layer more than the drafter
+        #: needs, so a healthy graph emits ``expected + 1``.  Getting exactly
+        #: ``expected`` back means the forward being executed was never traced
+        #: with our declaration -- a replayed compile-cache entry, the failure
+        #: job 370927 hit.  Noting it on the FIRST forward, armed or not, is
+        #: what lets a caller find out from a disarmed warm-up pass -- the
+        #: labelling guard in ``buffer`` only fires once ARMED, and there it
+        #: propagates out of ``execute_model`` and kills EngineCore, which is
+        #: how a diagnosable cache-staleness bug became a dead engine and zero
+        #: artifacts.  The guard still fires for an already-armed engine; this
+        #: only makes the same fact visible earlier and more cheaply.
+        if (
+            self.final_layer_idx is not None
+            and self.unavailable is None
+            and len(aux_hidden_states) == expected
+        ):
+            self._note_stale_graph(len(aux_hidden_states))
+
         if self.active:
             self.buffer(runner, aux_hidden_states)
 
@@ -359,6 +457,32 @@ class _CaptureSession:
         #: extra state on every pass from warm-up onwards.
         if expected > 0 and len(aux_hidden_states) > expected:
             del aux_hidden_states[expected:]
+
+    def _note_stale_graph(self, produced: int) -> None:
+        """Record that the running graph predates our declaration.
+
+        Diagnosis only: it logs and sets :attr:`unavailable`, which makes
+        ``capture_info`` and ``activate_capture`` report the cause.  It
+        deliberately does NOT disarm and does NOT restore the layer tuple, so
+        an engine that is *already* armed still hits the labelling guard in
+        :meth:`buffer` and refuses the request rather than silently writing
+        rows keyed off the wrong layers.  The point is that a caller now learns
+        this from a disarmed warm-up forward, before arming, instead of from a
+        dead EngineCore.
+
+        Must not raise: the engine is mid-forward.
+        """
+        reason = (
+            f"the compiled forward produced {produced} aux hidden states, "
+            f"but the aux layers {self.original_aux_layers} plus final layer "
+            f"{self.final_layer_idx} were declared before compilation; the "
+            f"engine is replaying a torch.compile/CUDA-graph artifact that was "
+            f"traced without the final layer (a stale compile cache under "
+            f"VLLM_CACHE_ROOT).  Capture is disabled for this engine; rerun "
+            f"with VLLM_DISABLE_COMPILE_CACHE=1 or a cleared cache"
+        )
+        logger.error("%s", reason)
+        self.unavailable = reason
 
     def buffer(self, runner: Any, aux_hidden_states: list[Tensor]) -> None:
         """Buffer aux hidden states into the pending dict, keyed by layer index.
@@ -733,6 +857,14 @@ class ActivationCaptureExtension:
         """
         self._ensure_init()
         if not _SESSION.active or _SESSION.capture_dir is None:
+            #: An engine that :meth:`_CaptureSession._note_stale_graph` found
+            #: unable to capture is "not active" for a specific reason.
+            #: Reporting the bare sentence sends the reader back to the engine
+            #: log to find out why -- exactly the detour job 370927 forced.
+            if _SESSION.unavailable is not None:
+                raise RuntimeError(
+                    f"capture is not active: {_SESSION.unavailable}"
+                )
             raise RuntimeError("capture is not active")
 
         with self._get_lock():

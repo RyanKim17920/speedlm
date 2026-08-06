@@ -41,6 +41,8 @@ import pytest
 from speedlm.gate import runner as gate_runner
 from speedlm.gate.metrics import compute_delta, parse_metrics
 from speedlm.gateway.process import build_vllm_argv
+from speedlm.profiles import ModelProfile, resolve_profile, resolve_speculative_tokens
+from speedlm.tuner.composition import declared_draft_depth
 
 pytestmark = pytest.mark.e2e
 
@@ -55,7 +57,6 @@ REPEATS_PER_DRAFT: Final = 4
 BLOCKS_PER_DRAFT: Final = 2
 MAX_MODEL_LEN: Final = 4096
 MAX_TOKENS: Final = 128
-NUM_SPECULATIVE_TOKENS: Final = 5
 WARMUP_REPEATS: Final = 1
 
 DEFAULT_MAX_SLOWDOWN_PERCENT: Final = 5.0
@@ -152,6 +153,32 @@ def _require_live_configuration() -> LiveConfiguration:
     )
 
 
+def _resolve_matrix_depth(
+    configuration: LiveConfiguration,
+) -> tuple[ModelProfile, int]:
+    """Resolve one profile-owned draft depth shared by both matrix arms."""
+    profile = resolve_profile(served_model=configuration.model)
+    drafts: dict[Arm, str] = {
+        "stock": configuration.reference_draft,
+        "candidate": configuration.candidate_draft,
+    }
+    resolved_by_arm = {
+        arm: resolve_speculative_tokens(
+            explicit=profile.num_speculative_tokens,
+            drafter_declared=declared_draft_depth(draft),
+        )
+        for arm, draft in drafts.items()
+    }
+    reference_depth = resolved_by_arm["stock"]
+    candidate_depth = resolved_by_arm["candidate"]
+    assert reference_depth == candidate_depth, (
+        "reference and candidate must be served at the same speculative depth; "
+        f"resolved reference={reference_depth}, candidate={candidate_depth} "
+        f"for profile {profile.name!r}"
+    )
+    return profile, reference_depth
+
+
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
@@ -245,12 +272,14 @@ def _engine_argv(
     cell: MatrixCell,
     *,
     port: int,
+    num_speculative_tokens: int,
+    profile: ModelProfile,
 ) -> list[str]:
     speculative = json.dumps(
         {
             "method": "eagle3",
             "model": draft,
-            "num_speculative_tokens": NUM_SPECULATIVE_TOKENS,
+            "num_speculative_tokens": num_speculative_tokens,
         },
         separators=(",", ":"),
         sort_keys=True,
@@ -276,6 +305,11 @@ def _engine_argv(
     regime = _engine_regime(argv)
     assert regime["execution_mode"] == cell.execution_mode
     assert regime["max_model_len"] == MAX_MODEL_LEN
+    assert regime["num_speculative_tokens"] == profile.num_speculative_tokens, (
+        f"engine argv would serve {regime['num_speculative_tokens']} speculative "
+        f"tokens, but model profile {profile.name!r} declares "
+        f"{profile.num_speculative_tokens}"
+    )
     return argv
 
 
@@ -518,6 +552,8 @@ def _validate_context_band(cell: MatrixCell, summary: JsonObject) -> None:
 
 def _measure_cell(
     configuration: LiveConfiguration,
+    profile: ModelProfile,
+    num_speculative_tokens: int,
     cell: MatrixCell,
     prompts: Sequence[str],
     cell_dir: Path,
@@ -542,7 +578,14 @@ def _measure_cell(
             assert raw_arm == "candidate"
             arm = "candidate"
         port = _free_port()
-        argv = _engine_argv(configuration.model, drafts[arm], cell, port=port)
+        argv = _engine_argv(
+            configuration.model,
+            drafts[arm],
+            cell,
+            port=port,
+            num_speculative_tokens=num_speculative_tokens,
+            profile=profile,
+        )
         regime = _engine_regime(argv)
         block_dir = cell_dir / f"block-{block_index:02d}-{arm}"
         block_dir.mkdir(parents=True)
@@ -615,6 +658,7 @@ def _measure_cell(
             "execution_mode": cell.execution_mode,
             "request_concurrency": cell.concurrency,
             "context_length": cell.context_length,
+            "resolved_num_speculative_tokens": num_speculative_tokens,
         },
         "schedule": {
             "design": "mirrored rounds from speedlm.gate.runner._block_schedule",
@@ -681,9 +725,11 @@ def test_synthetic_throughput_regression_is_detected() -> None:
 
 def test_speculative_inference_configuration_matrix() -> None:
     configuration = _require_live_configuration()
+    profile, num_speculative_tokens = _resolve_matrix_depth(configuration)
     prompts = _prompts_by_context(_load_corpus(configuration.corpus))
     manifest: JsonObject = {
         "model": configuration.model,
+        "profile": profile.name,
         "reference_draft": configuration.reference_draft,
         "candidate_draft": configuration.candidate_draft,
         "corpus": str(configuration.corpus),
@@ -698,6 +744,7 @@ def test_speculative_inference_configuration_matrix() -> None:
             "blocks_per_draft": BLOCKS_PER_DRAFT,
             "warmup_repeats_per_block": WARMUP_REPEATS,
             "max_tokens": MAX_TOKENS,
+            "resolved_num_speculative_tokens": num_speculative_tokens,
             "throughput_statistic": "Prometheus generation tokens / decode seconds",
             "accepted_length_statistic": "1 + accepted tokens / draft steps",
         },
@@ -712,7 +759,14 @@ def test_speculative_inference_configuration_matrix() -> None:
     for cell in MATRIX:
         cell_dir = configuration.artifact_dir / cell.name
         cell_dir.mkdir(parents=True, exist_ok=True)
-        report = _measure_cell(configuration, cell, prompts[cell.context_length], cell_dir)
+        report = _measure_cell(
+            configuration,
+            profile,
+            num_speculative_tokens,
+            cell,
+            prompts[cell.context_length],
+            cell_dir,
+        )
         reports.append(report)
         cell_failures = report["regression_failures"]
         assert isinstance(cell_failures, list)

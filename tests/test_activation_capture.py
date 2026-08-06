@@ -857,7 +857,9 @@ class _FakeModelConfig:
 
 
 class _FakeVllmConfig:
-    model_config = _FakeModelConfig()
+    def __init__(self) -> None:
+        self.model_config = _FakeModelConfig()
+        self.additional_config: dict[str, object] = {}
 
 
 def _make_runner_cls(generation: str) -> type:
@@ -958,13 +960,23 @@ def _make_capture_extension(runner: object, *, reset: bool = True):
     return ext
 
 
-def _boot_engine(generation: str, *, graphed: bool = True):
+def _boot_engine(
+    generation: str, *, graphed: bool = True, stale_graph: bool = False
+):
     """Drive the real worker start-up order against a fake runner.
 
     import (bootstrap installs) -> load_model (declaration) -> graph capture.
     That order is the fix: everything the graph bakes in is decided before
     ``capture_model`` runs, so arming later cannot desynchronise them.
+
+    ``stale_graph=True`` instead traces the fake graph before declaration and
+    then replays that fixed aux count after declaration.  This models a graph
+    loaded from a cache populated by an older process: its trace happened in
+    the past with three aux layers even though this engine now advertises four.
     """
+    if stale_graph and not graphed:
+        raise ValueError("a stale cached graph is necessarily graphed")
+
     from speedlm.activation_capture import hook
 
     hook.reset_session()
@@ -972,8 +984,10 @@ def _boot_engine(generation: str, *, graphed: bool = True):
     hook.install_bootstrap([runner_cls])
 
     runner = runner_cls()
+    if stale_graph:
+        runner.capture_model()
     runner.load_model()
-    if graphed:
+    if graphed and not stale_graph:
         runner.capture_model()
 
     return runner_cls, runner, _make_capture_extension(runner, reset=False)
@@ -1159,13 +1173,64 @@ class TestCaptureOnAGraphedEngine:
         the alternative is keying four buffers off three tensors and writing
         mislabelled rows into a training cache.
         """
-        _, runner, ext = _boot_engine(generation)
-        runner.baked_aux_count = len(_CANONICAL_AUX_LAYERS)  # graph is stale
+        _, runner, ext = _boot_engine(generation, stale_graph=True)
 
         ext.activate_capture(str(tmp_path / "cap"))
 
         with pytest.raises(RuntimeError, match="labelling cannot be trusted"):
             runner.drive()
+
+    @pytest.mark.parametrize("generation", RUNNER_GENERATIONS)
+    @pytest.mark.parametrize("armed", [False, True], ids=["disarmed", "armed"])
+    def test_stale_graph_sets_unavailable_on_the_first_forward(
+        self, generation: str, armed: bool, tmp_path: Path
+    ) -> None:
+        """Cache staleness is diagnosed before buffering, in either state."""
+        _, runner, ext = _boot_engine(generation, stale_graph=True)
+        assert ext.capture_info()["unavailable"] is None
+
+        if armed:
+            ext.activate_capture(str(tmp_path / "cap"))
+            with pytest.raises(RuntimeError, match="labelling cannot be trusted"):
+                runner.drive()
+        else:
+            runner.drive()
+
+        info = ext.capture_info()
+        assert info["armed"] is armed
+        assert info["unavailable"] is not None
+        assert "produced 3 aux hidden states" in info["unavailable"]
+        assert "stale compile cache" in info["unavailable"]
+
+    @pytest.mark.parametrize("generation", RUNNER_GENERATIONS)
+    def test_stale_graph_does_not_disarm_or_restore_the_layer_tuple(
+        self, generation: str, tmp_path: Path
+    ) -> None:
+        """An armed mismatch must still reach the existing labelling guard."""
+        _, runner, ext = _boot_engine(generation, stale_graph=True)
+        declared = runner.model.model.aux_hidden_state_layers
+        ext.activate_capture(str(tmp_path / "cap"))
+
+        with pytest.raises(RuntimeError, match="labelling cannot be trusted"):
+            runner.drive()
+
+        assert ext.capture_info()["armed"] is True
+        assert runner.model.model.aux_hidden_state_layers == declared
+
+    @pytest.mark.parametrize("generation", RUNNER_GENERATIONS)
+    def test_flush_surfaces_the_stale_graph_reason(
+        self, generation: str
+    ) -> None:
+        """Flush reports why capture is unavailable, not only its state."""
+        _, runner, ext = _boot_engine(generation, stale_graph=True)
+        runner.drive()
+        reason = ext.capture_info()["unavailable"]
+        assert reason is not None
+
+        with pytest.raises(RuntimeError) as exc_info:
+            ext.flush_capture()
+
+        assert str(exc_info.value) == f"capture is not active: {reason}"
 
     @pytest.mark.parametrize("generation", RUNNER_GENERATIONS)
     def test_arming_without_a_declaration_refuses(
