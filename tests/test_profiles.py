@@ -1254,3 +1254,484 @@ def test_every_builtin_profile_trains_to_the_depth_its_schedule_reaches() -> Non
             training_steps=profile.max_served_speculative_tokens,
             serving_schedule=profile.speculative_schedule,
         )
+
+
+# ---------------------------------------------------------------------------
+# A brand-new model, declared only in user JSON.
+#
+# Everything above proves the *error* path (an unknown verifier raises) and the
+# *override* path (a user file replacing a built-in by name).  Neither proves
+# the path the product's generality claim actually rests on: an operator points
+# SpeedLM at a model SpeedLM has never heard of, declares it in a JSON file, and
+# the whole resolution chain works with no code change.  These tests are that
+# path, from the file on disk to the argv the engine would be launched with.
+# ---------------------------------------------------------------------------
+
+#: A vendor and model that appear in no built-in profile.  Deliberately not a
+#: real Hub repository: nothing in this section may reach the network, so the
+#: name must be one that could never accidentally resolve to a cached snapshot.
+NEW_VERIFIER = "vertexis/Atlas-7B-Instruct"
+NEW_DRAFTER = "vertexis/Atlas-7B-Instruct-speculator.eagle3"
+NEW_PROFILE_NAME = "atlas-7b-instruct-eagle3"
+
+#: The JSON an operator would write.  Every optional field is populated, because
+#: an optional field left unset proves nothing about whether it is reachable.
+NEW_PROFILE_JSON: dict[str, object] = {
+    "name": NEW_PROFILE_NAME,
+    "verifier_model": NEW_VERIFIER,
+    "draft_model": NEW_DRAFTER,
+    "speculative_method": "eagle3",
+    "num_speculative_tokens": 4,
+    "target_layer_ids": [3, 11, 19, 25],
+    "chat_template_kind": "chatml",
+    "max_seq_len": 8192,
+    "num_hidden_layers": 28,
+    "max_scratch_bytes": 123_456_789,
+    "tool_call_parser": "atlas_xml",
+    "reasoning_parser": "atlas_think",
+    "speculative_schedule": [[1, 4, 2], [5, 64, 4]],
+}
+
+#: What each declared key must become on the resolved :class:`ModelProfile`.
+#: Keyed by dataclass field name so the structural test below can assert this
+#: covers every field -- a new field with no expectation here is a field nobody
+#: has proved reachable.
+NEW_PROFILE_EXPECTED: dict[str, object] = {
+    "name": NEW_PROFILE_NAME,
+    "verifier_model": NEW_VERIFIER,
+    "draft_model": NEW_DRAFTER,
+    "speculative_method": "eagle3",
+    "num_speculative_tokens": 4,
+    "target_layer_ids": (3, 11, 19, 25),
+    "chat_template_kind": "chatml",
+    "max_seq_len": 8192,
+    "num_hidden_layers": 28,
+    "max_scratch_bytes": 123_456_789,
+    "tool_call_parser": "atlas_xml",
+    "reasoning_parser": "atlas_think",
+    "speculative_schedule": ((1, 4, 2), (5, 64, 4)),
+    "trainable": True,
+}
+
+
+def _new_model_profile(home: Path) -> ModelProfile:
+    """Write the new-model JSON under *home* and return the loaded profile."""
+
+    _write_profile(home, "atlas.json", dict(NEW_PROFILE_JSON))
+    registry = load_profiles(home)
+    return registry[NEW_PROFILE_NAME]
+
+
+def test_a_model_with_no_builtin_profile_is_declarable_purely_in_json(
+    tmp_path: Path,
+) -> None:
+    """The success path: a new model added by a file, not by a code change."""
+
+    assert NEW_PROFILE_NAME not in BUILTIN_PROFILES
+    assert all(
+        builtin.verifier_model != NEW_VERIFIER for builtin in BUILTIN_PROFILES.values()
+    )
+
+    _write_profile(tmp_path, "atlas.json", dict(NEW_PROFILE_JSON))
+    registry = load_profiles(tmp_path)
+
+    # Added, not substituted: every built-in survives alongside it.
+    assert len(registry) == len(BUILTIN_PROFILES) + 1
+    for name, builtin in BUILTIN_PROFILES.items():
+        assert registry[name] == builtin
+    assert NEW_PROFILE_NAME in registry
+
+
+def test_every_declared_field_arrives_on_the_resolved_profile(
+    tmp_path: Path,
+) -> None:
+    """Assume nothing is reachable until the declared value has been seen.
+
+    The loop is over the dataclass's own fields rather than a hand-written list
+    of assertions, so a field added to :class:`ModelProfile` and never proved
+    loadable fails here instead of shipping unreachable.
+    """
+
+    profile = _new_model_profile(tmp_path)
+
+    assert set(NEW_PROFILE_EXPECTED) == profiles_module.PROFILE_FIELD_NAMES
+    for field_name in sorted(profiles_module.PROFILE_FIELD_NAMES):
+        assert getattr(profile, field_name) == NEW_PROFILE_EXPECTED[field_name], (
+            f"{field_name} did not survive the JSON round trip"
+        )
+
+    # And the reverse direction: nothing is dropped on the way back out.
+    assert profile.to_dict() == {**NEW_PROFILE_JSON, "trainable": True}
+
+
+def test_the_new_model_resolves_by_profile_name(tmp_path: Path) -> None:
+    _new_model_profile(tmp_path)
+
+    resolved = resolve_profile(
+        {"model": "some/other-model", "profile": NEW_PROFILE_NAME},
+        home=tmp_path,
+    )
+    assert resolved.name == NEW_PROFILE_NAME
+    assert resolved.verifier_model == NEW_VERIFIER
+
+
+def test_the_new_model_resolves_by_config_model_verifier_string(
+    tmp_path: Path,
+) -> None:
+    """Resolution by ``config.model``, not only by an explicit profile name.
+
+    This is the shape a deployment actually has: the operator names the model
+    they are serving and never names a profile at all.
+    """
+
+    _new_model_profile(tmp_path)
+
+    resolved = resolve_profile({"model": NEW_VERIFIER, "profile": None}, home=tmp_path)
+
+    assert resolved.name == NEW_PROFILE_NAME
+    assert resolved.draft_model == NEW_DRAFTER
+
+
+def test_the_new_model_resolves_by_served_model_and_by_cache_path(
+    tmp_path: Path,
+) -> None:
+    _new_model_profile(tmp_path)
+
+    by_served = resolve_profile(served_model=NEW_VERIFIER, home=tmp_path)
+    assert by_served.name == NEW_PROFILE_NAME
+
+    snapshot = (
+        "/data/hf-cache/hub/models--vertexis--Atlas-7B-Instruct/snapshots/abc123"
+    )
+    by_snapshot = resolve_profile(served_model=snapshot, home=tmp_path)
+    assert by_snapshot.name == NEW_PROFILE_NAME
+
+
+def test_the_new_models_declared_depth_and_schedule_reach_the_engine_fragment(
+    tmp_path: Path,
+) -> None:
+    """The vLLM speculative-config fragment carries the declared values."""
+
+    profile = _new_model_profile(tmp_path)
+
+    assert profile.speculative_config() == {
+        "method": "eagle3",
+        "num_speculative_tokens": 4,
+        "model": NEW_DRAFTER,
+        "num_speculative_tokens_per_batch_size": [[1, 4, 2], [5, 64, 4]],
+    }
+    assert profile.max_served_speculative_tokens == 4
+
+
+def test_the_new_models_declared_depth_drives_the_training_depth(
+    tmp_path: Path,
+) -> None:
+    profile = _new_model_profile(tmp_path)
+
+    training_depth = resolve_speculative_tokens(
+        explicit=profile.num_speculative_tokens,
+        drafter_declared=None,
+    )
+    assert training_depth == 4
+
+    validate_training_depth(
+        profile_name=profile.name,
+        serving_tokens=profile.num_speculative_tokens,
+        training_steps=training_depth,
+        serving_schedule=profile.speculative_schedule,
+    )
+    with pytest.raises(SpeculativeDepthError, match="3-deep"):
+        validate_training_depth(
+            profile_name=profile.name,
+            serving_tokens=profile.num_speculative_tokens,
+            training_steps=3,
+            serving_schedule=profile.speculative_schedule,
+        )
+
+
+def test_the_new_models_declared_aux_layers_drive_the_resolver(
+    tmp_path: Path,
+) -> None:
+    """``target_layer_ids`` and ``num_hidden_layers`` reach the aux resolver.
+
+    This is the call ``build_tuning_launch_plan`` makes: the profile's pin goes
+    *through* the resolver so it is cross-checked against the drafter's arity
+    rather than trusted.
+    """
+
+    profile = _new_model_profile(tmp_path)
+
+    resolved = resolve_target_layer_ids(
+        explicit=profile.target_layer_ids,
+        num_hidden_layers=profile.num_hidden_layers,
+        drafter_aux_count=4,
+    )
+    assert resolved == (3, 11, 19, 25)
+
+    # The declared layer count is what bounds them.
+    with pytest.raises(AuxLayerError, match="28 hidden layers"):
+        resolve_target_layer_ids(
+            explicit=(3, 11, 19, 99),
+            num_hidden_layers=profile.num_hidden_layers,
+            drafter_aux_count=4,
+        )
+
+    # And with no pin, the declared depth is what the spread is computed over.
+    derived = resolve_target_layer_ids(
+        explicit=None,
+        num_hidden_layers=profile.num_hidden_layers,
+        drafter_aux_count=4,
+    )
+    assert derived == spread_aux_layers(4, 28)
+    assert max(derived) < profile.num_hidden_layers
+
+
+def test_the_new_models_max_seq_len_caps_the_training_window(
+    tmp_path: Path,
+) -> None:
+    """``max_seq_len`` reaches the window a cycle would actually train on.
+
+    ``tuning.sequence_length`` defaults to 16384; the declared 8192 is lower, so
+    a profile that failed to reach ``training_sequence_length`` would show up as
+    16384 here.
+    """
+
+    from speedlm.tuner.composition import (
+        resolve_context_window_alignment,
+        training_sequence_length,
+    )
+
+    profile = _new_model_profile(tmp_path)
+    config = SpeedLMConfig(model=NEW_VERIFIER)
+    assert config.tuning.sequence_length == 16_384
+
+    assert training_sequence_length(config, profile) == 8192
+
+    aligned = resolve_context_window_alignment(
+        config,
+        profile,
+        ["--max-model-len", "8192"],
+        policy="record",
+    )
+    assert aligned.training_tokens == 8192
+    assert aligned.serving_tokens == 8192
+    assert aligned.source == "passthrough"
+    assert aligned.aligned is True
+
+    skewed = resolve_context_window_alignment(
+        config,
+        profile,
+        ["--max-model-len", "65536"],
+        policy="record",
+    )
+    assert skewed.aligned is False
+    assert skewed.ratio == 8.0
+    assert skewed.as_manifest_fields()["training_sequence_length"] == 8192
+
+
+def test_the_new_models_declared_parsers_win_over_auto_detection(
+    tmp_path: Path,
+) -> None:
+    """The declared parser names arrive as profile pins, not as guesses."""
+
+    profile = _new_model_profile(tmp_path)
+
+    resolution = resolve_model_parsers(
+        NEW_VERIFIER,
+        (),
+        model_type="atlas",
+        profile=profile,
+        registry=ParserRegistry(
+            tool_parsers=("hermes",),
+            reasoning_parsers=("deepseek_r1",),
+        ),
+    )
+    assert resolution.tool_call_parser == "atlas_xml"
+    assert resolution.tool_call_parser_source == "profile-pinned"
+    assert resolution.reasoning_parser == "atlas_think"
+    assert resolution.reasoning_parser_source == "profile-pinned"
+
+
+def test_the_new_model_reaches_the_vllm_argv_the_gateway_would_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """As far downstream as this goes without a GPU: the serving argv itself.
+
+    ``speedlm vllm serve`` builds its child argv from
+    ``_profiled_vllm_passthrough`` plus ``build_vllm_argv``.  Both are pure, so
+    the declared parsers and the declared speculative config can be shown to
+    land in the exact argument list a real launch would use.
+    """
+
+    from speedlm.cli import _profiled_vllm_passthrough
+    from speedlm.gateway.process import build_vllm_argv
+
+    profile = _new_model_profile(tmp_path)
+
+    # No network and no cache lookup: this model exists nowhere but the JSON.
+    monkeypatch.setattr(
+        profiles_module,
+        "read_model_type",
+        lambda model, allow_remote=False: None,
+    )
+    monkeypatch.setattr(
+        profiles_module,
+        "discover_vllm_parser_registry",
+        ParserRegistry,
+    )
+
+    passthrough = _profiled_vllm_passthrough(
+        NEW_VERIFIER,
+        [],
+        profile=profile,
+        home=tmp_path,
+    )
+    argv = build_vllm_argv(
+        NEW_VERIFIER,
+        [
+            *passthrough,
+            "--speculative-config",
+            json.dumps(profile.speculative_config(), sort_keys=True),
+        ],
+        host="127.0.0.1",
+        port=8000,
+    )
+
+    assert argv[:3] == ["vllm", "serve", NEW_VERIFIER]
+    assert "--enable-auto-tool-choice" in argv
+    assert argv[argv.index("--tool-call-parser") + 1] == "atlas_xml"
+    assert argv[argv.index("--reasoning-parser") + 1] == "atlas_think"
+    speculative = json.loads(argv[argv.index("--speculative-config") + 1])
+    assert speculative["model"] == NEW_DRAFTER
+    assert speculative["num_speculative_tokens"] == 4
+    assert speculative["num_speculative_tokens_per_batch_size"] == [
+        [1, 4, 2],
+        [5, 64, 4],
+    ]
+
+
+def test_a_new_model_profile_is_still_validated(tmp_path: Path) -> None:
+    """Generality is not permissiveness: the new-model path still refuses junk."""
+
+    broken = dict(NEW_PROFILE_JSON)
+    broken["target_layer_ids"] = [3, 11, 11]
+    _write_profile(tmp_path, "atlas.json", broken)
+    with pytest.raises(ProfileError, match="target_layer_ids"):
+        load_profiles(tmp_path)
+
+
+# ---------------------------------------------------------------------------
+# Structural checks on the from_dict key sets.
+# ---------------------------------------------------------------------------
+
+
+def test_the_profile_allow_list_is_derived_from_the_dataclass() -> None:
+    """A hand-maintained allow-list is a copy of a structure, and copies drift.
+
+    Modelled on ``tests/test_config.py``'s structural tests, which derive the
+    config section keys from ``dataclasses.fields`` for the same reason: the
+    promotion allow-list once omitted a documented, validated field and made it
+    unsettable from JSON.
+    """
+
+    import dataclasses
+
+    field_names = {f.name for f in dataclasses.fields(ModelProfile)}
+
+    assert field_names == profiles_module.PROFILE_FIELD_NAMES
+    assert field_names >= profiles_module.REQUIRED_PROFILE_KEYS
+    # to_dict is the other half of the same contract.
+    assert set(GPT_OSS_EAGLE3_PROFILE.to_dict()) == field_names
+
+
+def test_every_dataclass_field_is_actually_accepted_by_from_dict() -> None:
+    """Derivation is only worth having if the derived set is honoured."""
+
+    import dataclasses
+
+    complete = {**NEW_PROFILE_JSON, "trainable": True}
+    assert set(complete) == {f.name for f in dataclasses.fields(ModelProfile)}
+
+    profile = ModelProfile.from_dict(complete)
+
+    assert profile.name == NEW_PROFILE_NAME
+    assert profile.trainable is True
+
+
+def test_an_unknown_profile_key_is_still_rejected() -> None:
+    data = {**NEW_PROFILE_JSON, "_structural_test_fake_key_xyz": 1}
+
+    with pytest.raises(ProfileError, match="unknown keys: _structural_test_fake_key_xyz"):
+        ModelProfile.from_dict(data)
+
+
+def test_a_missing_required_key_is_still_rejected() -> None:
+    data = dict(NEW_PROFILE_JSON)
+    del data["draft_model"]
+
+    with pytest.raises(ProfileError, match="missing required keys: draft_model"):
+        ModelProfile.from_dict(data)
+
+
+def test_a_contradicting_trainable_is_still_rejected() -> None:
+    data = {**NEW_PROFILE_JSON, "trainable": False}
+
+    with pytest.raises(ProfileError, match="trainable must be True"):
+        ModelProfile.from_dict(data)
+
+
+def test_every_built_in_chat_template_is_declarable_in_a_profile() -> None:
+    """``chat_template_kind`` must be able to name every shipped template.
+
+    ``CHAT_TEMPLATE_KINDS`` is a hand-written frozenset while the templates are
+    classes carrying their own ``name``.  A template added to
+    ``speedlm.training.templates`` without a matching kind would be a renderer
+    no profile could ever select, so the link is asserted rather than assumed.
+    ``auto`` has no class by design -- it defers to the tokenizer -- so this is
+    a subset check, not an equality.
+    """
+
+    from speedlm.training import templates as templates_module
+    from speedlm.training.templates.base import ChatTemplate
+
+    exported = [
+        getattr(templates_module, attribute) for attribute in templates_module.__all__
+    ]
+    template_names = {
+        candidate.name
+        for candidate in exported
+        if isinstance(candidate, type)
+        and candidate is not ChatTemplate
+        and isinstance(getattr(candidate, "name", None), str)
+    }
+
+    assert template_names, "no chat templates were discovered"
+    undeclarable = template_names - profiles_module.CHAT_TEMPLATE_KINDS
+    assert not undeclarable, (
+        f"chat templates no profile can select: {sorted(undeclarable)}"
+    )
+
+
+def test_default_aux_layers_has_no_production_caller() -> None:
+    """The hardcoded ``k == 3`` in ``default_aux_layers`` is a dead fallback.
+
+    ``resolve_target_layer_ids`` is the live path and reads the drafter's own
+    aux arity (``build_tuning_launch_plan`` passes ``drafter_aux_count``).
+    ``default_aux_layers`` is documented as deprecated and is called by nothing
+    under ``src/``; this pins that, so re-introducing a caller -- and with it a
+    silently 3-way spread for a drafter that fuses a different number of aux
+    states -- fails here rather than at drafter load time.
+    """
+
+    import re
+
+    source_root = Path(profiles_module.__file__).parent
+    call = re.compile(r"(?<!def )\bdefault_aux_layers\s*\(")
+    callers = [
+        str(path.relative_to(source_root))
+        for path in sorted(source_root.rglob("*.py"))
+        if call.search(path.read_text(encoding="utf-8"))
+    ]
+
+    assert callers == [], f"default_aux_layers has production callers: {callers}"

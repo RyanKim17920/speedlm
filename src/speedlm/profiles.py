@@ -15,7 +15,7 @@ import os
 import re
 import shutil
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Final, Literal, Protocol, cast
@@ -387,24 +387,8 @@ class ModelProfile:
         if not isinstance(data, Mapping):
             raise ProfileError(f"{source}: profile must be a JSON object")
 
-        required = {
-            "name",
-            "verifier_model",
-            "draft_model",
-            "speculative_method",
-            "num_speculative_tokens",
-            "chat_template_kind",
-            "max_seq_len",
-        }
-        allowed = required | {
-            "target_layer_ids",
-            "num_hidden_layers",
-            "max_scratch_bytes",
-            "tool_call_parser",
-            "reasoning_parser",
-            "speculative_schedule",
-            "trainable",
-        }
+        required = REQUIRED_PROFILE_KEYS
+        allowed = PROFILE_FIELD_NAMES
         missing = required - set(data)
         if missing:
             raise ProfileError(f"{source}: missing required keys: {', '.join(sorted(missing))}")
@@ -507,6 +491,49 @@ class ModelProfile:
                     f"method {profile.speculative_method!r}"
                 )
         return profile
+
+
+#: Every key :meth:`ModelProfile.from_dict` will accept, derived from the
+#: dataclass rather than hand-listed.
+#:
+#: A hand-maintained allow-list is a copy of a structure, and copies drift.
+#: This project has already shipped that exact bug once on the config side:
+#: ``PromotionConfig.min_accepted_length_delta`` existed, was validated in
+#: ``__post_init__`` and was documented as settable, but was missing from the
+#: promotion allow-list, so every attempt to set it from JSON raised
+#: ``unknown keys in promotion``.  A field added to :class:`ModelProfile` is by
+#: definition part of the profile contract, so deriving the allow-list makes
+#: that class of defect unrepresentable instead of merely tested for.
+#:
+#: ``trainable`` is included because it is a real dataclass field: it is
+#: ``init=False`` and derived from ``speculative_method``, and ``to_dict``
+#: emits it, so a round-trip of a profile through JSON must be accepted back.
+#: ``from_dict`` still rejects a declared value that contradicts the derived
+#: one -- accepting the key is not the same as honouring it.
+PROFILE_FIELD_NAMES: Final[frozenset[str]] = frozenset(
+    profile_field.name for profile_field in fields(ModelProfile)
+)
+
+#: The keys a profile JSON object must carry.
+#:
+#: Deliberately *not* derived.  Which fields are mandatory is a semantic
+#: choice, not a structural fact: ``draft_model`` is required even though it
+#: may be null, because a profile that simply omits it is far more likely to be
+#: an author who forgot their drafter than one who meant "no drafter", and the
+#: optional fields all have defaults that are safe to leave unstated.  A
+#: structural test pins this set as a subset of the dataclass fields so a typo
+#: or a renamed field cannot make a key required that no longer exists.
+REQUIRED_PROFILE_KEYS: Final[frozenset[str]] = frozenset(
+    {
+        "name",
+        "verifier_model",
+        "draft_model",
+        "speculative_method",
+        "num_speculative_tokens",
+        "chat_template_kind",
+        "max_seq_len",
+    }
+)
 
 
 def spread_aux_layers(k: int, n: int) -> tuple[int, ...]:
