@@ -13,6 +13,7 @@ from speedlm.gate.decide import (
     DIVERGENCE_STATISTICS,
     DispersionBasis,
     Reason,
+    TruncationRegime,
     Verdict,
 )
 from speedlm.report import (
@@ -672,7 +673,49 @@ def test_load_decision_roundtrip(home: Path) -> None:
 
     loaded = decision.to_dict()
     original = _decision_dict()
-    assert {k: loaded[k] for k in original} == original
+    assert {
+        **{k: loaded[k] for k in original if k != "per_repeat"},
+        "per_repeat": [
+            {k2: row[k2] for k2 in original["per_repeat"][0]}
+            for row in loaded["per_repeat"]
+        ],
+    } == original
+
+
+def test_archived_per_repeat_row_lacking_truncation_fields_reads_as_untestable(
+    home: Path,
+) -> None:
+    """An archived per_repeat row whose four new truncation columns are absent
+    must parse to zeros, and the Decision must classify both arms as
+    ``TruncationRegime.UNTESTABLE`` -- not as ``BOUNDED``.
+
+    The distinction is critical: ``UNTESTABLE`` says "no finish reasons were
+    recorded, so we cannot tell"; ``BOUNDED`` says "finish reasons were
+    recorded and most stopped naturally".  An archived record that never
+    persisted the counts must never be silently relabelled as "measured, and
+    truncation was low".
+    """
+    payload = _decision_dict()
+    assert "stock_finish_reasons" not in payload["per_repeat"][0]
+    path = _write_decision(home, payload)
+
+    decision = load_decision(path)
+
+    for row in decision.per_repeat:
+        assert row.stock_finish_reasons == 0
+        assert row.candidate_finish_reasons == 0
+        assert row.stock_truncated == 0
+        assert row.candidate_truncated == 0
+
+    assert (
+        decision.stock_truncation_regime is TruncationRegime.UNTESTABLE
+    ), "stock arm must be UNTESTABLE, not BOUNDED"
+    assert (
+        decision.candidate_truncation_regime is TruncationRegime.UNTESTABLE
+    ), "candidate arm must be UNTESTABLE, not BOUNDED"
+    assert decision.stock_truncation_rate is None
+    assert decision.candidate_truncation_rate is None
+    assert decision.truncation_rate_delta is None
 
 
 def test_loading_a_pre_pinned_decision_labels_the_statistic_it_gated_on(
@@ -785,7 +828,13 @@ def test_measurement_context_survives_a_decision_round_trip(home: Path) -> None:
     assert decision.num_contexts == 103
     assert decision.stock_draft == "/runs/artifacts/incumbent"
     reloaded = decision.to_dict()
-    assert {key: reloaded[key] for key in payload} == payload
+    assert {
+        **{key: reloaded[key] for key in payload if key != "per_repeat"},
+        "per_repeat": [
+            {k2: row[k2] for k2 in payload["per_repeat"][0]}
+            for row in reloaded["per_repeat"]
+        ],
+    } == payload
 
 
 def test_a_decision_predating_the_measurement_context_stays_readable(

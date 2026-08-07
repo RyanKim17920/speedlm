@@ -36,7 +36,12 @@ from simulation.harness import (
     simulation_config,
 )
 from speedlm.config import PromotionConfig
-from speedlm.gate.decide import DispersionBasis, Reason, Verdict
+from speedlm.gate.decide import (
+    DispersionBasis,
+    Reason,
+    TruncationRegime,
+    Verdict,
+)
 from speedlm.gate.runner import BenchmarkGateRunner
 from speedlm.gate.suite import SuiteError
 from speedlm.tuner.orchestrator import GateFailure
@@ -537,7 +542,7 @@ class TestMeasuredRejections:
             assert decision.reason is Reason.HIGH_INVALID_RATE
             assert max(r.invalid_rate for r in decision.per_repeat) > 0.1
 
-    def test_a_reasoning_model_truncated_at_the_cap_is_not_a_flaky_engine(
+    def test_a_reasoning_model_at_the_cap_is_healthy_but_measured_nothing(
         self, tmp_path: Path
     ) -> None:
         """SLURM 369147: ``high_invalid_rate 0.7379`` on a healthy engine.
@@ -545,10 +550,23 @@ class TestMeasuredRejections:
         Both arms are thinking models whose generations run past
         ``benchmark_max_tokens``, so every held-out response comes back with
         ``content: null`` and ``finish_reason: "length"``.  Under the old
-        predicate that was a 100% invalid rate and an automatic rejection.  The
-        engine generated the full 512 tokens for each one and its acceptance
-        counters moved exactly as dialled, so the gate must measure and judge on
-        the merits -- here, promote.
+        predicate that was a 100% invalid rate and an automatic rejection.  That
+        was wrong and stays wrong: the engine generated the full 512 tokens for
+        each one and its acceptance counters moved exactly as dialled, so
+        ``invalid_rate`` is 0.0 in every repeat and nothing here is flaky.
+        Reasoning text arriving in the reasoning channel is not a fault.
+
+        The engine being healthy is not the same as the run being informative,
+        and this scenario is the extreme where the two part company.  With
+        ``completion_tokens=4096`` against ``benchmark_max_tokens=512``, the
+        harness ended *literally every* generation: the run observed nothing
+        whatsoever about where this model stops, so its throughput figure
+        describes the cap rather than the workload and cannot support a
+        promotion.  That is a measurement rejection --
+        ``TRUNCATION_SATURATED``, in the same family as ``COUNTER_RESET`` --
+        and not a verdict against the head.  See
+        :class:`~speedlm.gate.decide.TruncationRegime`; the sibling test below
+        is the same reasoning model with natural stops present, which promotes.
         """
         stock, candidate = _profiles()
         stock = replace(stock, completion_tokens=4096, reasoning_model=True)
@@ -560,8 +578,60 @@ class TestMeasuredRejections:
 
             decision = result.decision
             assert decision is not None
+            # The claim this test was written to defend, unchanged.
             assert all(r.invalid_rate == 0.0 for r in decision.per_repeat)
             assert decision.reason is not Reason.HIGH_INVALID_RATE
+            # The claim it now also records.
+            assert decision.stock_truncation_regime is TruncationRegime.SATURATED
+            assert decision.candidate_truncation_regime is TruncationRegime.SATURATED
+            assert decision.reason is Reason.TRUNCATION_SATURATED
+            assert decision.verdict is Verdict.REJECT
+
+    def test_a_reasoning_model_with_natural_stops_still_promotes(
+        self, tmp_path: Path
+    ) -> None:
+        """The regression guard on the check above: it must not be over-broad.
+
+        Identical to it in every respect -- same thinking models, same 15 pp
+        acceptance lift, same 512-token cap they mostly run past -- except that
+        one generation in five ends on the model's own terms.  That is the
+        regime every archived live run sits in (SLURM 8b72d9a: 92.2% and 85.3%
+        of responses at ``length``, the remainder stopping by themselves), and
+        it must still be measurable: the natural stops bound how much of the
+        length distribution the cap clipped, which is exactly what the
+        saturated run had none of.
+
+        Without this test, ``TRUNCATION_SATURATED`` could be widened to any
+        majority-truncated run and the suite would stay green while the gate
+        stopped promoting anything measured on realistic traffic.
+        """
+        stock, candidate = _profiles()
+        # 256 sits below ``benchmark_max_tokens`` (512), so the natural stop is
+        # real on the throughput pass, and at or above ``correctness_max_tokens``
+        # (128), so the single-stream correctness pass is untouched and both
+        # arms still emit identical text there.
+        mixture = {
+            "completion_tokens": 4096,
+            "reasoning_model": True,
+            "natural_stop_every": 5,
+            "natural_stop_tokens": 256,
+        }
+        stock = replace(stock, **mixture)
+        candidate = replace(candidate, **mixture)
+        with _fixture(tmp_path, stock, candidate) as fixture:
+            result = fixture.gate().benchmark(
+                fixture.candidate, timeout_seconds=600.0, should_abort=lambda: False
+            )
+
+            decision = result.decision
+            assert decision is not None
+            assert all(r.invalid_rate == 0.0 for r in decision.per_repeat)
+            assert decision.stock_truncation_regime is TruncationRegime.MIXED
+            assert decision.candidate_truncation_regime is TruncationRegime.MIXED
+            # Heavily truncated, and still judged on the merits.
+            assert decision.stock_truncation_rate == pytest.approx(0.8, abs=1e-9)
+            assert decision.candidate_truncation_rate == pytest.approx(0.8, abs=1e-9)
+            assert decision.reason is Reason.BOTH_THRESHOLDS_MET
             assert decision.verdict is Verdict.PROMOTE
             assert decision.acceptance_delta_pp == pytest.approx(15.0, abs=1e-4)
 

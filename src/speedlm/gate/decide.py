@@ -44,6 +44,68 @@ class StationarityStatus(Enum):
     NON_STATIONARY = "non_stationary"
 
 
+class TruncationRegime(Enum):
+    """What the output cap did to the generations a decision was measured over.
+
+    ``finish_reason`` was recorded on every replayed request from the day the
+    replay path was written and read by nothing: a run in which the harness
+    ended *every* generation reported ``invalid_rate 0.0`` and was gated as
+    though it had measured the workload.  It had not -- it had measured
+    fixed-length decode.  This is the type that says which.
+
+    The states are ordered by how much of the workload's own stopping behaviour
+    survived into the measurement, and the boundaries are counts rather than
+    tuned fractions:
+
+    * :attr:`UNTESTABLE` -- no response reported a finish reason at all.  Every
+      archived decision reads this, because none of them persisted the counts;
+      it must never be collapsed into ``BOUNDED``, which is the claim that
+      truncation was *measured* and was low.
+    * :attr:`SATURATED` -- finish reasons were reported and **not one**
+      generation ended on the model's own terms.  Zero, not "few": at zero the
+      run contains no observation whatsoever of where this model stops, so no
+      throughput figure from it can be attributed to the workload rather than
+      to ``benchmark_max_tokens``.  This is the only state that gates.
+    * :attr:`MIXED` -- most generations hit the cap, but some did not.  The
+      measurement is dominated by the cap and is still interpretable, because
+      the natural stops bound how much of the distribution was clipped.  This
+      is the state the archived live runs sit in: SLURM 8b72d9a captured 1889
+      of 2049 Qwen3-8B responses and 1747 of 2049 gpt-oss-20b responses at
+      ``length``, i.e. 92.2% and 85.3%.
+    * :attr:`BOUNDED` -- most generations stopped by themselves; the cap was
+      not the binding constraint on length.
+
+    A regime is not a verdict on the draft head.  Truncation is a property of
+    the harness configuration, and the same head measured under a larger cap
+    would report a different one.
+    """
+
+    UNTESTABLE = "untestable"
+    BOUNDED = "bounded"
+    MIXED = "mixed"
+    SATURATED = "saturated"
+
+
+def classify_truncation(*, reported: int, truncated: int) -> TruncationRegime:
+    """Classify one arm's truncation from its pooled finish-reason counts.
+
+    Args:
+        reported: Responses that carried a finish reason at all.
+        truncated: Of those, the ones that reported ``length``.
+    """
+    if reported <= 0:
+        return TruncationRegime.UNTESTABLE
+    natural_stops = reported - truncated
+    if natural_stops <= 0:
+        return TruncationRegime.SATURATED
+    # A majority boundary, and deliberately a description rather than a
+    # threshold: nothing gates on the MIXED/BOUNDED split, so it carries none
+    # of the calibration burden that ``SATURATED``'s exact zero avoids.
+    if truncated * 2 > reported:
+        return TruncationRegime.MIXED
+    return TruncationRegime.BOUNDED
+
+
 class Reason(Enum):
     """Enumerated reasons for a verdict."""
     BOTH_THRESHOLDS_MET = "both_thresholds_met"
@@ -53,6 +115,11 @@ class Reason(Enum):
     ACCEPTANCE_UNAVAILABLE = "acceptance_unavailable"
     THROUGHPUT_UNAVAILABLE = "throughput_unavailable"
     HIGH_INVALID_RATE = "high_invalid_rate"
+    #: An arm produced no generation that ended on the model's own terms -- see
+    #: :attr:`TruncationRegime.SATURATED`.  A measurement rejection, in the same
+    #: family as ``COUNTER_RESET`` and ``HIGH_INVALID_RATE``: it says the run
+    #: cannot support a promotion, not that the head is worse.
+    TRUNCATION_SATURATED = "truncation_saturated"
     TOO_FEW_REPEATS = "too_few_repeats"
     OUTPUT_MISMATCH = "output_mismatch"
     UNCERTAIN = "uncertain"
@@ -473,6 +540,22 @@ class RepeatSummary:
     #: field" stays distinguishable from any real reading.
     stock_accepted_length: float = 0.0
     candidate_accepted_length: float = 0.0
+
+    # -- what the output cap did to this repeat ------------------------------
+    # Counts, not rates, and one denominator per arm.  Rates are recoverable
+    # from counts and counts are not recoverable from rates, and the
+    # denominator is the field that distinguishes "nothing was truncated" from
+    # "the endpoint never said" -- the distinction the whole
+    # :class:`TruncationRegime` classification turns on.  All default to 0, so
+    # an archived record rebuilt by :func:`speedlm.report.parse_decision`
+    # classifies as ``UNTESTABLE`` rather than being relabelled ``BOUNDED``.
+
+    #: Responses in this repeat that carried a finish reason, per arm.
+    stock_finish_reasons: int = 0
+    candidate_finish_reasons: int = 0
+    #: Of those, the ones that reported ``length``, per arm.
+    stock_truncated: int = 0
+    candidate_truncated: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -957,6 +1040,87 @@ class Decision:
         """
         return _flat_from_repeat([r.candidate_tok_per_sec for r in self.per_repeat])
 
+    # -- what the output cap did ---------------------------------------------
+    # Derived from ``per_repeat`` on the same contract the dispersion
+    # properties hold: the array is the evidence, and these are readings of it
+    # that a reader can reproduce by hand.  Pooled across repeats rather than
+    # averaged, because ``SATURATED`` is a statement about a total count of
+    # natural stops and a per-repeat mean would round it away.
+
+    @property
+    def stock_finish_reasons_reported(self) -> int:
+        """Stock responses that carried a finish reason, all repeats pooled."""
+        return sum(r.stock_finish_reasons for r in self.per_repeat)
+
+    @property
+    def candidate_finish_reasons_reported(self) -> int:
+        """Candidate responses that carried a finish reason, all repeats pooled."""
+        return sum(r.candidate_finish_reasons for r in self.per_repeat)
+
+    @property
+    def stock_truncation_rate(self) -> float | None:
+        """Fraction of reported stock generations that hit the output cap.
+
+        ``None`` when nothing reported a finish reason, so that a record which
+        never measured truncation cannot be read as one that measured zero.
+        """
+        reported = self.stock_finish_reasons_reported
+        if reported <= 0:
+            return None
+        return sum(r.stock_truncated for r in self.per_repeat) / reported
+
+    @property
+    def candidate_truncation_rate(self) -> float | None:
+        """Fraction of reported candidate generations that hit the output cap."""
+        reported = self.candidate_finish_reasons_reported
+        if reported <= 0:
+            return None
+        return sum(r.candidate_truncated for r in self.per_repeat) / reported
+
+    @property
+    def stock_truncation_regime(self) -> TruncationRegime:
+        """What the cap did to the stock arm; see :class:`TruncationRegime`."""
+        return classify_truncation(
+            reported=self.stock_finish_reasons_reported,
+            truncated=sum(r.stock_truncated for r in self.per_repeat),
+        )
+
+    @property
+    def candidate_truncation_regime(self) -> TruncationRegime:
+        """What the cap did to the candidate arm."""
+        return classify_truncation(
+            reported=self.candidate_finish_reasons_reported,
+            truncated=sum(r.candidate_truncated for r in self.per_repeat),
+        )
+
+    @property
+    def truncation_rate_delta(self) -> float | None:
+        """Candidate truncation rate minus stock's, or ``None`` if unmeasured.
+
+        Recorded and **not** gated, deliberately.  Under exact-argmax
+        verification both arms emit the target's own tokens, so the honest
+        null is that this is zero and any departure is the two arms having
+        generated materially different text -- the same family of fault
+        ``OUTPUT_MISMATCH`` catches, but visible on the throughput pass, which
+        captures no logprobs and runs no divergence comparison.
+
+        It does not gate because the throughput pass has no control arm.  The
+        divergence criterion earned the right to reject by measuring the
+        engine's own stock-against-stock noise floor first (see
+        :data:`DIVERGENCE_ALPHA`); there is no such floor for this quantity in
+        any archived run, and a two-proportion test against a zero null at
+        these sample sizes would fire on the batching-dependent nondeterminism
+        the control pass exists to absorb.  Publishing the number is what makes
+        that floor measurable on the next runs; inventing a threshold for it
+        now would be exactly the uncalibrated constant this gate keeps getting
+        burned by.
+        """
+        stock = self.stock_truncation_rate
+        candidate = self.candidate_truncation_rate
+        if stock is None or candidate is None:
+            return None
+        return candidate - stock
+
     @property
     def output_early_divergences(self) -> int:
         """Divergences early enough to count against ``max_output_mismatches``."""
@@ -1051,9 +1215,21 @@ class Decision:
                     "output_mismatches": r.output_mismatches,
                     "stock_accepted_length": r.stock_accepted_length,
                     "candidate_accepted_length": r.candidate_accepted_length,
+                    "stock_finish_reasons": r.stock_finish_reasons,
+                    "candidate_finish_reasons": r.candidate_finish_reasons,
+                    "stock_truncated": r.stock_truncated,
+                    "candidate_truncated": r.candidate_truncated,
                 }
                 for r in self.per_repeat
             ],
+            # Derived from the ``per_repeat`` counts above, emitted so a reader
+            # of ``decision.json`` does not have to sum the array to learn
+            # whether the cap or the workload chose the generation lengths.
+            "stock_truncation_rate": self.stock_truncation_rate,
+            "candidate_truncation_rate": self.candidate_truncation_rate,
+            "stock_truncation_regime": self.stock_truncation_regime.value,
+            "candidate_truncation_regime": self.candidate_truncation_regime.value,
+            "truncation_rate_delta": self.truncation_rate_delta,
             # Which acceptance-side quantity decided, and the criterion's own
             # delta/threshold pair.  Emitted next to -- never instead of -- the
             # rate figures below, which every archived run is described by.
@@ -1940,6 +2116,10 @@ def decide_promotion(
                 candidate_accepted_length=_repeat_accepted_length(
                     candidate_repeat_metrics, i, c_mal
                 ),
+                stock_finish_reasons=s_run.finish_reason_count,
+                candidate_finish_reasons=c_run.finish_reason_count,
+                stock_truncated=s_run.truncated_count,
+                candidate_truncated=c_run.truncated_count,
             )
         )
 
@@ -2088,6 +2268,31 @@ def decide_promotion(
         or candidate_replay.avg_invalid_rate > _INVALID_RATE_THRESHOLD
     ):
         return _reject(Reason.HIGH_INVALID_RATE)
+
+    # --- Validation: the output cap chose every generation length ---
+    # ``invalid_rate`` does not see this and cannot be made to: a response that
+    # spent the whole budget generating is a *healthy* response, so every one
+    # of them is valid and the rate reads 0.0 no matter how completely the
+    # harness was the thing that ended them.  That is the shape a realistic
+    # agentic workload replayed under a chat-sized ``benchmark_max_tokens``
+    # produces, and it passed.
+    #
+    # Zero natural stops is the bar, so this rejects only runs that observed
+    # nothing at all about where the model stops -- it does not disturb the
+    # heavily-but-not-wholly truncated regime every archived live run sits in.
+    # See :class:`TruncationRegime`.
+    stock_truncation = classify_truncation(
+        reported=stock_replay.total_finish_reason_count,
+        truncated=stock_replay.total_finish_reason_count - stock_replay.total_natural_stops,
+    )
+    candidate_truncation = classify_truncation(
+        reported=candidate_replay.total_finish_reason_count,
+        truncated=(
+            candidate_replay.total_finish_reason_count - candidate_replay.total_natural_stops
+        ),
+    )
+    if TruncationRegime.SATURATED in (stock_truncation, candidate_truncation):
+        return _reject(Reason.TRUNCATION_SATURATED)
 
     # --- Validation: output mismatch ---
     # Excess over the engine's own noise floor, not any single occurrence.  Both

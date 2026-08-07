@@ -10,7 +10,7 @@ import httpx
 import pytest
 
 from speedlm.config import SamplingConfig
-from speedlm.gate.replay import ReplayError, replay_suite
+from speedlm.gate.replay import ReplayError, ReplayResult, RunResults, replay_suite
 from speedlm.gate.suite import BenchmarkSuite, FrozenContext
 
 
@@ -292,6 +292,14 @@ class _ScriptedClient:
     usage: dict[str, Any]
     #: Requests answered with ``choice``/``usage``; the rest get a plain reply.
     scripted: int = 0
+    #: Requests failed *before* the scripted ones begin.  A failed request is
+    #: precisely what ``finish_reason_count`` exists to keep out of the
+    #: truncation denominator, so a test has to be able to put failures and
+    #: reported responses inside one run.
+    failures: int = 0
+    #: Which shape of failure to answer those with -- the three ways
+    #: ``_send_request`` can come back without ever having heard from the model.
+    failure_mode: str = "http"
     seen: int = 0
     limits: Any = None
 
@@ -305,7 +313,13 @@ class _ScriptedClient:
         index = self.seen
         self.seen += 1
         await asyncio.sleep(0)
-        if index < self.scripted:
+        if index < self.failures:
+            if self.failure_mode == "transport":
+                raise httpx.ConnectError("connection reset by peer")
+            if self.failure_mode == "empty_choices":
+                return _FakeResponse({"choices": [], "usage": {}})
+            return _FakeResponse({"error": "internal"}, status_code=500)
+        if index < self.failures + self.scripted:
             return _FakeResponse({"choices": [dict(self.choice)], "usage": self.usage})
         return _FakeResponse(
             {
@@ -323,8 +337,16 @@ def _scripted(
     usage: dict[str, Any],
     *,
     scripted: int,
+    failures: int = 0,
+    failure_mode: str = "http",
 ) -> _ScriptedClient:
-    recorder = _ScriptedClient(choice=choice, usage=usage, scripted=scripted)
+    recorder = _ScriptedClient(
+        choice=choice,
+        usage=usage,
+        scripted=scripted,
+        failures=failures,
+        failure_mode=failure_mode,
+    )
 
     def factory(**kwargs: Any) -> _ScriptedClient:
         recorder.limits = kwargs.get("limits")
@@ -603,3 +625,175 @@ def test_thinking_channel_is_recognised(monkeypatch: pytest.MonkeyPatch) -> None
     assert request.reasoning_text == "step one, step two"
     assert request.valid
     assert request.error == ""
+
+
+# ---------------------------------------------------------------------------
+# Who chose the generation length: the truncation counting layer
+# ---------------------------------------------------------------------------
+
+
+def _finish_reason_choice(reason: str) -> dict[str, Any]:
+    """A healthy, non-empty response that ended for the given reason."""
+    return {"message": {"content": "a real answer"}, "finish_reason": reason}
+
+
+#: Usage for a response that spent the whole budget, i.e. one the harness ended.
+_CAPPED_USAGE: dict[str, Any] = {"prompt_tokens": 12, "completion_tokens": 512}
+
+
+def test_a_length_finish_reason_is_truncated_and_a_stop_is_reported_but_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Both shapes are *reported*; only one of them was ended by the harness.
+
+    ``finish_reason_count`` and ``truncated_count`` answer different questions
+    and a run has to be able to distinguish them, because the denominator is the
+    field that separates "nothing was truncated" from "the endpoint never said".
+    """
+    _scripted(monkeypatch, _finish_reason_choice("length"), _CAPPED_USAGE, scripted=3)
+
+    run = _replay(_suite(10), max_tokens=512).run_results[0]
+
+    # The seven unscripted requests come back with ``finish_reason: "stop"``.
+    assert run.finish_reason_count == 10
+    assert run.truncated_count == 3
+    assert run.natural_stop_count == 7
+    assert run.truncation_rate == pytest.approx(0.3)
+
+
+def test_a_tool_call_finish_reason_counts_as_a_natural_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tool dispatch is the model choosing where to stop, not the harness.
+
+    The whole point of the count is which of the two ended the generation, so
+    every non-``length`` reason belongs on the natural-stop side.  Filing
+    ``tool_calls`` as a truncation would make an agentic suite -- the traffic
+    this gate exists to measure -- read as saturated by construction.
+    """
+    _scripted(
+        monkeypatch,
+        {
+            "message": {
+                "content": "Let me look that up.",
+                "tool_calls": [
+                    {
+                        "id": "call_0",
+                        "type": "function",
+                        "function": {"name": "get_weather", "arguments": "{}"},
+                    }
+                ],
+            },
+            "finish_reason": "tool_calls",
+        },
+        {"prompt_tokens": 31, "completion_tokens": 24},
+        scripted=4,
+    )
+
+    run = _replay(_suite(4)).run_results[0]
+
+    assert run.finish_reason_count == 4
+    assert run.truncated_count == 0
+    assert run.natural_stop_count == 4
+    assert run.truncation_rate == 0.0
+
+
+@pytest.mark.parametrize("failure_mode", ["http", "transport", "empty_choices"])
+def test_failed_requests_stay_out_of_the_truncation_denominator(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_mode: str,
+) -> None:
+    """A request the model never answered is not evidence about where it stops.
+
+    Ninety of a hundred requests fail and the ten that survive were all ended by
+    the cap.  Folding the failures into the denominator would report ``0.10`` --
+    a comfortably bounded-looking run -- and would make the reported number fall
+    the *more* of the run broke.  The honest answer is that every generation
+    this run actually observed was ended by the harness.
+    """
+    _scripted(
+        monkeypatch,
+        _finish_reason_choice("length"),
+        _CAPPED_USAGE,
+        scripted=10,
+        failures=90,
+        failure_mode=failure_mode,
+    )
+
+    run = _replay(_suite(100), max_tokens=512).run_results[0]
+
+    assert len(run.results) == 100
+    assert run.invalid_count == 90
+    assert run.finish_reason_count == 10
+    assert run.truncated_count == 10
+    assert run.truncation_rate == 1.0
+    # And emphatically not the misleadingly low rate ``len(results)`` gives.
+    assert run.truncation_rate != pytest.approx(10 / len(run.results))
+
+
+def test_a_run_that_reported_no_finish_reason_is_unmeasured_not_untruncated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``truncation_rate`` reads 0.0, and the denominator is what says why.
+
+    Both assertions matter together: the rate alone cannot tell a run in which
+    nothing was truncated from a run in which nothing was reported, and reading
+    the second as the first is exactly what
+    :attr:`speedlm.gate.decide.TruncationRegime.UNTESTABLE` exists to stop.
+    """
+    _scripted(
+        monkeypatch,
+        {"message": {"content": "a real answer"}},
+        {"prompt_tokens": 12, "completion_tokens": 9},
+        scripted=5,
+    )
+
+    run = _replay(_suite(5)).run_results[0]
+
+    assert run.finish_reason_count == 0
+    assert run.truncated_count == 0
+    assert run.natural_stop_count == 0
+    assert run.truncation_rate == 0.0
+    # A measured zero looks identical in the rate, so the count is persisted.
+    assert run.to_dict()["finish_reason_count"] == 0
+    assert run.to_dict()["truncation_rate"] == 0.0
+
+
+def _counted_run(*, reported: int, truncated: int) -> RunResults:
+    """A run carrying nothing but the finish-reason counts under test."""
+    return RunResults(
+        results=(),
+        total_latency_s=0.0,
+        total_prompt_tokens=0,
+        total_completion_tokens=0,
+        valid_count=0,
+        invalid_count=0,
+        invalid_rate=0.0,
+        finish_reason_count=reported,
+        truncated_count=truncated,
+    )
+
+
+def test_pooled_truncation_rate_weighs_each_repeat_by_what_it_reported() -> None:
+    """Pooled over reported responses, never a mean of per-repeat rates.
+
+    The two answers only coincide when every repeat reported the same number of
+    responses, which is precisely the case a broken repeat is not.  Here a
+    ten-response repeat that was barely truncated sits beside a two-response one
+    that was wholly truncated; pooling says ``3/12``, while averaging the two
+    rates would let the near-empty repeat carry half the answer and say ``0.55``.
+    """
+    result = ReplayResult(
+        run_results=(
+            _counted_run(reported=10, truncated=1),
+            _counted_run(reported=2, truncated=2),
+        ),
+        num_runs=2,
+        suite_hash="suite-hash",
+    )
+
+    assert result.total_finish_reason_count == 12
+    assert result.total_natural_stops == 9
+    assert result.avg_truncation_rate == pytest.approx(3 / 12)
+    # The discriminating half: mean-of-means is a different number here.
+    assert result.avg_truncation_rate != pytest.approx((0.1 + 1.0) / 2)

@@ -258,14 +258,58 @@ annotations (not assignments) so they do not appear in `dir()`" — annotations 
 `CombinedWorkerExtension` (`draft_swap.py:886`) inherits it unchanged and
 explains why at `:898-904`.
 
-### 5.6 `finish_reason == "length"` is NORMAL
+### 5.6 `finish_reason == "length"` is NORMAL — but an ALL-TRUNCATED ARM IS NOT
 
-It means the response hit `max_tokens`, which is ordinary serving behaviour on
-realistic prompts (ultrachat p95 ≈ 2751 chars) and still produces valid training
-traces. `test_live_idle_tuning.py:398-405` accepts both:
-`assert finish in ("stop", "length")`. No gate rejects on `"length"` —
-`finish_reason` is recorded verbatim in replay results
-(`src/speedlm/gate/replay.py:46-49,87,380,391,403`).
+An individual response finishing at `"length"` means it hit `max_tokens`, which
+is ordinary serving behaviour on realistic prompts (ultrachat p95 ≈ 2751 chars)
+and still produces valid generations. `test_live_idle_tuning.py:398-403` accepts
+both: `assert finish in ("stop", "length")`. The gate does **not** reject on a
+single `"length"` finish reason.
+
+What the gate **does** now reject is an **arm** in which **no generation at all**
+stopped naturally. `finish_reason` is recorded on every replayed request
+(`src/speedlm/gate/replay.py:46-49`) and pooled per arm across repeats in
+`RunResults.finish_reason_count` / `RunResults.truncated_count`
+(`replay.py:103-114`). The `_run_single` function counts them at
+`replay.py:564-566`. Previously this data was written and read by nothing: a run
+in which the output cap ended *every* generation reported `invalid_rate 0.0` and
+was gated as though it had measured the workload — it had not; it had measured
+fixed-length decode.
+
+The gate now classifies each arm into a `TruncationRegime`
+(`src/speedlm/gate/decide.py:47-86`) using `classify_truncation`
+(`decide.py:89-106`), which distinguishes four states:
+
+- `UNTESTABLE` — no response reported a finish reason at all (archived records
+  that never persisted these counts all read this).
+- `SATURATED` — finish reasons were reported and **zero** generation ended on the
+  model's own terms. This is the only state that gates, rejecting with
+  `Reason.TRUNCATION_SATURATED` (`decide.py:118-122`) at the validation block
+  `decide.py:2272-2295`.
+- `MIXED` — most generations hit the cap, but some did not. The measurement is
+  dominated by the cap but still interpretable. This is where the archived live
+  runs sit (see below).
+- `BOUNDED` — most generations stopped by themselves; the cap was not binding.
+
+The bar is **exactly zero** natural stops, not a tuned fraction, because at zero
+the run contains **no observation whatsoever** of where this model stops when the
+harness is not stopping it — no throughput figure from it can be attributed to
+the workload rather than to `benchmark_max_tokens`. Any threshold above zero
+would require calibration against a known-good distribution of natural lengths,
+which the harness does not have and would need to re-derive per model, per
+workload.
+
+The heavily-but-not-wholly truncated regime is unaffected: the archived live
+runs at commit `8b72d9a` are `MIXED`, not `SATURATED` — 92.2% truncated for
+Qwen3-8B (1889 of 2049 at `length`, 160 at `stop`) and 85.3% for gpt-oss-20b
+(1747 of 2049 at `length`, 302 at `stop`). The presence of natural stops, even
+1-5%, provides the lower bound on where the model's own stopping distribution
+lies, so the measurement remains interpretable.
+
+**Caveat:** the truncation-saturated check has not yet been exercised by a GPU
+run. The classification logic is covered by GPU-free unit tests
+(`tests/test_gate_decide.py`), but no live benchmark has triggered
+`TRUNCATION_SATURATED` on hardware.
 
 The one place a specific value is demanded is the tool-calling harness, which
 requires `"tool_calls"` for tool-call traces (`test_agent_harness.py:914`); its
@@ -367,14 +411,21 @@ Top-level keys include `verdict`, `reason`, `acceptance_delta_pp`,
 `min_accepted_length_delta`, `min_throughput_delta_pct`, `num_repeats`,
 `warmup_repeats`, `per_repeat[]`, the acceptance criterion
 (`acceptance_criterion`), the stock/candidate acceptance means and stdevs,
-the stock/candidate accepted-length means and stdevs, and the output-divergence
-summary. The gate promotes on `accepted_length_delta >= min_accepted_length_delta`
-(not on `acceptance_delta_pp`; see `GATING_ACCEPTANCE_CRITERION` in
-`src/speedlm/gate/decide.py`).
+the stock/candidate accepted-length means and stdevs, the output-divergence
+summary, and the truncation evidence
+(`stock_truncation_rate`, `candidate_truncation_rate`,
+`stock_truncation_regime`, `candidate_truncation_regime`,
+`truncation_rate_delta`). The gate promotes on
+`accepted_length_delta >= min_accepted_length_delta` (not on
+`acceptance_delta_pp`; see `GATING_ACCEPTANCE_CRITERION` in
+`src/speedlm/gate/decide.py`). It rejects with `reason: "truncation_saturated"`
+when either arm is classified as `SATURATED` (zero natural stops across all
+repeats); see §5.6.
 
 `per_repeat[]` rows (`RepeatResult.to_dict` in `decide.py`): `repeat_index, stock_tok_per_sec,
 candidate_tok_per_sec, stock_acceptance_rate, candidate_acceptance_rate,
-invalid_rate, output_mismatches, stock_accepted_length, candidate_accepted_length`.
+invalid_rate, output_mismatches, stock_accepted_length, candidate_accepted_length,
+stock_finish_reasons, candidate_finish_reasons, stock_truncated, candidate_truncated`.
 `output_divergences[]` rows (`ContextDivergence.to_dict` in `decide.py`):
 `context_hash, repeat_index, first_divergence_index, basis` (`"token"` or
 `"character"`),

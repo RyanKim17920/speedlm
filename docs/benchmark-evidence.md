@@ -376,6 +376,33 @@ evidence that it generalizes: the matrix result reproduces in both modes and
 still does not transfer to representative traffic, because the confound was the
 workload, not the runtime.
 
+### The truncation caveat
+
+The gate now classifies each replay arm into a `TruncationRegime`
+(`src/speedlm/gate/decide.py:47-86`) based on how much of the workload's own
+stopping behaviour survived into the measurement. An arm in which **no**
+generation stopped naturally (regime `SATURATED`) is rejected with
+`truncation_saturated` before throughput is compared, because the output cap —
+not the model — chose every generation length, and the measured throughput
+number describes fixed-length decode, not the workload.
+
+Every archived decision predates the truncation columns
+(`stock_finish_reasons`, `candidate_finish_reasons`, `stock_truncated`,
+`candidate_truncated` on each `per_repeat[]` row), so all archived records
+classify as `untestable` rather than as low-truncation. The truncation check
+has not yet run on a live GPU benchmark; its classification logic is covered by
+GPU-free unit tests only.
+
+The archived live runs' serving traffic was 85-92% truncated at a 512-token
+cap: the Qwen3-8B run `8b72d9a-qwen-idle` finished 1889 of 2049 responses at
+`length` (92.2%), the gpt-oss-20b run `8b72d9a-gptoss-idle` finished 1747 of
+2049 (85.3%). Both sit in the `mixed` regime — heavily truncated, but with
+enough natural stops (160 and 302 respectively) to bound where the model's own
+stopping distribution lies. The throughput numbers from these runs are genuine
+measurements of the candidate versus stock under that cap; the caveat is that
+they are bounded by a 512-token ceiling and should not be read as claims about
+unbounded generation throughput.
+
 Code-level fail-closed checks must not be described as exercised merely because
 they exist. Several guards have not been observed firing in a real run. In
 particular, neither definitive run produced an observable **publish-time**

@@ -100,6 +100,41 @@ class RunResults:
     valid_count: int
     invalid_count: int
     invalid_rate: float
+    #: Responses that carried a non-empty ``finish_reason`` at all.
+    #:
+    #: The denominator of :attr:`truncation_rate`, and it is deliberately *not*
+    #: ``len(results)``.  A request that failed before the model answered (HTTP
+    #: error, empty ``choices``, transport exception) carries ``""``, and
+    #: folding those into the denominator would make a run look less truncated
+    #: the more of it failed.  Zero here means the endpoint never reported a
+    #: finish reason, which is a different fact from "nothing was truncated" --
+    #: see :class:`speedlm.gate.decide.TruncationRegime`.
+    finish_reason_count: int = 0
+    #: Of those, the ones that stopped because they exhausted ``max_tokens``.
+    truncated_count: int = 0
+
+    @property
+    def natural_stop_count(self) -> int:
+        """Responses that ended on the model's own terms rather than the cap.
+
+        Every non-``length`` finish reason counts, ``"tool_calls"`` included:
+        the question this answers is whether the generation length was chosen
+        by the model or imposed by the harness, and a tool dispatch is the
+        model choosing.
+        """
+        return self.finish_reason_count - self.truncated_count
+
+    @property
+    def truncation_rate(self) -> float:
+        """Fraction of *reported* generations that hit the output cap.
+
+        ``0.0`` when nothing reported a finish reason, which is why callers
+        must consult :attr:`finish_reason_count` before reading this as a
+        measurement.
+        """
+        if self.finish_reason_count <= 0:
+            return 0.0
+        return self.truncated_count / self.finish_reason_count
 
     @property
     def avg_latency_s(self) -> float:
@@ -122,6 +157,9 @@ class RunResults:
             "valid_count": self.valid_count,
             "invalid_count": self.invalid_count,
             "invalid_rate": self.invalid_rate,
+            "finish_reason_count": self.finish_reason_count,
+            "truncated_count": self.truncated_count,
+            "truncation_rate": self.truncation_rate,
         }
 
 
@@ -162,6 +200,36 @@ class ReplayResult:
         if not self.run_results:
             return 0.0
         return sum(r.output_tok_per_sec for r in self.run_results) / len(self.run_results)
+
+    @property
+    def total_finish_reason_count(self) -> int:
+        """Reported finish reasons across every repeat, pooled."""
+        return sum(r.finish_reason_count for r in self.run_results)
+
+    @property
+    def total_natural_stops(self) -> int:
+        """Generations that ended on the model's own terms, pooled.
+
+        Pooled rather than averaged because the question it settles is a
+        count: whether this arm produced *any* evidence of where the model
+        stops when the harness is not stopping it.  A per-repeat mean would
+        round that evidence away.
+        """
+        return sum(r.natural_stop_count for r in self.run_results)
+
+    @property
+    def avg_truncation_rate(self) -> float:
+        """Fraction of reported generations that hit the output cap, pooled.
+
+        Pooled over reported responses rather than averaged over repeats, so
+        that a repeat in which most requests errored cannot weigh as much as a
+        clean one.  ``0.0`` when nothing reported a finish reason; read
+        :attr:`total_finish_reason_count` first.
+        """
+        reported = self.total_finish_reason_count
+        if reported <= 0:
+            return 0.0
+        return sum(r.truncated_count for r in self.run_results) / reported
 
     @property
     def any_high_invalid_rate(self, threshold: float = 0.1) -> bool:
@@ -493,6 +561,8 @@ async def _run_single(
     total_ct = sum(r.completion_tokens for r in results)
     valid = sum(1 for r in results if r.valid)
     invalid = len(results) - valid
+    reported = [r.finish_reason for r in results if r.finish_reason]
+    truncated = sum(1 for fr in reported if fr == FINISH_REASON_LENGTH)
 
     return RunResults(
         results=tuple(results),
@@ -502,6 +572,8 @@ async def _run_single(
         valid_count=valid,
         invalid_count=invalid,
         invalid_rate=invalid / len(results) if results else 0.0,
+        finish_reason_count=len(reported),
+        truncated_count=truncated,
     )
 
 

@@ -204,7 +204,21 @@ DELTA_REASONS = frozenset(
 # data -- the gate has evidence, it is just evidence of a different kind -- so
 # these reasons are measured, and the evidence they *do* carry is asserted
 # below instead of the deltas.
-SHORT_CIRCUIT_MEASURED_REASONS = frozenset({"output_mismatch"})
+SHORT_CIRCUIT_MEASURED_REASONS = frozenset({"output_mismatch", "truncation_saturated"})
+
+# `truncation_saturated` is the second.  It returns at the truncation check,
+# which likewise sits above the delta computation, and it means something
+# specific: both arms replayed the whole suite, and `benchmark_max_tokens` --
+# not the model -- ended every single generation in one of them, so the run
+# observed nothing about where this model stops and its throughput figure
+# describes the cap rather than the workload.  See `TruncationRegime` in
+# `src/speedlm/gate/decide.py`.  That is emphatically a measured outcome, and
+# it must not be reported here as "the gate never compared the arms": the
+# diagnosis a realistic-workload run most needs is "raise the cap", and the
+# unmeasured-gate error would send the reader looking for a broken scrape.
+# The evidence this reason carries is truncation counts, not divergences, so
+# it is asserted on its own branch below.
+TRUNCATION_REASON = "truncation_saturated"
 
 # Verdicts reached by actually comparing the two arms.  Anything else means the
 # gate rejected for want of data, which is a legitimate runtime outcome but not
@@ -514,6 +528,36 @@ def _assert_gate_measured_something(decision: JsonObject) -> None:
         assert decision.get("accepted_length_delta") is not None, decision
         assert decision.get("throughput_delta_pct") is not None, decision
         assert decision.get("acceptance_criterion") == "mean_accepted_length_delta", decision
+    elif reason == TRUNCATION_REASON:
+        # Short-circuited at the truncation check.  Same contract as the
+        # divergence branch below -- require the evidence that justified the
+        # short circuit -- but the evidence is the finish-reason counts.
+        #
+        # An arm qualifies only by reporting finish reasons and having no
+        # natural stop among them, so demand exactly that: some arm reported,
+        # and some arm truncated everything it reported.  Asserting it here is
+        # what stops `truncation_saturated` from becoming a way for a gate that
+        # collected nothing to pass under a measured-looking reason -- a run
+        # that reported no finish reason at all classifies as `untestable` and
+        # can never reach this branch.
+        rates = (
+            decision.get("stock_truncation_rate"),
+            decision.get("candidate_truncation_rate"),
+        )
+        regimes = (
+            decision.get("stock_truncation_regime"),
+            decision.get("candidate_truncation_regime"),
+        )
+        assert "saturated" in regimes, decision
+        assert any(rate == 1.0 for rate in rates), decision
+        # The counts the rates were derived from, so the record is reconcilable
+        # by hand rather than only by trusting the derived field.
+        assert any(
+            row.get("stock_finish_reasons", 0) > 0
+            or row.get("candidate_finish_reasons", 0) > 0
+            for row in per_repeat
+            if isinstance(row, dict)
+        ), decision
     else:
         # Short-circuited above the delta computation.  Requiring the deltas
         # here would be unsatisfiable, so require the evidence that actually

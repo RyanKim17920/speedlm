@@ -67,6 +67,23 @@ class DraftProfile:
             and gpt-oss-20b under ``benchmark_max_tokens``.  A generation that
             reached its own stop token closed the block, so it reports
             normally.
+        natural_stop_every: When set, every Nth generation ends on the model's
+            own terms -- ``natural_stop_tokens`` tokens and ``finish_reason:
+            "stop"`` -- while the rest run to whatever cap the request carries.
+            Shaped like ``invalid_every`` because it is the same kind of knob:
+            a deterministic minority of an otherwise uniform run.  Without it
+            a profile can only produce an all-truncated or an all-natural run,
+            and the regime the archived live runs actually sit in --
+            heavily truncated *with* natural stops present, SLURM 8b72d9a's
+            1889 of 2049 and 1747 of 2049 -- is inexpressible.  Must be >= 2:
+            every generation stopping naturally is not a mixture.
+        natural_stop_tokens: Tokens a naturally-stopped generation emits.
+            Must be < ``completion_tokens``, so a natural stop is always
+            strictly shorter than the profile's full length.  A natural stop
+            is honoured only when it also fits *inside the request's own cap*;
+            a request whose cap is at or below this length was ended by the
+            harness, and the response says ``length`` accordingly rather than
+            claiming a stop that never happened.
     """
 
     name: str
@@ -78,6 +95,8 @@ class DraftProfile:
     divergence_at_token: int | None = None
     invalid_every: int | None = None
     reasoning_model: bool = False
+    natural_stop_every: int | None = None
+    natural_stop_tokens: int = 16
 
     def __post_init__(self) -> None:
         if not 0.0 <= self.acceptance_rate <= 1.0:
@@ -88,9 +107,23 @@ class DraftProfile:
             ("completion_tokens", self.completion_tokens),
             ("prompt_tokens", self.prompt_tokens),
             ("drafted_tokens_per_request", self.drafted_tokens_per_request),
+            ("natural_stop_tokens", self.natural_stop_tokens),
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError(f"{name} must be an integer >= 1")
+        if self.natural_stop_every is not None:
+            if (
+                isinstance(self.natural_stop_every, bool)
+                or not isinstance(self.natural_stop_every, int)
+                or self.natural_stop_every < 2
+            ):
+                raise ValueError("natural_stop_every must be an integer >= 2")
+            if self.natural_stop_tokens >= self.completion_tokens:
+                raise ValueError(
+                    "natural_stop_tokens must be < completion_tokens: a "
+                    "generation that ran to the profile's full length did not "
+                    "stop on its own terms"
+                )
 
 
 @dataclass
@@ -425,6 +458,10 @@ class SimulatedEngine:
                 profile.invalid_every is not None
                 and served % profile.invalid_every == 0
             )
+            stops_naturally = (
+                profile.natural_stop_every is not None
+                and served % profile.natural_stop_every == 0
+            )
 
         latency = profile.seconds_per_request + faults.stall_seconds
         if latency > 0:
@@ -434,9 +471,16 @@ class SimulatedEngine:
             return 500, {"error": "simulated upstream failure"}
 
         requested = request.get("max_tokens")
-        emitted = profile.completion_tokens
+        budget = profile.completion_tokens
         if isinstance(requested, int) and not isinstance(requested, bool):
-            emitted = min(emitted, max(requested, 1))
+            budget = min(budget, max(requested, 1))
+        # A natural stop is a claim that the model chose the length, so it is
+        # honoured only when it would have landed strictly inside the budget.
+        # Under a cap at or below ``natural_stop_tokens`` the harness is still
+        # the thing that ended the generation, and saying "stop" there would
+        # let a test manufacture a natural stop the run never observed.
+        stopped_naturally = stops_naturally and profile.natural_stop_tokens < budget
+        emitted = profile.natural_stop_tokens if stopped_naturally else budget
         drafted = profile.drafted_tokens_per_request
         accepted = int(round(drafted * profile.acceptance_rate))
         # One draft per generation keeps ``mean_accepted_length`` well defined
@@ -458,7 +502,10 @@ class SimulatedEngine:
             marker=profile.name,
         )
         text = "".join(tokens)
-        truncated = emitted < profile.completion_tokens
+        # ``usage.completion_tokens``, the emitted token stream and the finish
+        # reason all read off ``emitted``, so both branches stay consistent:
+        # a naturally-stopped response is short *and* says ``stop``.
+        truncated = not stopped_naturally and emitted < profile.completion_tokens
         # A thinking model that ran out of budget never closed ``<think>``, so
         # the server has nothing to put in ``content``.  The tokens are all
         # still there, and ``usage`` still counts them.

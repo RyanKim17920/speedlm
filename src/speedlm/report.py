@@ -1002,6 +1002,22 @@ def _parse_repeat(record: Mapping[str, Any], source: Path) -> RepeatSummary:
         candidate_accepted_length=(
             _optional_float(record.get("candidate_accepted_length")) or 0.0
         ),
+        # Optional: every archived decision predates the finish-reason counts
+        # and defaults them to 0. That makes the derived truncation regime
+        # classify as UNTESTABLE rather than being silently relabelled BOUNDED,
+        # which is a claim that truncation was measured and was low.
+        stock_finish_reasons=(
+            _optional_int(record.get("stock_finish_reasons")) or 0
+        ),
+        candidate_finish_reasons=(
+            _optional_int(record.get("candidate_finish_reasons")) or 0
+        ),
+        stock_truncated=(
+            _optional_int(record.get("stock_truncated")) or 0
+        ),
+        candidate_truncated=(
+            _optional_int(record.get("candidate_truncated")) or 0
+        ),
     )
 
 
@@ -1569,6 +1585,10 @@ class GainReport:
                     "output_mismatches": r.output_mismatches,
                     "stock_accepted_length": r.stock_accepted_length,
                     "candidate_accepted_length": r.candidate_accepted_length,
+                    "stock_finish_reasons": r.stock_finish_reasons,
+                    "candidate_finish_reasons": r.candidate_finish_reasons,
+                    "stock_truncated": r.stock_truncated,
+                    "candidate_truncated": r.candidate_truncated,
                 }
                 for r in decision.per_repeat
             ]
@@ -1635,6 +1655,27 @@ class GainReport:
                 f"replay            : concurrency {concurrency}, "
                 f"max {max_tokens} tokens"
             )
+        # Truncation regime and rates: how the output cap affected the measurement.
+        # Always rendered so the reader can see whether the cap was the binding
+        # constraint on generation lengths — and therefore whether throughput is
+        # attributable to the workload or to benchmark_max_tokens.
+        stock_regime = decision.stock_truncation_regime.value
+        cand_regime = decision.candidate_truncation_regime.value
+        stock_rate = decision.stock_truncation_rate
+        cand_rate = decision.candidate_truncation_rate
+        # When the rate is None, no finish reasons were reported — the measurement
+        # was never taken. Rendering it as 0% would be fabricated precision: the
+        # rate is unknown, not absent.
+        stock_rate_str = (
+            f"{stock_rate * 100:.1f}%" if stock_rate is not None else "unmeasured"
+        )
+        cand_rate_str = (
+            f"{cand_rate * 100:.1f}%" if cand_rate is not None else "unmeasured"
+        )
+        lines.append(
+            f"truncation        : stock {stock_regime} ({stock_rate_str}), "
+            f"candidate {cand_regime} ({cand_rate_str})"
+        )
         return lines
 
     @staticmethod
@@ -1825,13 +1866,29 @@ class GainReport:
         if decision.per_repeat:
             lines.append("per-repeat:")
             for r in decision.per_repeat:
+                # Truncation rates are computed per-arm, per-repeat from the raw
+                # counts so the reader can see where the cap bit.  When the
+                # denominator is zero (no finish reasons reported) we render
+                # "n/a" rather than 0.00% — a zero denominator means the
+                # measurement was never taken, not that nothing was truncated.
+                stock_trunc = (
+                    f"{r.stock_truncated / r.stock_finish_reasons * 100:.1f}%"
+                    if r.stock_finish_reasons > 0
+                    else "n/a"
+                )
+                cand_trunc = (
+                    f"{r.candidate_truncated / r.candidate_finish_reasons * 100:.1f}%"
+                    if r.candidate_finish_reasons > 0
+                    else "n/a"
+                )
                 lines.append(
                     f"  [{r.repeat_index}] stock {r.stock_tok_per_sec:.2f} tok/s, "
                     f"candidate {r.candidate_tok_per_sec:.2f} tok/s, "
                     f"acceptance {r.stock_acceptance_rate * 100:.2f}% -> "
                     f"{r.candidate_acceptance_rate * 100:.2f}%, "
                     f"invalid {r.invalid_rate * 100:.2f}%, "
-                    f"mismatches {r.output_mismatches}"
+                    f"mismatches {r.output_mismatches}, "
+                    f"truncation stock {stock_trunc}, candidate {cand_trunc}"
                 )
         lines.extend(self._divergence_lines(decision))
         lines.append(self.detail)

@@ -20,7 +20,9 @@ from speedlm.gate.decide import (
     DivergenceBasis,
     EngineExecution,
     Reason,
+    TruncationRegime,
     Verdict,
+    classify_truncation,
     decide_promotion,
     divergence_excess_p_value,
     divergence_position_p_value,
@@ -2513,3 +2515,191 @@ def test_replay_stamps_every_invocation_with_its_own_session() -> None:
     assert ReplayResult(run_results=(), num_runs=0, suite_hash="h").session_id == ""
     first = _make_replay([_valid_run()])
     assert "session_id" in first.to_dict()
+
+
+# ---------------------------------------------------------------------------
+# What the output cap did to the measurement
+# ---------------------------------------------------------------------------
+
+
+def _with_truncation(
+    replay: ReplayResult,
+    columns: list[tuple[int, int]],
+) -> ReplayResult:
+    """Stamp one ``(reported, truncated)`` pair onto each repeat of *replay*.
+
+    Layered on top of :func:`_valid_runs_with_tps` rather than written beside
+    it, so the throughput and validity the gate reads are exactly what the
+    existing fixtures produce and the only thing varying is the finish-reason
+    bookkeeping.
+    """
+    return dataclasses.replace(
+        replay,
+        run_results=tuple(
+            dataclasses.replace(
+                run, finish_reason_count=reported, truncated_count=truncated
+            )
+            for run, (reported, truncated) in zip(
+                replay.run_results, columns, strict=True
+            )
+        ),
+    )
+
+
+def test_an_arm_that_reported_no_finish_reason_classifies_as_untestable() -> None:
+    """Zero reported is not zero truncated; it is nothing observed at all.
+
+    Every archived decision reads this, because none of them persisted the
+    counts.  Collapsing it into ``BOUNDED`` would turn "we never looked" into
+    the affirmative claim that truncation was measured and was low.
+    """
+    assert classify_truncation(reported=0, truncated=0) is TruncationRegime.UNTESTABLE
+
+
+def test_an_arm_with_no_natural_stop_whatsoever_classifies_as_saturated() -> None:
+    """The bar is exactly zero natural stops, not a tuned fraction of them."""
+    assert classify_truncation(reported=7, truncated=7) is TruncationRegime.SATURATED
+
+
+def test_a_single_natural_stop_is_enough_to_leave_the_saturated_regime() -> None:
+    """The boundary is a count, so one observation moves it and is meant to.
+
+    At one natural stop the run has seen where this model stops at least once,
+    which is the whole of what ``SATURATED`` says it has not.
+    """
+    assert classify_truncation(reported=7, truncated=6) is TruncationRegime.MIXED
+
+
+def test_an_exact_tie_between_truncated_and_natural_lands_on_bounded() -> None:
+    """The MIXED split is a *strict* majority, so a tie is not a majority."""
+    assert classify_truncation(reported=10, truncated=5) is TruncationRegime.BOUNDED
+
+
+def test_one_truncation_more_than_natural_stops_flips_bounded_to_mixed() -> None:
+    """The other side of the same boundary, one response away from the tie."""
+    assert classify_truncation(reported=11, truncated=6) is TruncationRegime.MIXED
+
+
+def test_reject_when_the_stock_arm_produced_no_natural_stop() -> None:
+    """A measurement rejection: the run cannot support a promotion either way.
+
+    Every stock generation was ended by ``benchmark_max_tokens``, so the arm
+    contains no observation of the workload's own lengths and its throughput is
+    attributable to the cap rather than to the head.  ``invalid_rate`` cannot
+    see this -- a response that spent its whole budget generating is a healthy
+    response -- which is why it needs its own reason.
+    """
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.6, output_tok_per_sec=100.0),
+        _make_delta(acceptance_rate=0.65, output_tok_per_sec=110.0),
+        _with_truncation(_valid_runs_with_tps(100.0), [(5, 5)] * 3),
+        _with_truncation(_valid_runs_with_tps(110.0), [(5, 1)] * 3),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+
+    assert dec.verdict is Verdict.REJECT
+    assert dec.reason is Reason.TRUNCATION_SATURATED
+    assert dec.stock_truncation_regime is TruncationRegime.SATURATED
+    assert dec.candidate_truncation_regime is not TruncationRegime.SATURATED
+
+
+def test_reject_when_the_candidate_arm_produced_no_natural_stop() -> None:
+    """Either arm saturating is enough; the comparison needs both to be real."""
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.6, output_tok_per_sec=100.0),
+        _make_delta(acceptance_rate=0.65, output_tok_per_sec=110.0),
+        _with_truncation(_valid_runs_with_tps(100.0), [(5, 1)] * 3),
+        _with_truncation(_valid_runs_with_tps(110.0), [(5, 5)] * 3),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+
+    assert dec.verdict is Verdict.REJECT
+    assert dec.reason is Reason.TRUNCATION_SATURATED
+    assert dec.candidate_truncation_regime is TruncationRegime.SATURATED
+    assert dec.stock_truncation_regime is not TruncationRegime.SATURATED
+
+
+def test_heavily_truncated_arms_that_still_stopped_sometimes_are_not_rejected() -> None:
+    """The guard must not swallow the regime every archived live run sits in.
+
+    SLURM 8b72d9a captured 92.2% and 85.3% of its two arms' responses at
+    ``length`` and those runs are interpretable: the natural stops bound how
+    much of the length distribution was clipped.  Rejecting them would make the
+    guard a veto on realistic agentic traffic rather than on unmeasured runs.
+    """
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.6, output_tok_per_sec=100.0),
+        _make_delta(acceptance_rate=0.65, output_tok_per_sec=110.0),
+        _with_truncation(_valid_runs_with_tps(100.0), [(100, 92)] * 3),
+        _with_truncation(_valid_runs_with_tps(110.0), [(100, 99)] * 3),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+
+    assert dec.verdict is Verdict.PROMOTE
+    assert dec.reason is Reason.BOTH_THRESHOLDS_MET
+    assert dec.stock_truncation_regime is TruncationRegime.MIXED
+    assert dec.candidate_truncation_regime is TruncationRegime.MIXED
+
+
+def test_truncation_rates_pool_the_per_repeat_columns_rather_than_average_them() -> None:
+    """The published rate must be reproducible by hand from ``per_repeat``.
+
+    The repeats deliberately report different numbers of responses, which is
+    the only case in which pooling and a mean of per-repeat rates disagree --
+    and they disagree by a lot here, ``0.15`` against ``0.3667``.  A repeat in
+    which almost everything errored must not weigh as much as a clean one.
+    """
+    stock_columns = [(10, 1), (2, 2), (8, 0)]
+    candidate_columns = [(4, 1), (4, 1), (4, 2)]
+
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.6, output_tok_per_sec=100.0),
+        _make_delta(acceptance_rate=0.65, output_tok_per_sec=110.0),
+        _with_truncation(_valid_runs_with_tps(100.0), stock_columns),
+        _with_truncation(_valid_runs_with_tps(110.0), candidate_columns),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+
+    # The array the reader reconciles against really is the array handed in.
+    assert [
+        (r.stock_finish_reasons, r.stock_truncated) for r in dec.per_repeat
+    ] == stock_columns
+    assert [
+        (r.candidate_finish_reasons, r.candidate_truncated) for r in dec.per_repeat
+    ] == candidate_columns
+
+    assert dec.stock_finish_reasons_reported == 20
+    assert dec.candidate_finish_reasons_reported == 12
+    assert dec.stock_truncation_rate == pytest.approx(3 / 20)
+    assert dec.candidate_truncation_rate == pytest.approx(4 / 12)
+    assert dec.truncation_rate_delta == pytest.approx(4 / 12 - 3 / 20)
+
+    # The discriminating half: a mean of the per-repeat rates is a different
+    # number, so this test fails if anybody swaps pooling for averaging.
+    assert dec.stock_truncation_rate != pytest.approx((0.1 + 1.0 + 0.0) / 3)
+
+
+def test_truncation_rates_are_none_rather_than_zero_when_nothing_reported() -> None:
+    """An unmeasured record must not be readable as one that measured zero.
+
+    ``0.0`` here would say "no generation hit the cap", which is a claim about
+    the workload.  ``None`` says the endpoint never reported a finish reason,
+    which is a claim about the harness, and every archived record is the second.
+    """
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.6, output_tok_per_sec=100.0),
+        _make_delta(acceptance_rate=0.65, output_tok_per_sec=110.0),
+        _valid_runs_with_tps(100.0),
+        _valid_runs_with_tps(110.0),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+
+    assert dec.stock_finish_reasons_reported == 0
+    assert dec.candidate_finish_reasons_reported == 0
+    assert dec.stock_truncation_rate is None
+    assert dec.candidate_truncation_rate is None
+    assert dec.truncation_rate_delta is None
+    assert dec.stock_truncation_regime is TruncationRegime.UNTESTABLE
+    assert dec.candidate_truncation_regime is TruncationRegime.UNTESTABLE
+    # And an unmeasured arm is not a rejection -- see ``UNTESTABLE``.
+    assert dec.verdict is Verdict.PROMOTE
