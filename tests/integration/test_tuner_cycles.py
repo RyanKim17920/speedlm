@@ -485,6 +485,8 @@ class _Replay:
             total_tokens=14,
             response_text="stable output",
             valid=True,
+            # A completed response reports what ended it.
+            finish_reason="stop",
         )
         run = RunResults(
             results=(request,),
@@ -494,6 +496,8 @@ class _Replay:
             valid_count=1,
             invalid_count=0,
             invalid_rate=0.0,
+            finish_reason_count=1,
+            truncated_count=0,
         )
         return ReplayResult(
             run_results=(run,) * repeats,

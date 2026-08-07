@@ -1617,6 +1617,44 @@ def _expanded_model_terms(model_type: str) -> set[str]:
     return _name_terms(model_type)
 
 
+#: A term that is nothing but a version marker: an optional leading ``v``
+#: followed by digits. ``v1``, ``v2``, ``v`` and ``3`` all qualify; ``qwen3``
+#: and ``a13b`` do not, because :func:`_name_terms` already contributed their
+#: digit-stripped family stem (``qwen``, ``a``) to the term set separately.
+_BARE_VERSION_TERM: Final = re.compile(r"v\d*|\d+")
+
+
+def _carries_family_signal(shared_terms: set[str]) -> bool:
+    """Is there anything in the overlap besides a version number?
+
+    :func:`_name_terms` deliberately over-generates. It emits each part, the
+    compact join, and a digit-stripped family stem, so that a model typed
+    ``qwen3`` still matches a parser keyed ``qwen``. The price of that
+    generosity is that a version fragment like ``v1`` becomes a first-class
+    term on both sides -- and the match gate in :func:`_best_parser_match`
+    demands only ONE shared term, on either the descriptor or the key side.
+
+    Two unrelated families that both happen to be on their first revision
+    therefore "match" on the version number alone. Measured against the real
+    installed vLLM registry (43 tool parsers, 27 reasoning parsers),
+    ``hunyuan_v1_dense`` selected ``poolside_v1`` on the shared set
+    ``{"v", "v1"}`` and nothing else, and reported it as ``auto-detected`` for
+    BOTH the tool-call and the reasoning parser. Hunyuan and Poolside are
+    unrelated models with unrelated output dialects. The only thing the two
+    names have in common is the digit 1.
+
+    So: a bare version token may never be the sole basis for a match. If the
+    version number is all two names share, they share nothing, and we abstain.
+    Abstaining is the honest outcome here -- :func:`resolve_model_parsers`
+    degrades the source to ``"none"`` and ``cli.py`` then emits no
+    ``--tool-call-parser`` / ``--reasoning-parser`` flag at all. Not parsing
+    tool calls is a visible, correctable gap. Parsing them with another
+    family's grammar is a silent one, and silent wrongness is the failure mode
+    this codebase exists to avoid.
+    """
+    return any(not _BARE_VERSION_TERM.fullmatch(term) for term in shared_terms)
+
+
 def _best_parser_match(
     model_type: str,
     parsers: Sequence[str],
@@ -1644,15 +1682,23 @@ def _best_parser_match(
             model_version_terms & parser_version_terms
         ):
             continue
-        if not model_terms & descriptor_terms and not expanded_terms & key_terms:
+        direct_shared = model_terms & descriptor_terms
+        synonym_shared = expanded_terms & key_terms
+        if not direct_shared and not synonym_shared:
             continue
         if dialect_terms and not dialect_terms & key_terms:
+            continue
+        # Confidence floor. The gates above are satisfied by a single shared
+        # term, and a shared version number is a coincidence, not evidence of
+        # a shared dialect. See :func:`_carries_family_signal` for the
+        # hunyuan/poolside case this rejects.
+        if not _carries_family_signal(direct_shared | synonym_shared):
             continue
 
         compact_key = re.sub(r"[^a-z0-9]", "", parser.lower())
         exact_dialect = int(compact_key in expanded_terms)
-        direct_matches = len(model_terms & descriptor_terms)
-        synonym_matches = len(expanded_terms & key_terms)
+        direct_matches = len(direct_shared)
+        synonym_matches = len(synonym_shared)
         # Prefer a parser whose whole key names the output dialect (for example
         # ``hermes``) over specialized variants that happen to share a family
         # prefix. Shorter keys are the safer generic fallback.

@@ -120,6 +120,13 @@ class Reason(Enum):
     #: family as ``COUNTER_RESET`` and ``HIGH_INVALID_RATE``: it says the run
     #: cannot support a promotion, not that the head is worse.
     TRUNCATION_SATURATED = "truncation_saturated"
+    #: Not one valid response in an arm reported a finish reason, so the
+    #: saturation guard above had nothing to read -- see
+    #: :attr:`TruncationRegime.UNTESTABLE`.  A missing-instrument rejection in
+    #: the same family as ``ACCEPTANCE_UNAVAILABLE``, and distinct from
+    #: ``TRUNCATION_SATURATED``: saturation says the cap ended every generation,
+    #: this says nobody said what ended any of them.
+    TRUNCATION_UNMEASURED = "truncation_unmeasured"
     TOO_FEW_REPEATS = "too_few_repeats"
     OUTPUT_MISMATCH = "output_mismatch"
     UNCERTAIN = "uncertain"
@@ -2299,6 +2306,24 @@ def decide_promotion(
     )
     if TruncationRegime.SATURATED in (stock_truncation, candidate_truncation):
         return _reject(Reason.TRUNCATION_SATURATED)
+
+    # --- Validation: nothing reported a finish reason at all ---
+    # ``UNTESTABLE`` is deliberately non-gating *as a description of a record*:
+    # every archived ``decision.json`` predates the counts, so its properties
+    # must keep reading ``UNTESTABLE`` rather than being relabelled ``BOUNDED``,
+    # and :func:`speedlm.report.parse_decision` must keep loading them.  That is
+    # a schema gap, and it is not this branch's subject.
+    #
+    # Here the counts come from a replay that just ran.  ``invalid_rate`` has
+    # already been checked above, so this arm returned responses the gate
+    # accepted as valid -- and not one of them said what ended it.  That is a
+    # measurement gap, not a schema gap: the saturation guard directly above is
+    # structurally unable to fire, and without this branch such a run promotes
+    # with its strongest measurement check silently inert.  The precedent is
+    # ``ACCEPTANCE_UNAVAILABLE`` a few checks up: in this codebase a missing
+    # instrument rejects, it does not pass.
+    if TruncationRegime.UNTESTABLE in (stock_truncation, candidate_truncation):
+        return _reject(Reason.TRUNCATION_UNMEASURED)
 
     # --- Validation: output mismatch ---
     # Excess over the engine's own noise floor, not any single occurrence.  Both

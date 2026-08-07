@@ -505,7 +505,19 @@ async def _send_request(
         text = raw_text if isinstance(raw_text, str) else ""
         reasoning = _extract_reasoning(message)
         output_tokens = _extract_output_tokens(choice)
-        finish_reason = choice.get("finish_reason") or ""
+        # A finish reason that is not a string is a reason *not given*, and is
+        # normalised to ``""`` here -- at ingestion -- exactly as a missing one
+        # already was.  ``or ""`` alone accepted any truthy JSON value, so a
+        # server answering ``finish_reason: 7`` built a ``RequestResult`` whose
+        # ``str``-annotated field held an int.  Nothing failed at that point:
+        # the counting block in ``_run_single`` later called ``.strip()`` on it
+        # and raised ``AttributeError`` *outside* this function's ``except``
+        # boundary, so one malformed response killed the entire replay instead
+        # of being recorded as one response that gave no reason.  Guarding here
+        # rather than at the strip site keeps the annotation true and leaves the
+        # rest of the pipeline free of defensive checks.
+        raw_finish_reason = choice.get("finish_reason")
+        finish_reason = raw_finish_reason if isinstance(raw_finish_reason, str) else ""
         usage = body.get("usage", {})
         pt = usage.get("prompt_tokens", 0)
         ct = usage.get("completion_tokens", 0)

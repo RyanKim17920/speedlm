@@ -1,7 +1,9 @@
 """Tests for gate/decide.py — no GPU, no network."""
 
 import dataclasses
+import json
 import math
+from pathlib import Path
 
 import pytest
 
@@ -36,6 +38,7 @@ from speedlm.gate.replay import (
     _validity_error,
     is_truncated_finish_reason,
 )
+from speedlm.report import parse_decision
 
 # ---------------------------------------------------------------------------
 # Factory helpers
@@ -51,7 +54,12 @@ def _make_request_result(
     completion_tokens: int = 5,
     output_tokens: tuple[str, ...] = (),
     context_hash: str = "abcd1234",
-    finish_reason: str = "",
+    # A real endpoint reports a finish reason on every response it completes, so
+    # the default response here reports one too.  Leaving it blank modelled a
+    # server that answers valid responses while never saying what ended them --
+    # which is the measurement gap ``TRUNCATION_UNMEASURED`` rejects, not the
+    # ordinary healthy run these fixtures are meant to stand for.
+    finish_reason: str = "stop",
 ) -> RequestResult:
     return RequestResult(
         context_hash=context_hash,
@@ -75,6 +83,9 @@ def _make_run(
     total_latency = sum(r.latency_s for r in results)
     total_pt = sum(r.prompt_tokens for r in results)
     total_ct = sum(r.completion_tokens for r in results)
+    # Derived from the results exactly as ``replay._run_single`` derives them,
+    # so a fixture cannot describe a run its own responses contradict.
+    reported = [r.finish_reason for r in results if r.valid and r.finish_reason.strip()]
     return RunResults(
         results=tuple(results),
         total_latency_s=total_latency,
@@ -83,6 +94,8 @@ def _make_run(
         valid_count=valid_count,
         invalid_count=invalid_count,
         invalid_rate=invalid_count / len(results) if results else 0.0,
+        finish_reason_count=len(reported),
+        truncated_count=sum(1 for fr in reported if is_truncated_finish_reason(fr)),
     )
 
 
@@ -2693,8 +2706,8 @@ def test_truncation_rates_are_none_rather_than_zero_when_nothing_reported() -> N
     dec = decide_promotion(
         _make_delta(acceptance_rate=0.6, output_tok_per_sec=100.0),
         _make_delta(acceptance_rate=0.65, output_tok_per_sec=110.0),
-        _valid_runs_with_tps(100.0),
-        _valid_runs_with_tps(110.0),
+        _with_truncation(_valid_runs_with_tps(100.0), [(0, 0)] * 3),
+        _with_truncation(_valid_runs_with_tps(110.0), [(0, 0)] * 3),
         _pcfg(acc_pp=1.0, throughput_pct=2.0),
     )
 
@@ -2705,8 +2718,134 @@ def test_truncation_rates_are_none_rather_than_zero_when_nothing_reported() -> N
     assert dec.truncation_rate_delta is None
     assert dec.stock_truncation_regime is TruncationRegime.UNTESTABLE
     assert dec.candidate_truncation_regime is TruncationRegime.UNTESTABLE
-    # And an unmeasured arm is not a rejection -- see ``UNTESTABLE``.
-    assert dec.verdict is Verdict.PROMOTE
+    # The regime stays UNTESTABLE -- it describes the record, and archived
+    # records must keep reading it -- but a *live* gate run that measured
+    # nothing cannot promote.  See ``test_reject_when_a_live_arm_reported_no_
+    # finish_reason_at_all``.
+    assert dec.verdict is Verdict.REJECT
+    assert dec.reason is Reason.TRUNCATION_UNMEASURED
+
+
+@pytest.mark.parametrize("blank", ["", " ", "\t", "\n  "])
+def test_reject_when_a_live_arm_reported_no_finish_reason_at_all(blank: str) -> None:
+    """Valid responses that never said what ended them cannot support a promotion.
+
+    This is the live counterpart of ``UNTESTABLE``, and the distinction is the
+    whole point.  An archived ``decision.json`` reads ``UNTESTABLE`` because the
+    counts did not exist when it was written -- a schema gap, correctly not a
+    rejection.  Here the counts came out of a replay that just ran: the arm
+    answered, every response was valid, and not one carried a finish reason.
+    That is a measurement gap.  The saturation guard directly above is
+    structurally unable to fire on such a run, so without this branch the run
+    promotes with the gate's strongest measurement check silently inert.
+
+    Whitespace-only reasons are parametrised because a reason that says nothing
+    is a reason not given: ``replay._run_single`` strips before counting, so
+    ``" "`` must reach the gate as zero reported, not as one natural stop.
+    """
+    stock = _with_truncation(
+        _make_replay([
+            _make_run([
+                _make_request_result(
+                    "same output",
+                    latency_s=_RUN_COMPLETION_TOKENS / 100.0,
+                    completion_tokens=_RUN_COMPLETION_TOKENS,
+                    finish_reason=blank,
+                )
+            ])
+            for _ in range(3)
+        ]),
+        [(0, 0)] * 3,
+    )
+    candidate = _with_truncation(_valid_runs_with_tps(110.0), [(5, 1)] * 3)
+
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.6, output_tok_per_sec=100.0),
+        _make_delta(acceptance_rate=0.65, output_tok_per_sec=110.0),
+        stock,
+        candidate,
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+
+    # The fixture really is a healthy arm apart from the missing instrument:
+    # every response valid, so ``HIGH_INVALID_RATE`` cannot be what fired.
+    assert stock.avg_invalid_rate == 0.0
+    assert all(run.valid_count == 1 for run in stock.run_results)
+    assert dec.verdict is Verdict.REJECT
+    assert dec.reason is Reason.TRUNCATION_UNMEASURED
+    assert dec.stock_truncation_regime is TruncationRegime.UNTESTABLE
+    assert dec.candidate_truncation_regime is not TruncationRegime.UNTESTABLE
+
+
+def test_reject_when_only_the_candidate_arm_reported_no_finish_reason() -> None:
+    """Either arm being uninstrumented is enough; the comparison needs both."""
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.6, output_tok_per_sec=100.0),
+        _make_delta(acceptance_rate=0.65, output_tok_per_sec=110.0),
+        _with_truncation(_valid_runs_with_tps(100.0), [(5, 1)] * 3),
+        _with_truncation(_valid_runs_with_tps(110.0), [(0, 0)] * 3),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+
+    assert dec.verdict is Verdict.REJECT
+    assert dec.reason is Reason.TRUNCATION_UNMEASURED
+    assert dec.candidate_truncation_regime is TruncationRegime.UNTESTABLE
+    assert dec.stock_truncation_regime is not TruncationRegime.UNTESTABLE
+
+
+def test_saturation_is_reported_ahead_of_unmeasured_when_both_apply() -> None:
+    """One arm capped throughout and the other silent reports the stronger fact.
+
+    ``TRUNCATION_SATURATED`` is a statement about generations that *were*
+    observed; ``TRUNCATION_UNMEASURED`` is the absence of observation.  The
+    first is the more specific finding, so it must not be masked.
+    """
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.6, output_tok_per_sec=100.0),
+        _make_delta(acceptance_rate=0.65, output_tok_per_sec=110.0),
+        _with_truncation(_valid_runs_with_tps(100.0), [(5, 5)] * 3),
+        _with_truncation(_valid_runs_with_tps(110.0), [(0, 0)] * 3),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+
+    assert dec.reason is Reason.TRUNCATION_SATURATED
+
+
+def test_an_archived_decision_still_reads_untestable_and_still_parses(
+    tmp_path: Path,
+) -> None:
+    """The separation guard: the properties describe a record, they do not gate.
+
+    An archived ``decision.json`` predates the finish-reason counts, so every
+    ``per_repeat`` row carries zeroes.  The new live rejection must not change
+    what such a record *says* about itself, and ``parse_decision`` must keep
+    loading it -- otherwise fixing the gate would retroactively invalidate every
+    decision the project has ever written.
+    """
+    archived = decide_promotion(
+        _make_delta(acceptance_rate=0.6, output_tok_per_sec=100.0),
+        _make_delta(acceptance_rate=0.65, output_tok_per_sec=110.0),
+        _with_truncation(_valid_runs_with_tps(100.0), [(0, 0)] * 3),
+        _with_truncation(_valid_runs_with_tps(110.0), [(0, 0)] * 3),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+
+    assert all(r.stock_finish_reasons == 0 for r in archived.per_repeat)
+    assert all(r.candidate_finish_reasons == 0 for r in archived.per_repeat)
+    assert archived.stock_truncation_regime is TruncationRegime.UNTESTABLE
+    assert archived.candidate_truncation_regime is TruncationRegime.UNTESTABLE
+
+    record = archived.to_dict()
+    assert record["stock_truncation_regime"] == TruncationRegime.UNTESTABLE.value
+    assert record["candidate_truncation_regime"] == TruncationRegime.UNTESTABLE.value
+
+    # And the reader loads it back unchanged, reasons included.
+    path = tmp_path / "decision.json"
+    path.write_text(json.dumps(record), encoding="utf-8")
+    parsed = parse_decision(json.loads(path.read_text(encoding="utf-8")), source=path)
+    assert parsed.reason is archived.reason
+    assert parsed.stock_truncation_regime is TruncationRegime.UNTESTABLE
+    assert parsed.candidate_truncation_regime is TruncationRegime.UNTESTABLE
 
 
 def _finish_reason_columns(

@@ -220,6 +220,17 @@ SHORT_CIRCUIT_MEASURED_REASONS = frozenset({"output_mismatch", "truncation_satur
 # it is asserted on its own branch below.
 TRUNCATION_REASON = "truncation_saturated"
 
+# Deliberately NOT in either set above.  `truncation_unmeasured` is the gate
+# saying no replayed response in an arm reported a finish reason at all, so it
+# is exactly the "the gate returned a verdict without measuring" failure this
+# file exists to make loud -- the opposite of `truncation_saturated`, which is a
+# measured finding.  Leaving it out of MEASURED_REASONS means a live run that
+# hits it fails here unless SPEEDLM_E2E_ALLOW_UNMEASURED_GATE=1, which is the
+# intended behaviour: on a real vLLM endpoint every completed response carries a
+# finish reason, so seeing this reason means the harness lost the field.
+UNMEASURED_TRUNCATION_REASON = "truncation_unmeasured"
+assert UNMEASURED_TRUNCATION_REASON not in SHORT_CIRCUIT_MEASURED_REASONS
+
 # Verdicts reached by actually comparing the two arms.  Anything else means the
 # gate rejected for want of data, which is a legitimate runtime outcome but not
 # a passing end-to-end run: it proves the lifecycle turned over without proving

@@ -89,6 +89,9 @@ UNMEASURED_REASONS: Final[frozenset[Reason]] = frozenset(
         # numeric" on every saturated run -- the gate could write a verdict its
         # own reader could not load back.
         Reason.TRUNCATION_SATURATED,
+        # Returns from the same block, above the delta computation, for the same
+        # reason: its record carries no `acceptance_delta_pp` to require.
+        Reason.TRUNCATION_UNMEASURED,
     }
 )
 
@@ -114,6 +117,10 @@ _REASON_EXPLANATIONS: Final[Mapping[Reason, str]] = {
     Reason.TRUNCATION_SATURATED: (
         "the output cap ended every generation in an arm, so the benchmark "
         "measured fixed-length decode rather than the workload"
+    ),
+    Reason.TRUNCATION_UNMEASURED: (
+        "no replayed response in an arm reported a finish reason, so whether the "
+        "output cap ended the generations could not be measured"
     ),
     Reason.UNCERTAIN: "the gate could not reach a confident conclusion",
 }

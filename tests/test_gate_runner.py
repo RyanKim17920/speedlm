@@ -193,6 +193,10 @@ class FakeReplayExecutor:
                         response_text=self.response_text,
                         valid=True,
                         output_tokens=tokens,
+                        # A completed response says what ended it; a fake that
+                        # omits this models an endpoint reporting nothing, which
+                        # the gate now rejects as unmeasured truncation.
+                        finish_reason="stop",
                     )
                 )
             runs.append(
@@ -204,6 +208,8 @@ class FakeReplayExecutor:
                     valid_count=len(requests),
                     invalid_count=0,
                     invalid_rate=0.0,
+                    finish_reason_count=len(requests),
+                    truncated_count=0,
                 )
             )
         result = ReplayResult(

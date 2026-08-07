@@ -343,6 +343,8 @@ def _run(
             total_tokens=10 + completion_tokens,
             response_text=response_text,
             valid=True,
+            # A completed response reports what ended it.
+            finish_reason="stop",
         )
         for _ in range(1)
     )
@@ -354,6 +356,8 @@ def _run(
         valid_count=len(results),
         invalid_count=0,
         invalid_rate=0.0,
+        finish_reason_count=len(results),
+        truncated_count=0,
     )
 
 

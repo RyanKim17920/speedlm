@@ -365,6 +365,17 @@ def test_non_builtin_local_model_uses_config_model_type(tmp_path: Path) -> None:
 
 
 def test_unknown_model_type_safely_resolves_no_parsers(tmp_path: Path) -> None:
+    # NOTE: this test passes for an incidental reason, and is kept only as a
+    # guard on the "no candidate survived any gate" branch. ``acme_transformer``
+    # is a lexical island: against a two-entry registry of ``hermes`` /
+    # ``openai`` it shares no term with anything, so ``_best_parser_match``
+    # returns ``None`` before any confidence question is asked. It does NOT
+    # demonstrate a confidence floor -- a realistic new model name usually DOES
+    # share a term with some parser, and until the bare-version-token floor
+    # landed, ``hunyuan_v1_dense`` was confidently "auto-detected" as
+    # ``poolside_v1`` off the shared token ``v1`` alone. The floor itself is
+    # covered by ``test_a_shared_version_number_alone_is_not_a_match`` and
+    # ``test_real_world_model_types_keep_their_known_good_parsers`` below.
     model = tmp_path / "custom-model"
     model.mkdir()
     (model / "config.json").write_text(
@@ -384,6 +395,158 @@ def test_unknown_model_type_safely_resolves_no_parsers(tmp_path: Path) -> None:
     assert resolution.reasoning_parser is None
     assert resolution.tool_call_parser_source == "none"
     assert resolution.reasoning_parser_source == "none"
+
+
+#: A slice of the REAL installed vLLM parser registry (43 tool parsers, 27
+#: reasoning parsers), kept large enough that the known-good families have to
+#: out-compete near neighbours rather than win by being the only entry. The
+#: ``poolside_v1`` / ``hunyuan`` pairing is the observed misfire: two unrelated
+#: families whose only common term is the version number.
+_REALISTIC_REGISTRY = ParserRegistry(
+    tool_parsers=(
+        "deepseek_v3",
+        "hermes",
+        "hunyuan_a13b",
+        "internlm",
+        "kimi_k2",
+        "llama3_json",
+        "llama4_json",
+        "llama4_pythonic",
+        "mistral",
+        "openai",
+        "poolside_v1",
+        "qwen3_coder",
+        "qwen3_xml",
+        "seed_oss",
+        "step3",
+    ),
+    reasoning_parsers=(
+        "deepseek_v3",
+        "mistral",
+        "openai_gptoss",
+        "poolside_v1",
+        "qwen3",
+        "seed_oss",
+        "step3",
+    ),
+    tool_metadata={
+        "openai": "openai vllm.tool_parsers.gptoss_tool_parser.GptOssToolParser",
+    },
+)
+
+
+def test_a_shared_version_number_alone_is_not_a_match() -> None:
+    """A bare version token may never be the sole basis for auto-detection.
+
+    ``hunyuan_v1_dense`` and ``poolside_v1`` share exactly ``{"v", "v1"}`` and
+    nothing else -- unrelated vendors, unrelated output dialects, matched on
+    the digit 1. Before the floor this resolved as ``auto-detected`` for BOTH
+    parsers. It must now abstain.
+    """
+    resolution = resolve_model_parsers(
+        "tencent/some-unreleased-hunyuan",
+        model_type="hunyuan_v1_dense",
+        registry=_REALISTIC_REGISTRY,
+    )
+
+    assert resolution.tool_call_parser is None
+    assert resolution.reasoning_parser is None
+    assert resolution.tool_call_parser_source == "none"
+    assert resolution.reasoning_parser_source == "none"
+
+
+@pytest.mark.parametrize(
+    ("model_type", "tool_parser", "reasoning_parser"),
+    [
+        # Built-in profile families. These are the ones the heuristic was tuned
+        # against and the floor must leave them exactly where they were.
+        ("gpt_oss", "openai", "openai_gptoss"),
+        ("qwen3", "qwen3_xml", "qwen3"),
+        ("qwen3_moe", "qwen3_xml", "qwen3"),
+        ("mistral", "mistral", "mistral"),
+        ("llama4", "llama4_json", None),
+        # Families that carry a real stem alongside their version digits. The
+        # floor keys off "is the shared term ONLY a version", so these still
+        # match on ``deepseek`` / ``step`` / ``seed``.
+        ("deepseek_v3", "deepseek_v3", "deepseek_v3"),
+        ("step3_text", "step3", "step3"),
+        ("seed_oss", "seed_oss", "seed_oss"),
+        # Version-only overlap. Nothing in common but the number.
+        ("hunyuan_v1_dense", None, None),
+        ("hunyuan_v1_moe", None, None),
+    ],
+)
+def test_real_world_model_types_keep_their_known_good_parsers(
+    model_type: str,
+    tool_parser: str | None,
+    reasoning_parser: str | None,
+) -> None:
+    """Regression guard: every row is a real HF ``model_type``.
+
+    All rows run against the SAME realistic registry, so an over-broad floor
+    cannot pass by quietly abstaining everywhere -- the known-good rows assert
+    a specific parser name, not merely "something".
+    """
+    resolution = resolve_model_parsers(
+        f"vendor/{model_type}-checkpoint",
+        model_type=model_type,
+        registry=_REALISTIC_REGISTRY,
+    )
+
+    assert resolution.tool_call_parser == tool_parser
+    assert resolution.reasoning_parser == reasoning_parser
+    assert resolution.tool_call_parser_source == (
+        "auto-detected" if tool_parser is not None else "none"
+    )
+    assert resolution.reasoning_parser_source == (
+        "auto-detected" if reasoning_parser is not None else "none"
+    )
+
+
+def test_a_profile_pin_still_wins_where_the_floor_would_abstain() -> None:
+    """Abstention is an auto-detection verdict, not a veto on the other levels.
+
+    An operator who knows a bare-version-named model's dialect can still pin it
+    in a profile, and the pin must survive the floor untouched.
+    """
+    pinned = ModelProfile(
+        name="hunyuan-v1-dense-pinned",
+        verifier_model="tencent/Hunyuan-V1-Dense",
+        draft_model=None,
+        speculative_method="ngram",
+        num_speculative_tokens=3,
+        target_layer_ids=None,
+        chat_template_kind="auto",
+        max_seq_len=4096,
+        tool_call_parser="hermes",
+        reasoning_parser="qwen3",
+    )
+
+    resolution = resolve_model_parsers(
+        pinned.verifier_model,
+        model_type="hunyuan_v1_dense",
+        profile=pinned,
+        registry=_REALISTIC_REGISTRY,
+    )
+
+    assert resolution.tool_call_parser == "hermes"
+    assert resolution.reasoning_parser == "qwen3"
+    assert resolution.tool_call_parser_source == "profile-pinned"
+    assert resolution.reasoning_parser_source == "profile-pinned"
+
+
+def test_user_supplied_parsers_still_override_an_abstaining_match() -> None:
+    resolution = resolve_model_parsers(
+        "tencent/some-unreleased-hunyuan",
+        ["--tool-call-parser", "hermes", "--reasoning-parser=qwen3"],
+        model_type="hunyuan_v1_dense",
+        registry=_REALISTIC_REGISTRY,
+    )
+
+    assert resolution.tool_call_parser == "hermes"
+    assert resolution.reasoning_parser == "qwen3"
+    assert resolution.tool_call_parser_source == "user-supplied"
+    assert resolution.reasoning_parser_source == "user-supplied"
 
 
 def test_profile_pins_override_auto_detection() -> None:

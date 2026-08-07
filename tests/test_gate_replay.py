@@ -805,6 +805,51 @@ def test_a_run_that_reported_no_finish_reason_is_unmeasured_not_untruncated(
     assert run.to_dict()["truncation_rate"] == 0.0
 
 
+@pytest.mark.parametrize(
+    "raw_finish_reason",
+    [7, True, 0.5, ["length"], {"reason": "length"}, None],
+    ids=["int", "bool", "float", "list", "dict", "null"],
+)
+def test_a_non_string_finish_reason_is_recorded_as_absent_not_crashed_on(
+    monkeypatch: pytest.MonkeyPatch,
+    raw_finish_reason: object,
+) -> None:
+    """A malformed reason costs one response's evidence, not the whole replay.
+
+    ``choice.get("finish_reason") or ""`` accepted any truthy JSON value, so a
+    server answering ``finish_reason: 7`` built a ``RequestResult`` whose
+    ``str``-annotated field held an int.  Nothing failed there; the counting
+    block in ``_run_single`` then called ``.strip()`` on it and raised
+    ``AttributeError`` *outside* ``_send_request``'s ``except``, killing the run.
+
+    The response itself is still a perfectly good throughput sample -- it has
+    content and tokens -- so it stays valid.  What it no longer supplies is a
+    finish reason, which is the truth: a value the schema cannot express is a
+    reason not given, and ``finish_reason_count`` says so.
+    """
+    _scripted(
+        monkeypatch,
+        {
+            "message": {"content": "a real answer"},
+            "finish_reason": raw_finish_reason,
+        },
+        {"prompt_tokens": 12, "completion_tokens": 9},
+        scripted=5,
+    )
+
+    run = _replay(_suite(5)).run_results[0]
+
+    assert len(run.results) == 5
+    assert run.valid_count == 5
+    assert run.invalid_count == 0
+    # The annotation is true of every result, whatever the server sent.
+    assert all(isinstance(r.finish_reason, str) for r in run.results)
+    assert all(r.finish_reason == "" for r in run.results)
+    # And an absent reason stays out of the truncation denominator.
+    assert run.finish_reason_count == 0
+    assert run.truncated_count == 0
+
+
 def _counted_run(*, reported: int, truncated: int) -> RunResults:
     """A run carrying nothing but the finish-reason counts under test."""
     return RunResults(
