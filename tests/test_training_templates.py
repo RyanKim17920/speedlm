@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from speedlm.training.rows import TrainingRow
-from speedlm.training.templates.chatml import ChatMLTemplate
+from speedlm.training.templates.chatml import ChatMLStructureError, ChatMLTemplate
 from speedlm.training.templates.harmony import HarmonyTemplate
 
 
@@ -67,3 +69,86 @@ def test_chatml_renders_and_detects_flat_assistant_spans() -> None:
         "goodbye",
     ]
     assert [span.turn for span in spans] == [0, 1]
+
+# ===========================================================================
+# ChatMLTemplate's marker assumption is narrow and must be validated
+#
+# ``assistant_spans`` keys off one family's ChatML control markers.  Handed the
+# output of an arbitrary Hugging Face chat template it used to find no marker
+# and return an empty tuple -- indistinguishable, to every caller, from a
+# legitimate conversation with no assistant content.  Wrong spans dressed as an
+# answer is the worst of the three possible outcomes; these pin the refusal.
+#
+# The foreign renderings below use the Gemma-style turn markers deliberately:
+# they carry no pipe characters, so nothing here can be mistaken for a ChatML
+# control token by a reader or by a tool.
+# ===========================================================================
+
+
+def _chatml() -> ChatMLTemplate:
+    return ChatMLTemplate()
+
+
+def test_chatml_refuses_a_foreign_template_instead_of_reporting_no_spans() -> None:
+    """An empty tuple here reads as "supervises nothing", which is a lie."""
+    foreign = (
+        "<start_of_turn>user\nhi<end_of_turn>\n"
+        "<start_of_turn>model\nhello<end_of_turn>\n"
+    )
+
+    with pytest.raises(ChatMLStructureError) as caught:
+        _chatml().assistant_spans(foreign)
+
+    message = str(caught.value)
+    assert "no ChatML block" in message
+    assert "chat template" in message
+
+
+def test_chatml_refuses_text_wedged_between_two_chatml_blocks() -> None:
+    """Half-ChatML is not ChatML; the spans either side would be untrustworthy."""
+    template = _chatml()
+    head = template.render(({"role": "user", "content": "hi"},))
+    tail = template.render(({"role": "assistant", "content": "hello"},))
+
+    with pytest.raises(ChatMLStructureError) as caught:
+        template.assistant_spans(f"{head}<start_of_turn>model\nstray<end_of_turn>\n{tail}")
+
+    assert "between ChatML blocks" in str(caught.value)
+
+
+def test_chatml_refuses_trailing_text_after_the_final_block() -> None:
+    """Trailing content means the assumed structure did not describe the text."""
+    template = _chatml()
+    rendered = template.render(
+        (
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        )
+    )
+
+    with pytest.raises(ChatMLStructureError) as caught:
+        template.assistant_spans(f"{rendered}<start_of_turn>model\ntrailing")
+
+    assert "trailing text" in str(caught.value)
+
+
+def test_chatml_structure_refusal_stays_a_value_error() -> None:
+    """Callers already catch the renderer's structural ValueErrors."""
+    assert issubclass(ChatMLStructureError, ValueError)
+
+
+def test_chatml_counts_an_empty_assistant_turn_without_supervising_it() -> None:
+    """An empty turn yields no span but still consumes a turn number."""
+    template = _chatml()
+    rendered = template.render(
+        (
+            {"role": "assistant", "content": ""},
+            {"role": "user", "content": "hi"},
+            {"role": "assistant", "content": "hello"},
+        )
+    )
+
+    spans = template.assistant_spans(rendered)
+
+    assert [rendered[span.start : span.end] for span in spans] == ["hello"]
+    assert [span.turn for span in spans] == [1]

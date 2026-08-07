@@ -1796,6 +1796,20 @@ def _is_truncated(record: Mapping[str, Any]) -> bool:
     return isinstance(value, str) and value.strip().lower() in TRUNCATED_FINISH_REASONS
 
 
+#: Share of read rows the client-authorship filter may drop before the rendering
+#: pass reports a diagnosis, even when enough rows survive to clear
+#: ``min_rendered_rows``.
+#:
+#: The floors below only fire when this filter left too *few* rows outright.  A
+#: large multi-turn or agentic corpus can lose most of its rows here and still
+#: clear the floor, and what survives is exactly the single-turn slice the
+#: gateway tagged end to end -- a biased remnant that trains, promotes and
+#: reports like any other corpus.  One in five is well above the noise floor for
+#: a corpus that is genuinely mostly this verifier's own single-turn traffic and
+#: well below the "every multi-turn row is gone" case this exists to name.
+CLIENT_SUPPLIED_DROP_ALERT_FRACTION: Final = 0.2
+
+
 @dataclass(frozen=True, slots=True)
 class RenderedRowCounts:
     """What one rendering pass read, kept and discarded."""
@@ -1811,6 +1825,36 @@ class RenderedRowCounts:
     #: Assistant turns that were not this verifier's output, across all rows.
     client_supplied_turns_seen: int = 0
 
+    @property
+    def client_supplied_drop_fraction(self) -> float:
+        """Share of read rows the client-authorship filter removed."""
+        if not self.read:
+            return 0.0
+        return self.dropped_client_supplied / self.read
+
+    def client_supplied_diagnosis(self) -> str:
+        """Name the authorship filter, its counts and the knob that relaxes it.
+
+        Shared by the hard failure and the survived-but-biased warning so an
+        operator reads the same diagnosis either way.  Naming the counts is the
+        point: "not enough rows" sends someone hunting for a capture problem,
+        while "9 of 10 rows carried an assistant turn this verifier did not
+        produce" points straight at the corpus and at the one knob that changes
+        the outcome.
+        """
+        return (
+            f"{self.dropped_client_supplied} of {self.read} rows "
+            f"({self.client_supplied_drop_fraction:.1%}) carried an assistant "
+            f"turn this verifier did not produce "
+            f"({self.client_supplied_turns_seen} such turns in total) and were "
+            f"dropped, leaving {self.written}. Multi-turn and agentic traffic "
+            "replays earlier assistant turns in every request, so a corpus "
+            "whose messages carry no provenance_tag loses every multi-turn row "
+            "here. Set trust_untagged_assistant_messages=True if every "
+            "assistant turn in the corpus is known to be this verifier's own "
+            "output."
+        )
+
     def to_dict(self) -> dict[str, object]:
         return {
             "read": self.read,
@@ -1821,6 +1865,15 @@ class RenderedRowCounts:
             "truncated_row_policy": self.policy.value,
             "dropped_client_supplied": self.dropped_client_supplied,
             "client_supplied_turns_seen": self.client_supplied_turns_seen,
+            "client_supplied_drop_fraction": self.client_supplied_drop_fraction,
+            # Carried into ``state.rendered_rows`` and from there into the cycle
+            # report, so a corpus this filter reshaped is diagnosable from the
+            # artifact and not only from this process's logs.
+            "client_supplied_drop_diagnosis": (
+                self.client_supplied_diagnosis()
+                if self.dropped_client_supplied
+                else None
+            ),
         }
 
 
@@ -1852,14 +1905,10 @@ class ClientSupervisedCorpusError(Eagle3Error):
         super().__init__(
             f"dropping rows with client-supplied assistant turns left "
             f"{counts.written} trainable rows from {source}, below the floor of "
-            f"{minimum}: {counts.dropped_client_supplied} of {counts.read} rows "
-            f"carried an assistant turn this verifier did not produce "
-            f"({counts.client_supplied_turns_seen} such turns in total). "
+            f"{minimum}: {counts.client_supplied_diagnosis()} "
             "Supervising those turns would teach the draft head to predict "
-            "another model's outputs. If the corpus predates per-message "
-            "provenance tagging and every assistant turn in it is known to be "
-            "this verifier's own output, set "
-            "trust_untagged_assistant_messages to accept untagged turns."
+            "another model's outputs, so dropping the row is the only "
+            "representable answer."
         )
 
 
@@ -1968,6 +2017,17 @@ def _render_speculators_dataset(
         client_supplied_turns_seen,
         policy.value,
     )
+    # The floors below fire only when this filter left too FEW rows.  A corpus
+    # it merely reshaped clears them and then trains, promotes and reports like
+    # any other corpus while every multi-turn row is gone.  Warn on the drop
+    # FRACTION instead, carrying the same diagnosis the hard failure carries, so
+    # the survivable case and the fatal case read alike.
+    if counts.client_supplied_drop_fraction >= CLIENT_SUPPLIED_DROP_ALERT_FRACTION:
+        logger.warning(
+            "client-authorship filter dropped a material fraction of the "
+            "corpus: %s",
+            counts.client_supplied_diagnosis(),
+        )
     # Checked before the empty-dataset error so a corpus this filter emptied is
     # reported as "the truncation filter did it", not as the generic "nothing
     # converted" that predates the filter and names the wrong cause.

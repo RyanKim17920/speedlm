@@ -4,9 +4,11 @@ import contextlib
 import fnmatch
 import io
 import json
+import logging
 import sys
+import time
 import types
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
@@ -23,12 +25,15 @@ from speedlm.training.backends.eagle3 import (
     _VALIDATE_DRAFT,
     DEFAULT_TTT_STEP_LOSS_DECAY,
     REQUIRED_DRAFT_TENSORS,
+    ClientSupervisedCorpusError,
     Eagle3Adapter,
     Eagle3Backend,
     Eagle3Config,
     Eagle3Error,
+    RenderedRowCounts,
     SpeculatorsPipelineConfig,
     _fraction,
+    _render_speculators_dataset,
     _Resolver,
     _State,
 )
@@ -39,6 +44,9 @@ from speedlm.training.masking import (
     require_trainable_window,
     summarize_training_window,
 )
+from speedlm.tuner.eagle3 import TraceSnapshot
+
+_EAGLE3_LOGGER = "speedlm.training.backends.eagle3"
 
 
 def test_shifted_label_and_truncation_accounting() -> None:
@@ -848,3 +856,157 @@ def test_the_validator_requires_the_fusion_projection(tmp_path: Path) -> None:
             (2, 18, 33),
             tensor_keys=frozenset({"d2t", "t2d"}),
         )
+
+
+# ===========================================================================
+# A corpus the client-authorship filter RESHAPED, rather than emptied
+#
+# ``ClientSupervisedCorpusError`` only fires when the filter left fewer rows
+# than ``min_rendered_rows``.  A large multi-turn or agentic corpus can lose
+# most of its rows and still clear that floor, and the remnant is exactly the
+# single-turn slice the gateway tagged end to end.  That trains, promotes and
+# reports like any other corpus.  These pin the diagnosis that says otherwise.
+# ===========================================================================
+
+
+def _authorship_turn(role: str, content: str, **extra: object) -> dict[str, object]:
+    return {"role": role, "content": content, **extra}
+
+
+def _single_turn_row(index: int) -> dict[str, object]:
+    """One exchange exactly as the gateway tags it: the response is ours."""
+    return {
+        "id": f"row-{index}",
+        "messages": [
+            _authorship_turn("user", "q", provenance_tag="client_supplied"),
+            _authorship_turn("assistant", "a", provenance_tag="generated"),
+        ],
+    }
+
+
+def _multi_turn_row(index: int) -> dict[str, object]:
+    """An agentic request: the client replayed a prior assistant turn."""
+    return {
+        "id": f"row-{index}",
+        "messages": [
+            _authorship_turn("user", "q1", provenance_tag="client_supplied"),
+            _authorship_turn("assistant", "h", provenance_tag="client_supplied"),
+            _authorship_turn("user", "q2", provenance_tag="client_supplied"),
+            _authorship_turn("assistant", "a", provenance_tag="generated"),
+        ],
+    }
+
+
+def _render_corpus(
+    tmp_path: Path,
+    records: Sequence[Mapping[str, object]],
+    *,
+    name: str,
+    minimum_rows: int = 1,
+) -> RenderedRowCounts:
+    source = tmp_path / f"snap-{name}.jsonl"
+    source.write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+    )
+    return _render_speculators_dataset(
+        TraceSnapshot(source, "hash"),
+        tmp_path / f"{name}.jsonl",
+        guard=lambda: False,
+        started=time.monotonic(),
+        timeout=60.0,
+        minimum_rows=minimum_rows,
+    )
+
+
+def test_a_reshaped_corpus_that_clears_the_floor_is_still_diagnosed(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Eight of ten multi-turn rows gone, two survive, no error -- say so."""
+    records = [_multi_turn_row(index) for index in range(8)] + [
+        _single_turn_row(8),
+        _single_turn_row(9),
+    ]
+
+    with caplog.at_level(logging.WARNING, logger=_EAGLE3_LOGGER):
+        counts = _render_corpus(tmp_path, records, name="reshaped")
+
+    assert counts.written == 2
+    assert counts.dropped_client_supplied == 8
+    warnings = [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno >= logging.WARNING
+    ]
+    assert len(warnings) == 1, warnings
+    message = warnings[0]
+    # The reason, the counts and the knob -- the three things a bare
+    # "not enough rows" failure downstream would never have named.
+    assert "8 of 10 rows" in message
+    assert "80.0%" in message
+    assert "8 such turns in total" in message
+    assert "leaving 2" in message
+    assert "trust_untagged_assistant_messages" in message
+
+
+def test_a_corpus_the_authorship_filter_barely_touched_is_not_warned_about(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A warning on every corpus is a warning on none of them."""
+    records = [_multi_turn_row(0)] + [_single_turn_row(index) for index in range(1, 10)]
+
+    with caplog.at_level(logging.WARNING, logger=_EAGLE3_LOGGER):
+        counts = _render_corpus(tmp_path, records, name="grazed")
+
+    assert counts.dropped_client_supplied == 1
+    assert counts.client_supplied_drop_fraction == pytest.approx(0.1)
+    assert [
+        record.getMessage()
+        for record in caplog.records
+        if record.levelno >= logging.WARNING
+    ] == []
+
+
+def test_the_authorship_diagnosis_rides_into_the_cycle_report(
+    tmp_path: Path,
+) -> None:
+    """Logs are lost; the rendered-row counts land in the report artifact."""
+    records = [_multi_turn_row(index) for index in range(8)] + [
+        _single_turn_row(8),
+        _single_turn_row(9),
+    ]
+
+    reported = _render_corpus(tmp_path, records, name="reported").to_dict()
+
+    assert reported["client_supplied_drop_fraction"] == pytest.approx(0.8)
+    diagnosis = reported["client_supplied_drop_diagnosis"]
+    assert isinstance(diagnosis, str)
+    assert "8 of 10 rows" in diagnosis
+    assert "trust_untagged_assistant_messages" in diagnosis
+
+
+def test_an_untouched_corpus_reports_no_authorship_diagnosis(
+    tmp_path: Path,
+) -> None:
+    """A diagnosis on a corpus with nothing wrong is noise in every report."""
+    reported = _render_corpus(
+        tmp_path, [_single_turn_row(index) for index in range(4)], name="clean"
+    ).to_dict()
+
+    assert reported["client_supplied_drop_fraction"] == 0.0
+    assert reported["client_supplied_drop_diagnosis"] is None
+
+
+def test_the_authorship_failure_names_the_same_diagnosis_as_the_warning(
+    tmp_path: Path,
+) -> None:
+    """The loud case and the silent case must read alike, or one is a surprise."""
+    records = [_multi_turn_row(index) for index in range(9)] + [_single_turn_row(9)]
+
+    with pytest.raises(ClientSupervisedCorpusError) as caught:
+        _render_corpus(tmp_path, records, name="emptied", minimum_rows=4)
+
+    message = str(caught.value)
+    assert "below the floor of 4" in message
+    assert "9 of 10 rows" in message
+    assert "90.0%" in message
+    assert "trust_untagged_assistant_messages" in message
