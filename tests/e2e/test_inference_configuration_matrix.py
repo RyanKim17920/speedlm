@@ -6,7 +6,7 @@ Each of the twelve cells combines:
 
 * eager or CUDA-graph execution;
 * request concurrency 1, 8, or 32; and
-* short or long prompts drawn from the configured corpus.
+* a short or long prompt band sampled from a declared workload.
 
 Within every cell the reference and candidate drafts use the production gate
 runner's mirrored two-block schedule (ABBA).  Every block starts a new vLLM
@@ -16,6 +16,26 @@ measurement window.  No arm inherits a process or warm state from another.
 The live test is opt-in because the full matrix starts 48 engines.  A pure
 synthetic test exercises the same regression decision without a GPU, proving
 that the harness has a real failing path instead of merely recording numbers.
+
+WHERE THE PROMPTS COME FROM
+---------------------------
+Bands are percentile windows over a workload's own prompt-length distribution
+(``tests/e2e/harness/workloads.py`` plus the manifests beside it), selected with
+``SPEEDLM_E2E_WORKLOAD`` and defaulting to ``generic-chat``.  This replaces an
+earlier scheme that took the eight shortest prompts truncated to 480 characters
+as "short" and the eight longest self-tiled to exactly 6000 characters as
+"long".  Both were extremes rather than samples, and the tiled long band was
+repetition-padded text, which is maximally predictable and therefore flatters
+any drafter.  Nothing here truncates or pads: a band prompt is verbatim corpus
+text or the cell fails.
+
+CI COVERAGE
+-----------
+Only the live matrix carries the ``e2e`` marker.  The band-construction, band
+validation, preflight-refusal and regression-decision logic is covered by
+marker-free tests at the bottom of this module, so ``-m "not e2e"`` -- what CI
+runs -- selects them.  A module-level ``pytestmark`` used to deselect all of it,
+including the synthetic regression control.
 """
 
 from __future__ import annotations
@@ -28,6 +48,7 @@ import shlex
 import signal
 import socket
 import subprocess
+import sys
 import time
 from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
@@ -44,9 +65,16 @@ from speedlm.gateway.process import build_vllm_argv
 from speedlm.profiles import ModelProfile, resolve_profile, resolve_speculative_tokens
 from speedlm.tuner.composition import declared_draft_depth
 
-pytestmark = pytest.mark.e2e
-
 REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tests.e2e.harness import workloads  # noqa: E402
+
+# NOTE: there is deliberately no module-level ``pytestmark``.  One used to live
+# here, and it deselected the GPU-free tests below from every CI run -- the
+# synthetic regression control included.  Only the live matrix is marked e2e.
+
 VLLM_VENV = Path("/admin/home/ryan.kim/speedlm/.preflight/venvs/vllm")
 VLLM = VLLM_VENV / "bin" / "vllm"
 
@@ -62,6 +90,26 @@ WARMUP_REPEATS: Final = 1
 DEFAULT_MAX_SLOWDOWN_PERCENT: Final = 5.0
 DEFAULT_MAX_ACCEPTED_LENGTH_LOSS: Final = 0.25
 CONFIDENCE_MULTIPLIER: Final = 1.96
+
+#: Workload used when the launcher does not name one.  ``generic-chat`` is the
+#: comparability anchor every previously published matrix number was taken on.
+DEFAULT_WORKLOAD: Final = "generic-chat"
+
+#: How far the *served* model's tokenizer may disagree with the tokenizer the
+#: manifest's percentiles were computed under before the band is called
+#: mislabelled.  The manifests declare their basis in
+#: ``provenance.token_basis`` (currently openai/gpt-oss-20b); a different
+#: verifier tokenizes the same text differently, and that difference is a
+#: legitimate, bounded offset.  A ratio surprise larger than this is not an
+#: offset, it is a band that is not the band it claims to be, so the cell fails
+#: rather than publishing a mislabelled number.
+DEFAULT_BAND_TOKEN_TOLERANCE: Final = 0.35
+
+#: A prompt whose longest proper border is at least this fraction of its length
+#: is treated as repetition-padded.  Natural prose borders are a handful of
+#: characters; ``(prompt * copies)[:6000]`` -- the padding this module used to
+#: do -- has a border of thousands.  See :func:`_border_fraction`.
+REPETITION_BORDER_LIMIT: Final = 0.25
 
 ExecutionMode = Literal["eager", "cuda_graphs"]
 ContextLength = Literal["short", "long"]
@@ -85,13 +133,20 @@ class LiveConfiguration:
     model: str
     reference_draft: str
     candidate_draft: str
-    corpus: Path
+    workload: str
     artifact_dir: Path
     startup_timeout: float
     request_timeout: float
     inject_slowdown_percent: float
     max_slowdown_percent: float
     max_accepted_length_loss: float
+    max_model_len: int
+    band_token_tolerance: float
+    #: Only recorded.  The matrix no longer reads a raw corpus file; the
+    #: workload manifest owns the corpus, its digest and its distribution.
+    #: An un-updated launcher still sets ``SPEEDLM_E2E_PROMPT_CORPUS``, so the
+    #: value is kept in the artifact rather than silently discarded.
+    legacy_prompt_corpus: Path | None = None
 
 
 MATRIX: Final = tuple(
@@ -127,16 +182,32 @@ def _require_live_configuration() -> LiveConfiguration:
         assert value, f"{name} is required"
         return value
 
-    corpus = Path(required("SPEEDLM_E2E_PROMPT_CORPUS")).expanduser().resolve()
-    assert corpus.is_file(), f"prompt corpus is not a file: {corpus}"
+    raw_corpus = os.environ.get("SPEEDLM_E2E_PROMPT_CORPUS")
+    legacy_prompt_corpus = (
+        Path(raw_corpus).expanduser().resolve() if raw_corpus else None
+    )
+    workload = os.environ.get("SPEEDLM_E2E_WORKLOAD") or DEFAULT_WORKLOAD
+    available = workloads.available_workloads()
+    assert workload in available, (
+        f"SPEEDLM_E2E_WORKLOAD={workload!r} is not a declared workload; "
+        f"available: {', '.join(available)}"
+    )
     artifact_dir = Path(required("SPEEDLM_CONFIG_MATRIX_ARTIFACT_DIR")).resolve()
     artifact_dir.mkdir(parents=True, exist_ok=True)
     return LiveConfiguration(
         model=required("SPEEDLM_CONFIG_MATRIX_MODEL"),
         reference_draft=required("SPEEDLM_CONFIG_MATRIX_REFERENCE_DRAFT"),
         candidate_draft=required("SPEEDLM_CONFIG_MATRIX_CANDIDATE_DRAFT"),
-        corpus=corpus,
+        workload=workload,
+        legacy_prompt_corpus=legacy_prompt_corpus,
         artifact_dir=artifact_dir,
+        max_model_len=int(
+            _number_from_env("SPEEDLM_CONFIG_MATRIX_MAX_MODEL_LEN", MAX_MODEL_LEN)
+        ),
+        band_token_tolerance=_number_from_env(
+            "SPEEDLM_CONFIG_MATRIX_BAND_TOKEN_TOLERANCE",
+            DEFAULT_BAND_TOKEN_TOLERANCE,
+        ),
         startup_timeout=_number_from_env("SPEEDLM_CONFIG_MATRIX_STARTUP_TIMEOUT", 1800),
         request_timeout=_number_from_env("SPEEDLM_CONFIG_MATRIX_REQUEST_TIMEOUT", 600),
         inject_slowdown_percent=_number_from_env(
@@ -189,47 +260,237 @@ def _write_json(path: Path, value: object) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
-def _load_corpus(path: Path, *, limit: int = 2048) -> list[str]:
-    prompts: list[str] = []
-    with path.open(encoding="utf-8") as stream:
-        for raw_line in stream:
-            if len(prompts) >= limit:
-                break
-            stripped = raw_line.strip()
-            if not stripped:
-                continue
-            value: object = json.loads(stripped)
-            if not isinstance(value, dict):
-                continue
-            messages = value.get("messages")
-            if not isinstance(messages, list) or not messages:
-                continue
-            first = messages[0]
-            if not isinstance(first, dict) or first.get("role") != "user":
-                continue
-            content = first.get("content")
-            if isinstance(content, str) and content.strip():
-                prompts.append(content.strip())
-    assert prompts, f"corpus {path} yielded no user prompts"
-    return prompts
+def _distinct_prompts_needed(concurrency: int) -> int:
+    """How many distinct prompts a cell must draw.
 
-
-def _prompts_by_context(corpus: Sequence[str]) -> dict[ContextLength, tuple[str, ...]]:
-    """Build deterministic, materially separated prompt-length bands.
-
-    Character bounds keep this helper tokenizer-free.  The live measurement
-    records and validates the server-reported token counts, so a tokenizer whose
-    ratio is surprising fails the cell instead of silently mislabelling it.
+    ``_request_batch`` indexes ``prompts[(repeat * concurrency + index) % len]``,
+    so a cell consumes ``concurrency`` prompts per repeat and walks
+    ``REPEATS_PER_DRAFT`` scored repeats.  Anything smaller and a later repeat
+    replays an earlier one's inputs, which turns independent repeats into
+    correlated ones and understates the standard error.  The old code drew a
+    fixed eight, so concurrency 8 replayed the identical eight every repeat and
+    concurrency 32 replayed them four times *within* a single repeat.
     """
-    ordered = sorted(corpus, key=lambda prompt: (len(prompt), prompt))
-    short = tuple(prompt[:480] for prompt in ordered[:8])
-    long_source = ordered[-8:]
-    long: list[str] = []
-    for prompt in long_source:
-        copies = math.ceil(6000 / len(prompt))
-        long.append(((prompt + "\n") * copies)[:6000])
-    assert len(short) == 8 and len(long) == 8, "corpus needs at least eight prompts"
-    return {"short": short, "long": tuple(long)}
+    return concurrency * REPEATS_PER_DRAFT
+
+
+def _border_fraction(text: str) -> float:
+    """Longest proper border of ``text``, as a fraction of its length.
+
+    A border is a proper prefix that is also a suffix.  Text produced by tiling
+    a shorter string -- ``((prompt + "\\n") * copies)[:6000]``, which is exactly
+    what this module used to do to manufacture its "long" band -- has a border
+    of at least ``len(text) - len(prompt + "\\n")``, so a large fraction.  Real
+    prose borders are a few characters.  Computed with the KMP failure
+    function, linear in the length of the text.
+    """
+    length = len(text)
+    if length < 2:
+        return 0.0
+    failure = [0] * length
+    candidate = 0
+    for index in range(1, length):
+        while candidate and text[index] != text[candidate]:
+            candidate = failure[candidate - 1]
+        if text[index] == text[candidate]:
+            candidate += 1
+        failure[index] = candidate
+    return failure[-1] / length
+
+
+def _band_prompt_defects(
+    prompts: Sequence[str],
+    sources: Sequence[str],
+    *,
+    requested: int,
+) -> list[str]:
+    """Every way this band's prompts fail to be verbatim, distinct corpus text.
+
+    Pure and GPU-free on purpose: this is the check the whole fix rests on, so
+    it is exercised directly by the tests at the bottom of this module rather
+    than only through a live run nobody can reproduce on a laptop.
+    """
+    defects: list[str] = []
+    if len(prompts) != requested:
+        defects.append(
+            f"band produced {len(prompts)} prompts but the cell requested {requested}"
+        )
+    distinct = len(set(prompts))
+    if distinct != len(prompts):
+        defects.append(
+            f"band produced {len(prompts)} prompts of which only {distinct} are "
+            f"distinct; repeats would replay identical inputs"
+        )
+    for index, (prompt, source) in enumerate(zip(prompts, sources, strict=True)):
+        if prompt != source:
+            defects.append(
+                f"prompt {index} is not verbatim corpus text: sent {len(prompt)} "
+                f"characters, the record holds {len(source)} "
+                f"({'truncated' if len(prompt) < len(source) else 'altered or padded'})"
+            )
+            continue
+        border = _border_fraction(prompt)
+        if border >= REPETITION_BORDER_LIMIT:
+            defects.append(
+                f"prompt {index} repeats a shorter substring of itself: longest "
+                f"proper border is {border:.0%} of its {len(prompt)} characters, at "
+                f"or above the {REPETITION_BORDER_LIMIT:.0%} limit; repetition-padded "
+                f"text is trivially predictable and flatters any drafter"
+            )
+    return defects
+
+
+def _percentile_key(fraction: float) -> str:
+    """The manifest percentile key for a band bound, or a loud failure.
+
+    Band bounds and declared percentiles must line up exactly.  A band at
+    ``[0.07, 0.25]`` has no declared ``p7``, and quietly rounding it to ``p5``
+    would validate the measurement against a window it was not drawn from.
+    """
+    scaled = fraction * 100.0
+    rounded = round(scaled)
+    key = f"p{rounded}"
+    assert abs(scaled - rounded) < 1e-9 and key in workloads.PERCENTILE_KEYS, (
+        f"band bound {fraction} is not one of the manifest's declared percentiles "
+        f"({', '.join(workloads.PERCENTILE_KEYS)}); the declared window cannot be "
+        "looked up, so the measurement could not be validated against it"
+    )
+    return key
+
+
+def _declared_token_window(
+    spec: workloads.WorkloadSpec, band_name: str
+) -> tuple[str, float, str, float]:
+    """The band's declared prompt-token window, straight from the manifest."""
+    band = spec.band(band_name)
+    block = spec.characteristics["prompt_tokens"]
+    assert isinstance(block, dict), (
+        f"workload {spec.name!r} declares no prompt_tokens distribution; there is "
+        "nothing to validate the served token counts against"
+    )
+    lower_key = _percentile_key(band.lower)
+    upper_key = _percentile_key(band.upper)
+    return lower_key, float(block[lower_key]), upper_key, float(block[upper_key])
+
+
+def _preflight_refusals(
+    spec: workloads.WorkloadSpec, *, max_model_len: int
+) -> tuple[str, ...]:
+    """Reasons this workload must not be served at this window.
+
+    The matrix sends a single user turn with no tool schemas, so ``tool_support``
+    is honestly False.  Three of the four shipped workloads need a window far
+    above the matrix default of 4096 -- 18432, 23552 and 360960 -- and the
+    correct response is to refuse, not to trim the workload until it fits.  A
+    truncated corpus still produces numbers; they are just not numbers about
+    that workload.
+    """
+    return workloads.preflight_refusals(
+        spec, max_model_len=max_model_len, tool_support=False
+    )
+
+
+def _band_plan(
+    spec: workloads.WorkloadSpec,
+    cell: MatrixCell,
+    chosen: Sequence[workloads.WorkloadRecord],
+    prompts: Sequence[str],
+    *,
+    token_tolerance: float,
+    max_model_len: int,
+) -> JsonObject:
+    """Everything about this cell's measurement input, for the artifact.
+
+    A measurement whose input is not recorded is not reproducible, so the
+    workload name, its manifest version, the corpus digest, the percentile
+    window and the exact record ids all land in the cell's ``result.json``.
+    """
+    band = spec.band(cell.context_length)
+    lower_key, lower, upper_key, upper = _declared_token_window(spec, cell.context_length)
+    corpus_tokens = [record.prompt_tokens for record in chosen]
+    corpus_chars = [record.prompt_chars for record in chosen]
+    return {
+        "workload": spec.name,
+        "workload_version": spec.version,
+        "workload_domain": spec.domain,
+        "manifest_path": str(spec.manifest_path),
+        "manifest_schema_version": int(spec.manifest["schema_version"]),
+        "corpus_path": str(spec.source_path),
+        "corpus_sha256": spec.source_sha256,
+        "corpus_size_bytes": spec.source_size_bytes,
+        "corpus_verified_at_cell_start": True,
+        "band": cell.context_length,
+        "band_metric": spec.band_metric,
+        "percentile_window": [band.lower, band.upper],
+        "declared_prompt_tokens": {
+            "lower_percentile": lower_key,
+            "lower": lower,
+            "upper_percentile": upper_key,
+            "upper": upper,
+        },
+        "token_tolerance": token_tolerance,
+        "token_basis": spec.provenance.get("token_basis"),
+        "max_model_len": max_model_len,
+        "requested_prompts": _distinct_prompts_needed(cell.concurrency),
+        "distinct_prompts": len(set(prompts)),
+        "sampling_seed": spec.seed,
+        "record_ids": [record.id for record in chosen],
+        "corpus_prompt_tokens": {
+            "n": len(corpus_tokens),
+            "mean": math.fsum(corpus_tokens) / len(corpus_tokens),
+            "min": min(corpus_tokens),
+            "max": max(corpus_tokens),
+        },
+        "corpus_prompt_chars": {
+            "n": len(corpus_chars),
+            "mean": math.fsum(corpus_chars) / len(corpus_chars),
+            "min": min(corpus_chars),
+            "max": max(corpus_chars),
+        },
+    }
+
+
+def _cell_band(
+    spec: workloads.WorkloadSpec,
+    cell: MatrixCell,
+    *,
+    token_tolerance: float,
+    max_model_len: int,
+) -> tuple[tuple[str, ...], JsonObject]:
+    """Verify the corpus and draw this cell's band.  Called at cell start.
+
+    ``verify_workload`` re-derives the manifest from the file on disk -- digest,
+    per-record character counts, every declared percentile and fraction -- so a
+    corpus that was swapped, regenerated or truncated between cells fails the
+    cell instead of quietly changing what was measured.
+    """
+    refusals = _preflight_refusals(spec, max_model_len=max_model_len)
+    assert not refusals, f"{cell.name}: " + "; ".join(refusals)
+
+    records = workloads.verify_workload(spec)
+    requested = _distinct_prompts_needed(cell.concurrency)
+    try:
+        chosen = workloads.band_records(
+            spec, cell.context_length, requested, records=records
+        )
+    except workloads.BandExhaustedError as error:
+        raise AssertionError(f"{cell.name}: {error}") from error
+
+    by_id = {record.id: record for record in records}
+    prompts = tuple(record.final_user_text for record in chosen)
+    sources = tuple(by_id[record.id].final_user_text for record in chosen)
+    defects = _band_prompt_defects(prompts, sources, requested=requested)
+    assert not defects, f"{cell.name} band {cell.context_length!r}: " + "; ".join(defects)
+
+    plan = _band_plan(
+        spec,
+        cell,
+        chosen,
+        prompts,
+        token_tolerance=token_tolerance,
+        max_model_len=max_model_len,
+    )
+    return prompts, plan
 
 
 def _option_value(argv: Sequence[str], option: str) -> str | None:
@@ -274,6 +535,7 @@ def _engine_argv(
     port: int,
     num_speculative_tokens: int,
     profile: ModelProfile,
+    max_model_len: int = MAX_MODEL_LEN,
 ) -> list[str]:
     speculative = json.dumps(
         {
@@ -286,7 +548,7 @@ def _engine_argv(
     )
     passthrough = [
         "--max-model-len",
-        str(MAX_MODEL_LEN),
+        str(max_model_len),
         "--gpu-memory-utilization",
         "0.75",
         "--no-enable-prefix-caching",
@@ -304,7 +566,7 @@ def _engine_argv(
     )
     regime = _engine_regime(argv)
     assert regime["execution_mode"] == cell.execution_mode
-    assert regime["max_model_len"] == MAX_MODEL_LEN
+    assert regime["max_model_len"] == max_model_len
     assert regime["num_speculative_tokens"] == profile.num_speculative_tokens, (
         f"engine argv would serve {regime['num_speculative_tokens']} speculative "
         f"tokens, but model profile {profile.name!r} declares "
@@ -533,7 +795,36 @@ def _regression_failures(
     return failures
 
 
-def _validate_context_band(cell: MatrixCell, summary: JsonObject) -> None:
+def _band_token_bounds(plan: JsonObject) -> tuple[float, float]:
+    """The declared window widened by the tokenizer tolerance."""
+    declared = plan["declared_prompt_tokens"]
+    assert isinstance(declared, dict)
+    tolerance = float(plan["token_tolerance"])
+    return (
+        float(declared["lower"]) / (1.0 + tolerance),
+        float(declared["upper"]) * (1.0 + tolerance),
+    )
+
+
+def _validate_context_band(cell: MatrixCell, summary: JsonObject, plan: JsonObject) -> None:
+    """The served band must be the band the manifest says it is.
+
+    The bounds are the workload's OWN declared percentile window for this band,
+    not constants.  The constants that used to sit here (short at or below 256
+    tokens, long between 768 and ``MAX_MODEL_LEN - MAX_TOKENS``) encoded the
+    faked bands: they were satisfied by the eight shortest prompts truncated to
+    480 characters and by text tiled to 6000 characters, and they would have
+    been satisfied by almost anything else too.
+
+    What is kept from the old check is the virtue that made it worth having: it
+    compares the SERVER-reported ``usage.prompt_tokens`` against the expectation,
+    so a verifier whose tokenizer disagrees with the manifest's basis by more
+    than the stated tolerance fails the cell instead of publishing a number
+    under a band label that does not describe it.
+    """
+    declared = plan["declared_prompt_tokens"]
+    assert isinstance(declared, dict)
+    lower, upper = _band_token_bounds(plan)
     arms = summary["arms"]
     assert isinstance(arms, dict)
     for arm in ("stock", "candidate"):
@@ -542,12 +833,19 @@ def _validate_context_band(cell: MatrixCell, summary: JsonObject) -> None:
         prompt_statistic = arm_summary["prompt_tokens"]
         assert isinstance(prompt_statistic, dict)
         mean = float(prompt_statistic["mean"])
-        if cell.context_length == "short":
-            assert mean <= 256, f"{cell.name}/{arm} short prompt averaged {mean:.1f} tokens"
-        else:
-            assert 768 <= mean <= MAX_MODEL_LEN - MAX_TOKENS, (
-                f"{cell.name}/{arm} long prompt averaged {mean:.1f} tokens"
-            )
+        assert lower <= mean <= upper, (
+            f"{cell.name}/{arm}: the server reported a mean of {mean:.1f} prompt "
+            f"tokens, outside workload {plan['workload']!r} v{plan['workload_version']} "
+            f"band {plan['band']!r}, whose declared "
+            f"{declared['lower_percentile']}..{declared['upper_percentile']} window is "
+            f"[{declared['lower']:.0f}, {declared['upper']:.0f}] tokens "
+            f"(basis {plan['token_basis']!r}) and widens to [{lower:.1f}, {upper:.1f}] "
+            f"at the {float(plan['token_tolerance']):.0%} tokenizer tolerance. "
+            f"The corpus-side mean for the same draw is "
+            f"{float(plan['corpus_prompt_tokens']['mean']):.1f} tokens. Either the "
+            f"served tokenizer is not comparable to the manifest's, or the prompts "
+            f"that reached the server are not the ones this band drew."
+        )
 
 
 def _measure_cell(
@@ -555,9 +853,21 @@ def _measure_cell(
     profile: ModelProfile,
     num_speculative_tokens: int,
     cell: MatrixCell,
-    prompts: Sequence[str],
+    spec: workloads.WorkloadSpec,
     cell_dir: Path,
 ) -> JsonObject:
+    # Cell start: re-verify the corpus against its manifest and draw this cell's
+    # band.  Done per cell, not once per run, so a corpus that changes underneath
+    # a multi-hour matrix fails the next cell rather than silently shifting what
+    # the remaining cells measured.
+    prompts, band_plan = _cell_band(
+        spec,
+        cell,
+        token_tolerance=configuration.band_token_tolerance,
+        max_model_len=configuration.max_model_len,
+    )
+    _write_json(cell_dir / "band.json", band_plan)
+
     # This private helper is intentionally reused: it is the production gate's
     # canonical mirrored-round schedule and is the design this harness promises.
     schedule = gate_runner._block_schedule(  # noqa: SLF001
@@ -585,6 +895,7 @@ def _measure_cell(
             port=port,
             num_speculative_tokens=num_speculative_tokens,
             profile=profile,
+            max_model_len=configuration.max_model_len,
         )
         regime = _engine_regime(argv)
         block_dir = cell_dir / f"block-{block_index:02d}-{arm}"
@@ -660,6 +971,7 @@ def _measure_cell(
             "context_length": cell.context_length,
             "resolved_num_speculative_tokens": num_speculative_tokens,
         },
+        "band": band_plan,
         "schedule": {
             "design": "mirrored rounds from speedlm.gate.runner._block_schedule",
             "arm_blocks": BLOCKS_PER_DRAFT,
@@ -670,7 +982,7 @@ def _measure_cell(
         "summary": summary,
     }
     _write_json(cell_dir / "result.json", report)
-    _validate_context_band(cell, summary)
+    _validate_context_band(cell, summary, band_plan)
     failures = _regression_failures(
         summary,
         max_slowdown_percent=configuration.max_slowdown_percent,
@@ -723,16 +1035,82 @@ def test_synthetic_throughput_regression_is_detected() -> None:
         assert not failures, "; ".join(failures)
 
 
+@pytest.mark.e2e
 def test_speculative_inference_configuration_matrix() -> None:
     configuration = _require_live_configuration()
     profile, num_speculative_tokens = _resolve_matrix_depth(configuration)
-    prompts = _prompts_by_context(_load_corpus(configuration.corpus))
+    spec = workloads.load_spec(configuration.workload)
+
+    # Refuse before spending an allocation, and name both numbers.  A workload
+    # that does not fit the serving window is not shrunk to fit it.
+    refusals = _preflight_refusals(spec, max_model_len=configuration.max_model_len)
+    assert not refusals, (
+        "the configuration matrix refuses this workload:\n  "
+        + "\n  ".join(refusals)
+        + "\nRaise SPEEDLM_CONFIG_MATRIX_MAX_MODEL_LEN to at least "
+        f"{spec.requirements.get('min_max_model_len')} (and allocate the memory for "
+        "it), or select a workload that fits the window with SPEEDLM_E2E_WORKLOAD."
+    )
+
     manifest: JsonObject = {
         "model": configuration.model,
         "profile": profile.name,
         "reference_draft": configuration.reference_draft,
         "candidate_draft": configuration.candidate_draft,
-        "corpus": str(configuration.corpus),
+        "workload": {
+            "name": spec.name,
+            "version": spec.version,
+            "domain": spec.domain,
+            "manifest_path": str(spec.manifest_path),
+            "manifest_schema_version": int(spec.manifest["schema_version"]),
+            "corpus_path": str(spec.source_path),
+            "corpus_sha256": spec.source_sha256,
+            "corpus_size_bytes": spec.source_size_bytes,
+            "record_count": spec.characteristics.get("record_count"),
+            "token_basis": spec.provenance.get("token_basis"),
+            "band_metric": spec.band_metric,
+            "sampling_seed": spec.seed,
+            "percentile_windows": {
+                name: [
+                    spec.band(name).lower,
+                    spec.band(name).upper,
+                ]
+                for name in CONTEXT_LENGTHS
+            },
+            "declared_prompt_tokens_windows": {
+                name: dict(
+                    zip(
+                        ("lower_percentile", "lower", "upper_percentile", "upper"),
+                        _declared_token_window(spec, name),
+                        strict=True,
+                    )
+                )
+                for name in CONTEXT_LENGTHS
+            },
+            "band_token_tolerance": configuration.band_token_tolerance,
+            "distinct_prompts_per_cell": {
+                str(concurrency): _distinct_prompts_needed(concurrency)
+                for concurrency in CONCURRENCIES
+            },
+            "requirements": dict(spec.requirements),
+            "preflight_refusals": list(refusals),
+            "honest_scope": (
+                "Bands are percentile windows over this workload's own prompt-length "
+                "distribution: neither truncated nor repetition-padded, and never the "
+                "corpus extremes. On generic-chat the p75..p95 'long' band is roughly "
+                "150-600 prompt tokens, so a generic-chat cell does NOT exercise a "
+                "long-context regime -- it exercises the long tail of short chat. "
+                "Genuinely long context needs agentic-tool-loop (18432), "
+                "agentic-mixed-outcome (23552) or long-context-sessions (360960), all "
+                "of which this launch would refuse at "
+                f"--max-model-len {configuration.max_model_len}."
+            ),
+        },
+        "legacy_prompt_corpus": (
+            str(configuration.legacy_prompt_corpus)
+            if configuration.legacy_prompt_corpus
+            else None
+        ),
         "matrix": [cell.name for cell in MATRIX],
         "matrix_dimensions": {
             "execution_modes": list(EXECUTION_MODES),
@@ -747,6 +1125,7 @@ def test_speculative_inference_configuration_matrix() -> None:
             "resolved_num_speculative_tokens": num_speculative_tokens,
             "throughput_statistic": "Prometheus generation tokens / decode seconds",
             "accepted_length_statistic": "1 + accepted tokens / draft steps",
+            "max_model_len": configuration.max_model_len,
         },
         "fault_injection": {
             "candidate_slowdown_percent": configuration.inject_slowdown_percent,
@@ -764,7 +1143,7 @@ def test_speculative_inference_configuration_matrix() -> None:
             profile,
             num_speculative_tokens,
             cell,
-            prompts[cell.context_length],
+            spec,
             cell_dir,
         )
         reports.append(report)
@@ -777,3 +1156,419 @@ def test_speculative_inference_configuration_matrix() -> None:
         )
 
     assert not failures, "\n".join(failures)
+
+
+# ---------------------------------------------------------------------------
+# GPU-free coverage of the band machinery
+#
+# These carry no marker, so `-m "not e2e"` -- what CI runs -- selects them.
+# Every one of them has been driven RED by mutating the code it covers; the
+# mutation and the resulting message are recorded in each docstring.  A test
+# whose failure was never observed is not evidence.
+# ---------------------------------------------------------------------------
+
+
+_FIXTURE_WORDS: Final = (
+    "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
+    "india", "juliet", "kilo", "lima", "mike", "november", "oscar", "papa",
+)
+
+
+def _fixture_body(index: int) -> str:
+    """Non-repeating prose whose length increases strictly with ``index``.
+
+    Every word carries its own position, so the text has no internal period and
+    a border fraction of essentially zero.  A fixture built from ``"word " * n``
+    would itself be repetition-padded and could not distinguish the padding
+    detector working from it being broken.
+    """
+    words = [
+        f"{_FIXTURE_WORDS[(index * 7 + position) % len(_FIXTURE_WORDS)]}{position}"
+        for position in range(index + 1)
+    ]
+    return f"question {index:05d}: " + " ".join(words)
+
+
+def _build_fixture_workload(
+    tmp_path: Path, *, count: int, name: str = "fixture-matrix"
+) -> workloads.WorkloadSpec:
+    """A real workload built by the real builder, small enough to live in tmp_path."""
+    sys.path.insert(0, str(REPO_ROOT / "scripts"))
+    try:
+        import build_workload as builder  # noqa: PLC0415
+    finally:
+        sys.path.pop(0)
+
+    tokenizer = builder.Tokenizer("fixture", chars_per_token=4.0)
+    records = [
+        builder.make_record(
+            f"fixture-{index:05d}",
+            [{"role": "user", "content": _fixture_body(index)}],
+            tokenizer,
+        )
+        for index in range(count)
+    ]
+    records_path = tmp_path / "corpora" / name / "records.jsonl"
+    builder.write_records(records_path, records)
+    spec_dir = tmp_path / "specs"
+    builder.emit_manifest(
+        name=name,
+        version="1.0.0",
+        description="synthetic fixture workload for the configuration matrix",
+        domain="fixture",
+        records_path=records_path,
+        records=records,
+        provenance={"upstream": [], "method": "synthesized in a test"},
+        tokenizer=tokenizer,
+        output_reserve=MAX_TOKENS,
+        needs_tool_support=False,
+        ground_truth=None,
+        spec_dir=spec_dir,
+    )
+    return workloads.load_spec(name, directory=spec_dir)
+
+
+@pytest.fixture
+def fixture_spec(tmp_path: Path) -> workloads.WorkloadSpec:
+    # 800 records leaves 160 in each 20%-wide band, enough for the largest cell
+    # (concurrency 32 x 4 repeats = 128 distinct prompts).
+    return _build_fixture_workload(tmp_path, count=800)
+
+
+def _cell(concurrency: int = 8, context: ContextLength = "short") -> MatrixCell:
+    return MatrixCell("eager", concurrency, context)
+
+
+def _summary_with_prompt_token_mean(mean: float) -> JsonObject:
+    return {
+        "arms": {
+            arm: {"prompt_tokens": {"n": 8, "mean": mean, "standard_error": 0.0}}
+            for arm in ("stock", "candidate")
+        }
+    }
+
+
+def test_distinct_prompt_count_is_sized_from_concurrency_and_repeats() -> None:
+    """A cell must draw enough prompts that no scored repeat replays another.
+
+    MUTATION: ``return concurrency * REPEATS_PER_DRAFT`` -> ``return 8`` in
+    ``_distinct_prompts_needed``.
+    """
+    for concurrency in CONCURRENCIES:
+        needed = _distinct_prompts_needed(concurrency)
+        assert needed == concurrency * REPEATS_PER_DRAFT, (
+            f"concurrency {concurrency} would draw {needed} prompts, but "
+            f"{REPEATS_PER_DRAFT} repeats of {concurrency} concurrent requests "
+            f"consume {concurrency * REPEATS_PER_DRAFT}; the old fixed-8 draw "
+            "replayed inputs"
+        )
+        # The index _request_batch actually reaches on the last scored repeat.
+        highest_index = (REPEATS_PER_DRAFT - 1) * concurrency + (concurrency - 1)
+        assert highest_index < needed, (
+            f"concurrency {concurrency}: _request_batch reaches index "
+            f"{highest_index} but only {needed} prompts were drawn, so it wraps "
+            "and replays"
+        )
+
+
+def test_repetition_padding_is_rejected_and_real_prose_is_not() -> None:
+    """The exact padding this module used to do must be caught, prose must not.
+
+    MUTATION: ``REPETITION_BORDER_LIMIT = 0.25`` -> ``= 1.1`` (unreachable).
+    """
+    prose = _fixture_body(300)
+    assert len(prose) < 6000, "fixture prose must be shorter than the old pad width"
+    # Verbatim reproduction of the band this module used to manufacture:
+    #     copies = math.ceil(6000 / len(prompt))
+    #     ((prompt + "\n") * copies)[:6000]
+    copies = math.ceil(6000 / len(prose))
+    padded = ((prose + "\n") * copies)[:6000]
+
+    padded_border = _border_fraction(padded)
+    assert padded_border >= REPETITION_BORDER_LIMIT, (
+        f"the 6000-char self-tiled prompt was accepted: border "
+        f"{padded_border:.0%} is below the {REPETITION_BORDER_LIMIT:.0%} limit"
+    )
+    assert _border_fraction(prose) < REPETITION_BORDER_LIMIT, (
+        "natural prose was misflagged as repetition-padded; the detector would "
+        "reject honest corpora"
+    )
+
+    defects = _band_prompt_defects((padded,), (padded,), requested=1)
+    assert any("repeats a shorter substring" in defect for defect in defects), (
+        f"_band_prompt_defects did not report the padding: {defects}"
+    )
+    assert not _band_prompt_defects((prose,), (prose,), requested=1)
+
+
+def test_band_prompt_defects_catch_truncation_and_recycling() -> None:
+    """Truncation and duplicate prompts are defects, not silent adjustments.
+
+    MUTATION: in ``_band_prompt_defects`` change ``if prompt != source:`` to
+    ``if False:``.
+    """
+    source = _fixture_body(400)
+    truncated = source[:480]  # the old "short" band recipe
+    defects = _band_prompt_defects((truncated,), (source,), requested=1)
+    assert any("not verbatim" in defect and "truncated" in defect for defect in defects), (
+        f"truncation was not reported: {defects}"
+    )
+
+    duplicated = (source, source)
+    defects = _band_prompt_defects(duplicated, duplicated, requested=2)
+    assert any("distinct" in defect for defect in defects), (
+        f"a recycled prompt was not reported: {defects}"
+    )
+
+    short_draw = (source,)
+    defects = _band_prompt_defects(short_draw, short_draw, requested=4)
+    assert any("requested 4" in defect for defect in defects), (
+        f"an undersized band was not reported: {defects}"
+    )
+
+
+def test_band_is_verbatim_corpus_text(fixture_spec: workloads.WorkloadSpec) -> None:
+    """Every prompt a cell sends is byte-identical to the record it came from.
+
+    MUTATION: in ``_cell_band`` change
+    ``prompts = tuple(record.final_user_text for record in chosen)`` to
+    ``prompts = tuple(record.final_user_text[:480] for record in chosen)``.
+    """
+    records = workloads.load_records(fixture_spec)
+    by_text = {record.final_user_text for record in records}
+    for context in CONTEXT_LENGTHS:
+        prompts, plan = _cell_band(
+            fixture_spec,
+            _cell(8, context),
+            token_tolerance=DEFAULT_BAND_TOKEN_TOLERANCE,
+            max_model_len=MAX_MODEL_LEN,
+        )
+        assert len(prompts) == 32
+        assert len(set(prompts)) == 32
+        for prompt in prompts:
+            assert prompt in by_text, (
+                "a band prompt is not any record's text; it was synthesized, "
+                "truncated or padded somewhere between the corpus and the wire"
+            )
+            assert _border_fraction(prompt) < REPETITION_BORDER_LIMIT
+        assert plan["corpus_sha256"] == fixture_spec.source_sha256
+        assert plan["percentile_window"] == [
+            fixture_spec.band(context).lower,
+            fixture_spec.band(context).upper,
+        ]
+
+
+def test_short_band_is_not_the_shortest_records(
+    fixture_spec: workloads.WorkloadSpec,
+) -> None:
+    """THE fix, stated as one assertion: a band is a window, never an extreme.
+
+    The old code took the eight shortest prompts in the corpus.  A percentile
+    window at p5..p25 must not reach the corpus floor -- or its ceiling.
+
+    MUTATION: in ``_cell_band`` replace the ``workloads.band_records(...)`` call
+    with ``chosen = tuple(sorted(records, key=lambda r: r.prompt_chars)[:requested])``
+    -- i.e. restore the old extreme.
+    """
+    records = workloads.load_records(fixture_spec)
+    corpus_min = min(record.prompt_chars for record in records)
+    corpus_max = max(record.prompt_chars for record in records)
+
+    short_prompts, short_plan = _cell_band(
+        fixture_spec,
+        _cell(8, "short"),
+        token_tolerance=DEFAULT_BAND_TOKEN_TOLERANCE,
+        max_model_len=MAX_MODEL_LEN,
+    )
+    long_prompts, long_plan = _cell_band(
+        fixture_spec,
+        _cell(8, "long"),
+        token_tolerance=DEFAULT_BAND_TOKEN_TOLERANCE,
+        max_model_len=MAX_MODEL_LEN,
+    )
+
+    short_min = int(short_plan["corpus_prompt_chars"]["min"])
+    long_max = int(long_plan["corpus_prompt_chars"]["max"])
+    assert short_min > corpus_min, (
+        f"short band reached the corpus floor: its shortest prompt is "
+        f"{short_min} chars and the corpus minimum is {corpus_min}"
+    )
+    assert long_max < corpus_max, (
+        f"long band reached the corpus ceiling: its longest prompt is "
+        f"{long_max} chars and the corpus maximum is {corpus_max}"
+    )
+    assert short_plan["corpus_prompt_chars"]["max"] < long_plan["corpus_prompt_chars"]["min"], (
+        "the short and long bands overlap; they are not separated windows"
+    )
+    assert set(short_prompts).isdisjoint(long_prompts)
+
+
+def test_band_token_mean_is_validated_against_the_declared_window(
+    fixture_spec: workloads.WorkloadSpec,
+) -> None:
+    """The served token mean must agree with the manifest, and disagreement fails.
+
+    MUTATION: in ``_validate_context_band`` change
+    ``assert lower <= mean <= upper`` to ``assert True``.
+    """
+    cell = _cell(8, "short")
+    _, plan = _cell_band(
+        fixture_spec,
+        cell,
+        token_tolerance=DEFAULT_BAND_TOKEN_TOLERANCE,
+        max_model_len=MAX_MODEL_LEN,
+    )
+    declared = plan["declared_prompt_tokens"]
+    corpus_mean = float(plan["corpus_prompt_tokens"]["mean"])
+
+    # The band the workload actually produced passes.
+    _validate_context_band(cell, _summary_with_prompt_token_mean(corpus_mean), plan)
+
+    # A mean far outside the declared window must fail, and say both numbers.
+    outside = float(declared["upper"]) * 20.0
+    with pytest.raises(AssertionError) as raised:
+        _validate_context_band(cell, _summary_with_prompt_token_mean(outside), plan)
+    message = str(raised.value)
+    assert f"{outside:.1f}" in message and str(int(declared["upper"])) in message, (
+        f"the failure message did not name both numbers: {message}"
+    )
+
+    with pytest.raises(AssertionError):
+        _validate_context_band(
+            cell, _summary_with_prompt_token_mean(float(declared["lower"]) / 100.0), plan
+        )
+
+    lower_bound, upper_bound = _band_token_bounds(plan)
+    assert lower_bound < float(declared["lower"]) and upper_bound > float(declared["upper"]), (
+        "the tolerance must widen the declared window, not narrow it"
+    )
+    assert lower_bound <= corpus_mean <= upper_bound, (
+        f"a mean of {corpus_mean:.1f} tokens, drawn from the band itself, does not "
+        f"survive its own declared window [{lower_bound:.1f}, {upper_bound:.1f}]; "
+        "the guard would fail every honest run"
+    )
+
+
+def test_band_too_small_fails_loudly_instead_of_recycling(tmp_path: Path) -> None:
+    """An exhausted band names the counts; it never tops itself up with duplicates.
+
+    MUTATION: in ``_cell_band`` replace the ``except workloads.BandExhaustedError``
+    body with a recycling draw (``chosen = (window * 64)[:requested]``).
+    """
+    tiny = _build_fixture_workload(tmp_path, count=60, name="fixture-tiny")
+    window = workloads.band_window(tiny, "short", workloads.load_records(tiny))
+    assert len(window) < _distinct_prompts_needed(32), "fixture is not small enough"
+
+    with pytest.raises(AssertionError) as raised:
+        _cell_band(
+            tiny,
+            _cell(32, "short"),
+            token_tolerance=DEFAULT_BAND_TOKEN_TOLERANCE,
+            max_model_len=MAX_MODEL_LEN,
+        )
+    message = str(raised.value)
+    assert "eager-c32-short" in message
+    assert "128" in message and str(len(window)) in message, (
+        f"the refusal did not name the requested and available counts: {message}"
+    )
+    # Specifically the exhaustion refusal, not the distinctness backstop firing
+    # after a recycled draw: the band must never be topped up in the first place.
+    assert "percentile window holds only" in message, (
+        f"the band was topped up and only caught downstream: {message}"
+    )
+
+
+def test_workload_too_large_for_the_window_is_refused_and_a_fitting_one_is_not() -> None:
+    """Both halves: refuse what does not fit, admit what does.
+
+    A workload is never shrunk to fit the serving window.  A truncated corpus
+    still produces numbers; they are just not numbers about that workload.
+
+    MUTATION: make ``_preflight_refusals`` ``return ()``.
+    """
+    fits = workloads.load_spec("generic-chat")
+    assert int(fits.requirements["min_max_model_len"]) <= MAX_MODEL_LEN
+    assert _preflight_refusals(fits, max_model_len=MAX_MODEL_LEN) == (), (
+        "generic-chat fits the matrix window and must not be refused"
+    )
+
+    for name in ("agentic-tool-loop", "agentic-mixed-outcome", "long-context-sessions"):
+        spec = workloads.load_spec(name)
+        required = int(spec.requirements["min_max_model_len"])
+        assert required > MAX_MODEL_LEN, f"{name} no longer exceeds the matrix window"
+        refusals = _preflight_refusals(spec, max_model_len=MAX_MODEL_LEN)
+        assert refusals, (
+            f"{name} was admitted at --max-model-len {MAX_MODEL_LEN} although it "
+            f"declares min_max_model_len {required}"
+        )
+        joined = " ".join(refusals)
+        assert str(required) in joined and str(MAX_MODEL_LEN) in joined, (
+            f"the refusal for {name} must name both numbers: {joined}"
+        )
+        # ...and raising the window to what the workload declares clears the
+        # length refusal.  What may remain is the tool-support requirement,
+        # which this matrix genuinely does not satisfy: it sends one user turn
+        # with no tool schemas.
+        remaining = _preflight_refusals(spec, max_model_len=required)
+        assert all("tool" in reason for reason in remaining), (
+            f"{name} still refuses on length at its own declared window: {remaining}"
+        )
+
+
+def test_declared_percentile_lookup_refuses_an_undeclared_bound() -> None:
+    """A band bound with no matching declared percentile cannot be validated.
+
+    MUTATION: in ``_percentile_key`` drop the
+    ``and key in workloads.PERCENTILE_KEYS`` clause.
+    """
+    assert _percentile_key(0.05) == "p5"
+    assert _percentile_key(0.95) == "p95"
+    for undeclared in (0.07, 0.3, 0.125):
+        with pytest.raises(AssertionError, match="declared percentiles"):
+            _percentile_key(undeclared)
+
+
+_GENERIC_CHAT_CORPUS = workloads.load_spec(DEFAULT_WORKLOAD).source_path
+
+
+@pytest.mark.skipif(
+    not _GENERIC_CHAT_CORPUS.is_file(),
+    reason=f"generic-chat corpus is not on this machine: {_GENERIC_CHAT_CORPUS}",
+)
+def test_generic_chat_bands_are_honest_on_the_real_corpus() -> None:
+    """The shipped default workload, end to end, on the real 22,362-record file.
+
+    MUTATION: in ``_cell_band`` replace the draw with the shortest records
+    (the old behaviour).
+    """
+    spec = workloads.load_spec(DEFAULT_WORKLOAD)
+    records = workloads.verify_workload(spec)
+    corpus_min = min(record.prompt_chars for record in records)
+    corpus_max = max(record.prompt_chars for record in records)
+
+    for context in CONTEXT_LENGTHS:
+        cell = _cell(8, context)
+        prompts, plan = _cell_band(
+            spec,
+            cell,
+            token_tolerance=DEFAULT_BAND_TOKEN_TOLERANCE,
+            max_model_len=MAX_MODEL_LEN,
+        )
+        assert len(set(prompts)) == 32
+        assert int(plan["corpus_prompt_chars"]["min"]) > corpus_min, (
+            f"generic-chat {context} band reached the corpus floor: shortest "
+            f"drawn prompt is {plan['corpus_prompt_chars']['min']} chars, corpus "
+            f"minimum is {corpus_min}"
+        )
+        assert int(plan["corpus_prompt_chars"]["max"]) < corpus_max
+        for prompt in prompts:
+            assert _border_fraction(prompt) < REPETITION_BORDER_LIMIT, (
+                "a real UltraChat prompt looks repetition-padded; either the "
+                "corpus is polluted or the detector is too strict"
+            )
+        # The corpus-side mean must survive the same guard the served mean faces.
+        _validate_context_band(
+            cell,
+            _summary_with_prompt_token_mean(float(plan["corpus_prompt_tokens"]["mean"])),
+            plan,
+        )
