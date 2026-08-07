@@ -501,3 +501,105 @@ def test_each_invocation_gets_its_own_session_id(client: _RecordingClient) -> No
     # the id: it is a property of the call, not of the run.
     assert first.num_runs == 2
     assert first.to_dict()["session_id"] == first.session_id
+
+
+# ---------------------------------------------------------------------------
+# Tool schemas reach the endpoint
+# ---------------------------------------------------------------------------
+
+_WEATHER_TOOL: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "get_weather",
+        "description": "Look up the weather.",
+        "parameters": {
+            "type": "object",
+            "properties": {"city": {"type": "string"}},
+            "required": ["city"],
+        },
+    },
+}
+
+
+def _tool_suite(count: int) -> BenchmarkSuite:
+    contexts = tuple(
+        FrozenContext(
+            context_hash=f"tool-hash-{index:03d}",
+            messages=({"role": "user", "content": f"prompt {index}"},),
+            seed=0,
+            temperature=0.0,
+            top_p=1.0,
+            tools=(_WEATHER_TOOL,),
+        )
+        for index in range(count)
+    )
+    return BenchmarkSuite(suite_hash="tool-suite-hash", contexts=contexts)
+
+
+def test_tool_schemas_are_sent_with_every_request(
+    client: _RecordingClient,
+) -> None:
+    """Agentic contexts replay with the schemas production offered.
+
+    Without this the replayed prompt renders no tool block, so the model cannot
+    dispatch and the gate scores a request that was never served.
+    """
+    _replay(_tool_suite(3))
+
+    assert [body["tools"] for body in client.payloads] == [[_WEATHER_TOOL]] * 3
+
+
+def test_chat_requests_carry_no_tools_key(client: _RecordingClient) -> None:
+    """Tool-free traffic keeps a byte-identical payload to before."""
+    _replay(_suite(3))
+
+    assert all("tools" not in body for body in client.payloads)
+
+
+# ---------------------------------------------------------------------------
+# The reasoning-field list must not drift again
+# ---------------------------------------------------------------------------
+
+
+def test_reasoning_fields_agree_across_the_three_copies() -> None:
+    """``_REASONING_FIELDS`` is duplicated; the copies must stay identical.
+
+    This list lives in ``gateway.sse``, ``gateway.capture`` and ``gate.replay``.
+    It had already drifted: the gate's copy was missing ``thinking``, so a
+    server using that spelling was captured as a reasoning response by the
+    gateway and read as an empty one by the gate -- inflating ``invalid_rate``
+    and failing a healthy candidate.  See the module comment in ``gate.replay``
+    for the shared-constant requirement that would delete this test.
+    """
+    from speedlm.gate.replay import _REASONING_FIELDS as replay_fields
+    from speedlm.gateway.capture import _REASONING_FIELDS as capture_fields
+    from speedlm.gateway.sse import _REASONING_FIELDS as sse_fields
+
+    assert set(replay_fields) == set(sse_fields) == set(capture_fields)
+    # Order decides which channel wins when a server sends more than one, so
+    # the gate must consult them in the same order the capture path did.
+    assert tuple(replay_fields) == tuple(sse_fields)
+
+
+def test_thinking_channel_is_recognised(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A server that files the block under ``thinking`` is not a blank reply.
+
+    This is the concrete consequence of the drift: before the fix this response
+    surfaced nothing to the gate, so ``finish_reason: "stop"`` with an empty
+    ``content`` was scored invalid even though the engine generated 128 tokens.
+    """
+    _scripted(
+        monkeypatch,
+        {
+            "message": {"content": None, "thinking": "step one, step two"},
+            "finish_reason": "stop",
+        },
+        {"prompt_tokens": 11, "completion_tokens": 128},
+        scripted=1,
+    )
+
+    request = _replay(_suite(1)).run_results[0].results[0]
+
+    assert request.reasoning_text == "step one, step two"
+    assert request.valid
+    assert request.error == ""

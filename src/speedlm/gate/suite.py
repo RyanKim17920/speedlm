@@ -28,6 +28,41 @@ class SuiteError(ValueError):
 # Data types
 # ---------------------------------------------------------------------------
 
+def _context_hash(
+    messages: Sequence[Mapping[str, Any]],
+    tools: Sequence[Mapping[str, Any]],
+) -> str:
+    """Hash the request a replay will actually send.
+
+    Tools participate in the digest, but only when the request had any. Two
+    captured requests carrying the same messages and *different* tool schemas
+    are not the same benchmark context -- the schemas are rendered into the
+    prompt by the chat template, so they change the prompt length, the
+    engine's decoding, and whether a tool call is even reachable. Collapsing
+    them onto one hash would let the split treat them as duplicates and let
+    one silently stand in for the other.
+
+    The tool-free branch is kept byte-identical to the pre-tools digest (the
+    bare canonical JSON of ``messages``) rather than always hashing a wrapper
+    object. Plain chat traffic is the overwhelming majority of what is
+    captured, and rehashing it would invalidate every persisted suite
+    manifest, every stored ``context_hash``, and every train-set hash a
+    leakage check compares against.
+    """
+    payload: Any = (
+        list(messages)
+        if not tools
+        else {"messages": list(messages), "tools": list(tools)}
+    )
+    canonical = json.dumps(
+        payload,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class FrozenContext:
     """A single benchmark context with a deterministic hash.
@@ -39,6 +74,8 @@ class FrozenContext:
         temperature: Sampling temperature.
         top_p: Nucleus sampling top-p.
         expected_response: The reference response text for correctness checks.
+        tools: The tool schemas the original request offered the model, in
+            capture order. Empty for plain chat traffic.
     """
 
     context_hash: str
@@ -47,6 +84,15 @@ class FrozenContext:
     temperature: float
     top_p: float
     expected_response: str = ""
+    #: Tool schemas carried through from the captured request.
+    #:
+    #: A request that offered tools and one that did not are different
+    #: requests: the tool schemas sit in the prompt the engine actually
+    #: templates, and dropping them makes the gate benchmark a prompt
+    #: production never served. They therefore ride into ``context_hash``
+    #: whenever they are present -- but *only* when present, so chat traffic
+    #: keeps byte-identical hashes and manifests from before tools existed.
+    tools: tuple[dict[str, Any], ...] = ()
 
     @classmethod
     def from_trace(
@@ -63,15 +109,9 @@ class FrozenContext:
         reference output.
         """
         messages, captured_response = cls._input_messages(record)
-        canonical = json.dumps(
-            messages,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-        )
-        ctx_hash = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        tools = [dict(tool) for tool in record.tools]
         return cls(
-            context_hash=ctx_hash,
+            context_hash=_context_hash(messages, tools),
             messages=tuple(messages),
             seed=record.seed,
             temperature=record.temperature,
@@ -79,6 +119,7 @@ class FrozenContext:
             expected_response=(
                 captured_response if expected_response is None else expected_response
             ),
+            tools=tuple(tools),
         )
 
     @staticmethod
@@ -107,7 +148,7 @@ class FrozenContext:
         return inputs, expected
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "context_hash": self.context_hash,
             "messages": [dict(m) for m in self.messages],
             "seed": self.seed,
@@ -115,6 +156,11 @@ class FrozenContext:
             "top_p": self.top_p,
             "expected_response": self.expected_response,
         }
+        # Emitted only when non-empty so a chat-only suite serialises to the
+        # exact bytes it did before tools were carried at all.
+        if self.tools:
+            payload["tools"] = [dict(tool) for tool in self.tools]
+        return payload
 
     @classmethod
     def from_dict(cls, data: Mapping[str, Any]) -> FrozenContext:
@@ -133,6 +179,7 @@ class FrozenContext:
             temperature=data["temperature"],
             top_p=data["top_p"],
             expected_response=data.get("expected_response", ""),
+            tools=tuple(dict(tool) for tool in data.get("tools", ())),
         )
 
 
@@ -255,14 +302,15 @@ class BenchmarkSuite:
 
     @staticmethod
     def _record_hash(rec: TraceRecord) -> str:
+        """Hash a record exactly as ``FrozenContext.from_trace`` would.
+
+        This must stay in lockstep with :attr:`FrozenContext.context_hash`:
+        the split selects on this value while ``check_leakage`` compares the
+        frozen contexts' own hashes against it. Both therefore go through
+        :func:`_context_hash` rather than re-deriving the canonical form.
+        """
         messages, _ = FrozenContext._input_messages(rec)
-        canonical = json.dumps(
-            messages,
-            sort_keys=True,
-            separators=(",", ":"),
-            ensure_ascii=True,
-        )
-        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        return _context_hash(messages, [dict(tool) for tool in rec.tools])
 
     @staticmethod
     def _compute_hash(contexts: tuple[FrozenContext, ...]) -> str:

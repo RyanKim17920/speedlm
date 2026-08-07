@@ -189,8 +189,20 @@ FINISH_REASON_LENGTH: Final = "length"
 #: Field names a server may file a thinking model's ``<think>`` block under,
 #: in the order they are consulted.  vLLM 0.25.x uses ``reasoning``; the
 #: ``reasoning_content`` spelling is what several other OpenAI-compatible
-#: servers (and older vLLM reasoning parsers) emit.
-_REASONING_FIELDS: Final = ("reasoning", "reasoning_content")
+#: servers (and older vLLM reasoning parsers) emit; ``thinking`` is the
+#: third spelling in the wild.
+#:
+#: This list is duplicated in :mod:`speedlm.gateway.sse` and
+#: :mod:`speedlm.gateway.capture`, and it had already drifted: this copy was
+#: missing ``thinking``, so a server using that spelling was captured by the
+#: gateway as a reasoning response but read by the gate as an empty one --
+#: the exact shape that inflates ``invalid_rate`` and fails a healthy
+#: candidate.  The three copies are now identical in *content*; the order
+#: here matches ``gateway.sse`` so the gate resolves a response the same way
+#: the capture path did.  ``test_gate_replay`` asserts the three agree, which
+#: is the containable half of the fix -- see the report for the
+#: shared-constant requirement that would remove the duplication outright.
+_REASONING_FIELDS: Final = ("reasoning_content", "reasoning", "thinking")
 
 #: Recorded on a response the engine answered without generating anything at
 #: all.  This is the failure ``high_invalid_rate`` exists to catch: zero
@@ -333,6 +345,13 @@ async def _send_request(
         "top_p": sampling.top_p,
         "seed": sampling.seed,
     }
+    if ctx.tools:
+        # Agentic traffic is captured with the tool schemas the caller offered.
+        # Replaying without them sends a strictly different prompt -- the
+        # template renders no tool block, so the model cannot dispatch and the
+        # gate measures a request production never served. Sent only when the
+        # context has tools, so chat replays stay byte-identical.
+        payload["tools"] = [dict(tool) for tool in ctx.tools]
     if max_tokens is not None:
         payload["max_tokens"] = max_tokens
     if capture_tokens:
