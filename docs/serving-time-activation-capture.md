@@ -3,8 +3,19 @@
 **Status:** design proposal, with Stage 0 (Section 9) prototyped. Sections 1-8
 remain a proposal: no cache, no retention, no training integration exists. What
 does exist is the Stage 0 de-risking prototype —
-`src/speedlm/activation_capture/` and
-`tests/e2e/test_serving_activation_capture.py`.
+`src/speedlm/activation_capture/`,
+`tests/e2e/test_serving_activation_capture.py`, and
+`tests/e2e/test_capture_overhead.py`.
+
+**Stage 0's last open exit criterion — the serving latency cost — has now been
+measured (Section 7.2.1).** Two things came out of it that change how this
+document should be read. First, capture was **non-functional under CUDA graphs**,
+the production default, until commit `c5aa14c`; every earlier correctness result
+in this document was obtained in eager mode (Section 7.2.2). Second, the first
+honest graphed measurement showed capture costing **-14.49% throughput**, which
+is not a rounding error on the "byproduct of serving" framing in Section 1;
+deferring the transfer synchronization brought steady-state cost to
+statistically zero and left **+4.40 ms of TTFT**.
 
 **Read Section 6.2 before citing Stage 0 results.** Stage 0's original
 comparison (serving capture vs. vLLM's offline extraction) returned a perfect
@@ -914,6 +925,11 @@ audit. Additionally, spot-check that no captured row is bitwise identical to a
 row captured in a previous step at the same buffer offset — the signature of
 stale buffer reuse.
 
+**Related, and separate from padding:** CUDA graphs also broke capture outright
+(the aux-layer count is baked into the traced forward, and the compile cache can
+replay a graph from before a fix). That is Section 7.2.2, and it is the reason
+every correctness result above was obtained in eager mode.
+
 ### 6.6 The loss mask is not in the hidden-state file
 
 The loss mask does not travel with hidden states. It lives in the arrow dataset
@@ -1068,21 +1084,147 @@ Against PCIe Gen4 x16 (~32 GB/s theoretical), the high-load case is roughly 0.14
 of link bandwidth. **[unverified: the actual host link generation and width on the
 target machine has not been read from `lspci`; the ratio assumes Gen4 x16.]**
 
-**Latency.** The current Stage 0 hook stacks the four uniform aux tensors on the
-device and then calls `.cpu()` once. In-process counted-tensor instrumentation
-therefore measures one device-to-host transfer per forward pass instead of four;
-the non-uniform fallback still makes four. This is a transfer-count measurement,
-not a GPU serving benchmark (`_to_host` in
-`src/speedlm/activation_capture/hook.py`; `TestHotPathTransferCount` in
-`tests/test_activation_capture_hook.py`). TTFT and tokens per second have never
-been measured on a GPU with capture enabled, so no serving-latency improvement
-is claimed.
+**Latency. Measured on GPU — see 7.2.1.** The earlier statement that "TTFT and
+tokens per second have never been measured on a GPU with capture enabled" is
+now stale. They have been, twice: once with the blocking copy, which cost
+**-14.49% throughput** under CUDA graphs, and once after deferring the transfer
+synchronization, which reduced the throughput and inter-token cost to
+statistically zero. The remaining cost is on TTFT.
 
-The connector pattern proposed for a production implementation is different:
-it uses a dedicated copy stream and `non_blocking=True` into pinned memory
+The in-process transfer-count instrumentation still exists and is still only a
+transfer-count measurement, not a serving benchmark: the hook stacks the four
+uniform aux tensors on the device and issues one device-to-host transfer per
+forward pass instead of four; the non-uniform fallback still makes four
+(`_to_host` in `src/speedlm/activation_capture/hook.py`;
+`TestHotPathTransferCount` in `tests/test_activation_capture_hook.py`). Do not
+cite it as a latency result.
+
+The connector pattern proposed for a production implementation uses a dedicated
+copy stream and `non_blocking=True` into pinned memory
 (`example_hidden_states_connector.py:351-431`), with completion detected by
-event polling (`:570-575`). Its latency remains unmeasured and is a prototype
-exit criterion.
+event polling (`:570-575`). The shipped Stage 0 hook now follows the same shape
+(commit `5c492ab`), and 7.2.1 is its measurement.
+
+### 7.2.1 Measured serving overhead of capture
+
+**Harness.** `tests/e2e/test_capture_overhead.py`, paired and ABBA-interleaved
+on **one engine with no restart between arms**, so an engine-lifecycle
+difference cannot be mistaken for a capture effect — the failure mode that
+voided `badba71-gptoss-idle` (see [Benchmark evidence](benchmark-evidence.md)).
+Qwen3-8B verifier with the stock `RedHatAI/Qwen3-8B-speculator.eagle3` drafter
+on an H100, 3 prompts x 20 repetitions per condition = 60 paired samples, 128
+completion tokens per request, prefix caching off, 10 cycles, 20 armed and 20
+disarmed capture blocks.
+
+**Before — blocking copy, CUDA graphs (the production default).** Job 371003 at
+commit `c5aa14c`:
+
+`/data/ryan.kim/speedlm-runs/capture-overhead-cachekey-c5aa14c/results/capture-overhead-20260806T212332Z/capture_overhead.json`
+
+| Metric | OFF baseline | Capture-ON delta | SE | Delta % |
+| --- | ---: | ---: | ---: | ---: |
+| TTFT | 19.549 ms | +10.069 ms | 0.308 | **+51.5%** |
+| Throughput | 283.94 tok/s | -41.14 tok/s | 0.89 | **-14.49%** |
+| Median inter-token | 8.378 ms | +1.3881 ms | 0.034 | **+16.57%** |
+| End-to-end | 0.4522 s | +0.0771 s | 0.0019 | **+17.04%** |
+
+Every delta is 32-46 standard errors from zero. This is a material serving
+regression, not noise.
+
+**After — deferred synchronization, same regime.** Job 371031 at commit
+`5c492ab`:
+
+`/data/ryan.kim/speedlm-runs/capture-overhead-deferred-sync-5c492ab/results/capture-overhead-20260806T234924Z/capture_overhead.json`
+
+| Metric | OFF baseline | Capture-ON delta | SE | Delta / SE | Delta % |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| TTFT | 17.717 ms | +4.401 ms | 0.275 | 16.0 | +24.84% |
+| Throughput | 280.11 tok/s | +0.403 tok/s | 0.173 | 2.3 | +0.14% |
+| Median inter-token | 8.390 ms | -0.00028 ms | 0.0024 | -0.11 | -0.003% |
+| End-to-end | 0.4581 s | +0.000637 s | 0.00026 | 2.5 | +0.14% |
+
+The steady-state cost is gone. Inter-token overhead is statistically
+indistinguishable from zero (-0.11 SE). Throughput and end-to-end sit at
++0.14%, about 2.3-2.5 SE — small enough that the sign is not worth defending;
+what matters is that the -14.49% is not there. **TTFT is the one remaining
+cost: +4.40 ms at 16.0 SE, unambiguously real.** It is the prefill step, where
+the first transfer is issued and there is no prior step to have hidden it
+behind.
+
+**Eager, for contrast.** Job 370816
+(`/data/ryan.kim/speedlm-runs/capture-overhead-snap-20260806T031659Z/results/capture-overhead-20260806T032133Z/`)
+measured the blocking copy under `--enforce-eager`: TTFT +1.106 ms on a
+46.956 ms baseline (+2.36%), throughput -2.951 tok/s on 116.71 (-2.53%). The
+graphed regime was ~9x worse in absolute TTFT on a *faster* baseline — the cost
+grew, it was not merely a bigger fraction of a cheaper step.
+
+**Mechanism.** A blocking device-to-host copy cannot be folded into a replayed
+CUDA graph. It therefore stalls the serving thread on the compute stream every
+step — a cost eager never had to pay, because eager was already synchronizing
+per layer. The fix is not to copy less: it is to copy asynchronously on a
+dedicated stream into a pooled pinned buffer, record an event, and **defer the
+synchronization to the points that actually read captured state** (reading
+pending rows, flush, reset, arm, disarm). The hot path drains without waiting.
+
+**The speedup is not dropped rows.** This was checked before the number was
+believed, because "make it fast by capturing less" is the obvious way this
+result would be fake:
+
+| Check | Before (371003) | After (371031) |
+| --- | --- | --- |
+| Bytes per armed block | 67,633,488 | **68,813,136** (larger) |
+| Rows per layer per block | 2,064 | **2,100** (more) |
+| Aux layers present | `layer_2/18/33/36`, all 20 blocks | same, all 20 blocks |
+| Armed blocks non-empty | 20 / 20 | 20 / 20 |
+| Disarmed flushes that raised | — | 20 / 20, `RuntimeError: capture is not active` |
+| Completion-token asymmetry | 0.0% | 0.0% |
+
+The after-run captured *more* data, in the same four layers, in every block, in
+less time. The disarmed-flush count is the other half of the check: capture
+being genuinely off when disarmed is what makes the OFF arm a valid baseline.
+
+**Not measured: p50/p99 percentiles.** The harness reports paired means with
+standard errors over 60 samples, which is the right statistic for a paired
+A/B but is not the tail. The per-sample values are retained in
+`samples.on` / `samples.off` in both JSONs, so percentiles are derivable, but
+nobody has published them and no tail claim should be made.
+
+### 7.2.2 Capture was non-functional under CUDA graphs until this work
+
+Worth recording, because the eager-only measurements above were for a while the
+*only* ones that could exist. Capture worked in eager mode and was
+**dead on a graph-capturing engine — the production default** — and fixing it
+took two distinct changes, the second of which only surfaced because the first
+appeared to work:
+
+1. **Declare the aux-layer set before compilation** (commit `aa02ab8`). Arming
+   extended the model's aux-layer tuple from three to four on the live model,
+   but vLLM compiles and graph-captures the forward once at startup and never
+   re-traces. The attribute said four, the graph emitted three, the labelling
+   guard refused, and EngineCore died — reproduced on GPU as job 370798, dead in
+   three minutes. The fix separates *declaration* from *buffering*: the full
+   aux-layer set is declared before compilation so the graph bakes in the final
+   count, and arming toggles only whether states are buffered. Arming then
+   changes no shape and no graph, so eager and graphed engines capture
+   identically.
+2. **Fold the declared layers into the vLLM compile-cache key** (commit
+   `c5aa14c`). Fix 1 was defeated in job 370927 by a *cached* compiled graph
+   written by job 370798 — the pre-fix run. vLLM never recompiled; it replayed a
+   three-aux graph. The cache key hashes only the **config-declared** aux layer
+   ids, and ours was appended imperatively at load time, so it was invisible to
+   the key. Declaration now also records the declared tuple into the config's
+   `additional_config`, which is folded into both the backend and AOT keys, so a
+   four-aux engine gets its own cache namespace.
+
+The secondary finding is the more instructive one: with the graph stale, the
+whole of fix 1 was a **silent no-op**. Disarmed blocks and every warmup ran the
+old three-aux graph without complaint, because the layer strip only truncates
+when the list is longer than expected. Nothing surfaced until arming. A stale
+graph is now detected on the first forward, armed or not, and the e2e harness
+gained a preflight after warmup and before any measured block, so this class of
+failure fails in about ninety seconds with an exact message instead of killing
+the engine mid-run. This is the same defect class Section 6.0 is about: the
+check that cannot fail, and the fix that cannot be observed to have applied.
 
 **Maintenance.** An owned dependency on vLLM internals, re-validated on every
 upgrade (Section 5.5).
@@ -1212,7 +1354,8 @@ the first version of this document got it wrong, so it is stated explicitly.
 | Does the capture survive transport to disk intact — right rows, right layers, right order, no truncation? | Leg 1 (capture vs. offline) | **Yes** — job 369229, `max_abs_diff = 0.0` on all three layers. Note the two sides run *different model runners* (capture on V2, offline extraction falls back to V1 for `extract_hidden_states`), which makes the bit-identity a slightly stronger transport result than "same tensor twice" — but still says nothing about identity (see 6.2). |
 | Are the captured values the **same quantity** the trainer expects (pre-norm, layer `k`, not `k±1`)? | Leg 2 (capture vs. HF fp32) | **Met — job 369256**, the first run in which the reference leg actually executed. The fp32 reference ran on `cuda`; every claimed layer was the **strict argmin** over `{k−1, k, k+1}`, beating its nearest neighbour by 81.46× / 23.14× / 24.03× / 50.02× at layers 2 / 18 / 33 / 36 against a 3.0× required margin. Per-layer `mean_rel_error` 0.511 % / 0.963 % / 1.550 % / 1.772 %, all inside the derived 2.34 % / 8.59 % / 14.45 % / 15.63 %. Note Leg 1 still says nothing here: a `0.0` there is expected and carries no information about identity. See the limitations below before quoting this. |
 | Does a prefix-cache hit genuinely drop rows (6.1)? | `test_prefix_cache_coverage` | **Demonstrated — job 369256.** `vllm:prefix_cache_hits_total` 0 → 144 on the repeat, captured rows/layer 213 cold → 69 warm, difference exactly 144, matching a hit count *derived* from vLLM's block arithmetic and asserted as an equality. This no longer rests on hardcoded literals (the earlier `cache_hit: true` / `rows_missing: 0` retirement was withdrawn as fabricated) nor on the null first run (job 369236, zero hits — correct, an 18-token prompt cannot fill a hittable block under eagle3, see 6.1.1). The artifact's own `rows_missing: 96` is wrong by 48 and is superseded by `prompt_rows_missing: 144`. |
-| What is the real serving latency cost of capture? | p50/p99 with capture on vs. off | **Still open.** Not measured. |
+| What is the real serving latency cost of capture? | Paired capture-on vs. capture-off on one engine, both execution modes | **Measured (7.2.1).** Under CUDA graphs, with the blocking copy: -14.49% throughput, +10.07 ms TTFT (job 371003). After deferring the transfer sync: throughput and inter-token overhead statistically zero, **+4.40 ms TTFT remaining** (job 371031). Verified not to come from dropped rows. p50/p99 tails still unpublished. |
+| Does capture work at all on a graph-capturing engine (the production default)? | Running an armed engine under CUDA graphs | **Yes, since `c5aa14c`** — it did not before, and needed two fixes (7.2.2). |
 
 Do not cite "Stage 0 passed" as settling the correctness question. Cite which
 leg, and what that leg can see.
@@ -1298,8 +1441,17 @@ the plan is worth writing:
   rather than as `> 0`. The shortfall is measured cold-minus-warm; the
   artifact's `rows_missing: 96` conflated 48 decode rows into a prompt-row count
   and is superseded by `prompt_rows_missing: 144` (6.1.1).
-- Measured p50 and p99 serving latency with capture on versus off, published.
-  **Still outstanding.**
+- Measured serving latency with capture on versus off, published.
+  **Met in substance, with one gap.** Published in 7.2.1: paired,
+  ABBA-interleaved, one engine, 60 pairs, in both execution modes, before and
+  after the deferred-sync fix. The gap is that the published statistic is the
+  paired **mean** with a standard error, not p50/p99 — the per-sample values are
+  retained in the artifacts but the tails have not been reported, so no tail
+  claim is licensed.
+- **New, and it was not in the original plan:** capture must actually function
+  under CUDA graphs, not only under `--enforce-eager`. It did not until
+  `c5aa14c` (7.2.2). Any future criterion that can be satisfied in eager alone
+  should be assumed not to hold in the production regime until it is run there.
 
 **Kill condition:** if the tensors cannot be made to match, or if matching
 requires a model-runner patch that cannot be isolated from the drafter's forward
@@ -1357,8 +1509,16 @@ changes.
 
 ## 10. Open questions — what must be measured, not assumed
 
-1. **What is the real serving latency cost of capture?** Design intent says near
-   zero. Nobody has measured it. Stage 0.
+1. **What is the real serving latency cost of capture?** **Answered, and design
+   intent was wrong before it was right.** Measured on GPU (7.2.1): under CUDA
+   graphs the original blocking copy cost **-14.49% throughput and +10.07 ms
+   TTFT** — nowhere near zero. Deferring the transfer synchronization removed the
+   steady-state cost entirely (throughput +0.14%, inter-token -0.11 SE, both
+   indistinguishable from zero) and left **+4.40 ms TTFT** at 16.0 SE. What
+   remains open is narrower: the p50/p99 tails (means only were published), and
+   whether the residual TTFT can be pushed lower. Note also that "near zero"
+   would have been reported as true had this only ever been measured in eager
+   mode, where the same blocking copy cost -2.5%.
 2. **Do captured and offline activations actually match?** **Answered, and the
    question was the wrong one.** They match bit-for-bit (job 369229), because
    they are the same tensor transported two ways with no arithmetic on either

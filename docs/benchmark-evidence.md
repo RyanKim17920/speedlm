@@ -1,11 +1,18 @@
 # Benchmark evidence
 
-This is the benchmark record for commit
+The definitive promotion-gate record is for commit
 `8b72d9a654cdb0743ba1a0968863c151dd34f6fc`. The provenance files for both
 definitive runs record that exact commit and a clean source tree:
 
 - `/data/ryan.kim/speedlm-runs/8b72d9a-qwen-idle/snapshot-provenance.txt`
 - `/data/ryan.kim/speedlm-runs/8b72d9a-gptoss-idle/snapshot-provenance.txt`
+
+The configuration-matrix section below is from a later effort at `5c492ab` and
+re-uses the same rejected candidate artifact; its provenance files are
+`/data/ryan.kim/speedlm-runs/config-matrix-depth3-5c492ab/snapshot-provenance.txt`
+and `/data/ryan.kim/speedlm-runs/config-matrix-eager-c8-5c492ab/snapshot-provenance.txt`.
+It does not change the gate result. Read it after the gate result, not instead
+of it.
 
 ## Definitive result: the tuned head does not improve throughput
 
@@ -33,6 +40,103 @@ Exact decision artifacts:
 The decisions record the same interleaved block schedule for both models:
 candidate 3, stock 3, stock 2, candidate 2, with restarts at the block
 boundaries recorded in `block_schedule`.
+
+The Qwen gate replayed **410 UltraChat contexts** at 512 max tokens over 5
+scored repeats (`num_contexts: 410`, `benchmark_max_tokens: 512`,
+`num_repeats: 5`; the 410-row suite is
+`.../runs/b172cadd93d947f1a7bf82fada02dcb5/held-out/suite_contexts.jsonl`, and
+the corpus is `/data/ryan.kim/speedlm-corpora/ultrachat-prompts.jsonl`). Stock
+107.682 tok/s against candidate 108.196 tok/s; stock accepted length 2.13195
+against candidate 2.15572. Keep those figures in mind for the next section.
+
+## The configuration matrix, and why it does not overturn the gate
+
+The gate measures one regime. A configuration matrix was built to check whether
+the "no throughput improvement" result was an artifact of that regime — in
+particular whether `--enforce-eager`, which the gate uses, was hiding a win that
+CUDA graphs would reveal.
+
+### The execution-mode hypothesis is refuted
+
+Two cells, both at the **profile-resolved draft depth 3** (the matrix previously
+hardcoded depth 5, which is wrong for Qwen; depth is now resolved from the
+model's profile, shared by both arms, and recorded per cell — commit `c5aa14c`).
+Qwen3-8B, request concurrency 8, short context band, prefix caching off in both
+arms, and the **same candidate artifact** the gate rejected
+(`.../8b72d9a-qwen-idle/results/live-idle-tuning/speedlm_home/runs/artifacts/91aa5142…993a`,
+recorded as `candidate_draft` in each cell's `results/manifest.json`).
+
+| Cell | Job | Artifact | Stock tok/s | Candidate tok/s | Candidate delta | Stock accepted | Candidate accepted | Accepted delta |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| CUDA graphs | 371032 | `/data/ryan.kim/speedlm-runs/config-matrix-depth3-5c492ab/results/cuda_graphs-c8-short/result.json` | 274.862 ± 0.505 | 289.348 ± 1.094 | **+5.27% ± 0.36** | 2.1584 ± 0.0061 | 2.2792 ± 0.0103 | **+0.121** |
+| Eager | 371035 | `/data/ryan.kim/speedlm-runs/config-matrix-eager-c8-5c492ab/results/eager-c8-short/result.json` | 103.126 ± 4.106 | 111.046 ± 1.650 | **+8.05% ± 3.23** | 2.1956 ± 0.0208 | 2.3364 ± 0.000 | **+0.141** |
+
+Both modes show the candidate ahead. **Execution mode explains nothing.** The
+hypothesis that CUDA graphs would change the sign, or that eager was suppressing
+a win, is refuted by its own test.
+
+### The workload explains it, and the workload is not representative
+
+The matrix and the gate disagree by five to sixfold **on the same quantity, the
+same artifact, the same model, the same depth**:
+
+| | Matrix short band | Gate replay |
+| --- | --- | --- |
+| Inputs | **8 unique prompts**, 10-25 tokens (mean 16.0) | 410 UltraChat contexts |
+| Generation | 128 tokens | 512 tokens |
+| Repeats | 4 scored repeats of the same 8 prompts | 5 |
+| Accepted-length delta | **+0.121 to +0.141** | **+0.024 ± 0.0011** |
+| Throughput delta | +5.27% to +8.05% | +0.48% ± 1.11% |
+
+The cause is in the harness, and it is structural. `_prompts_by_context` in
+`tests/e2e/test_inference_configuration_matrix.py:217-232` sorts the corpus by
+**character length** and takes the eight shortest for the short band and the
+eight longest for the long band. The short band is therefore **by construction
+the length floor of the corpus**. On the UltraChat corpus that floor is not
+prompts at all — the eight shortest entries are things like ` ```yaml `,
+`- 1 oz argan oil`, and `- 2 cloves garlic (minced)`: recipe fragments and a
+code fence. At concurrency 8, request `i` of repeat `r` gets prompt
+`(r*8 + i) % 8 == i`, so every scored repeat replays the identical eight inputs
+(line 396).
+
+Two refinements to how this has been stated informally, both from reading the
+harness:
+
+- "No corpus choice moves it" is too strong. `_load_corpus`
+  (`:192-214`) truncates to the **first 2048 entries** before sorting, so the
+  band is the floor of *that* slice. A different corpus — or merely a different
+  ordering of the same 22,362-line file — yields a different short band. The
+  accurate statement is that the band is pinned to the degenerate minimum of
+  whatever it is handed, so it inherits that corpus's junk rather than sampling
+  its distribution.
+- The **long band is not natural long prompts either.** The eight longest are
+  each self-tiled by repetition to exactly 6000 characters (`:227-231`), which
+  is unusually easy for a speculative drafter to predict. The long band is as
+  synthetic as the short one, in the opposite direction.
+
+The band guard (`_validate_context_band`, `:536-550`) only checks that the short
+mean is under 256 tokens and the long mean lands in [768, 3968]. It does not
+enforce a floor, and it is not what sets the band.
+
+### What may and may not be claimed
+
+- **No matrix cell result is a production number** until the bands are built by
+  sampling the corpus rather than taking its extremes. Do not quote +5.27% or
+  +8.05% as a throughput improvement.
+- **The gate's 410-context measurement remains the trustworthy one.** On
+  representative traffic there is still **no demonstrated throughput
+  improvement**: +0.48% against a ±1.11% standard error, and the gate rejected
+  this candidate on accepted length (+0.024, below the required +0.05).
+- What the matrix does establish is narrower and real: **on short prompts with
+  short generations, this candidate measurably outperforms stock** — by more
+  than five times the effect the gate sees, in both execution modes, with
+  non-overlapping accepted-length errors in the CUDA-graph cell. That is worth
+  investigating as a workload-dependence result. It is not a headline, and it is
+  not evidence that the candidate should be promoted.
+
+The serving-time capture overhead measured in the same effort is recorded in
+[Serving-time activation capture](serving-time-activation-capture.md), Section
+7.2.1.
 
 ## Voided archive results
 
@@ -128,10 +232,24 @@ Artifacts:
 
 ## Limits of the evidence
 
-The definitive decisions record eager execution. They do not establish that
-`--enforce-eager` is speed-only or that execution mode has zero acceptance or
-output-equivalence effect. No such evidence exists; divergence must be measured
-for each runtime configuration.
+The definitive decisions record eager execution (`engine_enforce_eager: true`).
+They do not establish that `--enforce-eager` is speed-only or that execution
+mode has zero acceptance or output-equivalence effect, and divergence must still
+be measured for each runtime configuration.
+
+The configuration matrix narrows this slightly but does not close it. It shows
+that execution mode does **not** flip the sign of the candidate-versus-stock
+comparison — both modes favour the candidate on the same workload — while the
+absolute accepted lengths do differ across modes (stock 2.1584 under CUDA graphs
+against 2.1956 eager, on identical prompts). So mode is not a confound on the
+*direction* of that comparison, and is not established to be neutral on the
+measured quantities themselves. No output-equivalence measurement across modes
+exists.
+
+Separately, note that a result being reproducible in both execution modes is not
+evidence that it generalizes: the matrix result reproduces in both modes and
+still does not transfer to representative traffic, because the confound was the
+workload, not the runtime.
 
 Code-level fail-closed checks must not be described as exercised merely because
 they exist. Several guards have not been observed firing in a real run. In

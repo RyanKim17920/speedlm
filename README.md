@@ -220,6 +220,21 @@ recovery. Earlier positive measurements came from a prototype under confounded
 conditions and are void. The current honest result and exact artifact paths are
 recorded in [Benchmark evidence](docs/benchmark-evidence.md).
 
+**On representative traffic there is still no demonstrated throughput
+improvement from the tuned head.** A configuration matrix does show the
+candidate ahead on a short-prompt, short-generation workload, in both eager and
+CUDA-graph execution — but that workload is eight prompts taken from the length
+floor of the corpus, so it is not a production number. The gate's 410-context
+measurement remains the trustworthy one. Both are in
+[Benchmark evidence](docs/benchmark-evidence.md).
+
+Serving-time activation capture is a Stage 0 prototype, not a shipped feature.
+It was non-functional under CUDA graphs — the production default — until
+recently, and its measured serving cost is now down to statistically zero on
+throughput and inter-token latency with roughly +4.4 ms of TTFT remaining. The
+measurements and their caveats are in
+[Serving-time activation capture](docs/serving-time-activation-capture.md).
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the local checks and the GPU-test
