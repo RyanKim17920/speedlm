@@ -132,6 +132,12 @@ Optional:
                         vLLM-args variable (SPEEDLM_E2E_VLLM_ARGS, or the
                         CAPTURE/AGENT equivalent)
   --force               re-extract the snapshot even if it already exists
+  --skip-preflight      do NOT run the preflight gate.  The gate refuses
+                        configurations that would measure nothing (unset test
+                        gate variable, unbounded engine, missing required
+                        option, a workload that does not fit --max-model-len).
+                        Skipping it prints a loud warning and is only for
+                        debugging the launcher itself.
   -h | --help           this message
 
 The snapshot lands in /data/ryan.kim/speedlm-snapshots/<full-sha>/ and is made
@@ -206,6 +212,15 @@ hf_home=/data/ryan.kim/hf-cache
 hf_home_set=0
 vllm_args=""
 force=0
+skip_preflight=0
+# Named workload the run measures, and the context window it is measured in.
+# Defaults reproduce the pre-workload behaviour exactly.
+workload="generic-chat"
+max_model_len="4096"
+
+# The preflight gate re-parses the invocation rather than mirroring the bash
+# state built below, so the two cannot drift apart.  Keep the original argv.
+original_args=( "$@" )
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -238,6 +253,9 @@ while [[ $# -gt 0 ]]; do
         --hf-home)        hf_home="$2"; hf_home_set=1; shift 2 ;;
         --vllm-args)      vllm_args="$2"; shift 2 ;;
         --force)          force=1; shift ;;
+        --skip-preflight) skip_preflight=1; shift ;;
+        --workload)       workload="$2"; shift 2 ;;
+        --max-model-len)  max_model_len="$2"; shift 2 ;;
         -h|--help)        usage; exit 0 ;;
         *) echo "unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -568,6 +586,41 @@ fi
 # directory is named for the sha so the mapping run -> code is one-to-one.
 # --------------------------------------------------------------------------
 cd "$REPO"
+
+# --------------------------------------------------------------------------
+# Preflight gate.
+#
+# Several allocations have been spent on configurations that could not have
+# produced a measurement: a flavor whose vLLM args were silently dropped OOMed
+# four minutes in, an in-test deadline shorter than the wall clock would have
+# killed a healthy job with hours left, and a gate variable that was not
+# exactly "1" once consumed a whole allocation while reporting success.  Every
+# one of those is decidable before sbatch, from the argv alone.
+#
+# This runs on the ORIGINAL argv (minus --skip-preflight) so the gate sees what
+# the operator typed rather than a second, hand-maintained copy of it.  It is
+# advisory only in the sense that --skip-preflight exists; it is not advisory
+# by default, because a check that does not stop anything stops nothing.
+# --------------------------------------------------------------------------
+if (( skip_preflight )); then
+    echo "WARNING: --skip-preflight given; the launch was NOT validated." >&2
+    echo "WARNING: nothing has checked that this configuration can measure anything." >&2
+else
+    preflight_argv=()
+    for arg in "${original_args[@]}"; do
+        [[ "$arg" == "--skip-preflight" ]] || preflight_argv+=( "$arg" )
+    done
+    if [[ -x "$REPO/.venv/bin/python" ]]; then
+        "$REPO/.venv/bin/python" "$REPO/scripts/speedbench" preflight "${preflight_argv[@]}" || {
+            echo "error: preflight refused this launch; nothing was submitted." >&2
+            echo "       Fix the errors above, or pass --skip-preflight to launch anyway." >&2
+            exit 2
+        }
+    else
+        echo "WARNING: $REPO/.venv/bin/python is absent; preflight did not run." >&2
+    fi
+fi
+
 sha="$(git rev-parse --verify "${commit_ref}^{commit}")"
 short_sha="${sha:0:12}"
 snapshot="$SNAPSHOT_ROOT/$sha"
@@ -854,6 +907,12 @@ EOF
         echo "export SPEEDLM_CONFIG_MATRIX_STARTUP_TIMEOUT=1800"
         echo "export SPEEDLM_CONFIG_MATRIX_REQUEST_TIMEOUT=600"
         echo "export SPEEDLM_CONFIG_MATRIX_CELL=$config_matrix_cell"
+        # Without these two the workload system is unreachable from the
+        # launcher: the matrix would silently fall back to generic-chat at
+        # 4096 no matter what preflight was told, and the preflight capacity
+        # check would be validating a configuration the job does not run.
+        echo "export SPEEDLM_E2E_WORKLOAD=$workload"
+        echo "export SPEEDLM_CONFIG_MATRIX_MAX_MODEL_LEN=$max_model_len"
         if [[ -n "$inject_percent" ]]; then
             echo "export SPEEDLM_CONFIG_MATRIX_INJECT_SLOWDOWN_PERCENT=$inject_percent"
         fi

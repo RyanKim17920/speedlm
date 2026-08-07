@@ -1,0 +1,965 @@
+#!/admin/home/ryan.kim/speedlm-fr/.venv/bin/python
+"""One command for the benchmarking harness.
+
+Launching a benchmark used to mean hand-writing a config, remembering which
+environment variable a flavor's test actually reads, and hoping.  Allocations
+have been spent on runs that measured nothing because the gate variable was
+unset or the engine had no memory bounds.  This CLI puts the existing harness
+modules behind one entry point and, more importantly, behind one rule:
+
+    every subcommand exits non-zero on the failure it exists to detect.
+
+A reporting tool that always exits 0 cannot be put in a gate, and a check that
+cannot fail is this project's recurring defect.  So ``workloads verify`` exits
+non-zero on a swapped corpus, ``compare`` exits non-zero on a proven
+regression, ``regress`` exits non-zero on a proven regression in history, and
+``launch`` refuses outright to start a run that preflight rejects.
+
+The formatting rule is the second half of the same idea: a mean is never
+printed without its standard error, and where no standard error exists the
+column says so explicitly rather than being left blank.  A blank error bar
+reads as "small"; ``no SE`` reads as "absent", which is what it means.  The
+renderers in :mod:`compare` and :mod:`regression` are reused rather than
+reimplemented so a third formatter cannot drift from the first two.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import json
+import math
+import os
+import statistics
+import subprocess
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from tests.e2e.harness import compare as C  # noqa: E402
+from tests.e2e.harness import preflight as P  # noqa: E402
+from tests.e2e.harness import regression as R  # noqa: E402
+from tests.e2e.harness import resultsdb as DB  # noqa: E402
+from tests.e2e.harness import workloads as W  # noqa: E402
+from tests.e2e.harness.model import MetricSeries, RunRecord  # noqa: E402
+
+DEFAULT_RUN_ROOT = Path("/data/ryan.kim/speedlm-runs")
+LAUNCHER = REPO_ROOT / "scripts" / "make_snapshot_run.sh"
+
+#: The name is deliberately long and unpleasant to type.  It is the only way
+#: past a failing preflight, and it should never appear in a script by accident.
+OVERRIDE_FLAG = "--launch-anyway-despite-preflight-errors"
+
+
+# ---------------------------------------------------------------------------
+# Small shared helpers
+# ---------------------------------------------------------------------------
+class CliError(Exception):
+    """A failure that should print one line and set a non-zero exit code."""
+
+    def __init__(self, message: str, code: int = 2) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+def emit(payload: Any, text: str, as_json: bool) -> None:
+    """Print either the JSON document or the human rendering, never both."""
+    if as_json:
+        print(json.dumps(payload, indent=1, sort_keys=True, default=str))
+    else:
+        print(text)
+
+
+def standard_error(series: MetricSeries) -> float | None:
+    """Standard error of the mean, or ``None`` when the sample cannot support one.
+
+    ``None`` rather than ``0.0`` on purpose: a reduced series (the artifact only
+    kept a mean), a single observation, or a set of identical observations all
+    have *no* dispersion estimate, and a caller dividing by the result should
+    fail loudly instead of computing infinite headroom.
+    """
+    if series.reduced or len(series.values) < 2:
+        return None
+    deviation = statistics.stdev(series.values)
+    if deviation == 0.0:
+        return None
+    return deviation / math.sqrt(len(series.values))
+
+
+def dispersion_basis(series: MetricSeries) -> str:
+    """Why a series has no standard error, in the gate's own vocabulary."""
+    if series.reduced or len(series.values) < 2:
+        return "unsampled"
+    if statistics.stdev(series.values) == 0.0:
+        return "degenerate"
+    return "measured"
+
+
+def format_mean(series: MetricSeries) -> str:
+    """``mean +/- SE unit`` or ``mean +/- no SE (basis) unit``.  Never a bare mean."""
+    mean = sum(series.values) / len(series.values)
+    error = standard_error(series)
+    if error is None:
+        bar = f"{C.NO_STANDARD_ERROR_MARKER} ({dispersion_basis(series)})"
+    else:
+        bar = f"{error:.4g}"
+    return f"{mean:.6g} +/- {bar} {series.unit}"
+
+
+def comparison_json(c: Any) -> dict[str, Any]:
+    """One :class:`MetricComparison` as JSON.
+
+    ``delta_standard_error`` is always present, and is ``null`` exactly when
+    there is none -- omitting the key would let a consumer read "no error bar"
+    as "field not implemented yet".
+    """
+    return {
+        "cell": c.cell,
+        "arm": c.arm,
+        "metric": c.metric,
+        "unit": c.unit,
+        "direction": c.direction.value,
+        "baseline_mean": c.baseline_mean,
+        "candidate_mean": c.candidate_mean,
+        "delta": c.delta,
+        "delta_pct": c.delta_pct,
+        "delta_standard_error": c.delta_standard_error,
+        "dispersion_basis": c.dispersion_basis,
+        "t_statistic": c.t_statistic,
+        "verdict": c.verdict.value,
+        "baseline_n": c.baseline_n,
+        "candidate_n": c.candidate_n,
+        "positional_pairing": c.positional_pairing,
+        "notes": list(c.notes),
+    }
+
+
+def comparison_line(c: Any) -> str:
+    """One comparison as a line, using compare.py's own row renderer.
+
+    ``compare._row`` is reached for deliberately: it is the function that
+    formats the delta and its error bar in the comparison table, and reusing it
+    is what keeps this listing from drifting away from that table.
+    """
+    cell, arm, metric, delta, delta_pct, t_text, verdict = C._row(c)
+    return f"  {cell}/{arm}/{metric}  {delta}  {delta_pct}  t={t_text}  {verdict}"
+
+
+# ---------------------------------------------------------------------------
+# workloads
+# ---------------------------------------------------------------------------
+def workload_row(spec: W.WorkloadSpec) -> dict[str, Any]:
+    tokens = spec.characteristics.get("prompt_tokens", {})
+    return {
+        "name": spec.name,
+        "version": spec.version,
+        "domain": spec.domain,
+        "records": spec.characteristics.get("record_count"),
+        "prompt_tokens_p50": tokens.get("p50"),
+        "prompt_tokens_p95": tokens.get("p95"),
+        "tool_call_fraction": spec.characteristics.get("tool_call_fraction"),
+        "min_max_model_len": spec.requirements.get("min_max_model_len"),
+        "source": str(spec.source_path),
+    }
+
+
+def render_workload_table(rows: list[dict[str, Any]]) -> str:
+    header = ("workload", "records", "p50 tok", "p95 tok", "tool frac", "min max-model-len")
+    body = [
+        (
+            str(row["name"]),
+            str(row["records"]),
+            str(row["prompt_tokens_p50"]),
+            str(row["prompt_tokens_p95"]),
+            f"{row['tool_call_fraction']:.2f}"
+            if isinstance(row["tool_call_fraction"], (int, float))
+            else "n/a",
+            str(row["min_max_model_len"]),
+        )
+        for row in rows
+    ]
+    if not body:
+        return "(no workload manifests found)"
+    widths = [max(len(header[i]), max(len(r[i]) for r in body)) for i in range(len(header))]
+    lines = ["  ".join(h.ljust(widths[i]) for i, h in enumerate(header)).rstrip()]
+    lines.append("  ".join("-" * widths[i] for i in range(len(header))))
+    lines.extend("  ".join(r[i].ljust(widths[i]) for i in range(len(r))).rstrip() for r in body)
+    return "\n".join(lines)
+
+
+def cmd_workloads(args: argparse.Namespace) -> int:
+    directory = Path(args.spec_dir) if args.spec_dir else None
+    action = args.action or "list"
+
+    if action == "list":
+        rows = [workload_row(spec) for spec in W.iter_specs(directory=directory)]
+        emit({"workloads": rows}, render_workload_table(rows), args.json)
+        return 0
+
+    if action == "describe":
+        if not args.name:
+            raise CliError("workloads describe needs a workload name")
+        spec = W.load_spec(args.name, directory=directory)
+        emit(
+            {"workload": workload_row(spec), "manifest": dict(spec.manifest)},
+            W.describe(spec),
+            args.json,
+        )
+        return 0
+
+    # verify
+    names = (args.name,) if args.name else W.available_workloads(directory=directory)
+    if not names:
+        raise CliError(f"no workload manifests under {directory or W.spec_directory()}")
+    results: list[dict[str, Any]] = []
+    lines: list[str] = []
+    failed = False
+    for name in names:
+        spec = W.load_spec(name, directory=directory)
+        try:
+            records = W.verify_workload(spec)
+        except W.WorkloadVerificationError as error:
+            failed = True
+            failures = list(getattr(error, "failures", ())) or [str(error)]
+            results.append({"workload": name, "ok": False, "failures": failures})
+            lines.append(f"FAIL  {name}")
+            lines.extend(f"        {failure}" for failure in failures)
+        else:
+            results.append({"workload": name, "ok": True, "records": len(records)})
+            lines.append(f"OK    {name}  ({len(records)} records verified against the manifest)")
+    emit({"ok": not failed, "results": results}, "\n".join(lines), args.json)
+    return 1 if failed else 0
+
+
+# ---------------------------------------------------------------------------
+# preflight / launch
+# ---------------------------------------------------------------------------
+#: argparse dest -> the launcher option it came from.  Ordered so the command
+#: ``launch --dry-run`` prints is stable and diffable.
+LAUNCHER_OPTIONS: tuple[tuple[str, str], ...] = (
+    ("commit", "--commit"),
+    ("run_name", "--run-name"),
+    ("run_root", "--run-root"),
+    ("time", "--time"),
+    ("tuning_timeout", "--tuning-timeout"),
+    ("partition", "--partition"),
+    ("cpus", "--cpus"),
+    ("tuning_config", "--tuning-config"),
+    ("tuning_profile", "--tuning-profile"),
+    ("verifier", "--verifier"),
+    ("drafter", "--drafter"),
+    ("candidate_drafter", "--candidate-drafter"),
+    ("drafter_dir", "--drafter-dir"),
+    ("inject_ms", "--inject-ms"),
+    ("inject_percent", "--inject-percent"),
+    ("runner", "--runner"),
+    ("prompt_set", "--prompt-set"),
+    ("target_layer_ids", "--target-layer-ids"),
+    ("hf_reference", "--hf-reference"),
+    ("strict_verdict", "--strict-verdict"),
+    ("pytest_k", "--pytest-k"),
+    ("corpus", "--corpus"),
+    ("model", "--model"),
+    ("matrix_cell", "--matrix-cell"),
+    ("hf_home", "--hf-home"),
+    ("vllm_args", "--vllm-args"),
+    # The launcher grew these two so the workload system is reachable from it;
+    # they must be forwarded or the job would run generic-chat at 4096 whatever
+    # preflight was told.
+    ("workload", "--workload"),
+    ("max_model_len", "--max-model-len"),
+)
+
+#: Options preflight consults by launcher spelling (``Flavor.required_options``).
+PREFLIGHT_OPTION_KEYS: tuple[str, ...] = (
+    "--tuning-config",
+    "--tuning-profile",
+    "--matrix-cell",
+    "--candidate-drafter",
+    "--corpus",
+    "--pytest-k",
+    "--drafter",
+    "--verifier",
+)
+
+
+def add_launcher_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--flavor", required=True, help="launcher flavor")
+    parser.add_argument("--commit", default=None)
+    parser.add_argument("--run-name", default=None)
+    parser.add_argument("--run-root", default=None)
+    parser.add_argument("--time", default=None, help="#SBATCH --time (HH:MM:SS or D-HH:MM:SS)")
+    parser.add_argument("--tuning-timeout", default=None)
+    parser.add_argument("--partition", default=None)
+    parser.add_argument("--cpus", default=None)
+    parser.add_argument("--tuning-config", default=None)
+    parser.add_argument("--tuning-profile", default=None)
+    parser.add_argument("--verifier", default=None)
+    parser.add_argument("--drafter", default=None)
+    parser.add_argument("--candidate-drafter", default=None)
+    parser.add_argument("--drafter-dir", default=None)
+    parser.add_argument("--inject-ms", default=None)
+    parser.add_argument("--inject-percent", default=None)
+    parser.add_argument("--runner", default=None, choices=("auto", "v1", "v2"))
+    parser.add_argument("--prompt-set", default=None)
+    parser.add_argument("--target-layer-ids", default=None)
+    parser.add_argument("--hf-reference", default=None)
+    parser.add_argument("--strict-verdict", default=None)
+    parser.add_argument("--pytest-k", default=None)
+    parser.add_argument("--corpus", default=None)
+    parser.add_argument("--no-corpus", action="store_true")
+    parser.add_argument("--model", default=None)
+    parser.add_argument("--matrix-cell", default=None)
+    parser.add_argument("--hf-home", default=None)
+    parser.add_argument("--vllm-args", default=None, help="JSON array of strings")
+    parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--workload",
+        default=None,
+        help="workload manifest the run will serve; checked against --max-model-len",
+    )
+    parser.add_argument(
+        "--max-model-len",
+        default=None,
+        help=(
+            "context window the run will be configured with.  Needed explicitly "
+            "because the flavors that build their own engine argv (config-matrix, "
+            "model-matrix) never pass --vllm-args, so there is no argv for the "
+            "workload-capacity check to read it out of."
+        ),
+    )
+    parser.add_argument(
+        "--spec-dir", default=None, help="directory of workload manifests (for tests)"
+    )
+    parser.add_argument(
+        "--skip-git-checks",
+        action="store_true",
+        help="do not shell out to git for provenance facts (assume a clean, existing commit)",
+    )
+
+
+def git_state(commit: str, repo: Path) -> P.GitState:
+    def git(*argv: str) -> subprocess.CompletedProcess[str]:
+        return subprocess.run(  # noqa: S603 - fixed argv, no shell
+            ["git", "-C", str(repo), *argv], capture_output=True, text=True, check=False
+        )
+
+    exists = git("rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}").returncode == 0
+    dirty: list[str] = []
+    for line in git("status", "--porcelain").stdout.splitlines():
+        path = line[3:].strip()
+        if path:
+            dirty.append(path.split(" -> ")[-1])
+    return P.GitState(commit_exists=exists, dirty_paths=tuple(dirty))
+
+
+def build_preflight_config(args: argparse.Namespace) -> P.PreflightConfig:
+    flavor = P.FLAVORS.get(args.flavor)
+    commit = args.commit or "HEAD"
+
+    vllm_args = P.parse_vllm_args(args.vllm_args) if args.vllm_args is not None else None
+
+    options: dict[str, str] = {}
+    for dest, option in LAUNCHER_OPTIONS:
+        value = getattr(args, dest, None)
+        if value is not None and option in PREFLIGHT_OPTION_KEYS:
+            options[option] = str(value)
+    # The launcher defaults --corpus to the ultrachat file and only drops it for
+    # --no-corpus, so model the same thing rather than reporting a missing
+    # option the operator never had to supply.
+    if "--corpus" not in options and not args.no_corpus:
+        options["--corpus"] = "/data/ryan.kim/speedlm-corpora/ultrachat-prompts.jsonl"
+    if args.no_corpus:
+        options.pop("--corpus", None)
+
+    # The environment the generated sbatch will actually export.  The launcher
+    # unsets the three result-relaxing switches at make_snapshot_run.sh:730-733
+    # and re-exports two of them only when their option was given, so an
+    # operator asking for --strict-verdict 0 is visible here and nowhere else.
+    env: dict[str, str] = {}
+    if flavor is not None:
+        env[flavor.gate_var] = "1"
+    if args.strict_verdict is not None:
+        env["SPEEDLM_E2E_STRICT_VERDICT"] = str(args.strict_verdict)
+    if args.hf_reference is not None:
+        env["SPEEDLM_E2E_HF_REFERENCE"] = str(args.hf_reference)
+
+    # idle-tuning derives its in-test deadline from the allocation
+    # (make_snapshot_run.sh:543-551); reproduce that so the timeout check sees
+    # the number the job will really carry.
+    timeouts: dict[str, int] = {}
+    if args.flavor == "idle-tuning":
+        raw_time = args.time or (flavor.default_time if flavor else None)
+        if args.tuning_timeout is not None:
+            timeouts["tuning"] = int(args.tuning_timeout)
+        elif raw_time is not None:
+            # Genuinely intended suppression, not a swallowed error: a malformed
+            # --time is reported by preflight._check_timeouts, which parses the
+            # same string and emits an ERROR finding.  Deriving no tuning
+            # deadline here is the correct response, and the operator still sees
+            # the problem.
+            with contextlib.suppress(ValueError):
+                timeouts["tuning"] = P.parse_slurm_time(raw_time) - 900
+
+    # Handed to preflight as-is: preflight._declared_context_window reads the
+    # spec's Mapping-style ``requirements`` directly, so no adapter is needed and
+    # there is no second place for the two to disagree.
+    workload = None
+    if args.workload:
+        workload = W.load_spec(
+            args.workload, directory=Path(args.spec_dir) if args.spec_dir else None
+        )
+
+    git = (
+        P.GitState(commit_exists=True, dirty_paths=())
+        if args.skip_git_checks
+        else git_state(commit, REPO_ROOT)
+    )
+
+    return P.PreflightConfig(
+        flavor=args.flavor,
+        vllm_args=vllm_args,
+        options=options,
+        model=args.model,
+        slurm_time=args.time,
+        timeouts=timeouts,
+        env=env,
+        workload=workload,
+        max_model_len=args.max_model_len,
+        commit=commit,
+        git=git,
+    )
+
+
+def preflight_payload(config: P.PreflightConfig, findings: tuple[P.Finding, ...], ok: bool) -> dict:
+    return {
+        "flavor": config.flavor,
+        "commit": config.commit,
+        "ok": ok,
+        "findings": [
+            {"severity": f.severity.value, "check": f.check, "message": f.message}
+            for f in findings
+        ],
+    }
+
+
+def cmd_preflight(args: argparse.Namespace) -> int:
+    config = build_preflight_config(args)
+    findings, ok = P.preflight(config)
+    emit(preflight_payload(config, findings, ok), P.render_findings(findings), args.json)
+    return 0 if ok else 1
+
+
+def launcher_command(args: argparse.Namespace) -> list[str]:
+    command = [str(args.launcher), "--flavor", args.flavor]
+    for dest, option in LAUNCHER_OPTIONS:
+        value = getattr(args, dest, None)
+        if value is not None:
+            command.extend([option, str(value)])
+    if args.no_corpus:
+        command.append("--no-corpus")
+    if args.force:
+        command.append("--force")
+    # The launcher runs its own preflight; this one already ran, and running it
+    # twice would double every warning the operator has just read.
+    command.append("--skip-preflight")
+    return command
+
+
+def cmd_launch(args: argparse.Namespace) -> int:
+    config = build_preflight_config(args)
+    findings, ok = P.preflight(config)
+    rendered = P.render_findings(findings)
+    override = getattr(args, OVERRIDE_FLAG.lstrip("-").replace("-", "_"))
+
+    if not ok and not override:
+        print(rendered, file=sys.stderr)
+        print(
+            "\nrefusing to launch: preflight found blocking errors and nothing was submitted.\n"
+            f"Fix the findings above, or pass {OVERRIDE_FLAG} to launch regardless.",
+            file=sys.stderr,
+        )
+        return 1
+
+    command = launcher_command(args)
+    if not ok:
+        print(
+            "WARNING: launching a configuration that FAILED preflight because "
+            f"{OVERRIDE_FLAG} was given.\n"
+            "WARNING: the errors below were overridden, not fixed:",
+            file=sys.stderr,
+        )
+        print(rendered, file=sys.stderr)
+    elif findings:
+        print(rendered, file=sys.stderr)
+
+    if args.dry_run:
+        emit(
+            {
+                "command": command,
+                "preflight": preflight_payload(config, findings, ok),
+                "overridden": bool(override and not ok),
+            },
+            " ".join(command),
+            args.json,
+        )
+        return 0
+
+    os.execv(command[0], command)
+    raise CliError(f"exec of {command[0]} failed")  # pragma: no cover - execv does not return
+
+
+# ---------------------------------------------------------------------------
+# index
+# ---------------------------------------------------------------------------
+def index_counts(index: DB.ResultsIndex) -> dict[str, Any]:
+    cells = 0
+    series = 0
+    unparsed = 0
+    for record in index.runs:
+        cells += len(record.cells)
+        unparsed += len(record.unparsed)
+        for cell in record.cells.values():
+            for metrics in cell.arms.values():
+                series += len(metrics)
+    return {
+        "runs": len(index.runs),
+        "runs_with_measurements": sum(1 for r in index.runs if not r.is_empty),
+        "cells": cells,
+        "metric_series": series,
+        "unparsed_artifacts": unparsed,
+    }
+
+
+def load_index(args: argparse.Namespace) -> DB.ResultsIndex:
+    """The index a reporting subcommand should read.
+
+    ``--index`` reads a saved index; otherwise the run root is parsed fresh.
+    """
+    if getattr(args, "index", None):
+        path = Path(args.index)
+        if not path.is_file():
+            raise CliError(f"no such index file: {path}")
+        return DB.ResultsIndex.load(path)
+    root = Path(args.root)
+    if not root.is_dir():
+        raise CliError(f"no such run root: {root}")
+    return DB.build_index(root)
+
+
+def cmd_index(args: argparse.Namespace) -> int:
+    if args.check:
+        path = Path(args.check)
+        if not path.is_file():
+            raise CliError(f"no such index file: {path}")
+        index = DB.ResultsIndex.load(path)
+        stale = list(index.stale_runs())
+        counts = index_counts(index)
+        lines = [
+            f"index      {path}",
+            f"root       {index.root}",
+            f"built at   {index.built_at}",
+            f"runs       {counts['runs']} ({counts['runs_with_measurements']} with measurements)",
+            f"stale      {len(stale)}",
+        ]
+        lines.extend(f"  {run_id}" for run_id in stale)
+        emit({"index": str(path), "stale_runs": stale, **counts}, "\n".join(lines), args.json)
+        return 1 if stale else 0
+
+    root = Path(args.root)
+    if not root.is_dir():
+        raise CliError(f"no such run root: {root}")
+    index = DB.build_index(root)
+    counts = index_counts(index)
+    stale = list(index.stale_runs())
+    saved = None
+    if args.out:
+        saved = Path(args.out)
+        index.save(saved)
+
+    lines = [
+        f"root                    {index.root}",
+        f"built at                {index.built_at}",
+        f"runs                    {counts['runs']}",
+        f"runs with measurements  {counts['runs_with_measurements']}",
+        f"cells                   {counts['cells']}",
+        f"metric series           {counts['metric_series']}",
+        f"unparsed artifacts      {counts['unparsed_artifacts']}",
+        f"stale runs              {len(stale)}",
+    ]
+    lines.extend(f"  {run_id}" for run_id in stale)
+    if saved is not None:
+        lines.append(f"saved                   {saved}")
+
+    payload = {"root": str(index.root), "stale_runs": stale, "saved": str(saved) if saved else None}
+    payload.update(counts)
+    emit(payload, "\n".join(lines), args.json)
+    # An empty root is not an empty history; it is a wrong --root, and reporting
+    # "0 runs, all fine" with exit 0 is exactly the silent green this CLI exists
+    # to refuse.
+    if counts["runs"] == 0:
+        print(f"error: no runs found under {index.root}", file=sys.stderr)
+        return 1
+    return 1 if stale else 0
+
+
+# ---------------------------------------------------------------------------
+# compare
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class Resolution:
+    """What one command-line run selector turned out to mean."""
+
+    selector: str
+    kind: str  # "run" or "commit"
+    runs: tuple[RunRecord, ...]
+
+    @property
+    def note(self) -> str:
+        if self.kind == "run":
+            return f"{self.selector}: run id"
+        return (
+            f"{self.selector}: commit sha, {len(self.runs)} run(s) at that commit "
+            f"({', '.join(r.run_id for r in self.runs)})"
+        )
+
+
+def resolve_selector(index: DB.ResultsIndex, selector: str) -> Resolution:
+    for record in index.runs:
+        if record.run_id == selector:
+            return Resolution(selector, "run", (record,))
+    matched = index.select(commit=selector)
+    if not matched:
+        raise CliError(
+            f"{selector!r} is neither an indexed run id nor a commit with indexed runs"
+        )
+    ordered = tuple(sorted(matched, key=lambda r: (r.created_at or "", r.run_id)))
+    return Resolution(selector, "commit", ordered)
+
+
+def pair_runs(
+    baseline: Resolution, candidate: Resolution
+) -> list[tuple[RunRecord, RunRecord]]:
+    """Which baseline run is compared against which candidate run.
+
+    Two run ids give one pair.  Two commits can give several: a commit
+    typically carries one run per flavor, and comparing an idle-tuning run
+    against a capture-overhead run would produce a table of nothing.  Pairing
+    by flavor and taking the most recent run of each is the only pairing that
+    compares like with like; anything unmatched is reported, not dropped.
+    """
+    if baseline.kind == "run" and candidate.kind == "run":
+        return [(baseline.runs[0], candidate.runs[0])]
+
+    def latest_by_flavor(runs: tuple[RunRecord, ...]) -> dict[str, RunRecord]:
+        out: dict[str, RunRecord] = {}
+        for record in runs:  # already sorted oldest first
+            out[record.flavor] = record
+        return out
+
+    left = latest_by_flavor(baseline.runs)
+    right = latest_by_flavor(candidate.runs)
+    return [(left[flavor], right[flavor]) for flavor in sorted(set(left) & set(right))]
+
+
+def cmd_compare(args: argparse.Namespace) -> int:
+    index = load_index(args)
+    baseline = resolve_selector(index, args.baseline)
+    candidate = resolve_selector(index, args.candidate)
+    pairs = pair_runs(baseline, candidate)
+    if not pairs:
+        raise CliError(
+            f"{baseline.note}\n{candidate.note}\n"
+            "no flavor is present on both sides, so there is nothing comparable"
+        )
+
+    results = []
+    lines = [baseline.note, candidate.note, ""]
+    regressed = False
+    for base_run, cand_run in pairs:
+        comparison = C.compare_runs(
+            base_run,
+            cand_run,
+            materiality_pct=args.materiality_pct,
+            significance_t=args.significance_t,
+        )
+        regressed = regressed or bool(comparison.regressions)
+        lines.append(C.render_comparison(comparison))
+        lines.append("")
+        results.append(
+            {
+                "flavor": base_run.flavor,
+                "baseline": comparison.baseline,
+                "candidate": comparison.candidate,
+                "baseline_commit": comparison.baseline_commit,
+                "candidate_commit": comparison.candidate_commit,
+                "comparisons": [comparison_json(c) for c in comparison.comparisons],
+                "regressions": [comparison_json(c) for c in comparison.regressions],
+                "unresolved_shifts": [comparison_json(c) for c in comparison.unresolved_shifts],
+                "baseline_only": list(comparison.baseline_only),
+                "candidate_only": list(comparison.candidate_only),
+                "incomparable": list(comparison.incomparable),
+            }
+        )
+
+    if regressed:
+        lines.append("PROVEN REGRESSION(S) FOUND")
+    payload = {
+        "baseline": {"selector": baseline.selector, "kind": baseline.kind,
+                     "runs": [r.run_id for r in baseline.runs]},
+        "candidate": {"selector": candidate.selector, "kind": candidate.kind,
+                      "runs": [r.run_id for r in candidate.runs]},
+        "pairs": results,
+        "proven_regression": regressed,
+    }
+    emit(payload, "\n".join(lines).rstrip(), args.json)
+    return 1 if regressed else 0
+
+
+# ---------------------------------------------------------------------------
+# regress
+# ---------------------------------------------------------------------------
+def cmd_regress(args: argparse.Namespace) -> int:
+    index = load_index(args)
+    ordering = R.GitCommitOrdering(REPO_ROOT)
+
+    runs = list(index.select(metric=args.metric) if args.metric else index.runs)
+    if args.since:
+        floor = ordering.position(args.since)
+        if floor is None:
+            raise CliError(f"--since {args.since!r} is not a commit in this repository")
+        kept = []
+        for record in runs:
+            if record.commit is None:
+                continue
+            position = ordering.position(record.commit)
+            if position is not None and position >= floor:
+                kept.append(record)
+        runs = kept
+
+    report = R.detect_regressions(
+        runs,
+        ordering=ordering,
+        materiality_pct=args.materiality_pct,
+        significance_t=args.significance_t,
+    )
+    regressions = report.regressions
+    unresolved = report.unresolved_shifts
+    if args.metric:
+        regressions = tuple(c for c in regressions if c.metric == args.metric)
+        unresolved = tuple(c for c in unresolved if c.metric == args.metric)
+
+    lines = [
+        f"runs considered        {len(runs)}",
+        f"tracks                 {len(report.tracks)}",
+        f"proven regressions     {len(regressions)}",
+        f"unresolved shifts      {len(unresolved)}",
+        "",
+        "PROVEN REGRESSIONS",
+    ]
+    lines.extend([comparison_line(c) for c in regressions] or ["  (none)"])
+    lines.extend(["", "MATERIAL SHIFT, UNRESOLVED"])
+    lines.extend([comparison_line(c) for c in unresolved] or ["  (none)"])
+
+    if args.tracks:
+        interesting = [t for t in report.tracks if t.regressions or t.unresolved_shifts]
+        for track in interesting:
+            lines.extend(["", R.render_track(track)])
+
+    if report.excluded:
+        lines.extend(["", "excluded from commit-ordered history:"])
+        lines.extend(f"  {run_id}: {reason}" for run_id, reason in report.excluded)
+
+    payload = {
+        "runs_considered": len(runs),
+        "tracks": len(report.tracks),
+        "regressions": [comparison_json(c) for c in regressions],
+        "unresolved_shifts": [comparison_json(c) for c in unresolved],
+        "excluded": [{"run_id": r, "reason": reason} for r, reason in report.excluded],
+        "caveats": list(report.caveats),
+        "proven_regression": bool(regressions),
+    }
+    emit(payload, "\n".join(lines), args.json)
+    return 1 if regressions else 0
+
+
+# ---------------------------------------------------------------------------
+# show
+# ---------------------------------------------------------------------------
+def cmd_show(args: argparse.Namespace) -> int:
+    index = load_index(args)
+    record = next((r for r in index.runs if r.run_id == args.run), None)
+    if record is None:
+        raise CliError(f"no indexed run named {args.run!r} under {index.root}")
+
+    lines = [
+        f"run        {record.run_id}",
+        f"flavor     {record.flavor}",
+        f"commit     {record.commit or 'no recorded commit'}",
+        f"created    {record.created_at or 'unknown'}",
+        f"slurm job  {record.slurm_job_id or 'unknown'}",
+        f"workload   {record.workload or 'not declared'}",
+        f"directory  {record.run_dir}",
+        "",
+    ]
+    cells_payload = []
+    for cell_name in sorted(record.cells):
+        cell = record.cells[cell_name]
+        lines.append(f"cell {cell_name}")
+        if cell.config:
+            lines.append(f"  config: {json.dumps(cell.config, sort_keys=True, default=str)}")
+        for warning in cell.warnings:
+            lines.append(f"  warning: {warning}")
+        arms_payload = {}
+        for arm_name in sorted(cell.arms):
+            lines.append(f"  arm {arm_name}")
+            metrics_payload = {}
+            for metric_name in sorted(cell.arms[arm_name]):
+                series = cell.arms[arm_name][metric_name]
+                error = standard_error(series)
+                lines.append(
+                    f"    {metric_name:<34} {format_mean(series)}"
+                    f"   n={len(series.values)}  {series.direction.value}"
+                )
+                metrics_payload[metric_name] = {
+                    "unit": series.unit,
+                    "direction": series.direction.value,
+                    "mean": sum(series.values) / len(series.values),
+                    "standard_error": error,
+                    "dispersion_basis": dispersion_basis(series),
+                    "n": len(series.values),
+                    "reduced": series.reduced,
+                    "values": list(series.values),
+                    "pass_indices": list(series.pass_indices) if series.pass_indices else None,
+                }
+            arms_payload[arm_name] = metrics_payload
+        cells_payload.append(
+            {
+                "cell": cell_name,
+                "config": dict(cell.config),
+                "warnings": list(cell.warnings),
+                "arms": arms_payload,
+            }
+        )
+        lines.append("")
+
+    if record.unparsed:
+        lines.append("unparsed artifacts:")
+        lines.extend(f"  {path}: {reason}" for path, reason in sorted(record.unparsed.items()))
+
+    payload = {
+        "run_id": record.run_id,
+        "flavor": record.flavor,
+        "commit": record.commit,
+        "created_at": record.created_at,
+        "slurm_job_id": record.slurm_job_id,
+        "workload": record.workload,
+        "run_dir": str(record.run_dir),
+        "cells": cells_payload,
+        "unparsed": dict(record.unparsed),
+        "is_empty": record.is_empty,
+    }
+    emit(payload, "\n".join(lines).rstrip(), args.json)
+    # A run with no measurements is the thing `show` exists to surface; it must
+    # not read as a successful inspection.
+    if record.is_empty:
+        print(f"error: run {record.run_id} recorded no measurements", file=sys.stderr)
+        return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# argument parsing
+# ---------------------------------------------------------------------------
+def add_reporting_options(parser: argparse.ArgumentParser, *, index_source: bool = True) -> None:
+    parser.add_argument("--json", action="store_true", help="emit JSON instead of a table")
+    if index_source:
+        parser.add_argument("--root", default=str(DEFAULT_RUN_ROOT), help="run root to index")
+        parser.add_argument("--index", default=None, help="read a saved index instead of --root")
+
+
+def add_threshold_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--materiality-pct", type=float, default=C.DEFAULT_MATERIALITY_PCT)
+    parser.add_argument("--significance-t", type=float, default=C.DEFAULT_SIGNIFICANCE_T)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="speedbench",
+        description="Self-service front end for the SpeedLM benchmarking harness.",
+    )
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    workloads = sub.add_parser("workloads", help="list, describe and verify workload manifests")
+    workloads.add_argument("action", nargs="?", choices=("list", "describe", "verify"))
+    workloads.add_argument("name", nargs="?")
+    workloads.add_argument("--spec-dir", default=None, help="directory of workload manifests")
+    add_reporting_options(workloads, index_source=False)
+    workloads.set_defaults(func=cmd_workloads)
+
+    pre = sub.add_parser("preflight", help="check a proposed launch without launching it")
+    add_launcher_options(pre)
+    add_reporting_options(pre, index_source=False)
+    pre.set_defaults(func=cmd_preflight)
+
+    launch = sub.add_parser("launch", help="preflight, then run make_snapshot_run.sh")
+    add_launcher_options(launch)
+    add_reporting_options(launch, index_source=False)
+    launch.add_argument("--dry-run", action="store_true", help="print the command, run nothing")
+    launch.add_argument("--launcher", default=str(LAUNCHER), help=argparse.SUPPRESS)
+    launch.add_argument(
+        OVERRIDE_FLAG,
+        action="store_true",
+        help="launch even though preflight found blocking errors (prints a loud warning)",
+    )
+    launch.set_defaults(func=cmd_launch)
+
+    index = sub.add_parser("index", help="build or refresh the results index")
+    index.add_argument("--root", default=str(DEFAULT_RUN_ROOT))
+    index.add_argument("--out", default=None, help="write the index here")
+    index.add_argument("--check", default=None, help="check a saved index for staleness")
+    index.add_argument("--json", action="store_true")
+    index.set_defaults(func=cmd_index)
+
+    compare = sub.add_parser("compare", help="diff two runs or two commits")
+    compare.add_argument("baseline")
+    compare.add_argument("candidate")
+    add_reporting_options(compare)
+    add_threshold_options(compare)
+    compare.set_defaults(func=cmd_compare)
+
+    regress = sub.add_parser("regress", help="commit-ordered regression report")
+    regress.add_argument("--metric", default=None)
+    regress.add_argument("--since", default=None, help="only runs at or after this commit")
+    regress.add_argument("--tracks", action="store_true", help="also render each affected track")
+    add_reporting_options(regress)
+    add_threshold_options(regress)
+    regress.set_defaults(func=cmd_regress)
+
+    show = sub.add_parser("show", help="one run's cells, metrics, means and standard errors")
+    show.add_argument("run")
+    add_reporting_options(show)
+    show.set_defaults(func=cmd_show)
+
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return int(args.func(args))
+    except CliError as error:
+        print(f"error: {error}", file=sys.stderr)
+        return error.code
+    except (W.WorkloadError, ValueError) as error:
+        print(f"error: {error}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
