@@ -1766,3 +1766,125 @@ def test_control_divergences_must_be_a_list() -> None:
 
     with pytest.raises(ReportError, match="control_divergences"):
         parse_decision(payload, source=Path("d.json"))
+
+
+# ---------------------------------------------------------------------------
+# Every verdict the gate can write must survive its own reader
+# ---------------------------------------------------------------------------
+
+
+def _saturated_decision() -> Any:
+    """A saturated ``Decision`` produced by the gate, not assembled by hand.
+
+    Hand-building one would let this test pass against a ``Decision`` the gate
+    can never actually emit -- and the defect was precisely that the gate's own
+    output could not be read back.  So the record under test comes out of
+    ``decide_promotion``, on an arm whose every generation was ended by the
+    output cap.
+    """
+    from speedlm.config import PromotionConfig
+    from speedlm.gate.decide import decide_promotion
+    from speedlm.gate.metrics import MetricsDelta
+    from speedlm.gate.replay import ReplayResult, RunResults
+
+    def _delta(acceptance_rate: float, tok_per_sec: float) -> MetricsDelta:
+        return MetricsDelta(
+            reset_detected=False,
+            acceptance_available=True,
+            drafted_tokens=1000.0,
+            accepted_tokens=700.0,
+            acceptance_rate=acceptance_rate,
+            mean_accepted_length=1.0 + acceptance_rate * 5,
+            tpot_ms=10.0,
+            output_tok_per_sec=tok_per_sec,
+        )
+
+    def _replay_arm(tok_per_sec: float, truncated: int) -> ReplayResult:
+        runs = tuple(
+            RunResults(
+                results=(),
+                total_latency_s=1000.0 / tok_per_sec,
+                total_prompt_tokens=100,
+                total_completion_tokens=1000,
+                valid_count=5,
+                invalid_count=0,
+                invalid_rate=0.0,
+                finish_reason_count=5,
+                truncated_count=truncated,
+            )
+            for _ in range(3)
+        )
+        return ReplayResult(run_results=runs, num_runs=len(runs), suite_hash="suite-h")
+
+    return decide_promotion(
+        _delta(0.60, 100.0),
+        _delta(0.65, 110.0),
+        _replay_arm(100.0, truncated=5),
+        _replay_arm(110.0, truncated=1),
+        PromotionConfig(
+            min_acceptance_delta_pp=1.0,
+            min_accepted_length_delta=0.05,
+            min_throughput_delta_pct=2.0,
+        ),
+    )
+
+
+def test_a_saturated_decision_round_trips_through_the_report_layer() -> None:
+    """The gate must not be able to write a verdict its own reader rejects.
+
+    ``TRUNCATION_SATURATED`` returns above the delta computation, exactly as
+    ``OUTPUT_MISMATCH`` does, so the record it writes carries null deltas.
+    While the reason was missing from ``UNMEASURED_REASONS`` the loader demanded
+    numbers the gate had never computed and raised ``'acceptance_delta_pp' must
+    be numeric`` on every saturated run -- so the one rejection reason that
+    exists to say "this benchmark measured nothing" produced an artifact
+    ``speedlm gain`` could not open.
+    """
+    decision = _saturated_decision()
+
+    assert decision.verdict is Verdict.REJECT
+    assert decision.reason is Reason.TRUNCATION_SATURATED
+    assert decision.stock_truncation_regime is TruncationRegime.SATURATED
+    # The shape that made the loader fail: the deltas really are absent.
+    assert decision.to_dict()["acceptance_delta_pp"] is None
+
+    parsed = parse_decision(decision.to_dict(), source=Path("d.json"))
+
+    assert parsed.reason is Reason.TRUNCATION_SATURATED
+    assert parsed.verdict is Verdict.REJECT
+    assert parsed.to_dict() == decision.to_dict()
+
+
+def test_a_saturated_decision_renders_a_gain_report(home: Path) -> None:
+    """The other half of the same defect: three renderers index the mapping.
+
+    A reason absent from ``_REASON_EXPLANATIONS`` is a ``KeyError`` waiting in
+    the text renderer, the JSON renderer and the summary line, so loading the
+    record back is not enough -- it has to be reportable.
+    """
+    _write_decision(home, _saturated_decision().to_dict())
+
+    report = build_gain_report()
+
+    assert report.status is GainStatus.NOT_MEASURED
+    assert not report.deltas_measured
+    # All three renderers index ``_REASON_EXPLANATIONS`` directly.
+    assert "output cap" in report.to_dict()["reason_detail"]
+    assert "output cap" in report.to_json()
+    assert "output cap" in report.render_text()
+
+
+def test_every_rejection_reason_carries_an_explanation() -> None:
+    """Enumerated so the next reason added cannot repeat this defect.
+
+    ``_REASON_EXPLANATIONS`` is indexed, never ``.get``-ed, in three renderers.
+    Asserting over the enum rather than over a list the test maintains means a
+    new ``Reason`` member fails here at once, instead of at whatever moment a
+    live gate first writes it.
+    """
+    from speedlm.report import _REASON_EXPLANATIONS
+
+    missing = [reason.name for reason in Reason if reason not in _REASON_EXPLANATIONS]
+
+    assert missing == []
+    assert all(_REASON_EXPLANATIONS[reason].strip() for reason in Reason)

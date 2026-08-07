@@ -2281,15 +2281,21 @@ def decide_promotion(
     # nothing at all about where the model stops -- it does not disturb the
     # heavily-but-not-wholly truncated regime every archived live run sits in.
     # See :class:`TruncationRegime`.
+    # Classified from ``per_repeat_tuple`` -- the paired window -- and NOT from
+    # the two ``ReplayResult`` objects, which pool every run each arm made.
+    # The two differ whenever the arms returned unequal run counts: the record
+    # keeps only ``min_runs`` rows, so a gate reading the unpaired pool could
+    # promote on ``MIXED`` while the decision it wrote derived ``SATURATED``
+    # from the rows it actually persisted.  A verdict whose own evidence
+    # contradicts it is this project's recurring defect; deriving both from one
+    # array makes the divergence unrepresentable rather than merely unlikely.
     stock_truncation = classify_truncation(
-        reported=stock_replay.total_finish_reason_count,
-        truncated=stock_replay.total_finish_reason_count - stock_replay.total_natural_stops,
+        reported=sum(r.stock_finish_reasons for r in per_repeat_tuple),
+        truncated=sum(r.stock_truncated for r in per_repeat_tuple),
     )
     candidate_truncation = classify_truncation(
-        reported=candidate_replay.total_finish_reason_count,
-        truncated=(
-            candidate_replay.total_finish_reason_count - candidate_replay.total_natural_stops
-        ),
+        reported=sum(r.candidate_finish_reasons for r in per_repeat_tuple),
+        truncated=sum(r.candidate_truncated for r in per_repeat_tuple),
     )
     if TruncationRegime.SATURATED in (stock_truncation, candidate_truncation):
         return _reject(Reason.TRUNCATION_SATURATED)

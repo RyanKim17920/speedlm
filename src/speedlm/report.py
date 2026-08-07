@@ -83,6 +83,12 @@ UNMEASURED_REASONS: Final[frozenset[Reason]] = frozenset(
         Reason.TOO_FEW_REPEATS,
         Reason.HIGH_INVALID_RATE,
         Reason.OUTPUT_MISMATCH,
+        # Returns above the delta computation, exactly as OUTPUT_MISMATCH does,
+        # so its record carries no `acceptance_delta_pp` to require.  Without
+        # this entry `parse_decision` raised "'acceptance_delta_pp' must be
+        # numeric" on every saturated run -- the gate could write a verdict its
+        # own reader could not load back.
+        Reason.TRUNCATION_SATURATED,
     }
 )
 
@@ -105,6 +111,10 @@ _REASON_EXPLANATIONS: Final[Mapping[Reason, str]] = {
     Reason.HIGH_INVALID_RATE: "too many replayed requests failed to produce valid output",
     Reason.TOO_FEW_REPEATS: "the benchmark did not complete enough repeats to be meaningful",
     Reason.OUTPUT_MISMATCH: "candidate output diverged from stock output",
+    Reason.TRUNCATION_SATURATED: (
+        "the output cap ended every generation in an arm, so the benchmark "
+        "measured fixed-length decode rather than the workload"
+    ),
     Reason.UNCERTAIN: "the gate could not reach a confident conclusion",
 }
 

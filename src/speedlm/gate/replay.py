@@ -254,6 +254,40 @@ class ReplayResult:
 #: separates a deliberate truncation from a broken generation.
 FINISH_REASON_LENGTH: Final = "length"
 
+#: Every ``finish_reason`` spelling that means "the cap ended this", not just
+#: the OpenAI chat one above.
+#:
+#: Mirrors ``speedlm.training.backends.eagle3.TRUNCATED_FINISH_REASONS`` and
+#: ``speedlm.traces.store.TRUNCATED_FINISH_REASONS`` -- restated rather than
+#: imported for the same reason the trace store restates it (the gate must not
+#: depend on a training backend), and pinned against both by
+#: ``tests/test_gate_replay.py::test_the_gate_truncation_vocabulary_matches_the_training_filter``
+#: so the three cannot drift apart unnoticed.
+#:
+#: The gate needs the full set, not ``FINISH_REASON_LENGTH`` alone.  ``length``
+#: is the chat-completions spelling; ``incomplete`` is the Responses API's
+#: spelling of the identical event, and this project's own gateway emits it
+#: (``gateway/responses.py``).  Counting only ``length`` meant a server that
+#: says ``incomplete`` reported *zero* truncations for a wholly-capped run and
+#: classified ``BOUNDED`` -- the strongest possible "the cap was not binding"
+#: reading of the strongest possible saturation.  That is precisely the silent
+#: masking :class:`speedlm.gate.decide.TruncationRegime` exists to prevent, so
+#: the gate would have been generalizing itself into a vacuous guard on any
+#: server that is not the one it was written against.
+TRUNCATED_FINISH_REASONS: Final = frozenset({"length", "incomplete"})
+
+
+def is_truncated_finish_reason(value: str | None) -> bool:
+    """Whether *value* means the output cap ended the generation.
+
+    Normalised exactly as ``speedlm.traces.store._is_truncated_completion``
+    normalises it -- ``strip().lower()`` -- so a server spelling it ``Length``
+    is not silently read as a natural stop.  A positive test rather than "not
+    ``stop``": an unknown value is not evidence of truncation, and
+    ``tool_calls`` is a perfectly complete stop.
+    """
+    return isinstance(value, str) and value.strip().lower() in TRUNCATED_FINISH_REASONS
+
 #: Field names a server may file a thinking model's ``<think>`` block under,
 #: in the order they are consulted.  vLLM 0.25.x uses ``reasoning``; the
 #: ``reasoning_content`` spelling is what several other OpenAI-compatible
@@ -561,8 +595,15 @@ async def _run_single(
     total_ct = sum(r.completion_tokens for r in results)
     valid = sum(1 for r in results if r.valid)
     invalid = len(results) - valid
-    reported = [r.finish_reason for r in results if r.finish_reason]
-    truncated = sum(1 for fr in reported if fr == FINISH_REASON_LENGTH)
+    # Only *valid* responses may speak to who chose the generation length.
+    # An invalid one is a response the run failed to obtain, and its finish
+    # reason describes the failure, not the model: 99 healthy ``length``
+    # responses plus a single broken empty ``stop`` would otherwise report one
+    # natural stop, classify ``MIXED`` instead of ``SATURATED``, and promote --
+    # while ``invalid_rate`` sat at 0.01, far under its own threshold.  One
+    # failed request must not be able to vouch for a wholly-capped run.
+    reported = [r.finish_reason for r in results if r.valid and r.finish_reason]
+    truncated = sum(1 for fr in reported if is_truncated_finish_reason(fr))
 
     return RunResults(
         results=tuple(results),

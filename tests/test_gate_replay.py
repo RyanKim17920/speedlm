@@ -10,7 +10,14 @@ import httpx
 import pytest
 
 from speedlm.config import SamplingConfig
-from speedlm.gate.replay import ReplayError, ReplayResult, RunResults, replay_suite
+from speedlm.gate.replay import (
+    TRUNCATED_FINISH_REASONS,
+    ReplayError,
+    ReplayResult,
+    RunResults,
+    is_truncated_finish_reason,
+    replay_suite,
+)
 from speedlm.gate.suite import BenchmarkSuite, FrozenContext
 
 
@@ -299,6 +306,12 @@ class _ScriptedClient:
     failures: int = 0
     #: Which shape of failure to answer those with -- the three ways
     #: ``_send_request`` can come back without ever having heard from the model.
+    #: ``"http"``, ``"transport"``, ``"empty_choices"`` -- the three ways the
+    #: model is never heard from -- or ``"empty_stop"``, the fourth shape: a
+    #: 200 OK the endpoint *did* answer, carrying a finish reason but nothing
+    #: to show for it, which ``_validity_error`` scores invalid.  That one is
+    #: the only failure that arrives with a finish reason attached, so it is
+    #: the only one that can contaminate the truncation counts.
     failure_mode: str = "http"
     seen: int = 0
     limits: Any = None
@@ -318,6 +331,15 @@ class _ScriptedClient:
                 raise httpx.ConnectError("connection reset by peer")
             if self.failure_mode == "empty_choices":
                 return _FakeResponse({"choices": [], "usage": {}})
+            if self.failure_mode == "empty_stop":
+                return _FakeResponse(
+                    {
+                        "choices": [
+                            {"message": {"content": ""}, "finish_reason": "stop"}
+                        ],
+                        "usage": {"prompt_tokens": 12, "completion_tokens": 9},
+                    }
+                )
             return _FakeResponse({"error": "internal"}, status_code=500)
         if index < self.failures + self.scripted:
             return _FakeResponse({"choices": [dict(self.choice)], "usage": self.usage})
@@ -797,3 +819,157 @@ def test_pooled_truncation_rate_weighs_each_repeat_by_what_it_reported() -> None
     assert result.avg_truncation_rate == pytest.approx(3 / 12)
     # The discriminating half: mean-of-means is a different number here.
     assert result.avg_truncation_rate != pytest.approx((0.1 + 1.0) / 2)
+
+
+def test_an_invalid_response_cannot_supply_the_only_natural_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One broken response must not vouch for a wholly-capped run.
+
+    Ninety-nine healthy generations spent their whole budget and one response
+    came back empty while claiming ``finish_reason: "stop"``.  Counting every
+    truthy finish reason made that single failure the run's one natural stop,
+    which classifies ``MIXED`` instead of ``SATURATED`` and promotes -- while
+    ``invalid_rate`` sat at 0.01, an order of magnitude under its own 0.1
+    threshold, so no other guard could see it either.  A response the run
+    failed to obtain describes the failure, not where this model stops.
+    """
+    _scripted(
+        monkeypatch,
+        _finish_reason_choice("length"),
+        _CAPPED_USAGE,
+        scripted=99,
+        failures=1,
+        failure_mode="empty_stop",
+    )
+
+    run = _replay(_suite(100), concurrency=8, max_tokens=512).run_results[0]
+
+    # The contaminating response really is present, really did report "stop",
+    # and really is under the invalid-rate threshold -- otherwise this test
+    # would be asserting against a population that cannot occur.
+    assert run.invalid_count == 1
+    assert run.invalid_rate == pytest.approx(0.01)
+    assert [r.finish_reason for r in run.results if not r.valid] == ["stop"]
+
+    assert run.natural_stop_count == 0
+    assert run.finish_reason_count == 99
+    assert run.truncated_count == 99
+    assert run.truncation_rate == 1.0
+
+
+def test_the_gate_truncation_vocabulary_matches_the_training_filter() -> None:
+    """The three copies of the truncated-finish-reason set must stay identical.
+
+    ``gate.replay`` restates the set rather than importing it, because the gate
+    must not depend on the training backend.  Restating it is what lets it
+    drift: the gate's copy once held ``length`` alone, so an endpoint speaking
+    the Responses API spelling ``incomplete`` -- which this project's own
+    gateway emits -- reported zero truncations on a wholly-capped run and the
+    run classified ``BOUNDED``, the strongest possible "the cap was not
+    binding" reading of the strongest possible saturation.  This is the gate
+    side of ``test_trace_store.py::test_truncated_finish_reasons_match_the_
+    training_filter``; the two together pin all three copies.
+    """
+    from speedlm.traces import store
+    from speedlm.training.backends import eagle3
+
+    assert TRUNCATED_FINISH_REASONS == store.TRUNCATED_FINISH_REASONS
+    assert TRUNCATED_FINISH_REASONS == eagle3.TRUNCATED_FINISH_REASONS
+    # Spelled out as well as cross-checked, so deleting a member from all three
+    # copies at once still fails here rather than silently agreeing.
+    assert frozenset({"length", "incomplete"}) == TRUNCATED_FINISH_REASONS
+
+
+def test_an_incomplete_finish_reason_makes_a_run_wholly_truncated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``incomplete`` is the Responses API spelling of the identical event.
+
+    A run in which the cap ended every single generation must read as wholly
+    truncated no matter which of the two spellings the server used.  Counting
+    only ``length`` turned this exact run into zero truncations and five
+    natural stops -- ``BOUNDED``, and promotable.
+    """
+    _scripted(
+        monkeypatch,
+        _finish_reason_choice("incomplete"),
+        _CAPPED_USAGE,
+        scripted=5,
+    )
+
+    run = _replay(_suite(5), max_tokens=512).run_results[0]
+
+    assert run.finish_reason_count == 5
+    assert run.truncated_count == 5
+    assert run.natural_stop_count == 0
+    assert run.truncation_rate == 1.0
+
+
+@pytest.mark.parametrize("spelling", ["Length", " length ", "INCOMPLETE", "Incomplete"])
+def test_finish_reason_spelling_is_normalised_before_counting(
+    monkeypatch: pytest.MonkeyPatch,
+    spelling: str,
+) -> None:
+    """Case and surrounding whitespace are the server's, not evidence.
+
+    Normalised exactly as ``traces.store`` normalises it, so a server spelling
+    it ``Length`` is not silently read as a natural stop by the gate while the
+    training filter drops the same row.
+    """
+    _scripted(monkeypatch, _finish_reason_choice(spelling), _CAPPED_USAGE, scripted=4)
+
+    run = _replay(_suite(4), max_tokens=512).run_results[0]
+
+    assert run.finish_reason_count == 4
+    assert run.truncated_count == 4
+    assert run.natural_stop_count == 0
+
+
+def test_an_unknown_finish_reason_is_not_counted_as_truncated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The predicate is a positive list, never "anything that is not ``stop``".
+
+    A reason nobody has taught the gate about is not evidence that the cap
+    ended the generation, and reading it as one would let the guard fire on any
+    server whose vocabulary is merely wider than this one's -- turning a
+    calibrated measurement check into a veto on unfamiliar endpoints.
+    """
+    _scripted(monkeypatch, _finish_reason_choice("weird"), _CAPPED_USAGE, scripted=6)
+
+    run = _replay(_suite(6), max_tokens=512).run_results[0]
+
+    assert run.finish_reason_count == 6
+    assert run.truncated_count == 0
+    assert run.natural_stop_count == 6
+    assert run.truncation_rate == 0.0
+
+
+@pytest.mark.parametrize(
+    ("value", "truncated"),
+    [
+        ("length", True),
+        ("incomplete", True),
+        (" Length\n", True),
+        ("stop", False),
+        ("tool_calls", False),
+        ("content_filter", False),
+        ("weird", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test_is_truncated_finish_reason_is_a_positive_membership_test(
+    value: str | None,
+    truncated: bool,
+) -> None:
+    """The property behind the counts, stated directly on the predicate.
+
+    Pinning both sides keeps the guard from generalising itself: the truthy
+    cases stop ``incomplete`` from being dropped again, and the falsy ones stop
+    the predicate from being rewritten as ``value != "stop"``, which would file
+    an agentic suite's ``tool_calls`` dispatches as harness truncations and
+    make realistic traffic read as saturated by construction.
+    """
+    assert is_truncated_finish_reason(value) is truncated

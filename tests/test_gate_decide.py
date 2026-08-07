@@ -33,6 +33,7 @@ from speedlm.gate.replay import (
     ReplayResult,
     RequestResult,
     RunResults,
+    is_truncated_finish_reason,
 )
 
 # ---------------------------------------------------------------------------
@@ -2703,3 +2704,124 @@ def test_truncation_rates_are_none_rather_than_zero_when_nothing_reported() -> N
     assert dec.candidate_truncation_regime is TruncationRegime.UNTESTABLE
     # And an unmeasured arm is not a rejection -- see ``UNTESTABLE``.
     assert dec.verdict is Verdict.PROMOTE
+
+
+def _finish_reason_columns(
+    reasons: list[str],
+    *,
+    repeats: int = 3,
+) -> list[tuple[int, int]]:
+    """One ``(reported, truncated)`` column per repeat, from real finish reasons.
+
+    Counted with ``replay.is_truncated_finish_reason`` -- the production
+    predicate -- rather than with a literal the test picks, so the vocabulary
+    the gate actually classifies with is what these tests exercise.  A spelling
+    dropped from ``TRUNCATED_FINISH_REASONS`` therefore changes the regime here
+    exactly as it would on a live endpoint.
+    """
+    truncated = sum(1 for reason in reasons if is_truncated_finish_reason(reason))
+    return [(len(reasons), truncated)] * repeats
+
+
+def test_an_arm_capped_under_the_responses_api_spelling_is_still_rejected() -> None:
+    """``incomplete`` saturates an arm exactly as ``length`` does.
+
+    This project's own gateway emits the Responses API spelling, so an arm in
+    which the cap ended every generation can arrive saying ``incomplete``
+    throughout.  While the gate counted only ``length`` that arm reported zero
+    truncations and five natural stops, classified ``BOUNDED`` -- the strongest
+    available claim that the cap was *not* binding -- and promoted a benchmark
+    that had measured nothing but fixed-length decode.
+    """
+    capped = _finish_reason_columns(["incomplete"] * 5)
+    assert capped == [(5, 5)] * 3
+
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.6, output_tok_per_sec=100.0),
+        _make_delta(acceptance_rate=0.65, output_tok_per_sec=110.0),
+        _with_truncation(_valid_runs_with_tps(100.0), _finish_reason_columns(["stop"] * 5)),
+        _with_truncation(_valid_runs_with_tps(110.0), capped),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+
+    assert dec.verdict is Verdict.REJECT
+    assert dec.reason is Reason.TRUNCATION_SATURATED
+    assert dec.candidate_truncation_regime is TruncationRegime.SATURATED
+
+
+def test_a_run_whose_only_stop_came_from_a_failed_request_is_rejected() -> None:
+    """The decide-side half of the invalid-response defect.
+
+    ``replay`` now refuses to count a failed response's finish reason, so the
+    population in
+    ``test_gate_replay.py::test_an_invalid_response_cannot_supply_the_only_
+    natural_stop`` -- ninety-nine capped generations and one broken empty
+    ``stop`` -- reaches the gate as ninety-nine reported, ninety-nine
+    truncated.  That has to land on a rejection: had the one failure been
+    allowed to count, the arm would have read ``MIXED`` and promoted on a
+    benchmark that never once saw where this model stops.
+    """
+    capped = _finish_reason_columns(["length"] * 99)
+    assert capped == [(99, 99)] * 3
+
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.6, output_tok_per_sec=100.0),
+        _make_delta(acceptance_rate=0.65, output_tok_per_sec=110.0),
+        _with_truncation(_valid_runs_with_tps(100.0), capped),
+        _with_truncation(_valid_runs_with_tps(110.0), capped),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+
+    assert dec.verdict is Verdict.REJECT
+    assert dec.reason is Reason.TRUNCATION_SATURATED
+    assert dec.stock_truncation_regime is TruncationRegime.SATURATED
+    # And the same counts with one natural stop restored are *not* rejected,
+    # which is the whole of what the miscounted failure bought.
+    assert classify_truncation(reported=99, truncated=98) is TruncationRegime.MIXED
+
+
+def test_the_verdict_agrees_with_the_truncation_the_record_persists() -> None:
+    """The gate must classify the window it writes down, not a wider pool.
+
+    ``per_repeat`` keeps only ``min(stock_runs, candidate_runs)`` rows, so when
+    the arms return unequal run counts a gate classifying the pooled
+    ``ReplayResult`` reads evidence the record does not contain.  Here the
+    candidate's fourth run -- unpaired, and therefore never persisted -- is the
+    only one holding a natural stop: pooled it says ``MIXED`` and promotes,
+    while every row the decision actually wrote says ``SATURATED``.  A verdict
+    its own evidence contradicts is unauditable after the fact.
+    """
+    stock = _with_truncation(_valid_runs_with_tps(100.0), [(5, 1)] * 3)
+    candidate = _with_truncation(
+        _valid_runs_with_tps(110.0, count=4), [(5, 5), (5, 5), (5, 5), (5, 0)]
+    )
+
+    # The premise: the two readings genuinely disagree, so this is a test and
+    # not a tautology.
+    assert classify_truncation(
+        reported=candidate.total_finish_reason_count,
+        truncated=sum(r.truncated_count for r in candidate.run_results),
+    ) is TruncationRegime.MIXED
+
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.6, output_tok_per_sec=100.0),
+        _make_delta(acceptance_rate=0.65, output_tok_per_sec=110.0),
+        stock,
+        candidate,
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+
+    # The unpaired run is absent from the record, as it must be.
+    assert len(dec.per_repeat) == 3
+    assert [
+        (r.candidate_finish_reasons, r.candidate_truncated) for r in dec.per_repeat
+    ] == [(5, 5)] * 3
+
+    # And the verdict says exactly what those persisted rows imply.
+    assert dec.candidate_truncation_regime is TruncationRegime.SATURATED
+    assert dec.verdict is Verdict.REJECT
+    assert dec.reason is Reason.TRUNCATION_SATURATED
+    assert (dec.reason is Reason.TRUNCATION_SATURATED) is (
+        TruncationRegime.SATURATED
+        in (dec.stock_truncation_regime, dec.candidate_truncation_regime)
+    )
