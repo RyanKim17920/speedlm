@@ -1,0 +1,99 @@
+{
+  "band_metric": "prompt_chars",
+  "bands": {
+    "long": [
+      0.75,
+      0.95
+    ],
+    "medium": [
+      0.4,
+      0.6
+    ],
+    "short": [
+      0.05,
+      0.25
+    ]
+  },
+  "characteristics": {
+    "assistant_completion_fraction": 0.0,
+    "chars_per_token": 4.9909,
+    "completion_chars": null,
+    "distinct_prompt_fraction": 1.0,
+    "multi_turn_fraction": 0.0,
+    "prompt_chars": {
+      "p0": 12,
+      "p100": 4101,
+      "p25": 150,
+      "p40": 400,
+      "p5": 69,
+      "p50": 477,
+      "p60": 551,
+      "p75": 742,
+      "p90": 1958,
+      "p95": 2757,
+      "p99": 3748
+    },
+    "prompt_tokens": {
+      "p0": 4,
+      "p100": 1293,
+      "p25": 28,
+      "p40": 73,
+      "p5": 14,
+      "p50": 87,
+      "p60": 100,
+      "p75": 144,
+      "p90": 410,
+      "p95": 575,
+      "p99": 784
+    },
+    "record_count": 22362,
+    "system_prompt_fraction": 0.0,
+    "tool_call_fraction": 0.0,
+    "tools_declared_fraction": 0.0,
+    "unique_first_user_messages": 22362,
+    "unique_system_prompts": 0
+  },
+  "description": "CONTROL WORKLOAD, NOT REPRESENTATIVE OF AGENTIC SERVING. 22,362 single-turn, user-only chat prompts from UltraChat, hard-truncated upstream at 4095 characters. There are no system prompts, no tool schemas, no tool results, no assistant history and no reference completions in this corpus: 0% of records have any of them. Every measurement this project published before the workload system existed was taken here, which is why it is kept -- it is the comparability anchor and a throughput-saturation set of generic English text. It is NOT evidence about agentic traffic, whose prompts are two orders of magnitude longer and whose token density is ~1.6x higher because of tool JSON. Do not generalize a speedup measured here to a coding agent.",
+  "domain": "generic-chat",
+  "name": "generic-chat",
+  "provenance": {
+    "bounds": {
+      "max_records": null
+    },
+    "builder_sha256": "2dd15829d4acdd3016ffb495fa3472734baa69beba8bfb7624610ffd535bde99",
+    "built_at": "2026-08-07T04:55:05Z",
+    "built_by": "scripts/build_workload.py",
+    "method": "one record per upstream line; the single user message is kept verbatim. No truncation and no padding are applied here -- the 4095-character ceiling is upstream, in prepare_ultrachat_corpus.py.",
+    "token_basis": "tokenizer:openai/gpt-oss-20b",
+    "upstream": [
+      {
+        "path": "/data/ryan.kim/speedlm-corpora/ultrachat-prompts.jsonl",
+        "sha256": "6c34da750582329873ddf5c5a217225cd46dbbcecbacbe5656cb756f2f75a3e5",
+        "size_bytes": 17353487
+      }
+    ]
+  },
+  "requirements": {
+    "basis": "longest prompt in the corpus plus an output reserve, rounded up to a multiple of 512. A launch below this truncates the workload; a preflight must refuse rather than measure a truncated corpus.",
+    "longest_prompt_tokens": 1293,
+    "min_max_model_len": 3584,
+    "needs_tool_support": false,
+    "output_reserve_tokens": 2048
+  },
+  "sampling": {
+    "seed": 20260807
+  },
+  "schema_version": 1,
+  "source": {
+    "format": "speedlm.workload.records.v1",
+    "path": "/data/ryan.kim/speedlm-workloads/generic-chat/records.jsonl",
+    "sha256": "87bc24377683212eeeeeb1f5549e58b68bd8bc7acad011fffc4882a565d8cedc",
+    "size_bytes": 18567811
+  },
+  "tolerance": {
+    "count_absolute": 0,
+    "fraction_absolute": 0.001,
+    "percentile_relative": 0.005
+  },
+  "version": "1.0.0"
+}

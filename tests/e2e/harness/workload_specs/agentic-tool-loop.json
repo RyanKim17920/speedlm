@@ -1,0 +1,117 @@
+{
+  "band_metric": "prompt_chars",
+  "bands": {
+    "long": [
+      0.75,
+      0.95
+    ],
+    "medium": [
+      0.4,
+      0.6
+    ],
+    "short": [
+      0.05,
+      0.25
+    ]
+  },
+  "characteristics": {
+    "assistant_completion_fraction": 1.0,
+    "chars_per_token": 3.8813,
+    "completion_chars": {
+      "p0": 135,
+      "p100": 10773,
+      "p25": 255,
+      "p40": 290,
+      "p5": 213,
+      "p50": 316,
+      "p60": 347,
+      "p75": 428,
+      "p90": 618,
+      "p95": 848,
+      "p99": 3683
+    },
+    "distinct_prompt_fraction": 1.0,
+    "multi_turn_fraction": 1.0,
+    "prompt_chars": {
+      "p0": 35095,
+      "p100": 60501,
+      "p25": 45537,
+      "p40": 48026,
+      "p5": 37214,
+      "p50": 49178,
+      "p60": 50413,
+      "p75": 52178,
+      "p90": 53837,
+      "p95": 54748,
+      "p99": 56450
+    },
+    "prompt_tokens": {
+      "p0": 9022,
+      "p100": 15929,
+      "p25": 11673,
+      "p40": 12326,
+      "p5": 9515,
+      "p50": 12680,
+      "p60": 13009,
+      "p75": 13508,
+      "p90": 13954,
+      "p95": 14248,
+      "p99": 14788
+    },
+    "record_count": 626,
+    "system_prompt_fraction": 1.0,
+    "tool_call_fraction": 0.93131,
+    "tools_declared_fraction": 1.0,
+    "unique_first_user_messages": 44,
+    "unique_system_prompts": 129
+  },
+  "description": "Per-TURN records from a synthetic coding-agent tool loop against gpt-oss-20b, with five real function schemas (read, grep, edit, bash, write) declared on every request. This is realistic in SHAPE -- huge tool-heavy prefix, tiny generated turn -- and narrow in CONTENT, and the narrowness is load-bearing, so it is stated here rather than in a footnote: the 626 records come from only ~43 session instances over 16 bug templates on ONE synthetic e-commerce application; there are just 129 distinct system prompts and 44 distinct user messages in the whole corpus; the system prompt is a near-constant ~27,000 characters, so records share an enormous common prefix and any prefix-cache-sensitive measurement taken here will look far better than production; and the corpus is 'success-only', i.e. survivorship-biased -- every trajectory that failed was dropped, so the failure modes that dominate real agent traffic are absent by construction. Prefer agentic-mixed-outcome, which keeps its failures. Use this one to study the tool-loop prefix/decode ratio.",
+  "domain": "agentic-coding",
+  "name": "agentic-tool-loop",
+  "provenance": {
+    "bounds": {
+      "max_records": null
+    },
+    "builder_sha256": "2dd15829d4acdd3016ffb495fa3472734baa69beba8bfb7624610ffd535bde99",
+    "built_at": "2026-08-07T04:55:22Z",
+    "built_by": "scripts/build_workload.py",
+    "diversity": {
+      "bug_templates": 16,
+      "note": "instance and template counts are derived from the upstream run id; they are the honest denominator for any claim made on this corpus.",
+      "records_per_instance_max": 16,
+      "session_instances": 43
+    },
+    "method": "one record per upstream line. messages = conversations[:-1] (the request prefix actually sent), completion = conversations[-1] (the reference generated turn), tools = the five declared function schemas.",
+    "token_basis": "tokenizer:openai/gpt-oss-20b",
+    "upstream": [
+      {
+        "path": "/admin/home/ryan.kim/speedlm/mtp-hashline-demo/training/artifacts/gpt-oss-100k-v3-first-finalized-v6/success-only/corpus.eagle3.v1.jsonl",
+        "sha256": "f93a0f9dff03f7ce17efba6fef1978778ebf70a51c63b78c2a5c814bff5d5a55",
+        "size_bytes": 36120100
+      }
+    ]
+  },
+  "requirements": {
+    "basis": "longest prompt in the corpus plus an output reserve, rounded up to a multiple of 512. A launch below this truncates the workload; a preflight must refuse rather than measure a truncated corpus.",
+    "longest_prompt_tokens": 15929,
+    "min_max_model_len": 18432,
+    "needs_tool_support": true,
+    "output_reserve_tokens": 2048
+  },
+  "sampling": {
+    "seed": 20260807
+  },
+  "schema_version": 1,
+  "source": {
+    "format": "speedlm.workload.records.v1",
+    "path": "/data/ryan.kim/speedlm-workloads/agentic-tool-loop/records.jsonl",
+    "sha256": "851d5f2f6c6de149ed5f6caf73cd83dee717d3b23a98408f08357c2c9280110e",
+    "size_bytes": 32344404
+  },
+  "tolerance": {
+    "count_absolute": 0,
+    "fraction_absolute": 0.001,
+    "percentile_relative": 0.005
+  },
+  "version": "1.0.0"
+}

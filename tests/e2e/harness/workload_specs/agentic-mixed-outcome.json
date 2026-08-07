@@ -1,0 +1,134 @@
+{
+  "band_metric": "prompt_chars",
+  "bands": {
+    "long": [
+      0.75,
+      0.95
+    ],
+    "medium": [
+      0.4,
+      0.6
+    ],
+    "short": [
+      0.05,
+      0.25
+    ]
+  },
+  "characteristics": {
+    "assistant_completion_fraction": 1.0,
+    "chars_per_token": 3.8743,
+    "completion_chars": {
+      "p0": 85,
+      "p100": 2008,
+      "p25": 236,
+      "p40": 277,
+      "p5": 200,
+      "p50": 300,
+      "p60": 322,
+      "p75": 385,
+      "p90": 490,
+      "p95": 624,
+      "p99": 1076
+    },
+    "distinct_prompt_fraction": 1.0,
+    "multi_turn_fraction": 1.0,
+    "prompt_chars": {
+      "p0": 37282,
+      "p100": 78399,
+      "p25": 44779,
+      "p40": 46488,
+      "p5": 37306,
+      "p50": 47822,
+      "p60": 48892,
+      "p75": 50519,
+      "p90": 52434,
+      "p95": 56369,
+      "p99": 76516
+    },
+    "prompt_tokens": {
+      "p0": 9549,
+      "p100": 21018,
+      "p25": 11474,
+      "p40": 11988,
+      "p5": 9557,
+      "p50": 12240,
+      "p60": 12599,
+      "p75": 13032,
+      "p90": 13633,
+      "p95": 14710,
+      "p99": 20519
+    },
+    "record_count": 617,
+    "system_prompt_fraction": 1.0,
+    "tool_call_fraction": 0.918963,
+    "tools_declared_fraction": 1.0,
+    "unique_first_user_messages": 59,
+    "unique_system_prompts": 189
+  },
+  "description": "The best agentic set here, because it keeps its failures: 314 successful and 303 safe_failed_session trajectories, so it is not survivorship-biased the way agentic-tool-loop is. Per-turn records from a coding-agent session against gpt-oss-20b with tool schemas on every request. Two things make it uniquely useful. First, the upstream corpus carries its OWN token count per record (estimated_tokens), which is what this builder cross-checks its tokenizer against. Second, every record carries REAL MEASURED speculative-decoding metrics (metadata.metrics_delta: acceptance_fraction, draft/accepted token counts, mean_acceptance_length) captured at collection time; those are lifted into the manifest's ground_truth block and onto each record, so a harness result measured on this workload can be checked against an independently measured acceptance rate instead of being believed on its own. Caveat: 9 bug families / 9 templates on one synthetic application, so content diversity is still low even though outcome diversity is real.",
+  "domain": "agentic-coding",
+  "ground_truth": {
+    "mean": 0.808993,
+    "metric": "acceptance_fraction",
+    "n": 617,
+    "p25": 0.730769,
+    "p5": 0.555556,
+    "p50": 0.84127,
+    "p75": 0.91358,
+    "p95": 0.979167,
+    "semantics": "accepted speculative tokens / proposed draft tokens",
+    "source": "measured at collection time by the upstream harness against gpt-oss-20b with a 3-token eagle3 speculator (RedHatAI/gpt-oss-20b-speculator.eagle3), greedy sampling. NOT recomputed here.",
+    "success_record_count": 314,
+    "usage": "A harness run on this workload with the same verifier/drafter pair and greedy sampling should land near p50; landing far outside p5..p95 means the harness, not the model, changed."
+  },
+  "name": "agentic-mixed-outcome",
+  "provenance": {
+    "bounds": {
+      "max_records": null
+    },
+    "builder_sha256": "2dd15829d4acdd3016ffb495fa3472734baa69beba8bfb7624610ffd535bde99",
+    "built_at": "2026-08-07T04:55:38Z",
+    "built_by": "scripts/build_workload.py",
+    "family_count": 9,
+    "method": "one record per upstream line. messages = messages[:-1], completion = messages[-1], tools = metadata.request.tools. metadata.metrics_delta is carried verbatim onto each record's ground_truth and aggregated into the manifest ground_truth block.",
+    "status_counts": {
+      "safe_failed_session": 303,
+      "success": 314
+    },
+    "token_basis": "tokenizer:openai/gpt-oss-20b",
+    "token_cross_check": {
+      "median_ratio_measured_over_upstream_estimate": 0.9354,
+      "note": "upstream estimated_tokens counts the request the collector actually sent (chat template applied); this builder counts the template-free flattened prompt including tool schemas. A ratio near 1 means the two independent counts agree; it is recorded, not asserted."
+    },
+    "upstream": [
+      {
+        "path": "/admin/home/ryan.kim/speedlm/mtp-hashline-demo/training/artifacts/iteration2-all-session-safe-train/normalized.jsonl",
+        "sha256": "75807e4bfc1d8ac4d1c58e9ce420c8ba81237110bbbc2236835cf195e91c00b0",
+        "size_bytes": 54358839
+      }
+    ]
+  },
+  "requirements": {
+    "basis": "longest prompt in the corpus plus an output reserve, rounded up to a multiple of 512. A launch below this truncates the workload; a preflight must refuse rather than measure a truncated corpus.",
+    "longest_prompt_tokens": 21018,
+    "min_max_model_len": 23552,
+    "needs_tool_support": true,
+    "output_reserve_tokens": 2048
+  },
+  "sampling": {
+    "seed": 20260807
+  },
+  "schema_version": 1,
+  "source": {
+    "format": "speedlm.workload.records.v1",
+    "path": "/data/ryan.kim/speedlm-workloads/agentic-mixed-outcome/records.jsonl",
+    "sha256": "436395320a9c3c221b2825813b65cff41cba5ab1e73775846329d6d84d39ef77",
+    "size_bytes": 31644132
+  },
+  "tolerance": {
+    "count_absolute": 0,
+    "fraction_absolute": 0.001,
+    "percentile_relative": 0.005
+  },
+  "version": "1.0.0"
+}

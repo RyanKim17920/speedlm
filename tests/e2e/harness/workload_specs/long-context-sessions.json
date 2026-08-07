@@ -1,0 +1,138 @@
+{
+  "band_metric": "prompt_chars",
+  "bands": {
+    "long": [
+      0.75,
+      0.95
+    ],
+    "medium": [
+      0.4,
+      0.6
+    ],
+    "short": [
+      0.05,
+      0.25
+    ]
+  },
+  "characteristics": {
+    "assistant_completion_fraction": 1.0,
+    "chars_per_token": 3.4245,
+    "completion_chars": {
+      "p0": 34,
+      "p100": 15267,
+      "p25": 34,
+      "p40": 72,
+      "p5": 34,
+      "p50": 159,
+      "p60": 399,
+      "p75": 1541,
+      "p90": 2837,
+      "p95": 3951,
+      "p99": 8047
+    },
+    "distinct_prompt_fraction": 1.0,
+    "multi_turn_fraction": 0.890763,
+    "prompt_chars": {
+      "p0": 2097,
+      "p100": 1080066,
+      "p25": 20259,
+      "p40": 34625,
+      "p5": 6038,
+      "p50": 46400,
+      "p60": 61403,
+      "p75": 92874,
+      "p90": 180175,
+      "p95": 268825,
+      "p99": 483887
+    },
+    "prompt_tokens": {
+      "p0": 503,
+      "p100": 358630,
+      "p25": 5903,
+      "p40": 9910,
+      "p5": 1679,
+      "p50": 13911,
+      "p60": 18233,
+      "p75": 27636,
+      "p90": 52053,
+      "p95": 74084,
+      "p99": 144350
+    },
+    "record_count": 1245,
+    "system_prompt_fraction": 0.0,
+    "tool_call_fraction": 0.0,
+    "tools_declared_fraction": 0.0,
+    "unique_first_user_messages": 1219,
+    "unique_system_prompts": 0
+  },
+  "description": "Real Claude Code sessions from this cluster, exported and redacted. This is the only workload here that is not synthetic: the prefixes are genuine multi-hour agent conversations with real tool calls, real file contents, real failures and real recoveries, so its length distribution and its prefix/decode ratio are measurements rather than constructions. It is also the longest by a wide margin and the one most likely to be refused by a preflight against a small serving window -- that refusal is the point. Caveats: the sessions are one operator's on one project family, so topic diversity is low even though structural diversity is high; content is redacted (home paths, absolute paths, secret-shaped strings), which perturbs a small fraction of characters; and one trace is taken per session file, deepest turn first, so the workload is deliberately biased toward long context and is NOT a uniform sample of turns.",
+  "domain": "agentic-coding",
+  "name": "long-context-sessions",
+  "provenance": {
+    "bounds": {
+      "max_files": 1400,
+      "max_records": null,
+      "minimum_assistant_chars": 1,
+      "minimum_prompt_chars": 2000,
+      "per_file_limit": 1,
+      "scan_order": "round-robin across top-level project directories, not sorted path order: sorted order put 92% of the first 1400 files in one project's subagents/ directory",
+      "scan_seconds": 94.2,
+      "session_files_available": 13531,
+      "session_files_scanned": 1400
+    },
+    "builder_sha256": "b8b2bf09be24dfe4df5e20eab707180c373eeb6cddf90d6bb72c641d0b8eef65",
+    "built_at": "2026-08-07T05:04:09Z",
+    "built_by": "scripts/build_workload.py",
+    "diversity": {
+      "assistant_models": {
+        "Qwen/Qwen3.6-27B": 419,
+        "claude-fable-5": 21,
+        "claude-haiku-4-5-20251001": 2,
+        "claude-opus-4-8": 677,
+        "claude-opus-5": 124,
+        "claude-sonnet-4-6": 1,
+        "claude-sonnet-5": 1
+      },
+      "distinct_sessions": 443
+    },
+    "method": "ported from qwen-trace-pilot core.py. Per session file, walk records newest first, take up to per_file_limit assistant turns, reconstruct the ancestor chain as messages, keep the target assistant turn as completion, carry every turn's timestamp. Fixes over upstream: absolute-path redaction now covers /admin/home layouts; the 800-char assistant floor is configurable and set low; per-turn timestamps are retained; the hard Qwen-only model filter is replaced by 'any real model id' (upstream would export zero records here).",
+    "redaction": {
+      "absolute_paths": "(?<![\\w.-])(?:/[A-Za-z0-9_.-]+)?/(?:home|Users)/[^\\s'\\\"`]+",
+      "base64_blob_rejection": true,
+      "home_path": true,
+      "secret_patterns": 4
+    },
+    "token_basis": "tokenizer:openai/gpt-oss-20b",
+    "upstream": [
+      {
+        "note": "a live directory tree, not a file: it cannot be digested, so this workload's reproducibility rests on the materialized records file digest below, not on the upstream.",
+        "path": "/admin/home/ryan.kim/.claude/projects",
+        "sha256": null,
+        "size_bytes": null
+      }
+    ]
+  },
+  "requirements": {
+    "basis": "longest prompt in the corpus plus an output reserve, rounded up to a multiple of 512. A launch below this truncates the workload; a preflight must refuse rather than measure a truncated corpus.",
+    "longest_prompt_tokens": 358630,
+    "min_max_model_len": 360960,
+    "needs_tool_support": false,
+    "output_reserve_tokens": 2048
+  },
+  "sampling": {
+    "seed": 20260807
+  },
+  "schema_version": 1,
+  "source": {
+    "format": "speedlm.workload.records.v1",
+    "path": "/data/ryan.kim/speedlm-workloads/long-context-sessions/records.jsonl",
+    "sha256": "3988335e8741e88cd3db4dbb919218a1770ce9029b7e16bc6713703289d2ebfd",
+    "size_bytes": 109140120
+  },
+  "tolerance": {
+    "count_absolute": 0,
+    "fraction_absolute": 0.001,
+    "percentile_relative": 0.005
+  },
+  "version": "1.0.0"
+}
