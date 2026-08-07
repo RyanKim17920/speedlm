@@ -56,6 +56,17 @@ class RequestResult:
     #: the *only* direct evidence that a response whose ``content`` is empty was
     #: nonetheless a complete, healthy generation.
     reasoning_text: str = ""
+    #: How many tool calls the assistant message dispatched.
+    #:
+    #: The third channel a model can put its work in, and the one the replay
+    #: path used to be blind to.  An OpenAI-shaped tool dispatch is
+    #: ``content: null`` plus a populated ``tool_calls`` array plus
+    #: ``finish_reason: "tool_calls"`` -- a complete, healthy generation with
+    #: nothing in either text channel.  Recorded, and read by
+    #: :func:`_validity_error`, because this gate replays agentic traffic *with*
+    #: the captured tool schemas (see :func:`_send_request`), so this response
+    #: shape is one the suite actively provokes.
+    tool_call_count: int = 0
 
     @property
     def invalid(self) -> bool:
@@ -64,6 +75,11 @@ class RequestResult:
     @property
     def generated_text(self) -> str:
         """Everything the model emitted, reasoning channel included.
+
+        Tool-call arguments are deliberately absent: they are structured JSON
+        the server may re-serialise, not a token stream, so folding them in
+        would compare two renderings rather than two generations.
+        :attr:`tool_call_count` records that the dispatch happened.
 
         ``response_text`` alone is not the generation for a thinking model: at
         the caps this gate replays under, it is routinely empty while hundreds
@@ -86,6 +102,7 @@ class RequestResult:
             "output_tokens": list(self.output_tokens),
             "finish_reason": self.finish_reason,
             "reasoning_text": self.reasoning_text,
+            "tool_call_count": self.tool_call_count,
         }
 
 
@@ -100,36 +117,43 @@ class RunResults:
     valid_count: int
     invalid_count: int
     invalid_rate: float
-    #: Responses that carried a non-empty ``finish_reason`` at all.
-    #:
-    #: The denominator of :attr:`truncation_rate`, and it is deliberately *not*
-    #: ``len(results)``.  A request that failed before the model answered (HTTP
-    #: error, empty ``choices``, transport exception) carries ``""``, and
-    #: folding those into the denominator would make a run look less truncated
-    #: the more of it failed.  Zero here means the endpoint never reported a
-    #: finish reason, which is a different fact from "nothing was truncated" --
-    #: see :class:`speedlm.gate.decide.TruncationRegime`.
-    finish_reason_count: int = 0
-    #: Of those, the ones that stopped because they exhausted ``max_tokens``.
+    #: Valid responses whose finish reason said the output cap ended them, i.e.
+    #: it is in :data:`TRUNCATED_FINISH_REASONS`.
     truncated_count: int = 0
+    #: Valid responses whose finish reason said the *model* ended them, i.e. it
+    #: is in :data:`NATURAL_STOP_FINISH_REASONS`.
+    #:
+    #: Counted, not inferred as "reported minus truncated".  A finish reason
+    #: this build does not recognise falls into neither counter -- see
+    #: :func:`classify_finish_reason` for why that is the fail-closed choice.
+    natural_stop_count: int = 0
 
     @property
-    def natural_stop_count(self) -> int:
-        """Responses that ended on the model's own terms rather than the cap.
+    def finish_reason_count(self) -> int:
+        """Responses whose finish reason this build could classify.
 
-        Every non-``length`` finish reason counts, ``"tool_calls"`` included:
-        the question this answers is whether the generation length was chosen
-        by the model or imposed by the harness, and a tool dispatch is the
-        model choosing.
+        The denominator of :attr:`truncation_rate`, and it is deliberately
+        *not* ``len(results)``.  A request that failed before the model
+        answered (HTTP error, empty ``choices``, transport exception) carries
+        ``""``, and folding those into the denominator would make a run look
+        less truncated the more of it failed.  It is equally deliberately not
+        "everything that carried a non-empty string": an unrecognised spelling
+        is excluded on exactly the same footing as a blank one, because the
+        gate cannot say which of the two buckets it belongs in.
+
+        Zero here means the endpoint reported nothing this build understands,
+        which is a different fact from "nothing was truncated" -- see
+        :class:`speedlm.gate.decide.TruncationRegime`, which reads zero as
+        ``UNTESTABLE``.
         """
-        return self.finish_reason_count - self.truncated_count
+        return self.truncated_count + self.natural_stop_count
 
     @property
     def truncation_rate(self) -> float:
-        """Fraction of *reported* generations that hit the output cap.
+        """Fraction of *classified* generations that hit the output cap.
 
-        ``0.0`` when nothing reported a finish reason, which is why callers
-        must consult :attr:`finish_reason_count` before reading this as a
+        ``0.0`` when nothing was classifiable, which is why callers must
+        consult :attr:`finish_reason_count` before reading this as a
         measurement.
         """
         if self.finish_reason_count <= 0:
@@ -159,6 +183,7 @@ class RunResults:
             "invalid_rate": self.invalid_rate,
             "finish_reason_count": self.finish_reason_count,
             "truncated_count": self.truncated_count,
+            "natural_stop_count": self.natural_stop_count,
             "truncation_rate": self.truncation_rate,
         }
 
@@ -203,7 +228,7 @@ class ReplayResult:
 
     @property
     def total_finish_reason_count(self) -> int:
-        """Reported finish reasons across every repeat, pooled."""
+        """Classified finish reasons across every repeat, pooled."""
         return sum(r.finish_reason_count for r in self.run_results)
 
     @property
@@ -288,6 +313,91 @@ def is_truncated_finish_reason(value: str | None) -> bool:
     """
     return isinstance(value, str) and value.strip().lower() in TRUNCATED_FINISH_REASONS
 
+
+#: Every ``finish_reason`` spelling that means "the *model* ended this".
+#:
+#: Drawn from what this repository already knows servers emit, not invented:
+#:
+#: * ``stop`` -- the OpenAI chat value for the model emitting a stop token.
+#: * ``tool_calls`` -- an OpenAI-shaped tool dispatch.  A complete generation:
+#:   the model chose to hand off rather than keep decoding.  This gate replays
+#:   agentic contexts with their captured tool schemas (:func:`_send_request`),
+#:   so it provokes this value itself.
+#: * ``function_call`` -- the legacy single-function spelling of the same event,
+#:   still emitted by OpenAI-compatible servers with older-style tool support.
+#: * ``content_filter`` -- generation ended by a moderation hook.  Not a healthy
+#:   answer, but unambiguously *not* the output cap, which is the only question
+#:   this vocabulary is asked.
+#: * ``completed`` -- the Responses API's spelling.  That path files the
+#:   response *status* into this same field (``gateway/responses.py``), where a
+#:   finished response reads ``completed`` and a truncated one reads
+#:   ``incomplete`` -- the exact counterpart already carried in
+#:   :data:`TRUNCATED_FINISH_REASONS`.  This project's own gateway produces it.
+NATURAL_STOP_FINISH_REASONS: Final = frozenset(
+    {"stop", "tool_calls", "function_call", "content_filter", "completed"}
+)
+
+
+#: The three buckets :func:`classify_finish_reason` sorts a finish reason into.
+FINISH_REASON_TRUNCATED: Final = "truncated"
+FINISH_REASON_NATURAL: Final = "natural"
+FINISH_REASON_UNKNOWN: Final = "unknown"
+
+
+def is_natural_stop_finish_reason(value: str | None) -> bool:
+    """Whether *value* means the model, not the cap, ended the generation."""
+    return (
+        isinstance(value, str)
+        and value.strip().lower() in NATURAL_STOP_FINISH_REASONS
+    )
+
+
+def classify_finish_reason(value: str | None) -> str:
+    """Sort one finish reason into ``"truncated"``, ``"natural"``, ``"unknown"``.
+
+    Three buckets, and the third is the point.  A natural stop used to be
+    *inferred*: anything non-blank that was not in
+    :data:`TRUNCATED_FINISH_REASONS` was counted as the model stopping by
+    itself.  That makes an unrecognised spelling -- a server this build has
+    never seen, a value renamed upstream, a typo in a proxy -- into positive
+    evidence that the cap was not binding, which is precisely backwards.  A
+    wholly capped run behind such a server reports zero truncations against a
+    full denominator and classifies ``BOUNDED``: the strongest possible "the
+    cap did not bind" reading of the strongest possible saturation, which is
+    the silent masking :class:`speedlm.gate.decide.TruncationRegime` exists to
+    prevent.
+
+    So an unknown value counts in *neither* bucket and is excluded from the
+    denominator, on exactly the footing a blank or absent reason already had.
+    An arm whose responses all carry an unrecognised reason therefore reports a
+    classified count of zero, classifies ``UNTESTABLE``, and is rejected with
+    ``TRUNCATION_UNMEASURED`` -- the failure mode is "the gate says it could not
+    measure", never "the gate says the cap was fine".  Fail-closed.
+
+    **This deliberately reverses the argument recorded in**
+    ``speedlm.training.backends.eagle3.TRUNCATED_FINISH_REASONS``, **and both
+    are correct where they stand -- do not "reconcile" them by deleting one.**
+    That module keeps a positive truncation list and argues explicitly against
+    an inverted test, because there a row whose finish reason is unknown must
+    still be *kept*: the filter has exactly two outcomes, keep or drop, and an
+    unknown value falling into "drop" would silently discard corpora archived
+    before the field existed.  Keeping is that filter's safe default.
+
+    The gate has a third state the training filter does not: ``UNTESTABLE``,
+    i.e. "this run cannot answer the question", which rejects rather than
+    promotes.  Because refusing to classify is available *and* is the
+    conservative outcome, the gate's safe default is to refuse -- where the
+    filter's is to keep.  Same evidence, opposite defaults, because the two
+    have different action spaces.  The shared constant is the truncated
+    vocabulary, which is pinned across all three copies by
+    ``tests/test_gate_replay.py`` and stays identical.
+    """
+    if is_truncated_finish_reason(value):
+        return FINISH_REASON_TRUNCATED
+    if is_natural_stop_finish_reason(value):
+        return FINISH_REASON_NATURAL
+    return FINISH_REASON_UNKNOWN
+
 #: Field names a server may file a thinking model's ``<think>`` block under,
 #: in the order they are consulted.  vLLM 0.25.x uses ``reasoning``; the
 #: ``reasoning_content`` spelling is what several other OpenAI-compatible
@@ -327,12 +437,29 @@ def _extract_reasoning(message: dict[str, Any]) -> str:
     return ""
 
 
+def _extract_tool_calls(message: dict[str, Any]) -> int:
+    """Count the tool calls an assistant message dispatched.
+
+    Read the same way :mod:`speedlm.gateway.sse` reads them off a
+    non-streaming body -- a list of objects under ``tool_calls`` -- so the gate
+    recognises the responses the capture path recognised.  A malformed value is
+    counted as zero rather than raising: this is one field of one response, and
+    losing the whole replay over it is the failure mode the ``finish_reason``
+    coercion above already had to be fixed for.
+    """
+    raw = message.get("tool_calls")
+    if not isinstance(raw, list):
+        return 0
+    return sum(1 for call in raw if isinstance(call, dict))
+
+
 def _validity_error(
     *,
     completion_tokens: int,
     text: str,
     reasoning: str,
     output_tokens: tuple[str, ...],
+    tool_calls: int,
     finish_reason: str,
 ) -> str:
     """Classify one 200-OK response: ``""`` when usable, else why it is not.
@@ -360,15 +487,32 @@ def _validity_error(
        captured responses in that run, so a zero here is a real anomaly.
        Surfaced output is accepted as a substitute because a server may omit
        ``usage`` entirely.
-    2. Anything surfaced -- content, reasoning, or captured tokens -> valid.
+    2. Anything surfaced -- content, reasoning, captured tokens, *or a
+       dispatched tool call* -> valid.
     3. Nothing surfaced but the cap was hit -> valid.  The tokens exist and
        were counted; which channel the server filed them under does not change
        what a throughput sample measures.
     4. Nothing surfaced and the model claims it stopped on its own -> invalid.
        That is an engine returning empty responses, which is exactly the
        measurement-is-worthless case the threshold guards.
+
+    ``tool_calls`` is the third channel and was the missing one.  A tool
+    dispatch is ``content: null``, a populated ``tool_calls`` array and
+    ``finish_reason: "tool_calls"`` -- an entirely normal, healthy OpenAI-shaped
+    reply that both preceding tests read as empty, so it was recorded as
+    ``_ERROR_EMPTY_TEXT``.  That is not hypothetical here: this gate replays
+    agentic contexts *with* their captured tool schemas (see
+    :func:`_send_request`), so the suite provokes exactly this shape.  The
+    consequences compounded -- on agentic traffic the arm could trip
+    ``HIGH_INVALID_RATE`` outright, and even below that threshold each
+    misclassified response was dropped from the finish-reason counts, stripping
+    genuine natural stops out of a ``MIXED`` run until it read ``SATURATED`` (or
+    ``UNTESTABLE``).  Validity accounting and truncation accounting were
+    contradicting each other on the same response.
     """
-    surfaced = bool(text) or bool(reasoning) or bool(output_tokens)
+    surfaced = (
+        bool(text) or bool(reasoning) or bool(output_tokens) or tool_calls > 0
+    )
     if completion_tokens <= 0 and not surfaced:
         return _ERROR_NO_TOKENS
     if surfaced:
@@ -504,6 +648,7 @@ async def _send_request(
         raw_text = message.get("content")
         text = raw_text if isinstance(raw_text, str) else ""
         reasoning = _extract_reasoning(message)
+        tool_calls = _extract_tool_calls(message)
         output_tokens = _extract_output_tokens(choice)
         # A finish reason that is not a string is a reason *not given*, and is
         # normalised to ``""`` here -- at ingestion -- exactly as a missing one
@@ -527,6 +672,7 @@ async def _send_request(
             text=text,
             reasoning=reasoning,
             output_tokens=output_tokens,
+            tool_calls=tool_calls,
             finish_reason=finish_reason,
         )
 
@@ -542,6 +688,7 @@ async def _send_request(
             output_tokens=output_tokens,
             finish_reason=finish_reason,
             reasoning_text=reasoning,
+            tool_call_count=tool_calls,
         )
 
     except httpx.HTTPError as exc:
@@ -622,15 +769,22 @@ async def _run_single(
     # while ``invalid_rate`` sat at 0.01, far under its own threshold.  One
     # failed request must not be able to vouch for a wholly-capped run.
     #
-    # ``.strip()`` rather than truthiness, because a whitespace-only value is
-    # truthy: a single response reporting ``" "`` would otherwise enter the
-    # denominator, fail the truncation test, and count as the natural stop that
-    # turns SATURATED into MIXED -- a blank string vouching for a wholly-capped
-    # run.  A reason that says nothing must be treated as a reason not given.
-    reported = [
-        r.finish_reason for r in results if r.valid and r.finish_reason.strip()
-    ]
-    truncated = sum(1 for fr in reported if is_truncated_finish_reason(fr))
+    # Each reason is sorted into one of three buckets and only two of them are
+    # counted -- see :func:`classify_finish_reason`.  A whitespace-only value
+    # lands in ``unknown`` and so enters neither, which is the same treatment a
+    # blank or absent reason gets and the reason no separate ``.strip()`` guard
+    # is needed here: a reason that says nothing, and a reason this build cannot
+    # read, are both reasons the gate must not draw a conclusion from.
+    truncated = 0
+    natural = 0
+    for r in results:
+        if not r.valid:
+            continue
+        bucket = classify_finish_reason(r.finish_reason)
+        if bucket == FINISH_REASON_TRUNCATED:
+            truncated += 1
+        elif bucket == FINISH_REASON_NATURAL:
+            natural += 1
 
     return RunResults(
         results=tuple(results),
@@ -640,8 +794,8 @@ async def _run_single(
         valid_count=valid,
         invalid_count=invalid,
         invalid_rate=invalid / len(results) if results else 0.0,
-        finish_reason_count=len(reported),
         truncated_count=truncated,
+        natural_stop_count=natural,
     )
 
 

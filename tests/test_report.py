@@ -1809,8 +1809,8 @@ def _saturated_decision() -> Any:
                 valid_count=5,
                 invalid_count=0,
                 invalid_rate=0.0,
-                finish_reason_count=5,
                 truncated_count=truncated,
+                natural_stop_count=5 - truncated,
             )
             for _ in range(3)
         )

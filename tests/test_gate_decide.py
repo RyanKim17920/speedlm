@@ -32,11 +32,13 @@ from speedlm.gate.decide import (
 )
 from speedlm.gate.metrics import MetricsDelta
 from speedlm.gate.replay import (
+    FINISH_REASON_NATURAL,
+    FINISH_REASON_TRUNCATED,
     ReplayResult,
     RequestResult,
     RunResults,
     _validity_error,
-    is_truncated_finish_reason,
+    classify_finish_reason,
 )
 from speedlm.report import parse_decision
 
@@ -85,7 +87,9 @@ def _make_run(
     total_ct = sum(r.completion_tokens for r in results)
     # Derived from the results exactly as ``replay._run_single`` derives them,
     # so a fixture cannot describe a run its own responses contradict.
-    reported = [r.finish_reason for r in results if r.valid and r.finish_reason.strip()]
+    buckets = [
+        classify_finish_reason(r.finish_reason) for r in results if r.valid
+    ]
     return RunResults(
         results=tuple(results),
         total_latency_s=total_latency,
@@ -94,8 +98,8 @@ def _make_run(
         valid_count=valid_count,
         invalid_count=invalid_count,
         invalid_rate=invalid_count / len(results) if results else 0.0,
-        finish_reason_count=len(reported),
-        truncated_count=sum(1 for fr in reported if is_truncated_finish_reason(fr)),
+        truncated_count=sum(1 for b in buckets if b == FINISH_REASON_TRUNCATED),
+        natural_stop_count=sum(1 for b in buckets if b == FINISH_REASON_NATURAL),
     )
 
 
@@ -2554,7 +2558,9 @@ def _with_truncation(
         replay,
         run_results=tuple(
             dataclasses.replace(
-                run, finish_reason_count=reported, truncated_count=truncated
+                run,
+                truncated_count=truncated,
+                natural_stop_count=reported - truncated,
             )
             for run, (reported, truncated) in zip(
                 replay.run_results, columns, strict=True
@@ -2855,14 +2861,17 @@ def _finish_reason_columns(
 ) -> list[tuple[int, int]]:
     """One ``(reported, truncated)`` column per repeat, from real finish reasons.
 
-    Counted with ``replay.is_truncated_finish_reason`` -- the production
-    predicate -- rather than with a literal the test picks, so the vocabulary
-    the gate actually classifies with is what these tests exercise.  A spelling
-    dropped from ``TRUNCATED_FINISH_REASONS`` therefore changes the regime here
-    exactly as it would on a live endpoint.
+    Counted with ``replay.classify_finish_reason`` -- the production classifier
+    -- rather than with a literal the test picks, so the vocabulary the gate
+    actually classifies with is what these tests exercise.  A spelling dropped
+    from ``TRUNCATED_FINISH_REASONS`` therefore changes the regime here exactly
+    as it would on a live endpoint, and a spelling in *neither* vocabulary
+    shrinks the reported denominator here exactly as it would there.
     """
-    truncated = sum(1 for reason in reasons if is_truncated_finish_reason(reason))
-    return [(len(reasons), truncated)] * repeats
+    buckets = [classify_finish_reason(reason) for reason in reasons]
+    truncated = sum(1 for b in buckets if b == FINISH_REASON_TRUNCATED)
+    natural = sum(1 for b in buckets if b == FINISH_REASON_NATURAL)
+    return [(truncated + natural, truncated)] * repeats
 
 
 #: Tokens a capped-and-empty response generated before the cap ended it.  The
@@ -2885,6 +2894,7 @@ def _empty_capped_result(finish_reason: str, *, latency_s: float) -> RequestResu
         text="",
         reasoning="",
         output_tokens=(),
+        tool_calls=0,
         finish_reason=finish_reason,
     )
     return _make_request_result(
@@ -3027,6 +3037,115 @@ def test_an_arm_capped_under_the_responses_api_spelling_is_still_rejected() -> N
     assert dec.verdict is Verdict.REJECT
     assert dec.reason is Reason.TRUNCATION_SATURATED
     assert dec.candidate_truncation_regime is TruncationRegime.SATURATED
+
+
+def test_an_arm_whose_reasons_are_all_unrecognised_is_rejected_as_unmeasured() -> None:
+    """Fail-closed on a vocabulary this build does not share.
+
+    Every response is healthy and every one carries a finish reason; the gate
+    simply cannot read any of them.  Under the old subtraction each would have
+    counted as a natural stop -- five reported, zero truncated, ``BOUNDED``,
+    promote -- so a server that renamed its finish reasons would have silently
+    switched the saturation guard off while reporting the most reassuring regime
+    available.  Refusing to classify puts the arm in ``UNTESTABLE`` and rejects
+    it under the missing-instrument reason, beside ``ACCEPTANCE_UNAVAILABLE``.
+    """
+    unreadable = _finish_reason_columns(["eos_token"] * 5)
+    # The premise: nothing at all was classifiable, not merely nothing truncated.
+    assert unreadable == [(0, 0)] * 3
+
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.6, output_tok_per_sec=100.0),
+        _make_delta(acceptance_rate=0.65, output_tok_per_sec=110.0),
+        _with_truncation(_valid_runs_with_tps(100.0), _finish_reason_columns(["stop"] * 5)),
+        _with_truncation(_valid_runs_with_tps(110.0), unreadable),
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+
+    assert dec.verdict is Verdict.REJECT
+    assert dec.reason is Reason.TRUNCATION_UNMEASURED
+    assert dec.candidate_truncation_regime is TruncationRegime.UNTESTABLE
+    assert dec.candidate_truncation_regime is not TruncationRegime.BOUNDED
+
+
+#: Tokens a tool dispatch generated before handing off.  Non-zero for the same
+#: reason ``_EMPTY_CAPPED_COMPLETION_TOKENS`` is: the engine did real work.
+_TOOL_CALL_COMPLETION_TOKENS = 24
+
+
+def _tool_call_only_result(*, latency_s: float) -> RequestResult:
+    """One 200-OK reply that dispatched a tool and surfaced no text at all.
+
+    Validity is *computed* by ``replay._validity_error``, the production
+    classifier, exactly as :func:`_empty_capped_result` computes it.  Passing
+    ``valid=True`` here would answer the question the test is asking.
+    """
+    error = _validity_error(
+        completion_tokens=_TOOL_CALL_COMPLETION_TOKENS,
+        text="",
+        reasoning="",
+        output_tokens=(),
+        tool_calls=1,
+        finish_reason="tool_calls",
+    )
+    return _make_request_result(
+        "",
+        valid=not error,
+        error=error,
+        latency_s=latency_s,
+        completion_tokens=_TOOL_CALL_COMPLETION_TOKENS,
+        finish_reason="tool_calls",
+    )
+
+
+def _tool_call_only_arm(*, tps: float, repeats: int = 3) -> ReplayResult:
+    """An arm of pure tool dispatches, held at *tps*, counted from its own rows."""
+    runs = [
+        _make_run([_tool_call_only_result(latency_s=_TOOL_CALL_COMPLETION_TOKENS / tps)])
+        for _ in range(repeats)
+    ]
+    return _make_replay(runs)
+
+
+def test_an_arm_of_tool_dispatches_is_neither_invalid_nor_saturated() -> None:
+    """The decide-side half of the tool-call defect.
+
+    ``tool_calls`` is the finish reason an agentic suite produces most, and the
+    responses carrying it were scored invalid because neither text channel nor
+    the captured logprobs held anything.  That cost the run twice: the arm could
+    reject on ``HIGH_INVALID_RATE`` for an engine doing exactly what was asked,
+    and -- since only valid responses may enter the finish-reason counts -- the
+    dispatches were struck from the truncation accounting too, leaving an arm
+    that had observed nothing and would have read ``UNTESTABLE``.
+
+    Classified correctly they are natural stops, the cap was never the binding
+    constraint, and nothing about truncation stands in the way of the promotion
+    this arm's thresholds otherwise earn.
+    """
+    # Both arms are agentic: this is the whole workload dispatching tools, which
+    # is the traffic the gate exists to measure and the shape the defect broke.
+    stock = _tool_call_only_arm(tps=100.0)
+    candidate = _tool_call_only_arm(tps=110.0)
+
+    # The premise, under the production classifier: nothing here is invalid,
+    # and every response said what ended it.
+    assert candidate.avg_invalid_rate == 0.0
+    assert candidate.total_finish_reason_count == 3
+    assert candidate.total_natural_stops == 3
+
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.6, output_tok_per_sec=100.0),
+        _make_delta(acceptance_rate=0.65, output_tok_per_sec=110.0),
+        stock,
+        candidate,
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+
+    assert dec.candidate_truncation_regime is TruncationRegime.BOUNDED
+    assert dec.reason is not Reason.TRUNCATION_SATURATED
+    assert dec.reason is not Reason.TRUNCATION_UNMEASURED
+    assert dec.reason is not Reason.HIGH_INVALID_RATE
+    assert dec.verdict is Verdict.PROMOTE
 
 
 def test_a_run_whose_only_stop_came_from_a_failed_request_is_rejected() -> None:

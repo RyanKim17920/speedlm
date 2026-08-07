@@ -496,8 +496,8 @@ class _Replay:
             valid_count=1,
             invalid_count=0,
             invalid_rate=0.0,
-            finish_reason_count=1,
             truncated_count=0,
+            natural_stop_count=1,
         )
         return ReplayResult(
             run_results=(run,) * repeats,

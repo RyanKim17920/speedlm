@@ -57,10 +57,13 @@ class TruncationRegime(Enum):
     survived into the measurement, and the boundaries are counts rather than
     tuned fractions:
 
-    * :attr:`UNTESTABLE` -- no response reported a finish reason at all.  Every
-      archived decision reads this, because none of them persisted the counts;
-      it must never be collapsed into ``BOUNDED``, which is the claim that
-      truncation was *measured* and was low.
+    * :attr:`UNTESTABLE` -- no response reported a finish reason this build can
+      classify.  Every archived decision reads this, because none of them
+      persisted the counts, and so does a run behind a server whose finish-reason
+      spellings are all unrecognised (see
+      :func:`speedlm.gate.replay.classify_finish_reason`).  It must never be
+      collapsed into ``BOUNDED``, which is the claim that truncation was
+      *measured* and was low.
     * :attr:`SATURATED` -- finish reasons were reported and **not one**
       generation ended on the model's own terms.  Zero, not "few": at zero the
       run contains no observation whatsoever of where this model stops, so no
@@ -90,8 +93,15 @@ def classify_truncation(*, reported: int, truncated: int) -> TruncationRegime:
     """Classify one arm's truncation from its pooled finish-reason counts.
 
     Args:
-        reported: Responses that carried a finish reason at all.
-        truncated: Of those, the ones that reported ``length``.
+        reported: Responses whose finish reason the replay could *classify* --
+            i.e. truncations plus known natural stops.  Deliberately not "every
+            response that carried a non-empty string": a spelling the replay
+            does not recognise is excluded from this denominator, exactly as a
+            blank or absent reason is, so ``reported - truncated`` is a count of
+            observed natural stops rather than an inference from the absence of
+            a truncation marker.  See
+            :func:`speedlm.gate.replay.classify_finish_reason`.
+        truncated: Of those, the ones the output cap ended.
     """
     if reported <= 0:
         return TruncationRegime.UNTESTABLE
@@ -557,10 +567,12 @@ class RepeatSummary:
     # an archived record rebuilt by :func:`speedlm.report.parse_decision`
     # classifies as ``UNTESTABLE`` rather than being relabelled ``BOUNDED``.
 
-    #: Responses in this repeat that carried a finish reason, per arm.
+    #: Responses in this repeat whose finish reason was classifiable, per arm --
+    #: truncations plus known natural stops.  Unrecognised spellings are in
+    #: neither, and so in neither this count nor the one below.
     stock_finish_reasons: int = 0
     candidate_finish_reasons: int = 0
-    #: Of those, the ones that reported ``length``, per arm.
+    #: Of those, the ones the output cap ended, per arm.
     stock_truncated: int = 0
     candidate_truncated: int = 0
 

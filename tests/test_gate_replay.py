@@ -11,6 +11,7 @@ import pytest
 
 from speedlm.config import SamplingConfig
 from speedlm.gate.replay import (
+    NATURAL_STOP_FINISH_REASONS,
     TRUNCATED_FINISH_REASONS,
     ReplayError,
     ReplayResult,
@@ -323,6 +324,12 @@ class _ScriptedClient:
     #: server has several ways to say nothing, and truthiness only distinguishes
     #: one of them, so the exact spelling has to be a test parameter.
     blank_finish_reason: str = " "
+    #: The finish reason the ``"unknown_reason"`` shape reports: a healthy 200
+    #: OK whose finish reason is a spelling this build classifies as neither a
+    #: truncation nor a natural stop.  Sixth shape, and like ``"blank_reason"``
+    #: it is not a failure -- it is the response the gate must decline to draw
+    #: any conclusion from.
+    unknown_finish_reason: str = "eos_token"
     seen: int = 0
     limits: Any = None
 
@@ -348,6 +355,18 @@ class _ScriptedClient:
                             {
                                 "message": {"content": "a real answer"},
                                 "finish_reason": self.blank_finish_reason,
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 12, "completion_tokens": 9},
+                    }
+                )
+            if self.failure_mode == "unknown_reason":
+                return _FakeResponse(
+                    {
+                        "choices": [
+                            {
+                                "message": {"content": "a real answer"},
+                                "finish_reason": self.unknown_finish_reason,
                             }
                         ],
                         "usage": {"prompt_tokens": 12, "completion_tokens": 9},
@@ -384,6 +403,7 @@ def _scripted(
     failures: int = 0,
     failure_mode: str = "http",
     blank_finish_reason: str = " ",
+    unknown_finish_reason: str = "eos_token",
 ) -> _ScriptedClient:
     recorder = _ScriptedClient(
         choice=choice,
@@ -392,6 +412,7 @@ def _scripted(
         failures=failures,
         failure_mode=failure_mode,
         blank_finish_reason=blank_finish_reason,
+        unknown_finish_reason=unknown_finish_reason,
     )
 
     def factory(**kwargs: Any) -> _ScriptedClient:
@@ -744,6 +765,201 @@ def test_a_tool_call_finish_reason_counts_as_a_natural_stop(
     assert run.truncation_rate == 0.0
 
 
+#: An OpenAI-shaped tool dispatch with *nothing* in either text channel: the
+#: response a model returns when it decides to call a tool instead of answering.
+#: ``content`` is explicitly ``null`` rather than absent, which is what vLLM and
+#: OpenAI both emit, so nothing but ``tool_calls`` can make this response valid.
+_TOOL_CALL_ONLY_CHOICE: dict[str, Any] = {
+    "message": {
+        "content": None,
+        "tool_calls": [
+            {
+                "id": "call_0",
+                "type": "function",
+                "function": {
+                    "name": "get_weather",
+                    "arguments": '{"city": "Paris"}',
+                },
+            }
+        ],
+    },
+    "finish_reason": "tool_calls",
+}
+
+
+def test_a_tool_call_only_response_is_valid(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dispatching a tool is doing the work, not failing to do it.
+
+    ``content: null`` plus a populated ``tool_calls`` array plus
+    ``finish_reason: "tool_calls"`` is a perfectly normal reply, and the replay
+    path used to score it ``_ERROR_EMPTY_TEXT`` because it read only ``content``,
+    the reasoning channel and captured logprobs.  This gate sends the captured
+    tool schemas with every agentic context, so it provokes this shape itself.
+    """
+    _scripted(
+        monkeypatch,
+        _TOOL_CALL_ONLY_CHOICE,
+        {"prompt_tokens": 31, "completion_tokens": 24},
+        scripted=4,
+    )
+
+    run = _replay(_suite(4)).run_results[0]
+
+    # The premise: nothing *but* the tool call could have made these valid.
+    assert all(r.response_text == "" for r in run.results)
+    assert all(r.reasoning_text == "" for r in run.results)
+    assert all(r.output_tokens == () for r in run.results)
+
+    assert run.invalid_count == 0
+    assert [r.error for r in run.results] == [""] * 4
+    assert all(r.tool_call_count == 1 for r in run.results)
+
+
+def test_a_tool_call_only_arm_neither_looks_invalid_nor_looks_saturated(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The two accountings have to agree about the same response.
+
+    Marking the dispatch invalid did two things at once: it drove
+    ``invalid_rate`` to 1.0, and -- because only valid responses may speak to
+    who chose the generation length -- it stripped every one of these genuine
+    natural stops out of the finish-reason counts, leaving an arm that reported
+    nothing at all.  A run of pure tool dispatches would therefore reject as
+    ``HIGH_INVALID_RATE``, and behind that it would have classified
+    ``UNTESTABLE`` too: a wholly healthy agentic replay indistinguishable from a
+    broken engine.
+    """
+    _scripted(
+        monkeypatch,
+        _TOOL_CALL_ONLY_CHOICE,
+        {"prompt_tokens": 31, "completion_tokens": 24},
+        scripted=8,
+    )
+
+    run = _replay(_suite(8)).run_results[0]
+
+    assert run.invalid_rate == 0.0
+    assert run.finish_reason_count == 8
+    assert run.natural_stop_count == 8
+    assert run.truncated_count == 0
+
+
+def test_an_otherwise_empty_response_is_still_invalid_without_a_tool_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The tool-call channel widens the validity test; it must not void it.
+
+    Same ``finish_reason``, same empty text, no dispatch: the model claims it
+    stopped of its own accord and has nothing whatsoever to show for it, which
+    is the broken-engine case the invalid-rate threshold exists to catch.
+    """
+    _scripted(
+        monkeypatch,
+        {"message": {"content": None, "tool_calls": []}, "finish_reason": "tool_calls"},
+        {"prompt_tokens": 31, "completion_tokens": 24},
+        scripted=4,
+    )
+
+    run = _replay(_suite(4)).run_results[0]
+
+    assert run.invalid_count == 4
+    assert all(r.error == "Empty response text" for r in run.results)
+
+
+@pytest.mark.parametrize("reason", sorted(NATURAL_STOP_FINISH_REASONS))
+def test_every_known_natural_stop_spelling_is_counted_as_one(
+    monkeypatch: pytest.MonkeyPatch,
+    reason: str,
+) -> None:
+    """The positive vocabulary, end to end, one spelling at a time.
+
+    ``completed`` is the load-bearing entry: it is the Responses API's word for
+    a finished generation, this project's own gateway files the response status
+    into this field (``gateway/responses.py``), and it is the counterpart of the
+    ``incomplete`` already carried in ``TRUNCATED_FINISH_REASONS``.  Omitting it
+    would make a Responses-API arm report *nothing* and reject as unmeasured.
+    """
+    _scripted(
+        monkeypatch,
+        {"message": {"content": "a real answer"}, "finish_reason": reason},
+        {"prompt_tokens": 12, "completion_tokens": 9},
+        scripted=5,
+    )
+
+    run = _replay(_suite(5)).run_results[0]
+
+    assert run.natural_stop_count == 5
+    assert run.truncated_count == 0
+    assert run.finish_reason_count == 5
+
+
+def test_the_two_finish_reason_vocabularies_do_not_overlap() -> None:
+    """A spelling cannot mean both, or the buckets would double-count."""
+    assert not (TRUNCATED_FINISH_REASONS & NATURAL_STOP_FINISH_REASONS)
+
+
+def test_an_unrecognised_finish_reason_counts_in_neither_bucket(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A spelling this build cannot read is not evidence the cap was slack.
+
+    A natural stop used to be inferred by subtraction -- anything non-blank that
+    was not a truncation.  On a server whose vocabulary this build does not
+    share, that turns a wholly-capped run into zero truncations over a full
+    denominator, i.e. ``BOUNDED``: the strongest possible "the cap did not bind"
+    reading of the strongest possible saturation.  Excluded from the denominator
+    instead, the same run reports nothing, classifies ``UNTESTABLE``, and is
+    rejected for not having measured -- which is the fail-closed direction.
+    """
+    _scripted(
+        monkeypatch,
+        {"message": {"content": "a real answer"}, "finish_reason": "eos_token"},
+        {"prompt_tokens": 12, "completion_tokens": 9},
+        scripted=6,
+    )
+
+    run = _replay(_suite(6)).run_results[0]
+
+    # The premise: these are healthy responses.  Only their reason is unreadable.
+    assert run.valid_count == 6
+    assert run.invalid_count == 0
+
+    assert run.truncated_count == 0
+    assert run.natural_stop_count == 0
+    assert run.finish_reason_count == 0
+    assert run.truncation_rate == 0.0
+
+
+def test_unknown_reasons_do_not_dilute_a_wholly_truncated_run(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The mixed case, which is where the subtraction did its damage.
+
+    Four responses carry a reason this build cannot classify and six were ended
+    by the cap.  Under subtraction the four would have counted as natural stops:
+    ten reported, six truncated, ``MIXED`` -- an arm that looks like it observed
+    where the model stops four times, having observed it zero times.
+    """
+    _scripted(
+        monkeypatch,
+        _finish_reason_choice("length"),
+        _CAPPED_USAGE,
+        scripted=6,
+        failures=4,
+        failure_mode="unknown_reason",
+    )
+
+    run = _replay(_suite(10), max_tokens=512).run_results[0]
+
+    assert run.valid_count == 10
+    assert run.truncated_count == 6
+    assert run.natural_stop_count == 0
+    assert run.finish_reason_count == 6
+    assert run.truncation_rate == 1.0
+
+
 @pytest.mark.parametrize("failure_mode", ["http", "transport", "empty_choices"])
 def test_failed_requests_stay_out_of_the_truncation_denominator(
     monkeypatch: pytest.MonkeyPatch,
@@ -860,8 +1076,8 @@ def _counted_run(*, reported: int, truncated: int) -> RunResults:
         valid_count=0,
         invalid_count=0,
         invalid_rate=0.0,
-        finish_reason_count=reported,
         truncated_count=truncated,
+        natural_stop_count=reported - truncated,
     )
 
 
@@ -1135,14 +1351,18 @@ def test_an_unknown_finish_reason_is_not_counted_as_truncated(
     ended the generation, and reading it as one would let the guard fire on any
     server whose vocabulary is merely wider than this one's -- turning a
     calibrated measurement check into a veto on unfamiliar endpoints.
+
+    It is equally not evidence of the *opposite*.  The reason lands in neither
+    counter, so it leaves the denominator too: see
+    ``test_an_unrecognised_finish_reason_counts_in_neither_bucket``.
     """
     _scripted(monkeypatch, _finish_reason_choice("weird"), _CAPPED_USAGE, scripted=6)
 
     run = _replay(_suite(6), max_tokens=512).run_results[0]
 
-    assert run.finish_reason_count == 6
     assert run.truncated_count == 0
-    assert run.natural_stop_count == 6
+    assert run.natural_stop_count == 0
+    assert run.finish_reason_count == 0
     assert run.truncation_rate == 0.0
 
 

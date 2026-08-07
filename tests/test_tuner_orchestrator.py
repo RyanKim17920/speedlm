@@ -356,8 +356,8 @@ def _run(
         valid_count=len(results),
         invalid_count=0,
         invalid_rate=0.0,
-        finish_reason_count=len(results),
         truncated_count=0,
+        natural_stop_count=len(results),
     )
 
 
