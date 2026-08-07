@@ -1096,6 +1096,145 @@ def test_only_the_first_matching_suffix_is_stripped() -> None:
     )
 
 
+def test_a_result_naming_a_second_declared_suffixed_tool_is_not_relabelled() -> None:
+    """The nastiest reachable case: both spellings are real, declared tools.
+
+    A capture from a service that fans output across channels can legitimately
+    declare ``emit`` and ``emit<|channel|>analysis`` as two separate tools. If a
+    result then names ``emit<|channel|>analysis`` against a call to ``emit``, the
+    trace is inconsistent and must be rejected. Stripping it to ``emit`` would
+    instead accept it and attribute the analysis tool's output to the plain one
+    -- corrupting a supervision target rather than repairing a capture artefact.
+
+    Neither name here is invented: the pre-existing mismatch test used
+    ``write<|channel|>analysis``, which is *not* a declared tool, so it could
+    never reach the relabel.
+    """
+    with pytest.raises(
+        ValueError,
+        match=re.escape("messages[2].name does not match its referenced tool call"),
+    ):
+        training_row_from_trace(
+            _trace(
+                tools=[_tool("emit"), _tool("emit<|channel|>analysis")],
+                messages=[
+                    {"role": "user", "content": "go"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [_call(name="emit")],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call-1",
+                        "name": "emit<|channel|>analysis",
+                        "content": "ok",
+                    },
+                ],
+            )
+        )
+
+
+def test_a_call_naming_a_second_declared_suffixed_tool_keeps_its_literal_name() -> None:
+    """The call-site twin, with the ambiguity actually present.
+
+    The existing literal-wins test declares only the suffixed tool, so the
+    stripped name resolves to nothing and the guard is never really exercised.
+    Here ``emit`` is declared too, so both branches are live and the literal name
+    still has to win -- end to end, through the result as well.
+    """
+    row = training_row_from_trace(
+        _trace(
+            tools=[_tool("emit"), _tool("emit<|channel|>analysis")],
+            messages=[
+                {"role": "user", "content": "go"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [_call(name="emit<|channel|>analysis")],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-1",
+                    "name": "emit<|channel|>analysis",
+                    "content": "ok",
+                },
+            ],
+        )
+    )
+
+    assert (
+        row.conversation[1]["tool_calls"][0]["function"]["name"] == "emit<|channel|>analysis"
+    )
+    assert row.conversation[2]["name"] == "emit<|channel|>analysis"
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [
+        "<|im_channel|>analysis",
+        "<|channel|>reasoning",
+        ".analysis",
+        "<|channel|>",
+    ],
+)
+def test_a_suffix_outside_the_harmony_vocabulary_is_never_stripped(suffix: str) -> None:
+    """Behaviour for an unknown or future family: the vocabulary is closed.
+
+    A family this module has never heard of gets no repair at all -- its
+    channel-ish markers are not in ``_HARMONY_TOOL_SUFFIXES``, so a call whose
+    name carries one fails closed on the ordinary "no matching tool schema"
+    path. That is the honest claim: the vendor vocabulary buys unknown families
+    nothing, and costs them nothing.
+    """
+    with pytest.raises(
+        ValueError,
+        match=re.escape("messages[0].tool_calls[0].function.name has no matching tool schema"),
+    ):
+        training_row_from_trace(
+            _trace(
+                tools=[_tool("search")],
+                messages=[
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [_call(name=f"search{suffix}")],
+                    }
+                ],
+            )
+        )
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    ["<|im_channel|>analysis", "<|channel|>reasoning", ".analysis"],
+)
+def test_an_unknown_family_result_suffix_is_rejected_rather_than_repaired(suffix: str) -> None:
+    """Same closed-vocabulary claim at the result site."""
+    with pytest.raises(
+        ValueError,
+        match=re.escape("messages[1].name does not match its referenced tool call"),
+    ):
+        training_row_from_trace(
+            _trace(
+                tools=[_tool("search")],
+                messages=[
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "tool_calls": [_call(name="search")],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "call-1",
+                        "name": f"search{suffix}",
+                        "content": "ok",
+                    },
+                ],
+            )
+        )
+
+
 # --------------------------------------------------------------------------
 # _validate_reasoning
 # --------------------------------------------------------------------------

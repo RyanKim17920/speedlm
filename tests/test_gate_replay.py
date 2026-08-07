@@ -312,7 +312,17 @@ class _ScriptedClient:
     #: to show for it, which ``_validity_error`` scores invalid.  That one is
     #: the only failure that arrives with a finish reason attached, so it is
     #: the only one that can contaminate the truncation counts.
+    #:
+    #: ``"blank_reason"`` is the fifth shape and the only one here that is not
+    #: a failure at all: a healthy 200 OK with real content and real tokens,
+    #: whose ``finish_reason`` field is present but says nothing.  It is filed
+    #: alongside the failures because it occupies the same slot in a run -- the
+    #: one response that is not part of the scripted, wholly-capped majority.
     failure_mode: str = "http"
+    #: The blank ``finish_reason`` the ``"blank_reason"`` shape reports.  A
+    #: server has several ways to say nothing, and truthiness only distinguishes
+    #: one of them, so the exact spelling has to be a test parameter.
+    blank_finish_reason: str = " "
     seen: int = 0
     limits: Any = None
 
@@ -331,6 +341,18 @@ class _ScriptedClient:
                 raise httpx.ConnectError("connection reset by peer")
             if self.failure_mode == "empty_choices":
                 return _FakeResponse({"choices": [], "usage": {}})
+            if self.failure_mode == "blank_reason":
+                return _FakeResponse(
+                    {
+                        "choices": [
+                            {
+                                "message": {"content": "a real answer"},
+                                "finish_reason": self.blank_finish_reason,
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 12, "completion_tokens": 9},
+                    }
+                )
             if self.failure_mode == "empty_stop":
                 return _FakeResponse(
                     {
@@ -361,6 +383,7 @@ def _scripted(
     scripted: int,
     failures: int = 0,
     failure_mode: str = "http",
+    blank_finish_reason: str = " ",
 ) -> _ScriptedClient:
     recorder = _ScriptedClient(
         choice=choice,
@@ -368,6 +391,7 @@ def _scripted(
         scripted=scripted,
         failures=failures,
         failure_mode=failure_mode,
+        blank_finish_reason=blank_finish_reason,
     )
 
     def factory(**kwargs: Any) -> _ScriptedClient:
@@ -858,6 +882,55 @@ def test_an_invalid_response_cannot_supply_the_only_natural_stop(
     assert run.truncation_rate == 1.0
 
 
+@pytest.mark.parametrize("blank", [" ", "\t", "\n", "  \t ", ""])
+def test_a_blank_finish_reason_cannot_supply_the_only_natural_stop(
+    monkeypatch: pytest.MonkeyPatch,
+    blank: str,
+) -> None:
+    """A finish reason that says nothing is a reason not given.
+
+    The sibling above keeps a *failed* response out of the denominator; this
+    pins the other way the denominator could be contaminated, by a response
+    that is entirely healthy and simply reported no reason.  The counting
+    filter tested truthiness (``r.valid and r.finish_reason``), and a
+    whitespace-only string is truthy in Python: a single response reporting
+    ``" "`` entered the denominator, failed the truncation test, and became the
+    one natural stop that turns ``SATURATED`` into ``MIXED`` -- promoting a run
+    in which the cap had ended all ninety-nine generations it actually
+    measured.  ``invalid_rate`` cannot see this either, because there is
+    nothing invalid here at all.
+
+    Parametrised over the spellings of "nothing" a server can send, because
+    truthiness rejects only one of them.  ``""`` is included as the boundary
+    the old filter did get right; the whitespace cases are the defect.
+    """
+    _scripted(
+        monkeypatch,
+        _finish_reason_choice("length"),
+        _CAPPED_USAGE,
+        scripted=99,
+        failures=1,
+        failure_mode="blank_reason",
+        blank_finish_reason=blank,
+    )
+
+    run = _replay(_suite(100), concurrency=8, max_tokens=512).run_results[0]
+
+    # The premise: the blank-reason response really is present, really is
+    # *valid*, and really did report the blank spelling under test -- otherwise
+    # this would be asserting against a population that cannot occur.
+    assert run.invalid_count == 0
+    assert [r.finish_reason for r in run.results if not r.finish_reason.strip()] == [
+        blank
+    ]
+    assert not is_truncated_finish_reason(blank)
+
+    assert run.finish_reason_count == 99
+    assert run.truncated_count == 99
+    assert run.natural_stop_count == 0
+    assert run.truncation_rate == 1.0
+
+
 def test_the_gate_truncation_vocabulary_matches_the_training_filter() -> None:
     """The three copies of the truncated-finish-reason set must stay identical.
 
@@ -904,6 +977,88 @@ def test_an_incomplete_finish_reason_makes_a_run_wholly_truncated(
     assert run.truncated_count == 5
     assert run.natural_stop_count == 0
     assert run.truncation_rate == 1.0
+
+
+#: The shape a Responses-API server returns when the cap ended a generation
+#: that had surfaced nothing: tokens counted in ``usage``, no content, no
+#: reasoning channel, and the Responses-API spelling of "the cap ended this".
+_EMPTY_CAPPED_USAGE: dict[str, Any] = {"prompt_tokens": 12, "completion_tokens": 512}
+
+
+@pytest.mark.parametrize(
+    "spelling", ["length", "incomplete", "Incomplete", " incomplete\n"]
+)
+def test_an_empty_response_the_cap_ended_is_valid_however_it_is_spelled(
+    monkeypatch: pytest.MonkeyPatch,
+    spelling: str,
+) -> None:
+    """Validity asked ``finish_reason == "length"``, so ``incomplete`` failed it.
+
+    Rule 3 of ``_validity_error`` -- "nothing surfaced but the cap was hit" --
+    was written against the chat-completions spelling alone, while the counting
+    layer above it already understood both.  The consequence is worse than a
+    mislabel: an arm whose every response came back empty at ``incomplete``
+    scored *invalid*, dropped out of the truncation counts entirely (only valid
+    responses enter the denominator), and the run rejected as
+    ``HIGH_INVALID_RATE``.  ``TRUNCATION_SATURATED`` could therefore never fire
+    for the exact response shape it was written to catch.
+
+    Normalised spellings are included because the validity check and the
+    counting predicate must agree on the same vocabulary; an equality test
+    against a literal agrees with neither ``Incomplete`` nor ``" length"``.
+    """
+    _scripted(
+        monkeypatch,
+        {"message": {"content": ""}, "finish_reason": spelling},
+        _EMPTY_CAPPED_USAGE,
+        scripted=5,
+    )
+
+    run = _replay(_suite(5), max_tokens=512).run_results[0]
+
+    assert run.invalid_count == 0
+    assert run.invalid_rate == 0.0
+    assert run.results[0].error == ""
+    # And having stayed valid, they reach the counts as what they are.
+    assert run.finish_reason_count == 5
+    assert run.truncated_count == 5
+    assert run.natural_stop_count == 0
+    assert run.truncation_rate == 1.0
+
+
+def test_an_empty_response_is_valid_only_because_the_cap_ended_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The contrast that makes the fix a widening and not a weakening.
+
+    Two responses identical in every respect -- empty ``content``, no reasoning
+    channel, 512 generated tokens -- differing only in who ended them.  The one
+    the cap ended is a usable throughput sample; the one claiming it stopped of
+    its own accord with nothing to show is a broken engine, and must stay
+    invalid.  Accepting ``incomplete`` by widening the test to "any finish
+    reason at all" would have swallowed this second case, which is precisely
+    the failure ``high_invalid_rate`` exists to catch.
+    """
+    _scripted(
+        monkeypatch,
+        {"message": {"content": ""}, "finish_reason": "incomplete"},
+        _EMPTY_CAPPED_USAGE,
+        scripted=1,
+    )
+    capped = _replay(_suite(1), max_tokens=512).run_results[0].results[0]
+
+    _scripted(
+        monkeypatch,
+        {"message": {"content": ""}, "finish_reason": "stop"},
+        _EMPTY_CAPPED_USAGE,
+        scripted=1,
+    )
+    self_stopped = _replay(_suite(1), max_tokens=512).run_results[0].results[0]
+
+    assert capped.valid
+    assert capped.error == ""
+    assert not self_stopped.valid
+    assert self_stopped.error == "Empty response text"
 
 
 @pytest.mark.parametrize("spelling", ["Length", " length ", "INCOMPLETE", "Incomplete"])

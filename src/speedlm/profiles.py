@@ -223,8 +223,27 @@ class ModelProfile:
     speculative_method: SpeculativeMethod
     num_speculative_tokens: int
     target_layer_ids: tuple[int, ...] | None
-    chat_template_kind: ChatTemplateKind
     max_seq_len: int
+    #: Descriptive only, and defaulted because it gates nothing.
+    #:
+    #: No code in ``src/`` branches on this value -- it is validated on load,
+    #: copied into ``to_dict`` and printed by ``speedlm status``/``doctor``,
+    #: and that is all.  Chat rendering is done by the *server*: replay posts
+    #: OpenAI-shaped messages to ``/v1/chat/completions`` and vLLM applies the
+    #: model's own HF template (no ``--chat-template`` argv is ever passed),
+    #: while training rows are rendered downstream by Speculators'
+    #: ``prepare_data.py --model <verifier>``, again from the verifier's own
+    #: tokenizer.  The local template stack under ``training/templates/`` is
+    #: reachable only from tests.
+    #:
+    #: It was required until now, against a closed vocabulary of three values.
+    #: That combination could only ever *reject* a legitimate model: a family
+    #: that is neither Harmony nor ChatML had to claim to be one of them to be
+    #: declarable at all, and the claim changed no behaviour once accepted.  A
+    #: required gate that admits nothing true and blocks something true is
+    #: worse than no gate, so it now defaults to ``"auto"`` -- which is what
+    #: every value already meant operationally.
+    chat_template_kind: ChatTemplateKind = "auto"
     num_hidden_layers: int | None = None
     max_scratch_bytes: int | None = None
     """Hidden-state scratch scales with hidden_size x num_aux_layers x tokens."""
@@ -408,7 +427,10 @@ class ModelProfile:
                 f"got {method_value!r}"
             )
 
-        template_value = data["chat_template_kind"]
+        # Absent is legitimate and means ``"auto"``; a value that IS supplied is
+        # still held to the vocabulary, so an existing profile carrying a typo
+        # is not silently downgraded to the default.
+        template_value = data.get("chat_template_kind", "auto")
         if not isinstance(template_value, str) or template_value not in CHAT_TEMPLATE_KINDS:
             allowed_templates = ", ".join(sorted(CHAT_TEMPLATE_KINDS))
             raise ProfileError(
@@ -530,7 +552,6 @@ REQUIRED_PROFILE_KEYS: Final[frozenset[str]] = frozenset(
         "draft_model",
         "speculative_method",
         "num_speculative_tokens",
-        "chat_template_kind",
         "max_seq_len",
     }
 )

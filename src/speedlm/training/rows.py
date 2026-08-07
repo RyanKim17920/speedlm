@@ -1,4 +1,16 @@
-"""Template-agnostic conversion from captured traces to training rows."""
+"""Conversion from captured traces to training rows.
+
+The *output* of this module is template-agnostic: a ``TrainingRow`` holds the
+captured OpenAI-shaped conversation exactly as produced, before any chat
+template renders it, and nothing here branches on a profile's
+``chat_template_kind``.
+
+The *repairs* are not. ``_HARMONY_TOOL_SUFFIXES`` below is one vendor's
+control-token vocabulary, and it runs on every trace from every model family.
+That asymmetry is deliberate rather than accidental -- see the note on the
+constant -- but the module should not be read as claiming a neutrality its
+repair path does not have.
+"""
 
 from __future__ import annotations
 
@@ -17,6 +29,25 @@ from speedlm.training.templates.base import (
     ChatTemplate,
 )
 
+#: gpt-oss / Harmony channel control-token suffixes, leaking into tool names
+#: when a capture splices a channel marker onto the function name.
+#:
+#: This is one family's vocabulary sitting on a path every family flows through.
+#: Gating it on the profile's ``chat_template_kind`` is not available here:
+#: ``training_row_from_trace`` is handed a trace, not a profile, and no caller in
+#: ``src/`` holds one at this layer -- threading a profile in would change the
+#: public signature and every call site for a repair that is inert off Harmony.
+#:
+#: So the vocabulary stays unconditional and is instead made *safe by
+#: construction* at both strip sites: a captured name that is itself a declared
+#: tool is never rewritten, at either site. That property does not depend on
+#: knowing the family, so it holds for families that do not exist yet.
+#:
+#: What a non-Harmony -- or unknown, or future -- family can therefore observe is
+#: bounded to exactly one thing: a trace that was *already* self-inconsistent (a
+#: call naming no declared tool, or a result naming a tool other than the one it
+#: references) may be repaired instead of rejected. No self-consistent trace on
+#: any family is altered, and no name is ever moved off a tool that exists.
 _HARMONY_TOOL_SUFFIXES = (
     "<|channel|>analysis",
     "<|channel|>commentary",
@@ -161,13 +192,22 @@ def _messages(
             if result_name is not None:
                 if not isinstance(result_name, str):
                     raise ValueError(f"{location}.name must be a string")
-                #: Mirror the guarded call-name strip below: only adopt the
-                #: stripped name when it resolves to the referenced call. A tool
-                #: genuinely named ``search<|channel|>analysis`` is left alone
-                #: instead of being rewritten into a mismatch, while a result
-                #: naming a different tool is still rejected.
+                #: Mirror the guarded call-name strip below on BOTH of its
+                #: guards: only adopt the stripped name when it resolves to the
+                #: referenced call, and only attempt the strip when the captured
+                #: name is not itself a declared tool.
+                #:
+                #: The second guard is what the call site gets from its
+                #: ``name not in tool_names`` test, and its absence here was the
+                #: one way this vendor vocabulary could corrupt rather than
+                #: repair: with both ``emit`` and ``emit<|channel|>analysis``
+                #: declared, a result legitimately naming ``emit<|channel|>analysis``
+                #: against a call to ``emit`` was silently relabelled onto
+                #: ``emit`` instead of being rejected as the mismatch it is. A
+                #: result naming a real, different tool must fail closed --
+                #: relabelling it would attribute one tool's output to another.
                 expected = known_calls[call_id]
-                if result_name != expected:
+                if result_name != expected and result_name not in tool_names:
                     for suffix in _HARMONY_TOOL_SUFFIXES:
                         if (
                             result_name.endswith(suffix)

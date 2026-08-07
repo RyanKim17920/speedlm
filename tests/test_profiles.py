@@ -1713,6 +1713,190 @@ def test_every_built_in_chat_template_is_declarable_in_a_profile() -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# chat_template_kind: optional, descriptive, still a closed vocabulary.
+#
+# The field gates nothing.  Chat rendering happens on the *server*: replay posts
+# OpenAI-shaped messages to ``/v1/chat/completions`` and vLLM applies the model's
+# own HF template (SpeedLM never passes ``--chat-template``), while training rows
+# are rendered downstream by Speculators' ``prepare_data.py --model <verifier>``
+# from the verifier's own tokenizer.  The local template stack under
+# ``speedlm/training/templates/`` is reachable only from tests, and nothing under
+# ``src/`` branches on the value.
+#
+# Required-plus-closed-vocabulary therefore had exactly one effect: a family that
+# renders neither Harmony nor ChatML had to *claim* to be one of them before it
+# could be declared at all, and the claim changed no behaviour once accepted.
+# The field is now optional and defaults to ``"auto"``.  A value that IS supplied
+# is still held to the vocabulary, so a typo in an existing profile is rejected
+# rather than silently downgraded to the default.
+# ---------------------------------------------------------------------------
+
+#: A second fictional family, deliberately distinct from Atlas above.  Atlas
+#: declares ``chatml``; this one renders something of its own and so has nothing
+#: honest to declare -- which is precisely the profile the old required field
+#: made undeclarable.  Like Atlas, it is not a real Hub repository, so nothing
+#: here can accidentally resolve against a cached snapshot.
+UNTEMPLATED_VERIFIER = "meridian/Helix-11B-Instruct"
+UNTEMPLATED_DRAFTER = "meridian/Helix-11B-Instruct-speculator.eagle3"
+UNTEMPLATED_PROFILE_NAME = "helix-11b-instruct-eagle3"
+
+#: The JSON an operator would write for it: no ``chat_template_kind`` key at all.
+UNTEMPLATED_PROFILE_JSON: dict[str, object] = {
+    "name": UNTEMPLATED_PROFILE_NAME,
+    "verifier_model": UNTEMPLATED_VERIFIER,
+    "draft_model": UNTEMPLATED_DRAFTER,
+    "speculative_method": "eagle3",
+    "num_speculative_tokens": 3,
+    "max_seq_len": 8192,
+}
+
+
+def _untemplated_profile(home: Path, **overrides: object) -> ModelProfile:
+    """Write the no-template-declared JSON under *home* and load it back."""
+
+    _write_profile(
+        home, "helix.json", {**UNTEMPLATED_PROFILE_JSON, **overrides}
+    )
+    return load_profiles(home)[UNTEMPLATED_PROFILE_NAME]
+
+
+def test_a_new_family_may_omit_chat_template_kind_entirely(tmp_path: Path) -> None:
+    """A model that is neither Harmony nor ChatML is declarable without lying.
+
+    This is the whole point of the field becoming optional: the operator does
+    not have to pick one of two renderers their model does not use in order to
+    get a loadable profile.
+    """
+
+    assert "chat_template_kind" not in UNTEMPLATED_PROFILE_JSON
+    assert UNTEMPLATED_PROFILE_NAME not in BUILTIN_PROFILES
+
+    profile = _untemplated_profile(tmp_path)
+
+    assert profile.chat_template_kind == "auto"
+    assert profile.verifier_model == UNTEMPLATED_VERIFIER
+    assert profile.draft_model == UNTEMPLATED_DRAFTER
+
+    # Not a degraded profile: it resolves and reaches the engine fragment like
+    # any other, which is what "the field gates nothing" has to mean in practice.
+    assert profile.trainable is True
+    resolved = resolve_profile(
+        {"model": UNTEMPLATED_VERIFIER, "profile": None}, home=tmp_path
+    )
+    assert resolved == profile
+    assert profile.speculative_config() == {
+        "method": "eagle3",
+        "model": UNTEMPLATED_DRAFTER,
+        "num_speculative_tokens": 3,
+    }
+
+
+def test_a_declared_chat_template_kind_still_round_trips(tmp_path: Path) -> None:
+    """Optional does not mean ignored: a supplied value survives intact."""
+
+    profile = _untemplated_profile(tmp_path, chat_template_kind="harmony")
+
+    assert profile.chat_template_kind == "harmony"
+    assert profile.to_dict()["chat_template_kind"] == "harmony"
+    assert ModelProfile.from_dict(profile.to_dict()) == profile
+
+
+@pytest.mark.parametrize(
+    "declared",
+    [
+        "harmnoy",  # a plausible typo for a real kind
+        "openai",  # a parser name, not a template kind
+        "",
+        None,  # an explicit JSON null is not the same as an absent key
+        3,
+    ],
+)
+def test_a_supplied_chat_template_kind_is_still_held_to_the_vocabulary(
+    declared: object, tmp_path: Path
+) -> None:
+    """Defaulting must not become "anything goes".
+
+    An absent key means ``"auto"``.  A key that is present and wrong is an
+    operator error, and downgrading it to the default silently would turn a
+    typo in an existing profile into a no-op.
+    """
+
+    data = {**UNTEMPLATED_PROFILE_JSON, "chat_template_kind": declared}
+
+    with pytest.raises(ProfileError, match="chat_template_kind must be one of"):
+        ModelProfile.from_dict(data)
+
+    _write_profile(tmp_path, "helix.json", data)
+    with pytest.raises(ProfileError, match="chat_template_kind must be one of"):
+        load_profiles(tmp_path)
+
+
+def test_chat_template_kind_is_not_a_required_profile_key() -> None:
+    """One field was narrowed; the required set otherwise still bites.
+
+    The loop is over ``REQUIRED_PROFILE_KEYS`` itself rather than one sampled
+    key, so a future edit that empties or weakens the set fails here instead of
+    letting a profile missing its verifier load as if it were complete.
+    """
+
+    assert "chat_template_kind" not in profiles_module.REQUIRED_PROFILE_KEYS
+    # Still a real field, just not a mandatory one.
+    assert "chat_template_kind" in profiles_module.PROFILE_FIELD_NAMES
+
+    expected_required = {
+        "name",
+        "verifier_model",
+        "draft_model",
+        "speculative_method",
+        "num_speculative_tokens",
+        "max_seq_len",
+    }
+    assert set(profiles_module.REQUIRED_PROFILE_KEYS) == expected_required
+    for key in sorted(profiles_module.REQUIRED_PROFILE_KEYS):
+        data = dict(NEW_PROFILE_JSON)
+        del data[key]
+        with pytest.raises(ProfileError, match=f"missing required keys: {key}"):
+            ModelProfile.from_dict(data)
+
+
+def test_to_dict_still_emits_chat_template_kind_when_it_was_defaulted(
+    tmp_path: Path,
+) -> None:
+    """``status`` and ``doctor`` read the key by name, so it must always be there.
+
+    ``speedlm.doctor`` and ``speedlm.report`` both emit a
+    ``"chat_template_kind"`` entry for the unprofiled case, so a profiled
+    payload that omitted it would make the two shapes disagree.
+    """
+
+    profile = _untemplated_profile(tmp_path)
+    payload = profile.to_dict()
+
+    assert "chat_template_kind" in payload
+    assert payload["chat_template_kind"] == "auto"
+    # Nothing else went missing along with the undeclared key.
+    assert set(payload) == profiles_module.PROFILE_FIELD_NAMES
+    # And the emitted document is itself a loadable profile.
+    assert ModelProfile.from_dict(payload) == profile
+
+
+def test_every_builtin_profile_still_declares_its_original_template_kind() -> None:
+    """Making the field optional must not have moved any shipped declaration."""
+
+    assert {
+        name: profile.chat_template_kind
+        for name, profile in BUILTIN_PROFILES.items()
+    } == {
+        "gpt-oss-20b-eagle3": "harmony",
+        "llama-3.1-8b-instruct-eagle3": "auto",
+        "qwen3.5-9b-mtp": "chatml",
+        "qwen3-8b-eagle3": "chatml",
+    }
+    for profile in BUILTIN_PROFILES.values():
+        assert profile.chat_template_kind in profiles_module.CHAT_TEMPLATE_KINDS
+
+
 def test_default_aux_layers_has_no_production_caller() -> None:
     """The hardcoded ``k == 3`` in ``default_aux_layers`` is a dead fallback.
 

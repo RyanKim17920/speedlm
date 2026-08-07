@@ -373,7 +373,14 @@ def _validity_error(
         return _ERROR_NO_TOKENS
     if surfaced:
         return ""
-    if finish_reason == FINISH_REASON_LENGTH:
+    # Any spelling of "the cap ended this", not just the chat-completions one.
+    # A Responses-API server reports the identical event as ``incomplete``, and
+    # testing only ``length`` here marked its truncated-empty responses invalid.
+    # That is not merely a mislabel: those responses then fail the validity
+    # filter, drop out of the truncation counts entirely, and the run rejects
+    # as ``HIGH_INVALID_RATE`` -- so ``TRUNCATION_SATURATED`` could never fire
+    # for the very response shape it was written to catch.
+    if is_truncated_finish_reason(finish_reason):
         return ""
     return _ERROR_EMPTY_TEXT
 
@@ -602,7 +609,15 @@ async def _run_single(
     # natural stop, classify ``MIXED`` instead of ``SATURATED``, and promote --
     # while ``invalid_rate`` sat at 0.01, far under its own threshold.  One
     # failed request must not be able to vouch for a wholly-capped run.
-    reported = [r.finish_reason for r in results if r.valid and r.finish_reason]
+    #
+    # ``.strip()`` rather than truthiness, because a whitespace-only value is
+    # truthy: a single response reporting ``" "`` would otherwise enter the
+    # denominator, fail the truncation test, and count as the natural stop that
+    # turns SATURATED into MIXED -- a blank string vouching for a wholly-capped
+    # run.  A reason that says nothing must be treated as a reason not given.
+    reported = [
+        r.finish_reason for r in results if r.valid and r.finish_reason.strip()
+    ]
     truncated = sum(1 for fr in reported if is_truncated_finish_reason(fr))
 
     return RunResults(

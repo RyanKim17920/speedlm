@@ -33,6 +33,7 @@ from speedlm.gate.replay import (
     ReplayResult,
     RequestResult,
     RunResults,
+    _validity_error,
     is_truncated_finish_reason,
 )
 
@@ -50,6 +51,7 @@ def _make_request_result(
     completion_tokens: int = 5,
     output_tokens: tuple[str, ...] = (),
     context_hash: str = "abcd1234",
+    finish_reason: str = "",
 ) -> RequestResult:
     return RequestResult(
         context_hash=context_hash,
@@ -61,6 +63,7 @@ def _make_request_result(
         valid=valid,
         error=error,
         output_tokens=output_tokens,
+        finish_reason=finish_reason,
     )
 
 
@@ -2721,6 +2724,144 @@ def _finish_reason_columns(
     """
     truncated = sum(1 for reason in reasons if is_truncated_finish_reason(reason))
     return [(len(reasons), truncated)] * repeats
+
+
+#: Tokens a capped-and-empty response generated before the cap ended it.  The
+#: number only has to be non-zero: it is what makes the response "the engine
+#: did real work" rather than "the engine answered with nothing".
+_EMPTY_CAPPED_COMPLETION_TOKENS = 512
+
+
+def _empty_capped_result(finish_reason: str, *, latency_s: float) -> RequestResult:
+    """One 200-OK response that generated tokens and surfaced none of them.
+
+    Validity is *computed* by ``replay._validity_error``, the production
+    classifier, rather than asserted by the fixture.  A fixture that passed
+    ``valid=True`` here would make the test below a tautology: the whole
+    question is which side of the validity filter this response shape falls on,
+    and answering it in the fixture would answer it for the gate too.
+    """
+    error = _validity_error(
+        completion_tokens=_EMPTY_CAPPED_COMPLETION_TOKENS,
+        text="",
+        reasoning="",
+        output_tokens=(),
+        finish_reason=finish_reason,
+    )
+    return _make_request_result(
+        "",
+        valid=not error,
+        error=error,
+        latency_s=latency_s,
+        completion_tokens=_EMPTY_CAPPED_COMPLETION_TOKENS,
+        finish_reason=finish_reason,
+    )
+
+
+def _empty_capped_arm(
+    finish_reason: str,
+    *,
+    tps: float,
+    responses: int = 1,
+    repeats: int = 3,
+) -> ReplayResult:
+    """An arm whose every response came back empty at *finish_reason*.
+
+    Throughput is held at *tps* the same way :func:`_valid_run` holds it, so
+    this arm differs from a healthy one only in the response shape under test.
+    One response per repeat, likewise matching :func:`_valid_run`: the gate
+    pairs the two arms request by request, so an arm of a different width would
+    fail to zip against the healthy arm it is compared with.
+    The finish-reason columns come from :func:`_finish_reason_columns`, i.e.
+    from the production truncation predicate over the same reasons the
+    responses carry, so the counts and the responses describe one population.
+    """
+    runs = [
+        _make_run(
+            [
+                _empty_capped_result(
+                    finish_reason,
+                    latency_s=_EMPTY_CAPPED_COMPLETION_TOKENS / tps,
+                )
+                for _ in range(responses)
+            ]
+        )
+        for _ in range(repeats)
+    ]
+    return _with_truncation(
+        _make_replay(runs),
+        _finish_reason_columns([finish_reason] * responses, repeats=repeats),
+    )
+
+
+def test_an_arm_of_empty_capped_responses_rejects_as_saturated_not_invalid() -> None:
+    """The reason is the whole point: this run measured fixed-length decode.
+
+    A Responses-API server whose every generation ran into the cap without
+    surfacing anything reports ``incomplete`` on responses that are, for
+    throughput purposes, entirely healthy -- 512 tokens each.  The validity
+    check tested ``finish_reason == "length"``, so it scored all of them
+    invalid, and because only valid responses enter the truncation denominator
+    the arm reported *nothing* about where the model stops.  The gate then
+    rejected on ``HIGH_INVALID_RATE``, which is a claim about a broken engine,
+    for an engine that was working exactly as asked.  ``HIGH_INVALID_RATE`` is
+    checked first, so the wrong reason also shadowed the right one entirely:
+    ``TRUNCATION_SATURATED`` could not fire for the response shape it exists to
+    catch.
+
+    Both arms would promote on their thresholds, so the verdict here comes from
+    the truncation guard and nothing else.
+    """
+    candidate = _empty_capped_arm("incomplete", tps=110.0)
+
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.6, output_tok_per_sec=100.0),
+        _make_delta(acceptance_rate=0.65, output_tok_per_sec=110.0),
+        _with_truncation(
+            _valid_runs_with_tps(100.0), _finish_reason_columns(["stop"] * 5)
+        ),
+        candidate,
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+
+    assert dec.verdict is Verdict.REJECT
+    assert dec.reason is Reason.TRUNCATION_SATURATED
+    assert dec.reason is not Reason.HIGH_INVALID_RATE
+    assert dec.candidate_truncation_regime is TruncationRegime.SATURATED
+    # And why the reason above is the truncation guard's rather than the
+    # invalid-rate guard's, which is checked first: under the production
+    # classifier there is nothing invalid here for it to fire on.
+    assert candidate.avg_invalid_rate == 0.0
+
+
+def test_an_arm_of_empty_self_stopped_responses_still_rejects_as_invalid() -> None:
+    """The contrast that keeps the widening from becoming a hole.
+
+    Identical to the arm above in every respect except who ended the
+    generations: these responses claim they stopped of their own accord and
+    have nothing to show for it, which is a broken engine and exactly what
+    ``HIGH_INVALID_RATE`` is for.  Accepting the ``incomplete`` shape by
+    treating any finish reason as proof the cap was hit would have swallowed
+    this arm too -- and it would then have been read as a fully *natural-stop*
+    arm, the strongest possible "the cap was not binding" reading of an engine
+    returning nothing at all.
+    """
+    candidate = _empty_capped_arm("stop", tps=110.0)
+
+    assert candidate.avg_invalid_rate == 1.0
+
+    dec = decide_promotion(
+        _make_delta(acceptance_rate=0.6, output_tok_per_sec=100.0),
+        _make_delta(acceptance_rate=0.65, output_tok_per_sec=110.0),
+        _with_truncation(
+            _valid_runs_with_tps(100.0), _finish_reason_columns(["stop"] * 5)
+        ),
+        candidate,
+        _pcfg(acc_pp=1.0, throughput_pct=2.0),
+    )
+
+    assert dec.verdict is Verdict.REJECT
+    assert dec.reason is Reason.HIGH_INVALID_RATE
 
 
 def test_an_arm_capped_under_the_responses_api_spelling_is_still_rejected() -> None:
