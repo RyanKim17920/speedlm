@@ -1298,3 +1298,95 @@ class TestCosineSimilarity:
         b = a.float().clone()
         b[:, :1440] *= -1.0
         assert cosine_similarity(a, b) < 0.9
+
+
+# ---------------------------------------------------------------------------
+# _default_vllm_pip_path — Issue 3: no hardcoded foreign homes
+# ---------------------------------------------------------------------------
+
+
+class TestDefaultVllmPipPath:
+    """Verify _default_vllm_pip_path derives from speedlm_home(), not a
+    literal /admin/home/… path baked into the source."""
+
+    def test_default_pip_derives_from_speedlm_home(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPathFactory
+    ) -> None:
+        """When SPEEDLM_HOME is set and SPEEDLM_E2E_VLLM_PYTHON is unset,
+        the returned pip path must sit under the custom home.
+
+        A hardcoded literal would still point at the foreign home after the
+        env var changes — this assertion catches that."""
+        from pathlib import Path
+
+        from speedlm.activation_capture.hf_reference import _default_vllm_pip_path
+
+        custom_home = str(Path(str(tmp_path)) / "custom_speedlm")
+        monkeypatch.setenv("SPEEDLM_HOME", custom_home)
+        monkeypatch.delenv("SPEEDLM_E2E_VLLM_PYTHON", raising=False)
+        # speedlm_home() is called at call-time (not module-load time), so
+        # the monkeypatch takes effect immediately without a reload.
+        pip = _default_vllm_pip_path()
+        assert custom_home in str(pip)
+
+    def test_env_override_vllm_python_wins(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPathFactory
+    ) -> None:
+        """SPEEDLM_E2E_VLLM_PYTHON must win; the pip path must be its sibling."""
+        from pathlib import Path
+
+        from speedlm.activation_capture.hf_reference import _default_vllm_pip_path
+
+        custom_python = str(Path(str(tmp_path)) / "override_venv" / "bin" / "python")
+        expected_pip = str(Path(str(tmp_path)) / "override_venv" / "bin" / "pip")
+        monkeypatch.setenv("SPEEDLM_E2E_VLLM_PYTHON", custom_python)
+        pip = _default_vllm_pip_path()
+        assert str(pip) == expected_pip
+
+    def test_error_message_reflects_overridden_repo_path(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: pytest.TempPathFactory
+    ) -> None:
+        """The ReferenceUnavailable error message must use the resolved pip
+        path, not a hardcoded literal.
+
+        This exercises the ImportError branch of loaded_reference_model by
+        injecting a fake transformers that raises ImportError on from_pretrained.
+        """
+        import sys
+        import types
+        from pathlib import Path
+
+        from speedlm.activation_capture.hf_reference import loaded_reference_model
+
+        custom_python = str(Path(str(tmp_path)) / "my_venv" / "bin" / "python")
+        expected_pip = str(Path(str(tmp_path)) / "my_venv" / "bin" / "pip")
+        monkeypatch.setenv("SPEEDLM_E2E_VLLM_PYTHON", custom_python)
+
+        float32 = object()
+        fake_torch = types.SimpleNamespace(
+            float32=float32,
+            long=object(),
+        )
+
+        class _RaisingLoader:
+            class _Raiser:
+                @staticmethod
+                def from_pretrained(*_a: object, **_kw: object) -> None:
+                    raise ImportError("no accelerate here")
+
+            AutoModelForCausalLM = _Raiser()
+
+        monkeypatch.setitem(sys.modules, "torch", fake_torch)
+        monkeypatch.setitem(sys.modules, "transformers", types.SimpleNamespace(
+            AutoModelForCausalLM=_RaisingLoader.AutoModelForCausalLM
+        ))
+
+        from speedlm.activation_capture.hf_reference import ReferenceUnavailable
+
+        with (
+            pytest.raises(ReferenceUnavailable) as exc_info,
+            loaded_reference_model("some-model", device="cpu"),
+        ):
+            pass  # pragma: no cover
+
+        assert expected_pip in str(exc_info.value)

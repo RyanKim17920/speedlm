@@ -2417,3 +2417,68 @@ class TestMatrixResultSerialization:
         text = out.read_text(encoding="utf-8")
         assert text.endswith("\n")
         assert json.loads(text) == matrix.to_dict()
+
+
+# ---------------------------------------------------------------------------
+# Default-path derivation — Issue 3: no hardcoded foreign homes
+# ---------------------------------------------------------------------------
+
+
+class TestOfflineExtractDefaultPaths:
+    """Verify that offline_extract defaults derive from speedlm_home(), not
+    from a literal /admin/home/… path baked into the source."""
+
+    @pytest.mark.no_torch
+    def test_default_vllm_python_derives_from_speedlm_home(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """When SPEEDLM_HOME is overridden and SPEEDLM_E2E_VLLM_PYTHON is
+        unset, _DEFAULT_VLLM_PYTHON must be rooted under the custom home.
+
+        This fails for any hardcoded absolute path because changing
+        SPEEDLM_HOME has no effect on a literal string."""
+        import importlib
+
+        custom_home = str(tmp_path / "my_speedlm")
+        monkeypatch.setenv("SPEEDLM_HOME", custom_home)
+        monkeypatch.delenv("SPEEDLM_E2E_VLLM_PYTHON", raising=False)
+        importlib.reload(offline_extract)
+        assert custom_home in str(offline_extract._DEFAULT_VLLM_PYTHON)
+
+    @pytest.mark.no_torch
+    def test_default_speculators_repo_derives_from_speedlm_home(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """When SPEEDLM_HOME is overridden and SPEEDLM_SPECULATORS_REPO is
+        unset, _DEFAULT_SPECULATORS_REPO must be rooted under the custom home."""
+        import importlib
+
+        custom_home = str(tmp_path / "my_speedlm")
+        monkeypatch.setenv("SPEEDLM_HOME", custom_home)
+        monkeypatch.delenv("SPEEDLM_SPECULATORS_REPO", raising=False)
+        importlib.reload(offline_extract)
+        assert custom_home in str(offline_extract._DEFAULT_SPECULATORS_REPO)
+
+    @pytest.mark.no_torch
+    def test_env_override_vllm_python_wins(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """SPEEDLM_E2E_VLLM_PYTHON must win over the speedlm_home() fallback."""
+        import importlib
+
+        custom = str(tmp_path / "override_venv" / "bin" / "python")
+        monkeypatch.setenv("SPEEDLM_E2E_VLLM_PYTHON", custom)
+        importlib.reload(offline_extract)
+        assert str(offline_extract._DEFAULT_VLLM_PYTHON) == custom
+
+    @pytest.mark.no_torch
+    def test_env_override_speculators_repo_wins(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """SPEEDLM_SPECULATORS_REPO must win over the speedlm_home() fallback."""
+        import importlib
+
+        custom = str(tmp_path / "override_speculators")
+        monkeypatch.setenv("SPEEDLM_SPECULATORS_REPO", custom)
+        importlib.reload(offline_extract)
+        assert str(offline_extract._DEFAULT_SPECULATORS_REPO) == custom

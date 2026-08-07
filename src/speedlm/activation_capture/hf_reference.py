@@ -170,9 +170,13 @@ fitting the bound to one sample.
 
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
+
+from speedlm.config import speedlm_home
 
 if TYPE_CHECKING:
     # Only executed by static type checkers.  mypy has per-module overrides for
@@ -182,6 +186,26 @@ if TYPE_CHECKING:
     from pathlib import Path
 
     from torch import Tensor
+
+# ---------------------------------------------------------------------------
+# Path helpers
+# ---------------------------------------------------------------------------
+
+
+def _default_vllm_pip_path() -> Path:
+    """Return the pip binary path for the vLLM venv.
+
+    Resolves ``SPEEDLM_E2E_VLLM_PYTHON`` first; falls back to the ``pip``
+    sibling of the vLLM python inferred from :func:`~speedlm.config.speedlm_home`.
+    """
+    python = Path(
+        os.environ.get(
+            "SPEEDLM_E2E_VLLM_PYTHON",
+            str(speedlm_home() / ".preflight" / "venvs" / "vllm" / "bin" / "python"),
+        )
+    )
+    return python.parent / "pip"
+
 
 # ---------------------------------------------------------------------------
 # Tolerance
@@ -916,13 +940,14 @@ def loaded_reference_model(model_dir: str, *, device: str = "cpu") -> Iterator[A
             **load_kwargs,
         )
     except ImportError as error:
+        _vllm_pip = _default_vllm_pip_path()
         raise ReferenceUnavailable(
             f"loading the fp32 reference for {model_dir} failed on a missing "
             f"optional dependency: {error}. The usual candidate is "
             f"`accelerate`, which transformers' mxfp4 quantizer demands before "
             f"it reaches its capability gates "
             f"(quantizer_mxfp4.py:72-76). It can be installed with "
-            f"`/admin/home/ryan.kim/speedlm/.preflight/venvs/vllm/bin/pip "
+            f"`{_vllm_pip} "
             f"install accelerate`, but do NOT expect that to be sufficient or "
             f"even the right fix: with `kernels` absent the quantizer then just "
             f"defaults to dequantizing to bf16 anyway, i.e. it reaches the "

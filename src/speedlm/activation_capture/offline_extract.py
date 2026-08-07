@@ -19,11 +19,13 @@ import time
 from pathlib import Path
 from typing import Any
 
+from speedlm.config import speedlm_home
+
 #: Default path to the vLLM venv Python.
 _DEFAULT_VLLM_PYTHON = Path(
     os.environ.get(
         "SPEEDLM_E2E_VLLM_PYTHON",
-        "/admin/home/ryan.kim/speedlm/.preflight/venvs/vllm/bin/python",
+        str(speedlm_home() / ".preflight" / "venvs" / "vllm" / "bin" / "python"),
     )
 )
 
@@ -31,7 +33,7 @@ _DEFAULT_VLLM_PYTHON = Path(
 _DEFAULT_SPECULATORS_REPO = Path(
     os.environ.get(
         "SPEEDLM_SPECULATORS_REPO",
-        "/admin/home/ryan.kim/speedlm/.preflight/speculators",
+        str(speedlm_home() / ".preflight" / "speculators"),
     )
 )
 
