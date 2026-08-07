@@ -203,6 +203,58 @@ class SamplingConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkloadConfig:
+    """What kind of traffic this deployment expects to capture and tune on.
+
+    SpeedLM's premise is that it learns from *your* traffic, but every default
+    in the tuning section was chosen against one corpus: single-turn,
+    user-only, tool-free chat with a median prompt around 117 tokens.  Nothing
+    recorded that.  A deployment serving agentic tool dispatch or long-context
+    retrieval inherits those defaults silently and degrades in ways that read
+    as drafter quality rather than as a corpus mismatch.
+
+    This section makes the assumption explicit.  ``domain`` is a free-text
+    label that is recorded and never interpreted -- it exists so a run
+    artifact says what it trained on.  The ``expect_*`` fields are operator
+    *claims* about the traffic; ``None`` means "not declared, infer from the
+    measurement" and is the default, because a wrong default claim is worse
+    than no claim.  A declared claim that the measured corpus contradicts is
+    reported by :mod:`speedlm.workload`.
+    """
+
+    #: Free-text traffic label, recorded into every cycle. Never interpreted.
+    domain: str = ""
+    #: Whether requests are expected to offer tool schemas.
+    expect_tools: bool | None = None
+    #: Whether requests are expected to carry conversation history.
+    expect_multi_turn: bool | None = None
+    #: Whether requests are expected to carry a system prompt.
+    expect_system_prompts: bool | None = None
+    #: Whether requests are expected to carry assistant turns this deployment
+    #: did not generate. These cannot be supervised, so the training path
+    #: drops the whole row; declaring them says the loss is expected.
+    expect_client_supplied_assistant_turns: bool | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.domain, str):
+            raise ConfigError(
+                f"workload.domain must be a string, got {type(self.domain).__name__!r}"
+            )
+        for name in (
+            "expect_tools",
+            "expect_multi_turn",
+            "expect_system_prompts",
+            "expect_client_supplied_assistant_turns",
+        ):
+            value = getattr(self, name)
+            if value is not None and not isinstance(value, bool):
+                raise ConfigError(
+                    f"workload.{name} must be a bool or null, got "
+                    f"{type(value).__name__!r}"
+                )
+
+
+@dataclass(frozen=True, slots=True)
 class TargetConfig:
     host: str = "127.0.0.1"
     port: int = 8000
@@ -1157,6 +1209,7 @@ class SpeedLMConfig:
     promotion: PromotionConfig = field(default_factory=PromotionConfig)
     tuning: IdleTuningConfig = field(default_factory=IdleTuningConfig)
     sampling: SamplingConfig = field(default_factory=SamplingConfig)
+    workload: WorkloadConfig = field(default_factory=WorkloadConfig)
     idle_threshold_seconds: float = 300.0
     startup_timeout_seconds: float = field(default_factory=startup_timeout_seconds)
     startup_stall_seconds: float = field(default_factory=startup_stall_seconds)
@@ -1338,6 +1391,15 @@ class SpeedLMConfig:
             "top_p": self.sampling.top_p,
             "seed": self.sampling.seed,
         }
+        result["workload"] = {
+            "domain": self.workload.domain,
+            "expect_tools": self.workload.expect_tools,
+            "expect_multi_turn": self.workload.expect_multi_turn,
+            "expect_system_prompts": self.workload.expect_system_prompts,
+            "expect_client_supplied_assistant_turns": (
+                self.workload.expect_client_supplied_assistant_turns
+            ),
+        }
         return result
 
     @classmethod
@@ -1358,6 +1420,7 @@ class SpeedLMConfig:
             "promotion",
             "tuning",
             "sampling",
+            "workload",
             "idle_threshold_seconds",
             "startup_timeout_seconds",
             "startup_stall_seconds",
@@ -1448,6 +1511,17 @@ class SpeedLMConfig:
             },
         )
         sampling_data = _nested(data, "sampling", {"temperature", "top_p", "seed"})
+        workload_data = _nested(
+            data,
+            "workload",
+            {
+                "domain",
+                "expect_tools",
+                "expect_multi_turn",
+                "expect_system_prompts",
+                "expect_client_supplied_assistant_turns",
+            },
+        )
 
         # Handle nested val_loss_prefilter config.  Shallow-copy to avoid
         # mutating the caller's dict — the _nested() helper returns a reference
@@ -1469,6 +1543,7 @@ class SpeedLMConfig:
             promotion=PromotionConfig(**promotion_data),
             tuning=IdleTuningConfig(**tuning_data),
             sampling=SamplingConfig(**sampling_data),
+            workload=WorkloadConfig(**workload_data),
             idle_threshold_seconds=data.get("idle_threshold_seconds", 300.0),
             startup_timeout_seconds=data.get(
                 "startup_timeout_seconds", startup_timeout_seconds()

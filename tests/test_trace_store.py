@@ -14,7 +14,13 @@ import pytest
 from speedlm.config import TraceBufferConfig
 from speedlm.storage import StorageError, _exclusive_file_lock
 from speedlm.traces.redact import RedactionReport
-from speedlm.traces.store import TraceError, TraceRecord, TraceStats, TraceStore
+from speedlm.traces.store import (
+    TRUNCATED_FINISH_REASONS,
+    TraceError,
+    TraceRecord,
+    TraceStats,
+    TraceStore,
+)
 
 # ── helpers ─────────────────────────────────────────────────────────────────
 
@@ -523,6 +529,258 @@ class TestStoreConcurrency:
         stats = store.stats()
         assert stats.total_dropped == 1
         assert stats.drops_by_reason["lock_timeout"] == 1
+
+
+# ── Corpus shape ───────────────────────────────────────────────────────────
+
+
+def _shaped(
+    rid: str,
+    messages: tuple[dict[str, Any], ...],
+    *,
+    tools: tuple[dict[str, Any], ...] = (),
+    tool_calls: tuple[dict[str, Any], ...] = (),
+    prompt_tokens: int = 100,
+    completion_tokens: int = 50,
+    finish_reason: str | None = None,
+) -> TraceRecord:
+    return TraceRecord(
+        id=rid,
+        timestamp=1.0,
+        model="m1",
+        messages=messages,
+        tool_calls=tool_calls,
+        temperature=0.7,
+        top_p=0.9,
+        seed=42,
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        tools=tools,
+        finish_reason=finish_reason,
+    )
+
+
+_ANSWER = {"role": "assistant", "content": "hello", "provenance_tag": "generated"}
+
+
+class TestCorpusShape:
+    """The shape measurements added so a domain cannot stay implicit."""
+
+    def test_single_turn_chat_corpus_reports_no_shape(self, tmp_path: Path) -> None:
+        """The corpus every default was calibrated on must read as plain."""
+        store = TraceStore(tmp_path / "t.jsonl", redaction_enabled=False)
+        for index in range(3):
+            store.append(
+                _shaped(f"r{index}", ({"role": "user", "content": "hi"}, _ANSWER))
+            )
+        stats = store.stats()
+        assert stats.count == 3
+        assert stats.multi_turn_records == 0
+        assert stats.tool_schema_records == 0
+        assert stats.tool_call_records == 0
+        assert stats.system_prompt_records == 0
+        assert stats.assistant_history_records == 0
+        assert stats.client_supplied_assistant_records == 0
+        assert stats.truncated_completion_records == 0
+        assert stats.training_dropped_records == 0
+
+    def test_multi_turn_counts_non_assistant_turns(self, tmp_path: Path) -> None:
+        store = TraceStore(tmp_path / "t.jsonl", redaction_enabled=False)
+        store.append(
+            _shaped("single", ({"role": "user", "content": "hi"}, _ANSWER))
+        )
+        store.append(
+            _shaped(
+                "multi",
+                (
+                    {"role": "system", "content": "be terse"},
+                    {"role": "user", "content": "hi"},
+                    _ANSWER,
+                ),
+            )
+        )
+        stats = store.stats()
+        assert stats.multi_turn_records == 1
+        assert stats.system_prompt_records == 1
+
+    def test_tool_schemas_and_tool_calls_are_counted_apart(
+        self, tmp_path: Path
+    ) -> None:
+        """Offering tools and using them are different facts about traffic."""
+        store = TraceStore(tmp_path / "t.jsonl", redaction_enabled=False)
+        store.append(
+            _shaped(
+                "offered",
+                ({"role": "user", "content": "hi"}, _ANSWER),
+                tools=({"type": "function", "function": {"name": "search"}},),
+            )
+        )
+        store.append(
+            _shaped(
+                "called",
+                (
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "provenance_tag": "generated",
+                        "tool_calls": [{"id": "c1", "function": {"name": "search"}}],
+                    },
+                ),
+            )
+        )
+        stats = store.stats()
+        assert stats.tool_schema_records == 1
+        assert stats.tool_call_records == 1
+
+    def test_assistant_history_excludes_the_captured_answer(
+        self, tmp_path: Path
+    ) -> None:
+        """The trailing generated answer is the answer, not history."""
+        store = TraceStore(tmp_path / "t.jsonl", redaction_enabled=False)
+        store.append(
+            _shaped("answer-only", ({"role": "user", "content": "hi"}, _ANSWER))
+        )
+        store.append(
+            _shaped(
+                "history",
+                (
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
+                        "content": "earlier",
+                        "provenance_tag": "generated",
+                    },
+                    {"role": "user", "content": "again"},
+                    _ANSWER,
+                ),
+            )
+        )
+        stats = store.stats()
+        assert stats.assistant_history_records == 1
+
+    def test_untagged_assistant_turn_counts_as_client_supplied(
+        self, tmp_path: Path
+    ) -> None:
+        """Absent provenance is not evidence of authorship; it is a drop."""
+        store = TraceStore(tmp_path / "t.jsonl", redaction_enabled=False)
+        store.append(
+            _shaped(
+                "untagged",
+                (
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "replayed"},
+                    {"role": "user", "content": "again"},
+                    _ANSWER,
+                ),
+            )
+        )
+        stats = store.stats()
+        assert stats.client_supplied_assistant_records == 1
+        assert stats.training_dropped_records == 1
+
+    def test_training_dropped_is_the_union_of_the_three_filters(
+        self, tmp_path: Path
+    ) -> None:
+        """Client-supplied, truncated and answerless rows, counted once each."""
+        store = TraceStore(tmp_path / "t.jsonl", redaction_enabled=False)
+        store.append(_shaped("keep", ({"role": "user", "content": "hi"}, _ANSWER)))
+        store.append(
+            _shaped(
+                "client",
+                (
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "theirs"},
+                    _ANSWER,
+                ),
+            )
+        )
+        store.append(
+            _shaped(
+                "truncated",
+                ({"role": "user", "content": "hi"}, _ANSWER),
+                finish_reason="length",
+            )
+        )
+        store.append(_shaped("no-answer", ({"role": "user", "content": "hi"},)))
+        store.append(
+            _shaped(
+                "both",
+                (
+                    {"role": "user", "content": "hi"},
+                    {"role": "assistant", "content": "theirs"},
+                    _ANSWER,
+                ),
+                finish_reason="length",
+            )
+        )
+        stats = store.stats()
+        assert stats.count == 5
+        assert stats.client_supplied_assistant_records == 2
+        assert stats.truncated_completion_records == 2
+        # "both" is dropped once, not twice.
+        assert stats.training_dropped_records == 4
+
+    def test_prompt_percentiles_use_the_prune_token_accounting(
+        self, tmp_path: Path
+    ) -> None:
+        store = TraceStore(tmp_path / "t.jsonl", redaction_enabled=False)
+        for index, prompt in enumerate([10, 20, 30, 40, 1000]):
+            store.append(
+                _shaped(
+                    f"r{index}",
+                    ({"role": "user", "content": "hi"}, _ANSWER),
+                    prompt_tokens=prompt,
+                    completion_tokens=5,
+                )
+            )
+        stats = store.stats()
+        # Nearest rank over [10, 20, 30, 40, 1000].
+        assert stats.prompt_tokens_p50 == 30
+        assert stats.prompt_tokens_p95 == 1000
+        assert stats.prompt_tokens_max == 1000
+        assert stats.completion_tokens_p50 == 5
+        assert stats.completion_tokens_max == 5
+        assert stats.tokens == 10 + 20 + 30 + 40 + 1000 + 25
+
+    def test_untrusted_zero_usage_falls_back_to_the_estimate(
+        self, tmp_path: Path
+    ) -> None:
+        """A zeroed usage block must not report a zero-token prompt."""
+        store = TraceStore(tmp_path / "t.jsonl", redaction_enabled=False)
+        store.append(
+            _shaped(
+                "zeroed",
+                ({"role": "user", "content": "x" * 400}, _ANSWER),
+                prompt_tokens=0,
+                completion_tokens=0,
+            )
+        )
+        stats = store.stats()
+        assert stats.prompt_tokens_p50 is not None
+        assert stats.prompt_tokens_p50 > 50
+        assert stats.prompt_tokens_p50 + stats.completion_tokens_p50 == stats.tokens
+
+    def test_empty_store_reports_no_distribution(self, tmp_path: Path) -> None:
+        stats = TraceStore(tmp_path / "t.jsonl").stats()
+        assert stats.prompt_tokens_p50 is None
+        assert stats.prompt_tokens_p95 is None
+        assert stats.prompt_tokens_max is None
+        assert stats.completion_tokens_p95 is None
+
+    def test_truncated_finish_reasons_match_the_training_filter(self) -> None:
+        """The drop population must be the one the renderer actually drops.
+
+        ``store.TRUNCATED_FINISH_REASONS`` is a deliberate copy of the training
+        backend's set, so that the store does not import a training module.  A
+        copy that drifts would make ``training_dropped_records`` a number about
+        nothing, so the copy is pinned here.
+        """
+        eagle3 = pytest.importorskip(
+            "speedlm.training.backends.eagle3",
+            reason="training backend not importable in this environment",
+        )
+        assert TRUNCATED_FINISH_REASONS == eagle3.TRUNCATED_FINISH_REASONS
 
 
 # ── Missing file behaviour ─────────────────────────────────────────────────

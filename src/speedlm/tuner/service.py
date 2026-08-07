@@ -10,7 +10,7 @@ from pathlib import Path
 from threading import Event, Lock, Thread, current_thread
 from typing import Protocol
 
-from speedlm.config import SpeedLMConfig
+from speedlm.config import SpeedLMConfig, WorkloadConfig
 from speedlm.profiles import ModelProfile, resolve_profile
 from speedlm.storage import atomic_write_json, ensure_layout, resolve_layout
 from speedlm.traces.store import TraceStats
@@ -26,6 +26,7 @@ from speedlm.tuner.orchestrator import (
     TunerOrchestrator,
 )
 from speedlm.tuner.state import TunerStateMachine
+from speedlm.workload import WorkloadAssessment, format_workload_findings
 
 logger = logging.getLogger(__name__)
 
@@ -402,6 +403,20 @@ class TunerService:
         self._thread: Thread | None = None
         self._last_attempted: _TraceWatermark | None = None
         self._last_status_watermark: _TraceWatermark | None = None
+        #: What the corpus of the last attempted cycle actually looked like.
+        #: Deliberately *not* folded into ``_TraceWatermark``: the watermark is
+        #: the scheduler's dedupe key, and widening the key would make two
+        #: buffers that differ only in shape look like two separate cycles'
+        #: worth of work. Shape is recorded alongside it, never used to decide.
+        self._last_status_workload: WorkloadAssessment | None = None
+        #: The declaration and the bounds every finding is measured against.
+        #: Read once at construction: a config change mid-run would otherwise
+        #: silently reinterpret cycles the running orchestrator already built.
+        self._workload_config: WorkloadConfig = getattr(
+            config, "workload", WorkloadConfig()
+        )
+        self._sequence_length = config.tuning.sequence_length
+        self._benchmark_max_tokens = config.tuning.benchmark_max_tokens
         self._last_result: CycleResult | None = None
         self._last_status_result: CycleResult | None = None
         self._last_error: str | None = None
@@ -585,7 +600,8 @@ class TunerService:
             return
 
         try:
-            watermark = _TraceWatermark.from_stats(self._traces.stats())
+            stats = self._traces.stats()
+            watermark = _TraceWatermark.from_stats(stats)
         except Exception as exc:
             logger.exception("idle tuner could not inspect the trace buffer")
             self._record_error(exc)
@@ -600,7 +616,7 @@ class TunerService:
             return
 
         self._idle_streak = 0
-        self._record_attempt(watermark)
+        self._record_attempt(watermark, self._assess_workload(stats))
         try:
             result = self._orchestrator.run_once()
         except Exception as exc:
@@ -790,9 +806,59 @@ class TunerService:
             self._last_error_at = self._wall_clock()
         self._persist_scheduler_status()
 
-    def _record_attempt(self, watermark: _TraceWatermark) -> None:
+    def _assess_workload(self, stats: TraceStats) -> WorkloadAssessment:
+        """Measure the corpus this cycle is about to train on, and say so.
+
+        Findings are reported and recorded; none of them stops the cycle. The
+        reasoning is in :func:`speedlm.workload.evaluate_workload`: a mismatch
+        means the configuration did not anticipate this traffic, not that the
+        cycle's measurement is invalid -- the benchmark gate still scores the
+        candidate against the incumbent on held-out contexts from the same
+        corpus, so a candidate that does not help this traffic is still
+        rejected on evidence. Blocking here would halt tuning on precisely the
+        deployments this work exists to support, and it would do so on a
+        heuristic threshold rather than on a measured regression.
+
+        What it must never do is fail the poll. A shape report that can raise
+        would turn "we could not describe the corpus" into "we did not tune",
+        which is a strictly worse trade than tuning without the description.
+        """
+        try:
+            assessment = WorkloadAssessment.measure(
+                stats,
+                workload=self._workload_config,
+                sequence_length=self._sequence_length,
+                benchmark_max_tokens=self._benchmark_max_tokens,
+            )
+        except Exception:
+            logger.exception("could not measure the trace corpus workload shape")
+            return WorkloadAssessment.measure(
+                TraceStats(count=0, tokens=0, oldest=None, newest=None),
+                workload=self._workload_config,
+                sequence_length=self._sequence_length,
+                benchmark_max_tokens=self._benchmark_max_tokens,
+            )
+        # Named and loud: the whole point is that the domain a cycle trained
+        # on stops being something a reader has to infer.
+        logger.info(
+            "tuning cycle corpus: domain=%s records=%d\n%s",
+            assessment.domain or "(undeclared)",
+            assessment.shape.records,
+            format_workload_findings(assessment.findings),
+        )
+        for finding in assessment.findings:
+            logger.warning("workload mismatch: %s", finding.render())
+        return assessment
+
+    def _record_attempt(
+        self,
+        watermark: _TraceWatermark,
+        workload: WorkloadAssessment | None = None,
+    ) -> None:
         with self._lock:
             self._last_status_watermark = watermark
+            if workload is not None:
+                self._last_status_workload = workload
             self._last_attempt_at = self._wall_clock()
         self._persist_scheduler_status()
 
@@ -847,6 +913,15 @@ class TunerService:
             "last_watermark": (
                 self._last_status_watermark.to_dict()
                 if self._last_status_watermark is not None
+                else None
+            ),
+            # A sibling of ``last_watermark`` rather than a member of it: the
+            # watermark is a dedupe key with an equality contract, and this is
+            # a description. Kept top level so an operator can answer "what was
+            # this draft trained on" without reading a cycle result.
+            "workload": (
+                self._last_status_workload.to_dict()
+                if self._last_status_workload is not None
                 else None
             ),
             "last_result": (

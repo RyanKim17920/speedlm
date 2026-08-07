@@ -19,6 +19,7 @@ from speedlm.config import (
     SpeedLMConfig,
     TargetConfig,
     TraceBufferConfig,
+    WorkloadConfig,
     WrapperConfig,
     classify_divergence_criterion,
     load_config,
@@ -840,6 +841,7 @@ _SENTINELS: dict[str, tuple[type, Any]] = {
     "promotion": (PromotionConfig, 99.0),
     "tuning": (IdleTuningConfig, 999),
     "sampling": (SamplingConfig, 0.5),
+    "workload": (WorkloadConfig, "structural_test_domain"),
 }
 
 _SENTINEL_DEFAULT: dict[str, Any] = {
@@ -890,6 +892,13 @@ _SENTINEL_DEFAULT: dict[str, Any] = {
         },
     },
     "sampling": {"temperature": 0.5, "top_p": 1.0, "seed": 999},
+    "workload": {
+        "domain": "structural_test_domain",
+        "expect_tools": True,
+        "expect_multi_turn": True,
+        "expect_system_prompts": True,
+        "expect_client_supplied_assistant_turns": True,
+    },
 }
 
 
@@ -995,15 +1004,10 @@ def test_to_dict_does_not_emit_ghost_keys() -> None:
     A key in to_dict() that has no matching field means either stale code
     or a field was renamed without updating serialization.
     """
-    section_classes = {
-        "target": TargetConfig,
-        "wrapper": WrapperConfig,
-        "buffer": TraceBufferConfig,
-        "redaction": RedactionConfig,
-        "promotion": PromotionConfig,
-        "tuning": IdleTuningConfig,
-        "sampling": SamplingConfig,
-    }
+    # Derived, not restated: a new config section that is added to _SENTINELS
+    # must be covered by every structural test, and a hand-maintained second
+    # list is exactly how one of them ends up not covering it.
+    section_classes = {name: cls for name, (cls, _) in _SENTINELS.items()}
 
     cfg = SpeedLMConfig(model="structural-test")
     dumped = cfg.to_dict()
@@ -1024,15 +1028,10 @@ def test_unknown_section_keys_are_rejected() -> None:
     This catches the reverse of the 'unreachable field' bug: an allow-list
     key that no longer corresponds to a real field.
     """
-    section_classes = {
-        "target": TargetConfig,
-        "wrapper": WrapperConfig,
-        "buffer": TraceBufferConfig,
-        "redaction": RedactionConfig,
-        "promotion": PromotionConfig,
-        "tuning": IdleTuningConfig,
-        "sampling": SamplingConfig,
-    }
+    # Derived, not restated: a new config section that is added to _SENTINELS
+    # must be covered by every structural test, and a hand-maintained second
+    # list is exactly how one of them ends up not covering it.
+    section_classes = {name: cls for name, (cls, _) in _SENTINELS.items()}
 
     for section, _cls in section_classes.items():
         # Use a sentinel name that is guaranteed not to be a field
@@ -1095,3 +1094,88 @@ def test_val_loss_prefilter_round_trips() -> None:
     restored = SpeedLMConfig.from_dict(dumped)
     assert restored.tuning.val_loss_prefilter.enabled is False
     assert restored.tuning.val_loss_prefilter.min_improvement == 0.03
+
+
+# ---------------------------------------------------------------------------
+# workload
+# ---------------------------------------------------------------------------
+
+
+def test_workload_defaults_declare_nothing() -> None:
+    """An operator who says nothing must not be taken to have claimed anything.
+
+    ``None`` is "not declared, infer from the measurement"; a defaulted
+    ``False`` would be a claim the deployment never made and would produce
+    contradiction findings against traffic nobody described.
+    """
+    workload = SpeedLMConfig(model="m").workload
+    assert workload.domain == ""
+    assert workload.expect_tools is None
+    assert workload.expect_multi_turn is None
+    assert workload.expect_system_prompts is None
+    assert workload.expect_client_supplied_assistant_turns is None
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("domain", "agentic-tool-dispatch"),
+        ("expect_tools", True),
+        ("expect_tools", False),
+        ("expect_multi_turn", True),
+        ("expect_system_prompts", True),
+        ("expect_client_supplied_assistant_turns", True),
+    ],
+)
+def test_workload_fields_load_from_json_and_round_trip(
+    key: str, value: object
+) -> None:
+    """Each field must be settable from JSON and survive to_dict.
+
+    This is the shipped-bug class the structural tests exist for: a field that
+    validates and is documented but was never added to the section allow-list.
+    """
+    cfg = SpeedLMConfig.from_dict({"model": "m", "workload": {key: value}})
+    assert getattr(cfg.workload, key) == value
+    assert cfg.to_dict()["workload"][key] == value
+    assert getattr(SpeedLMConfig.from_dict(cfg.to_dict()).workload, key) == value
+
+
+def test_workload_config_survives_a_file_round_trip(tmp_path: Path) -> None:
+    path = tmp_path / "config.json"
+    save_config(
+        SpeedLMConfig(
+            model="m",
+            workload=WorkloadConfig(domain="retrieval", expect_tools=False),
+        ),
+        path,
+    )
+    loaded = load_config(path)
+    assert loaded.workload.domain == "retrieval"
+    assert loaded.workload.expect_tools is False
+
+
+@pytest.mark.parametrize("value", [1, None, ["chat"]])
+def test_invalid_workload_domain_is_rejected(value: object) -> None:
+    with pytest.raises(ConfigError, match="workload.domain"):
+        WorkloadConfig(domain=value)
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "expect_tools",
+        "expect_multi_turn",
+        "expect_system_prompts",
+        "expect_client_supplied_assistant_turns",
+    ],
+)
+@pytest.mark.parametrize("value", ["yes", 1, 0])
+def test_invalid_workload_expectation_is_rejected(key: str, value: object) -> None:
+    with pytest.raises(ConfigError, match=f"workload.{key}"):
+        WorkloadConfig(**{key: value})
+
+
+def test_unknown_workload_key_is_rejected() -> None:
+    with pytest.raises(ConfigError, match="unknown keys in workload"):
+        SpeedLMConfig.from_dict({"model": "m", "workload": {"expect_rag": True}})

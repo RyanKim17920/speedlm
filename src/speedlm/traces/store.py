@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import re
 import time
 from collections import Counter
 from collections.abc import Iterable, Iterator, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Protocol
@@ -26,6 +27,14 @@ logger = logging.getLogger(__name__)
 
 _REDACTION_PLACEHOLDER_RE = re.compile(r"<REDACTED:([a-z0-9_]+)>")
 _PROVENANCE_TAGS = {"generated", "client_supplied"}
+
+#: ``finish_reason`` values that mean the completion was cut off rather than
+#: finished.  Mirrors ``speedlm.training.backends.eagle3.TRUNCATED_FINISH_REASONS``
+#: -- restated here rather than imported because the trace store must not
+#: depend on a training backend, and checked by
+#: ``tests/test_trace_store.py::test_truncated_finish_reasons_match_the_training_filter``
+#: so the two cannot drift apart unnoticed.
+TRUNCATED_FINISH_REASONS = frozenset({"length", "incomplete"})
 DROP_REASONS = (
     "lock_timeout",
     "capture_error",
@@ -332,6 +341,50 @@ class TraceStats:
     )
     truncated_at_line: int | None = None
 
+    # ── Corpus shape ────────────────────────────────────────────────────────
+    #
+    # Everything below describes *what kind of traffic* the buffer holds, as
+    # opposed to how much of it there is.  SpeedLM trains on whatever the
+    # gateway captured, and until these existed the shape of that traffic was
+    # an assumption nothing measured: a corpus of single-turn, tool-free,
+    # system-prompt-free chat and a corpus of agentic tool dispatch produced
+    # identical statistics.  Each counter is a record count out of ``count``.
+
+    #: Records carrying more than one non-assistant turn.
+    multi_turn_records: int = 0
+    #: Records offering a non-empty ``tools`` array (tool schemas in-prompt).
+    tool_schema_records: int = 0
+    #: Records where an assistant turn actually produced tool calls.
+    tool_call_records: int = 0
+    #: Records containing a ``system``-role message.
+    system_prompt_records: int = 0
+    #: Records carrying at least one assistant message in the *input* history,
+    #: i.e. before the final provider-authored answer.  This is conversation
+    #: history, as opposed to the single answer every capture ends with.
+    assistant_history_records: int = 0
+    #: Records carrying at least one assistant message that is not tagged
+    #: exactly ``"generated"``.  An absent tag counts here: see
+    #: :class:`TraceRecord`.
+    client_supplied_assistant_records: int = 0
+    #: Records whose completion was cut off (``finish_reason`` truncated).
+    truncated_completion_records: int = 0
+    #: The exact population the training path discards.  The Speculators
+    #: renderer drops a row when it carries a client-supplied assistant turn
+    #: (unsupervisable), when the completion was truncated (wrong
+    #: supervision), or when it has no assistant turn at all (nothing to
+    #: supervise).  This is the union of those three, so an operator can read
+    #: "how much of what was captured can never be trained on" as one number.
+    training_dropped_records: int = 0
+    #: Prompt-token distribution, nearest-rank percentiles over the same token
+    #: accounting the prune budget uses.  ``None`` on an empty buffer.
+    prompt_tokens_p50: int | None = None
+    prompt_tokens_p95: int | None = None
+    prompt_tokens_max: int | None = None
+    #: Completion-token distribution, same accounting.
+    completion_tokens_p50: int | None = None
+    completion_tokens_p95: int | None = None
+    completion_tokens_max: int | None = None
+
     def __post_init__(self) -> None:
         object.__setattr__(
             self,
@@ -614,10 +667,22 @@ class TraceStore:
         oldest: float | None = None
         newest: float | None = None
         truncated_at_line: int | None = None
+        # Corpus shape, measured in the same pass: a second pass would mean a
+        # second deserialization of the whole buffer on every scheduler poll.
+        shape_counts: Counter[str] = Counter()
+        prompt_token_samples: list[int] = []
+        completion_token_samples: list[int] = []
         try:
             for rec in self.iter_records():
                 count += 1
-                record_tokens = _accounting_tokens(rec)
+                prompt_tokens, completion_tokens = _accounting_token_split(rec)
+                record_tokens = prompt_tokens + completion_tokens
+                prompt_token_samples.append(prompt_tokens)
+                completion_token_samples.append(completion_tokens)
+                record_shape = _record_shape(rec)
+                for shape_field in fields(record_shape):
+                    if getattr(record_shape, shape_field.name):
+                        shape_counts[shape_field.name] += 1
                 tokens += record_tokens
                 if rec.token_count_source == "measured" and rec.total_tokens is not None:
                     measured_tokens += record_tokens
@@ -642,7 +707,25 @@ class TraceStore:
             if truncated_at_line is None:
                 raise
         drops_by_reason = self._read_drop_counts()
+        prompt_token_samples.sort()
+        completion_token_samples.sort()
         return TraceStats(
+            multi_turn_records=shape_counts["multi_turn"],
+            tool_schema_records=shape_counts["tool_schemas"],
+            tool_call_records=shape_counts["tool_calls"],
+            system_prompt_records=shape_counts["system_prompt"],
+            assistant_history_records=shape_counts["assistant_history"],
+            client_supplied_assistant_records=shape_counts["client_supplied_assistant"],
+            truncated_completion_records=shape_counts["truncated_completion"],
+            training_dropped_records=shape_counts["training_dropped"],
+            prompt_tokens_p50=_nearest_rank(prompt_token_samples, 0.50),
+            prompt_tokens_p95=_nearest_rank(prompt_token_samples, 0.95),
+            prompt_tokens_max=prompt_token_samples[-1] if prompt_token_samples else None,
+            completion_tokens_p50=_nearest_rank(completion_token_samples, 0.50),
+            completion_tokens_p95=_nearest_rank(completion_token_samples, 0.95),
+            completion_tokens_max=(
+                completion_token_samples[-1] if completion_token_samples else None
+            ),
             count=count,
             tokens=tokens,
             oldest=oldest,
@@ -733,17 +816,120 @@ class TraceStore:
             return dropped
 
 
-def _accounting_tokens(record: TraceRecord) -> int:
-    """Return the token cost the prune budget charges *record*.
+def _accounting_token_split(record: TraceRecord) -> tuple[int, int]:
+    """Return the ``(prompt, completion)`` token cost charged to *record*.
 
     A reported total of zero is never trusted as a measurement: an upstream
     that answers ``usage: {"prompt_tokens": 0, "completion_tokens": 0}``
     alongside megabytes of message text would otherwise sit in the buffer at
     zero cost and defeat the token ceiling entirely. Zero and missing counts
     both fall back to the estimate.
+
+    The split exists so the corpus-shape percentiles and the prune budget read
+    the *same* accounting; a second, independent notion of "how many tokens is
+    this prompt" is exactly how a shape report ends up contradicting the
+    buffer it describes.
     """
     total = record.total_tokens
     if total is not None and total > 0:
-        return total
-    prompt_tokens, completion_tokens = estimate_message_tokens(list(record.messages))
+        # total_tokens is not None only when both counts are ints.
+        return int(record.prompt_tokens or 0), int(record.completion_tokens or 0)
+    return estimate_message_tokens(list(record.messages))
+
+
+def _accounting_tokens(record: TraceRecord) -> int:
+    """Return the token cost the prune budget charges *record*."""
+    prompt_tokens, completion_tokens = _accounting_token_split(record)
     return prompt_tokens + completion_tokens
+
+
+def _nearest_rank(values: list[int], quantile: float) -> int | None:
+    """Nearest-rank percentile of an already-sorted *values*.
+
+    Nearest-rank (rather than an interpolating definition) because every
+    consumer of these numbers compares them against an integer configuration
+    bound: an interpolated p95 of 16 383.5 against a 16 384-token sequence
+    length answers a question nobody asked. ``None`` for an empty sample.
+    """
+    if not values:
+        return None
+    index = math.ceil(quantile * len(values)) - 1
+    return values[max(0, min(index, len(values) - 1))]
+
+
+def _is_truncated_completion(record: TraceRecord) -> bool:
+    """Whether *record*'s completion was cut off rather than finished."""
+    value = record.finish_reason
+    return isinstance(value, str) and value.strip().lower() in TRUNCATED_FINISH_REASONS
+
+
+@dataclass(frozen=True, slots=True)
+class _RecordShape:
+    """What one record contributes to the corpus-shape counters."""
+
+    multi_turn: bool
+    tool_schemas: bool
+    tool_calls: bool
+    system_prompt: bool
+    assistant_history: bool
+    client_supplied_assistant: bool
+    truncated_completion: bool
+    training_dropped: bool
+
+
+def _record_shape(record: TraceRecord) -> _RecordShape:
+    """Classify one record's traffic shape in a single scan of its messages.
+
+    The "input history" boundary is drawn exactly where
+    :meth:`speedlm.gate.suite.FrozenContext._input_messages` draws it -- at the
+    last provider-authored assistant message -- so "conversation history"
+    means the same thing here as it does at replay. Anything at or after that
+    message is the captured answer, not history.
+    """
+    messages = record.messages
+    answer_index: int | None = None
+    for index in range(len(messages) - 1, -1, -1):
+        message = messages[index]
+        if (
+            message.get("role") == "assistant"
+            and message.get("provenance_tag") == "generated"
+        ):
+            answer_index = index
+            break
+
+    non_assistant_turns = 0
+    system_prompt = False
+    assistant_history = False
+    client_supplied_assistant = False
+    assistant_turns = 0
+    tool_calls = bool(record.tool_calls)
+    for index, message in enumerate(messages):
+        role = message.get("role")
+        if role == "assistant":
+            assistant_turns += 1
+            if answer_index is None or index < answer_index:
+                assistant_history = True
+            if message.get("provenance_tag") != "generated":
+                client_supplied_assistant = True
+            if message.get("tool_calls"):
+                tool_calls = True
+        else:
+            non_assistant_turns += 1
+        if role == "system":
+            system_prompt = True
+
+    truncated = _is_truncated_completion(record)
+    return _RecordShape(
+        multi_turn=non_assistant_turns > 1,
+        tool_schemas=bool(record.tools),
+        tool_calls=tool_calls,
+        system_prompt=system_prompt,
+        assistant_history=assistant_history,
+        client_supplied_assistant=client_supplied_assistant,
+        truncated_completion=truncated,
+        # The three filters the Speculators renderer applies, unioned. See
+        # ``TraceStats.training_dropped_records``.
+        training_dropped=(
+            client_supplied_assistant or truncated or assistant_turns == 0
+        ),
+    )
