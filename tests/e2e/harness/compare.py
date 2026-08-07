@@ -70,12 +70,29 @@ DEFAULT_SIGNIFICANCE_T: Final = 2.0
 #: speculative depths, produces a delta that is real, large, and about nothing
 #: the commit under test did.  Such pairs are reported as ``incomparable``
 #: rather than compared.
-COMPARABILITY_KEYS: Final[tuple[str, ...]] = (
-    "execution_mode",
-    "concurrency",
-    "context_band",
-    "model",
-    "speculative_depth",
+#: Each entry is the set of spellings one dimension may appear under in a
+#: ``CellRecord.config``.  Spellings matter more than they look: the first
+#: version of this tuple asked for ``concurrency``, ``context_band`` and
+#: ``speculative_depth``, none of which :mod:`resultsdb` emits -- it writes
+#: ``request_concurrency``, ``context_length`` and
+#: ``resolved_num_speculative_tokens``.  Three of the five dimensions therefore
+#: matched nothing on either side, compared equal as "both absent", and the
+#: guard waved through exactly the comparisons it existed to refuse.  It was
+#: caught by diffing two real runs whose names differ by their speculative
+#: depth and getting an empty ``incomparable`` list.
+#:
+#: :func:`test_every_comparability_key_is_a_name_resultsdb_emits` pins each
+#: spelling against what the index actually produces, so this cannot rot again.
+COMPARABILITY_KEYS: Final[tuple[tuple[str, ...], ...]] = (
+    ("execution_mode", "engine_execution_mode"),
+    ("request_concurrency", "concurrency"),
+    ("context_length", "context_band"),
+    ("model",),
+    ("resolved_num_speculative_tokens", "speculative_depth"),
+    # Recorded since the workload system landed.  A generic-chat run and an
+    # agentic run measure different traffic, so their deltas are about the
+    # workload and not about the commit.
+    ("workload",),
 )
 
 _MISSING: Final = object()
@@ -356,16 +373,32 @@ def _verdict(
 def config_differences(baseline: CellRecord, candidate: CellRecord) -> tuple[str, ...]:
     """Comparability-relevant config keys on which two cells disagree."""
     differences: list[str] = []
-    for key in COMPARABILITY_KEYS:
-        left: Any = baseline.config.get(key, _MISSING)
-        right: Any = candidate.config.get(key, _MISSING)
+    for spellings in COMPARABILITY_KEYS:
+        left, left_key = _config_value(baseline, spellings)
+        right, right_key = _config_value(candidate, spellings)
         if left is _MISSING and right is _MISSING:
             continue
         if left != right:
+            label = left_key or right_key or spellings[0]
             differences.append(
-                f"{key}: {_render_config_value(left)} -> {_render_config_value(right)}"
+                f"{label}: {_render_config_value(left)} -> {_render_config_value(right)}"
             )
     return tuple(differences)
+
+
+def _config_value(cell: CellRecord, spellings: tuple[str, ...]) -> tuple[Any, str | None]:
+    """First spelling of a dimension present on *cell*, with the name it used.
+
+    Returns ``_MISSING`` when the cell recorded the dimension under none of its
+    spellings.  A dimension recorded on one side and absent on the other is a
+    *difference*, not a match: the run that did not record it may well have
+    used a different value, and treating "unknown" as "same" is how a guard
+    silently stops guarding.
+    """
+    for name in spellings:
+        if name in cell.config:
+            return cell.config[name], name
+    return _MISSING, None
 
 
 def _render_config_value(value: Any) -> str:

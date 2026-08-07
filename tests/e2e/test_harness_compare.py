@@ -13,6 +13,7 @@ from pathlib import Path
 
 import pytest
 
+from tests.e2e.harness import compare
 from tests.e2e.harness.compare import (
     DEFAULT_MATERIALITY_PCT,
     DEFAULT_SIGNIFICANCE_T,
@@ -557,3 +558,104 @@ def test_render_reports_a_provenance_less_run_as_such() -> None:
     text = render_comparison(compare_runs(empty, empty))
     assert "no recorded commit" in text
     assert "(no comparable metrics)" in text
+
+
+# ---------------------------------------------------------------------------
+# The comparability guard must name keys that exist.
+#
+# COMPARABILITY_KEYS originally asked for "concurrency", "context_band" and
+# "speculative_depth".  resultsdb emits "request_concurrency",
+# "context_length" and "resolved_num_speculative_tokens".  Three of the five
+# dimensions therefore matched nothing on either side, compared equal as
+# "both absent", and the guard waved through every comparison it existed to
+# refuse -- including two real config-matrix runs at different speculative
+# depths, which returned an empty `incomparable` list.
+#
+# A guard whose keys do not exist is a check that cannot fail, so it gets a
+# test that pins it to the producer rather than to a restated list.
+# ---------------------------------------------------------------------------
+
+_REAL_RUN_ROOT = Path("/data/ryan.kim/speedlm-runs")
+
+
+@pytest.mark.skipif(not _REAL_RUN_ROOT.is_dir(), reason="no run root on this host")
+def test_every_comparability_key_is_a_name_the_index_actually_emits() -> None:
+    """Pin each dimension's spelling against what resultsdb really produces.
+
+    Checked against the live index rather than a restated list, because a
+    restated list is what went wrong: three of the five original spellings
+    existed nowhere, matched nothing on either side, compared equal as "both
+    absent", and silently disabled the guard.
+    """
+    from tests.e2e.harness import resultsdb
+
+    emitted: set[str] = set()
+    for record in resultsdb.index_runs(_REAL_RUN_ROOT):
+        for cell in record.cells.values():
+            emitted.update(cell.config)
+    assert emitted, "the index produced no cell configuration at all"
+
+    unknown = [
+        spellings
+        for spellings in compare.COMPARABILITY_KEYS
+        # "workload" is recorded only by runs made after the workload system
+        # landed, so it is legitimately absent from a purely historical index.
+        if spellings != ("workload",)
+        and not any(name in emitted for name in spellings)
+    ]
+    assert unknown == [], (
+        "these comparability dimensions are spelled in a way the index never "
+        f"emits, so the guard can never fire for them: {unknown}"
+    )
+
+
+def test_a_dimension_recorded_on_one_side_only_is_a_difference() -> None:
+    """"Unknown" must not compare equal to "same"; that is how a guard dies."""
+    baseline = CellRecord(name="cell", arms={}, config={"execution_mode": "eager"})
+    candidate = CellRecord(
+        name="cell",
+        arms={},
+        config={"execution_mode": "eager", "resolved_num_speculative_tokens": 3},
+    )
+    differences = compare.config_differences(baseline, candidate)
+    assert differences, "a depth recorded on one side only was treated as a match"
+    assert "resolved_num_speculative_tokens" in differences[0]
+
+
+def test_an_alternate_spelling_still_matches_the_same_dimension() -> None:
+    """Old artifacts spell concurrency differently; that is not a difference."""
+    baseline = CellRecord(name="cell", arms={}, config={"request_concurrency": 8})
+    candidate = CellRecord(name="cell", arms={}, config={"request_concurrency": 8})
+    assert compare.config_differences(baseline, candidate) == ()
+    other = CellRecord(name="cell", arms={}, config={"request_concurrency": 32})
+    assert compare.config_differences(baseline, other), "concurrency 8 vs 32 compared equal"
+
+
+def test_differing_workloads_make_two_cells_incomparable() -> None:
+    """Two workloads measure different traffic; the delta is not about the commit."""
+    baseline = CellRecord(name="cell", arms={}, config={"workload": "generic-chat"})
+    candidate = CellRecord(name="cell", arms={}, config={"workload": "agentic-tool-loop"})
+    differences = compare.config_differences(baseline, candidate)
+    assert differences and "workload" in differences[0]
+
+
+@pytest.mark.skipif(not _REAL_RUN_ROOT.is_dir(), reason="no run root on this host")
+def test_two_real_runs_at_different_depths_are_refused() -> None:
+    """The exact pair that exposed the dead guard.
+
+    ``config-matrix-depth3-5c492ab`` ran at speculative depth 3;
+    ``config-matrix-snap-20260806T170445Z`` did not record a depth at all.
+    Comparing them produced a large, real, and entirely uninformative
+    mean-accepted-length "regression" that is an artifact of the depth.
+    """
+    from tests.e2e.harness import resultsdb
+
+    older = _REAL_RUN_ROOT / "config-matrix-snap-20260806T170445Z"
+    depth3 = _REAL_RUN_ROOT / "config-matrix-depth3-5c492ab"
+    if not (older.is_dir() and depth3.is_dir()):
+        pytest.skip("the archived config-matrix runs are not on this host")
+    result = compare.compare_runs(resultsdb.load_run(older), resultsdb.load_run(depth3))
+    assert result.incomparable, (
+        "two runs at different speculative depths compared as if alike; the "
+        "config guard is not firing"
+    )
