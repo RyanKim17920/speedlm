@@ -17,8 +17,15 @@ confirmed against a source or a measurement is labelled **[unverified]**.
 
 ## 1. Summary
 
-`tests/e2e/` holds nine test modules that drive a **real vLLM engine on a real
-GPU**. They are not selected by a marker; they are collected on every single
+`tests/e2e/` holds eleven test modules that drive a **real vLLM engine on a real
+GPU** — the eleven that declare a module-level `pytestmark`. (It was nine at
+`1c8f5c0`; `test_serving_activation_capture_overhead.py` and
+`test_inference_configuration_matrix.py` have been added since.) Alongside them
+sit six GPU-free modules — `test_harness_workloads.py`,
+`test_harness_preflight.py`, `test_harness_compare.py`,
+`test_harness_regression.py`, `test_harness_resultsdb.py` and
+`test_harness_cli.py` — which cover the benchmarking harness described in
+Section 10 and start no engine. The eleven are not selected by a marker; they are collected on every single
 `pytest` run and skip themselves at runtime unless an environment variable opts
 them in. Three things must line up or the run is wasted:
 
@@ -181,7 +188,7 @@ Each of these has cost real time. All six were re-verified against the sources.
 ### 5.1 Module-level `pytest.importorskip` makes a file collect as ZERO tests
 
 **Confirmed, and already fixed** in `tests/e2e/` — no module there uses
-`importorskip` any more; all nine declare `pytestmark`. The pattern is
+`importorskip` any more; all eleven GPU modules declare `pytestmark`. The pattern is
 documented in-tree at `test_serving_draft_hot_swap.py:66-69` ("a module-level
 `importorskip` would make the whole file collect as zero tests on any
 interpreter without torch — a silent pass, not a skip") and
@@ -193,7 +200,8 @@ The fix is a module-level `pytestmark` list combining the marker with a
 
 `pyproject.toml:53-64` records why `-ra` exists at all: this exact failure mode.
 `importorskip` **inside a function body** is fine and still used
-(`tests/test_draft_swap.py:1910`, `tests/test_training_rows.py:1509,1518`) —
+(`tests/test_draft_swap.py:1910`, `tests/test_training_rows.py:1509,1518`,
+`tests/e2e/test_harness_preflight.py:310`) —
 function scope does not abort collection.
 
 ### 5.2 The served model id is the resolved snapshot path, not the repo id
@@ -589,3 +597,312 @@ distribution, reusing the e2e corpus loader when importable (`:7-16`).
 Use the simulation for orchestration, state-machine, gate-reason and
 promotion-arithmetic changes. Use a GPU e2e run for anything that claims a
 speedup, an acceptance rate, or correct behaviour of the vLLM integration.
+
+---
+
+## 10. `speedbench` — the operator surface
+
+**Status of this section:** read out of sources in the working tree at the time
+of writing. The code it describes — `tests/e2e/harness/`, `scripts/speedbench`,
+`scripts/build_workload.py` and the rewritten config matrix — is **not yet
+committed**, so unlike the rest of this document its line anchors are not pinned
+to a commit and will move. Nothing in it has been exercised by a GPU run yet;
+the harness modules it describes are covered by the six GPU-free
+`test_harness_*.py` modules only. Treat every behavioural claim below as "this
+is what the code does", not "this is what a run showed".
+
+`scripts/speedbench` is a single CLI over the whole cycle: pick a workload,
+validate the launch, submit it, index what came back, compare two runs, and
+track a metric across commits. It adds the repo root to `sys.path`
+(`scripts/speedbench:40-42`) and imports the harness modules directly
+(`:44-49`), so it runs under the project `.venv` and needs no torch.
+`DEFAULT_RUN_ROOT` is `/data/ryan.kim/speedlm-runs` (`:51`) and `LAUNCHER` is
+`scripts/make_snapshot_run.sh` (`:52`).
+
+### 10.1 The seven subcommands
+
+Parser at `scripts/speedbench:875-933`, dispatch at `main()` `:936`. Every
+subcommand's exit code is load-bearing — each one exits non-zero on the failure
+it exists to detect, so they compose in a shell script without parsing stdout.
+
+| command | handler | what it does | exits non-zero when |
+|---|---|---|---|
+| `workloads` | `cmd_workloads` `:195` (parser `:882`) | lists the declarative workloads and re-verifies each against the corpus on disk | any workload fails verification (`:236`) |
+| `preflight` | `cmd_preflight` `:435` (`:889`) | runs the launch-validation checks against the argv you are about to submit | any ERROR finding (`:439`) |
+| `launch` | `cmd_launch` `:458` (`:894`) | preflights, then invokes `make_snapshot_run.sh` | preflight refused and the override flag was absent (`:464-471`) |
+| `index` | `cmd_index` `:539` (`:906`) | walks the run root and builds the results index | the index is stale, or zero runs were found (`:589-592`) |
+| `compare` | `cmd_compare` `:654` (`:913`) | paired comparison of two runs, per cell / arm / metric | any metric returns `PROVEN_REGRESSION` (`:705`) |
+| `regress` | `cmd_regress` `:711` (`:920`) | tracks one metric across commit-ordered history | any step is a proven regression (`:772`) |
+| `show` | `cmd_show` `:778` (`:928`) | prints one run's cells, arms and metrics | the run parsed to nothing (`:856`) |
+
+`index` deserves a note: an empty root is not an empty history, it is a wrong
+`--root`, and the code says so inline (`:586-591`) — reporting "0 runs, all
+fine" with exit 0 is exactly the silent green this CLI exists to refuse.
+
+Two selectors are shared by `compare` and `regress`: `resolve_selector`
+(`:616`) and `pair_runs` (`:629`). Two run ids give exactly one pair;
+two commits give the latest run per flavor on each side and compare only the
+flavors present on **both** — the intersection, never a best-effort union.
+
+### 10.2 Adding a workload without touching test code
+
+A workload is a JSON manifest in `tests/e2e/harness/workload_specs/`
+(`workloads.spec_directory()` `tests/e2e/harness/workloads.py:410`), discovered
+by filename (`available_workloads()` `:414`). The config matrix selects one by
+name through `SPEEDLM_E2E_WORKLOAD`
+(`tests/e2e/test_inference_configuration_matrix.py:189-194`, default
+`generic-chat` at `:96`). Adding a workload therefore means adding a manifest
+and a corpus; no test module changes.
+
+The manifest is **not** hand-written. `scripts/build_workload.py` materializes
+the corpus into `/data/ryan.kim/speedlm-workloads/<name>/records.jsonl` and
+emits the manifest from the materialized records (`emit_manifest` `:809-880`).
+The declared statistics come from `recompute_characteristics`
+(`workloads.py:551-612`) — the *same* function the verifier uses — so a
+hand-typed number cannot enter the manifest at all. `min_max_model_len` is
+derived, not chosen: `round_up(longest_prompt_tokens + output_reserve, 512)`
+(`build_workload.py:861`, reserve default 2048 at `:906`). The builder refuses
+to write a manifest when a builder produced no records (`:948-950`).
+
+So the loop is:
+
+1. Add a builder function and register it in `WORKLOADS`
+   (`scripts/build_workload.py:887`).
+2. Run the builder. It writes `records.jsonl` plus the manifest, with source
+   digest, tolerance, provenance, `builder_sha256` and `token_basis`
+   (`:847-869`).
+3. `speedbench workloads` — this re-runs `verify_workload`
+   (`workloads.py:637-767`), which re-derives every declared count, percentile
+   and fraction from the corpus, re-checks the source `sha256` and
+   `size_bytes`, re-checks per-record `prompt_chars`, and re-checks that
+   `min_max_model_len` still covers `max(prompt_tokens) + output_reserve`
+   (`:753-763`). Failures are collected and raised together
+   (`WorkloadVerificationError` `:133-146`), not one at a time.
+4. `SPEEDLM_E2E_WORKLOAD=<name>` on the run.
+
+Two refusals worth knowing before you write a builder. `load_spec` refuses a
+manifest whose `name` disagrees with its filename (`:477-480`) and whose
+`schema_version` is not `SCHEMA_VERSION = 1` (`:91`, checked `:432-437`). And
+band bounds must land exactly on `PERCENTILE_KEYS` (`:99-111`) for the config
+matrix, because `_percentile_key`
+(`tests/e2e/test_inference_configuration_matrix.py:343`) needs the declared
+token window at the band's own quantiles to validate what the server actually
+received.
+
+Bands themselves are declared quantile windows over `band_metric` (default
+`prompt_chars`, `workloads.py:278-280`); the shipped defaults are
+`short [0.05, 0.25]`, `medium [0.40, 0.60]`, `long [0.75, 0.95]`
+(`scripts/build_workload.py:117-121`). `band_window` (`workloads.py:788`) slices
+the length-sorted corpus and de-duplicates byte-identical prompts;
+`band_records` (`:818`) draws `count` distinct records from that window with an
+RNG seeded on `(name, version, band, count, spec.seed)` (`:837-843`), so the
+draw is reproducible across runs but is not the corpus's extremes. If the
+window cannot supply `count` distinct records it raises `BandExhaustedError`
+(`:149-162`, raised `:836`) rather than returning a short band.
+
+### 10.3 The preflight gate, and when `--skip-preflight` is legitimate
+
+Preflight answers one question from the argv alone: *could this allocation have
+produced a measurement?* The rationale is written at
+`scripts/make_snapshot_run.sh:585-597` and names the allocations that motivated
+it — a flavor whose vLLM args were silently dropped and OOMed four minutes in,
+an in-test deadline shorter than the wall clock, and a gate variable that was
+not exactly `"1"` and consumed a whole allocation while reporting success.
+
+The checks are `_CHECKS` (`tests/e2e/harness/preflight.py:774`), run in
+order by `preflight()` (`:789`). Only `Severity.ERROR` blocks (`:66`, `:74`;
+`Finding.blocking` `:87`); warnings print and proceed. `render_findings`
+(`:815`) prints errors first and ends with `DO NOT LAUNCH` or `launch is OK`.
+
+| # | check | site | severity |
+|---|---|---|---|
+| 1 | `--vllm-args` given to a flavor that never reads it | `_check_vllm_args_consumed` `:492` | ERROR |
+| 2 | a flavor's required options missing or empty | `_check_required_options` `:507` | ERROR |
+| 3 | no `--max-model-len` / `--gpu-memory-utilization` reaching an unbounded-defaulting test | `_check_memory_bounds` `:522` | ERROR |
+| 4 | Qwen3.5/GDN model without `--gdn-prefill-backend triton` | `_check_gdn_prefill_backend` `:555` | WARNING |
+| 5 | `--max-model-len` below the workload's `min_max_model_len` | `_check_workload_compatibility` `:627` | ERROR |
+| 6 | in-test timeout at or beyond the allocation, or wasting >30 min of paid wall clock | `_check_timeouts` `:680` | WARNING / ERROR |
+| 7 | gate variable not exactly `"1"`, or a result-relaxing switch set | `_check_silent_green` `:711` | ERROR |
+| 8 | commit does not exist; working tree dirty in a path the flavor executes | `_check_provenance` `:748` | ERROR / WARNING |
+
+Check 1 is the silent-OOM bug made decidable. `model-matrix` declares
+`consumes_vllm_args=False` (`:276`) because the test builds its own argv, so a
+`--vllm-args` on that flavor produced a job.sbatch byte-identical to one without
+it. `config-matrix` declares the same (`:325`) for the same reason —
+`_engine_argv()` builds each cell's argv itself. The flavor table
+(`FLAVORS` `:152-333`) is not a hand-maintained copy of the
+launcher: `launcher_flavors()` (`:435`) parses the launcher's own
+`case "$flavor" in` block, so the table cannot rot silently.
+
+**Where the gate actually sits.** The launcher runs it, not you:
+`make_snapshot_run.sh:599-615` rebuilds `preflight_argv` from the *original*
+argv minus `--skip-preflight` (`:603-606`) — deliberately, so the gate sees what
+the operator typed rather than a second hand-maintained copy — and on refusal
+prints `nothing was submitted` and `exit 2` (`:609-611`). That exit happens
+before `mkdir -p "$run_dir/results"` at `:680`, so a refused launch leaves **no
+run directory** behind: there is no half-run to mistake for a result later.
+
+`speedbench launch` therefore always appends `--skip-preflight` to the launcher
+command (`scripts/speedbench:454`, reason at `:452-453`): it has already run
+preflight itself, and running it twice would double every warning. That is the
+one automatic use of the flag and it is not a bypass.
+
+**When passing `--skip-preflight` yourself is legitimate:**
+
+- You are driving the launcher from something that already ran
+  `speedbench preflight` on the same argv — the `speedbench launch` case above.
+- You are deliberately launching a configuration preflight cannot model, and you
+  have read the two `WARNING:` lines it prints (`:600-601`) that say the launch
+  was not validated and that nothing has checked it can measure anything.
+
+**When it is not:** to get past an ERROR you do not want to fix. For that case
+`speedbench launch` has a separate flag,
+`--launch-anyway-despite-preflight-errors` (`scripts/speedbench:56`), named that
+way on purpose (`:54-55`); it refuses without it (`:464-471`) and prints a loud
+warning with it (`:473-483`). An ERROR is a prediction that the allocation
+cannot produce a measurement, so overriding it usually costs the GPU hours it
+was trying to save.
+
+### 10.4 Reading a comparison
+
+**A bare mean is not a finding here.** `format_mean`
+(`scripts/speedbench:103-111`) never prints one; when a standard error does not
+exist the row carries `NO_STANDARD_ERROR_MARKER = "no SE"`
+(`tests/e2e/harness/compare.py:450`) instead of a number. This is the contract
+at `tests/e2e/harness/model.py:167-170`: `delta_standard_error` is
+`float | None` and is **`None` when the sample cannot support one — never
+`0.0`**, so that a consumer dividing by it fails loudly instead of computing
+infinite headroom. The zero-variance case is converted explicitly at
+`compare.py:224-233` and independently at `scripts/speedbench:78-91`, and
+`dispersion_basis` (`model.py:173`) records which of `measured` / `degenerate` /
+`unsampled` produced the absence.
+
+`MetricSeries` (`model.py:49-78`) stores raw observations, never a pre-reduced
+mean; `__post_init__` (`:66-78`) rejects an empty series, rejects a
+`pass_indices` tuple whose length disagrees with `values`, and rejects
+`reduced=True` with anything other than exactly one value. A reduced series is a series that can
+no longer produce an error bar, and it is marked as such rather than silently
+averaged.
+
+Pairing comes before statistics. `pair_observations` (`compare.py:107-147`)
+matches observations by recovered pass index; if the two index *sets* differ it
+raises `MispairedObservations` (`:134-141`) rather than intersecting them,
+because pairing the overlap would shrink the error bar without anyone noticing.
+If either side has no pass indices it falls back to list position, sets
+`positional=True`, and records a note (`:116-130`). Cells whose comparability
+keys disagree (`COMPARABILITY_KEYS` `:73-79`: execution mode, concurrency,
+context band, model, speculative depth) are routed to `incomparable`
+(`config_differences` `:356-368`) instead of being compared.
+
+The verdict ladder is `_verdict` (`compare.py:310-353`), with
+`DEFAULT_MATERIALITY_PCT = 2.0` (`:59`) and `DEFAULT_SIGNIFICANCE_T = 2.0`
+(`:64`). Six members of `ComparisonVerdict` (`model.py:128-151`):
+
+| verdict | meaning | decided at |
+|---|---|---|
+| `PROVEN_FLAT` | the delta is below the materiality threshold **and** the sample was powerful enough that a material shift would have been resolved: `material_delta >= significance_t * standard_error` | `compare.py:336-338` |
+| `MATERIAL_SHIFT_UNRESOLVED` | the delta is at or above materiality but `t < 2.0` — something moved, the sample cannot say it was real | `:347-348` |
+| `PROVEN_REGRESSION` | material, significant, and in the direction the metric's `Direction` calls worse | `:350-353` |
+| `UNRESOLVED` | the comparison could not be made at all: no standard error, no t-statistic, a zero baseline mean, or a small delta that the sample could not have resolved a material shift against either | `:324-345` |
+
+Two further members exist and are not findings: `PROVEN_IMPROVEMENT` (`:352`)
+and `DESCRIPTIVE` (`model.py:151`), returned immediately for
+`Direction.NEUTRAL` metrics (`compare.py:322-323`) — a neutral metric is
+reported, never judged.
+
+The distinction the module exists for is **`PROVEN_FLAT` versus `UNRESOLVED`**.
+Both look like "no change". Only the first one means it. A small delta with a
+large error bar is `UNRESOLVED` with a note saying so (`:339-345`), not a pass.
+And **`UNRESOLVED` specifically covers the zero-variance case**: fewer than two
+observations per arm, or every observation returning an identical value
+(`model.py:145-148`). In that case there is no standard error, so none is
+reported — the field is absent, not `0.0`. An arm that produced the same number
+four times has not proven stability; it has failed to measure dispersion.
+
+`RunComparison` exposes the two lists worth acting on: `regressions` (`:203-207`)
+and `unresolved_shifts` (`:209-215`).
+
+### 10.5 Reading a regression track
+
+`speedbench regress` orders runs by **topology, not timestamp**.
+`GitCommitOrdering._load` (`tests/e2e/harness/regression.py:166-174`) runs
+`git rev-list --topo-order --reverse --all` once and caches the position of
+every sha; `position()` (`:183-188`) resolves short shas through
+`git rev-parse --verify --quiet <c>^{commit}`.
+
+Three honesty properties are worth relying on:
+
+- **Runs with no recorded commit are excluded and named** (`:224-237`), never
+  attributed to HEAD. An unattributable run does not silently become a data
+  point.
+- **Non-ancestor consecutive pairs get a caveat** rather than being compared
+  silently (`:259-265`, `is_ancestor` `:190-191`): two runs on diverging
+  branches are adjacent in topological order without one following from the
+  other. Config drift between adjacent runs gets a caveat too (`:266-274`).
+- **Each step is judged by the same `compare_metric`** (`:275-285`), so history
+  uses the identical verdict ladder as a two-run comparison — there is no
+  second, looser standard for trends.
+
+`summarize_trend` (`:299-325`) returns `TrendStatus.UNTESTABLE` when the slope
+t-statistic does not exist (`:307-316`), `TRENDING` at or above
+`FLAT_TREND_T_STATISTIC` and `FLAT` below (`:317-319`). `UNTESTABLE` is again
+the "we did not measure this" answer, distinct from `FLAT`.
+
+### 10.6 The measurement rules the harness encodes
+
+These cost real GPU time to learn. They are listed here because reading them is
+cheaper than rediscovering them, and because the code below is where they are
+enforced — if you write a new e2e measurement, it has to satisfy the same list.
+
+1. **Arms interleave; they do not run in sequence.** The config matrix reuses
+   the production gate's mirrored-round schedule:
+   `gate_runner._block_schedule("stock", blocks=BLOCKS_PER_DRAFT,
+   repeats=REPEATS_PER_DRAFT)`
+   (`tests/e2e/test_inference_configuration_matrix.py:873-875`;
+   `src/speedlm/gate/runner.py:341`, docstring `:350-359`). A sequential
+   stock-then-candidate schedule confounds the arm with anything that drifts
+   over the allocation — this is exactly what voided
+   `badba71-gptoss-idle` (see `benchmark-evidence.md`).
+2. **The measured block opens on the same engine lifecycle state.** Each block
+   gets a fresh engine process (`_fresh_engine` `:597-639`, one per block at
+   `:890-917`, recorded as `"fresh_process": True` at `:908`) and burns
+   `WARMUP_REPEATS = 1` before the measurement window opens (`:918-929`). Two
+   arms compared across different amounts of accumulated engine state are not
+   compared.
+3. **Always report a standard error, and report its absence as absence.** See
+   §10.4. `format_mean` (`scripts/speedbench:103-111`) has no code path that
+   prints a bare mean.
+4. **The control must be able to fail.** The GPU-free block of the matrix
+   (`test_inference_configuration_matrix.py:1161-1574`) states a concrete
+   MUTATION in each test's docstring (`:1254, 1277, 1307, 1333, 1369, 1411,
+   1455, 1487, 1521, 1541`) and drives the guard red with it. A guard that has
+   never been observed failing is a guard whose behaviour is unknown; this is
+   the repo's recurring defect class.
+5. **Artifacts are written before assertions, so a failing bound does not
+   discard the run.** `band.json` at `:869` before any measurement;
+   `engine-regime.json` at `:903`; per-repeat metrics inside the loop
+   (`:930, :944`); `result.json` at `:984` *before* `_validate_context_band`
+   (`:985`) and `_regression_failures` (`:986`), then rewritten with the verdict
+   at `:993`; `matrix-result.json` rewritten after every cell (`:1153-1156`) so
+   a crash mid-matrix still leaves the completed cells. The final
+   `assert not failures` is last (`:1158`). An assertion that fires before the
+   write turns an expensive allocation into no evidence at all.
+6. **Anti-vacuity guards must prove the thing under test actually happened.**
+   `_band_prompt_defects` (`:301`) asserts the exact prompt count, full
+   distinctness, byte-identical match against the source record, and a
+   repetition-border fraction under `REPETITION_BORDER_LIMIT = 0.25`
+   (`:112`, `_border_fraction` `:277`). `_engine_argv` asserts the argv it built
+   matches the cell's declared regime and the profile's speculative depth
+   (`:568-573`). `_request_batch` asserts a `usage` block exists with both token
+   counts above zero (`:672-678`). Each scored repeat asserts
+   `output_tok_per_sec > 0.0` and `accepted_length_available` (`:948-951`).
+   `_validate_context_band` (`:809`) proves the prompts the server actually saw
+   fall in the declared band window. Without these, a green run is compatible
+   with the engine having speculated nothing.
+7. **Refuse before spending, not after.** `workloads.preflight_refusals`
+   (`tests/e2e/harness/workloads.py:950-977`) refuses a workload whose
+   `min_max_model_len` exceeds the engine's `--max-model-len`, or that needs
+   tool support the cell does not have, and the matrix asserts that refusal
+   before the GPU is touched (`test_inference_configuration_matrix.py:1046-1053`).
+   Truncating the workload to fit would have produced a number, and the number
+   would have been of a different workload.
