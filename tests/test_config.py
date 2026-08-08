@@ -770,6 +770,51 @@ def test_invalid_warmup_repeats_is_rejected(value: object) -> None:
         IdleTuningConfig(warmup_repeats=value)
 
 
+# ---------------------------------------------------------------------------
+# The untagged-assistant opt-in
+# ---------------------------------------------------------------------------
+
+
+def test_trust_untagged_assistant_messages_is_settable_and_round_trips() -> None:
+    """``speedlm.workload`` prints advice naming this key.
+
+    Before it existed here, ``from_dict`` answered that advice with
+    ``unknown keys in tuning: trust_untagged_assistant_messages``, so the only
+    documented remedy for a replayed offline corpus could not be applied.
+    """
+    config = SpeedLMConfig.from_dict(
+        {"model": "m", "tuning": {"trust_untagged_assistant_messages": True}}
+    )
+
+    assert config.tuning.trust_untagged_assistant_messages is True
+    assert config.to_dict()["tuning"]["trust_untagged_assistant_messages"] is True
+    assert (
+        SpeedLMConfig.from_dict(
+            config.to_dict()
+        ).tuning.trust_untagged_assistant_messages
+        is True
+    )
+
+
+def test_an_archived_config_without_the_key_is_unchanged() -> None:
+    """Off by default: an untagged turn is not evidence of authorship."""
+    archived = {"model": "m", "tuning": {"epochs": 1}}
+
+    config = SpeedLMConfig.from_dict(archived)
+
+    assert config.tuning.trust_untagged_assistant_messages is False
+    assert SpeedLMConfig(model="m").tuning.trust_untagged_assistant_messages is False
+
+
+@pytest.mark.parametrize("value", ["yes", 1, None])
+def test_a_non_bool_untagged_opt_in_is_rejected(value: object) -> None:
+    """``"yes"`` is truthy, and a corpus trained under a typo is unrecoverable."""
+    with pytest.raises(ConfigError, match="trust_untagged_assistant_messages"):
+        SpeedLMConfig.from_dict(
+            {"model": "m", "tuning": {"trust_untagged_assistant_messages": value}}
+        )
+
+
 def test_benchmark_repeats_is_unbounded_above_for_characterisation_runs() -> None:
     """The diagnostic mode is a config value, not a separate code path.
 
@@ -886,6 +931,7 @@ _SENTINEL_DEFAULT: dict[str, Any] = {
         "shutdown_timeout_seconds": 0.001,
         "restore_fast_path_timeout_seconds": 0.001,
         "draft_hot_swap_enabled": True,
+        "trust_untagged_assistant_messages": True,
         "val_loss_prefilter": {
             "enabled": True,
             "min_improvement": 0.0,

@@ -1069,6 +1069,24 @@ class IdleTuningConfig:
     #: and that the new draft has identical architecture, shapes, and quantization.
     #: Defaults to DISABLED pending GPU validation of cudagraph-pointer stability.
     draft_hot_swap_enabled: bool = False
+    #: Accept assistant turns that carry no ``provenance_tag`` as this
+    #: verifier's own output.
+    #:
+    #: The render stage drops any row carrying an assistant turn it cannot
+    #: attribute to this verifier, because supervising another model's tokens
+    #: teaches the draft head the wrong distribution.  A corpus replayed from
+    #: an offline capture has assistant turns authored elsewhere and therefore
+    #: carries no tag at all, so that filter empties it -- which is what
+    #: :mod:`speedlm.workload` tells the operator to fix with this flag.  It
+    #: was named in that advice, in the backend and in
+    #: :func:`speedlm.training.rows.training_row_from_trace`, and reachable
+    #: from none of them: ``SpeedLMConfig.from_dict`` rejected the key, so the
+    #: advice could not be followed.
+    #:
+    #: Off by default because "predates tagging" is not evidence of
+    #: authorship; see the field of the same name on
+    #: :class:`speedlm.training.backends.eagle3.SpeculatorsPipelineConfig`.
+    trust_untagged_assistant_messages: bool = False
 
     def __post_init__(self) -> None:
         _validate_int_gte(self.min_trace_records, "tuning.min_trace_records", 2)
@@ -1194,6 +1212,11 @@ class IdleTuningConfig:
             raise ConfigError(
                 "tuning.draft_hot_swap_enabled must be a bool, "
                 f"got {type(self.draft_hot_swap_enabled).__name__!r}"
+            )
+        if not isinstance(self.trust_untagged_assistant_messages, bool):
+            raise ConfigError(
+                "tuning.trust_untagged_assistant_messages must be a bool, "
+                f"got {type(self.trust_untagged_assistant_messages).__name__!r}"
             )
 
 
@@ -1381,6 +1404,9 @@ class SpeedLMConfig:
                 self.tuning.restore_fast_path_timeout_seconds
             ),
             "draft_hot_swap_enabled": self.tuning.draft_hot_swap_enabled,
+            "trust_untagged_assistant_messages": (
+                self.tuning.trust_untagged_assistant_messages
+            ),
             "val_loss_prefilter": {
                 "enabled": self.tuning.val_loss_prefilter.enabled,
                 "min_improvement": self.tuning.val_loss_prefilter.min_improvement,
@@ -1507,6 +1533,7 @@ class SpeedLMConfig:
                 "shutdown_timeout_seconds",
                 "restore_fast_path_timeout_seconds",
                 "draft_hot_swap_enabled",
+                "trust_untagged_assistant_messages",
                 "val_loss_prefilter",
             },
         )

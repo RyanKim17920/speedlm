@@ -1014,6 +1014,114 @@ def test_the_two_row_filters_report_their_own_causes(tmp_path: Path) -> None:
     assert counts.dropped_client_supplied == 1
 
 
+def test_the_filter_that_dropped_the_most_rows_owns_the_failure(
+    tmp_path: Path,
+) -> None:
+    """Job 375414's shape: both filters fired, the authorship one did the damage.
+
+    409 rows read, none written, 36 dropped as truncated and 373 as
+    client-supplied -- and the failure raised was the truncation one, purely
+    because it is checked first.  The remedy it printed (raise the serving
+    ``max_tokens`` cap) would have left the corpus exactly as empty.
+    """
+    records: list[Mapping[str, object]] = [_replayed(index) for index in range(8)]
+    truncated = _generated(8)
+    truncated["finish_reason"] = "length"
+    records.append(truncated)
+
+    with pytest.raises(ClientSupervisedCorpusError) as caught:
+        _render(
+            tmp_path, records, policy=TruncatedRowPolicy.DROP, minimum_rows=4
+        )
+
+    message = str(caught.value)
+    assert caught.value.counts.dropped_client_supplied == 8
+    assert caught.value.counts.dropped_truncated == 1
+    assert "trust_untagged_assistant_messages" in message
+    # The subordinate cause is reported, not silently folded into the dominant
+    # one: an operator who fixes only the named cause must be able to see what
+    # is left.
+    assert "1 were truncated" in message
+
+
+def test_truncation_still_owns_a_shortfall_it_dominates(tmp_path: Path) -> None:
+    """The tiebreak must not simply invert the old fixed order.
+
+    Its companion above passes for an implementation that always blames the
+    authorship filter; this one fails for it.
+    """
+    records: list[Mapping[str, object]] = []
+    for index in range(8):
+        row = _generated(index)
+        row["finish_reason"] = "length"
+        records.append(row)
+    records.append(_replayed(8))
+
+    with pytest.raises(TruncationFilteredCorpusError) as caught:
+        _render(
+            tmp_path, records, policy=TruncatedRowPolicy.DROP, minimum_rows=4
+        )
+
+    message = str(caught.value)
+    assert caught.value.counts.dropped_truncated == 8
+    assert caught.value.counts.dropped_client_supplied == 1
+    # Truncation dominates, so the truncation remedy leads -- but the row the
+    # other filter took is named, with the knob that would return it.
+    assert "raise the serving max_tokens cap" in message
+    assert "trust_untagged_assistant_messages" in message
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [TruncationFilteredCorpusError, ClientSupervisedCorpusError],
+)
+def test_every_drop_bucket_is_named_in_the_failure(
+    error_type: type[Eagle3Error],
+) -> None:
+    """The numbers in the message must reconcile against ``read``.
+
+    Job 375414's message accounted for 36 of 409 missing rows and named a
+    remedy for those 36 only.  Reconciliation is what makes that unwritable:
+    a drop bucket added to ``RenderedRowCounts`` without a clause in
+    ``_DROP_BUCKETS`` leaves the message short of ``read`` and fails here.
+    """
+    import dataclasses
+
+    from speedlm.training.backends.eagle3 import _DROP_BUCKETS
+
+    counts = RenderedRowCounts(
+        read=409,
+        written=0,
+        dropped_untrainable=0,
+        dropped_truncated=36,
+        truncated_seen=36,
+        policy=TruncatedRowPolicy.DROP,
+        dropped_client_supplied=373,
+        client_supplied_turns_seen=1_193,
+    )
+    buckets = [
+        field.name
+        for field in dataclasses.fields(RenderedRowCounts)
+        if field.name.startswith("dropped_")
+    ]
+    assert set(buckets) == set(_DROP_BUCKETS), (
+        "a drop bucket without a clause in _DROP_BUCKETS cannot appear in the "
+        "failure message"
+    )
+    assert counts.read == counts.written + sum(
+        getattr(counts, name) for name in buckets
+    )
+
+    message = str(error_type(Path("/corpus.jsonl"), counts, 32))
+
+    for name in buckets:
+        assert f"{getattr(counts, name)} {_DROP_BUCKETS[name]}" in message, (
+            f"{name} is not accounted for in {error_type.__name__}"
+        )
+    assert "409 rows read" in message
+    assert "trust_untagged_assistant_messages" in message
+
+
 def _authorship_renderer(
     tmp_path: Path,
     **config_kwargs: object,

@@ -868,6 +868,12 @@ def create_production_tuner(
         # it adds no memory pressure beyond the requests already in flight.
         max_num_seqs=tuning.extraction_concurrency,
         scratch_quota_bytes=tuning.scratch_quota_bytes,
+        # The render stage's authorship filter has always read this field off
+        # the pipeline, and nothing ever wrote it: the dataclass default was
+        # the only value production could ever have.  ``speedlm.workload``
+        # names the flag in the advice it prints for a replayed offline
+        # corpus, so the line below is what makes that advice followable.
+        trust_untagged_assistant_messages=tuning.trust_untagged_assistant_messages,
     )
     backend = Eagle3Backend.from_speculators(
         pipeline,

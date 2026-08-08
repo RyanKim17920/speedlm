@@ -1681,11 +1681,21 @@ def _compose_tuner(
     monkeypatch: pytest.MonkeyPatch,
     config: SpeedLMConfig,
     profile: ModelProfile,
+    keep_real_pipeline: bool = False,
     **kwargs: Any,
 ) -> tuple[dict[str, Any], _FakeBackend]:
-    """Run ``create_production_tuner`` against inert collaborators."""
+    """Run ``create_production_tuner`` against inert collaborators.
+
+    With *keep_real_pipeline* the genuine ``SpeculatorsPipelineConfig`` is
+    constructed from the keyword arguments composition passes, and the instance
+    handed to ``Eagle3Backend.from_speculators`` is captured under
+    ``backend_pipeline``.  A test that only inspects the captured *kwargs*
+    cannot see a name the dataclass would reject, and the stage that reads the
+    field reads it off that instance.
+    """
     captured: dict[str, Any] = {}
     backend = _FakeBackend()
+    real_pipeline = composition.SpeculatorsPipelineConfig
 
     monkeypatch.setattr(
         composition,
@@ -1709,13 +1719,19 @@ def _compose_tuner(
 
     def build_pipeline(**pipeline_kwargs: object) -> object:
         captured["pipeline"] = pipeline_kwargs
+        if keep_real_pipeline:
+            return real_pipeline(**pipeline_kwargs)  # type: ignore[arg-type]
         return SimpleNamespace(gpu_memory_utilization=0.80)
+
+    def build_backend(pipeline: object, **_kwargs: object) -> object:
+        captured["backend_pipeline"] = pipeline
+        return backend
 
     monkeypatch.setattr(composition, "SpeculatorsPipelineConfig", build_pipeline)
     monkeypatch.setattr(
         composition,
         "Eagle3Backend",
-        SimpleNamespace(from_speculators=lambda _pipeline, **_kwargs: backend),
+        SimpleNamespace(from_speculators=build_backend),
     )
     monkeypatch.setattr(
         composition, "RuntimeController", lambda **_kwargs: object()
@@ -1766,6 +1782,51 @@ def test_the_training_window_is_the_lower_of_the_two_caps(
     captured, _backend = _compose_tuner(tmp_path, monkeypatch, config, profile)
 
     assert captured["pipeline"]["sequence_length"] == 4_096
+
+
+def test_the_untagged_opt_in_reaches_the_pipeline_the_backend_renders_with(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """JSON to the render stage, in one hop per link.
+
+    The flag was referenced nine times in the backend, named in the advice
+    ``speedlm.workload`` prints, and absent from ``SpeedLMConfig`` -- so setting
+    it raised ``unknown keys in tuning`` and leaving it unset was the only
+    reachable state.  Asserting on the pipeline instance rather than on the
+    parsed config is the point: the render stage reads
+    ``self.config.trust_untagged_assistant_messages`` off exactly this object.
+    """
+    from speedlm.training.backends.eagle3 import SpeculatorsPipelineConfig
+
+    profile = _profile()
+    dumped = _config(tmp_path, profile).to_dict()
+    dumped["tuning"]["trust_untagged_assistant_messages"] = True
+    config = SpeedLMConfig.from_dict(dumped)
+    assert config.tuning.trust_untagged_assistant_messages is True
+
+    captured, _backend = _compose_tuner(
+        tmp_path, monkeypatch, config, profile, keep_real_pipeline=True
+    )
+
+    pipeline = captured["backend_pipeline"]
+    assert isinstance(pipeline, SpeculatorsPipelineConfig)
+    assert pipeline.trust_untagged_assistant_messages is True
+
+
+def test_the_untagged_opt_in_stays_off_when_the_config_is_silent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Its companion above passes for a pipeline that always opted in."""
+    profile = _profile()
+    config = SpeedLMConfig.from_dict(_config(tmp_path, profile).to_dict())
+
+    captured, _backend = _compose_tuner(
+        tmp_path, monkeypatch, config, profile, keep_real_pipeline=True
+    )
+
+    assert captured["backend_pipeline"].trust_untagged_assistant_messages is False
 
 
 def test_the_context_window_lands_in_the_published_training_params(

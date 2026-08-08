@@ -1810,6 +1810,26 @@ def _is_truncated(record: Mapping[str, Any]) -> bool:
 CLIENT_SUPPLIED_DROP_ALERT_FRACTION: Final = 0.2
 
 
+#: Every bucket a read row can end up in other than ``written``, with the
+#: clause each one contributes to a failure message.
+#:
+#: Keyed by field name and consulted by :meth:`RenderedRowCounts.drop_accounting`
+#: so that the two corpus-filter failures cannot report a partial account.  Job
+#: 375414 is what a partial account costs: 409 rows read, 0 written, 36 dropped
+#: by the truncation filter and 373 by the authorship filter, and the message
+#: named only the 36 -- so the remedy it printed (raise the token cap) would
+#: have changed nothing.  A drop bucket added to :class:`RenderedRowCounts`
+#: without an entry here leaves ``read`` un-reconciled, which
+#: ``test_every_drop_bucket_is_named_in_the_failure`` fails on.
+_DROP_BUCKETS: Final = {
+    "dropped_untrainable": "carried no trainable assistant turn",
+    "dropped_truncated": "were truncated",
+    "dropped_client_supplied": (
+        "carried an assistant turn this verifier did not produce"
+    ),
+}
+
+
 @dataclass(frozen=True, slots=True)
 class RenderedRowCounts:
     """What one rendering pass read, kept and discarded."""
@@ -1831,6 +1851,23 @@ class RenderedRowCounts:
         if not self.read:
             return 0.0
         return self.dropped_client_supplied / self.read
+
+    def drop_accounting(self) -> str:
+        """Account for every read row, whichever filter is being blamed.
+
+        A failure message that names one filter's count invites the reader to
+        treat that count as the whole loss, and the two filters run in the same
+        pass over the same corpus.  Reconciling ``read`` against ``written``
+        plus every bucket is what makes the dominant cause visible instead of
+        inferred.
+        """
+        clauses = ", ".join(
+            f"{getattr(self, name)} {clause}" for name, clause in _DROP_BUCKETS.items()
+        )
+        return (
+            f"Of {self.read} rows read, {self.written} were written and the "
+            f"rest were dropped: {clauses}"
+        )
 
     def client_supplied_diagnosis(self) -> str:
         """Name the authorship filter, its counts and the knob that relaxes it.
@@ -1878,26 +1915,49 @@ class RenderedRowCounts:
 
 
 class TruncationFilteredCorpusError(Eagle3Error):
-    """The truncation filter left too few rows to train on."""
+    """The truncation filter left too few rows to train on.
+
+    Raised only when truncation is the *dominant* cause of the shortfall.  It
+    used to be raised whenever the truncation filter had dropped anything at
+    all, because it was checked first: on job 375414 that reported 36 truncated
+    rows as the reason a 409-row corpus rendered nothing, when 373 rows had
+    gone to the authorship filter, and the remedy it printed (raise the token
+    cap) would have left the corpus exactly as empty.
+    """
 
     def __init__(self, source: Path, counts: RenderedRowCounts, minimum: int) -> None:
         self.counts = counts
         self.minimum = minimum
-        super().__init__(
-            f"dropping truncated rows left {counts.written} trainable rows from "
-            f"{source}, below the floor of {minimum}: "
-            f"{counts.dropped_truncated} of {counts.read} rows were truncated "
-            f"(finish_reason in {sorted(TRUNCATED_FINISH_REASONS)}) and "
-            f"{counts.dropped_untrainable} carried no trainable assistant turn. "
+        remedy = (
             "Training on the remainder would be a silently tiny corpus. Either "
             "raise the serving max_tokens cap so completions finish, lower "
             "min_rendered_rows, or set truncated_row_policy to 'keep' to accept "
             "training on truncated fragments."
         )
+        if counts.dropped_client_supplied:
+            # Truncation dominates here, but it is not the whole loss, and the
+            # remedy above does nothing for the rows the other filter took.
+            remedy += (
+                f" The authorship filter also dropped "
+                f"{counts.dropped_client_supplied} rows: "
+                f"{counts.client_supplied_diagnosis()}"
+            )
+        super().__init__(
+            f"dropping truncated rows left {counts.written} trainable rows from "
+            f"{source}, below the floor of {minimum}: "
+            f"{counts.dropped_truncated} of {counts.read} rows were truncated "
+            f"(finish_reason in {sorted(TRUNCATED_FINISH_REASONS)}). "
+            f"{counts.drop_accounting()}. {remedy}"
+        )
 
 
 class ClientSupervisedCorpusError(Eagle3Error):
-    """The client-authorship filter left too few rows to train on."""
+    """The client-authorship filter left too few rows to train on.
+
+    Raised when the authorship filter is the dominant cause of the shortfall,
+    including when the truncation filter also removed rows -- that overlap used
+    to be resolved in favour of truncation by check order alone.
+    """
 
     def __init__(self, source: Path, counts: RenderedRowCounts, minimum: int) -> None:
         self.counts = counts
@@ -1906,6 +1966,7 @@ class ClientSupervisedCorpusError(Eagle3Error):
             f"dropping rows with client-supplied assistant turns left "
             f"{counts.written} trainable rows from {source}, below the floor of "
             f"{minimum}: {counts.client_supplied_diagnosis()} "
+            f"{counts.drop_accounting()}. "
             "Supervising those turns would teach the draft head to predict "
             "another model's outputs, so dropping the row is the only "
             "representable answer."
@@ -2028,13 +2089,19 @@ def _render_speculators_dataset(
             "corpus: %s",
             counts.client_supplied_diagnosis(),
         )
-    # Checked before the empty-dataset error so a corpus this filter emptied is
-    # reported as "the truncation filter did it", not as the generic "nothing
-    # converted" that predates the filter and names the wrong cause.
-    if dropped_truncated and written < minimum_rows:
+    # Checked before the empty-dataset error so a corpus a filter emptied is
+    # reported as that filter's doing, not as the generic "nothing converted"
+    # that predates the filters and names the wrong cause.
+    #
+    # Which filter is blamed is decided by which one dropped more rows, not by
+    # which is checked first.  Fixed order made truncation the reported cause
+    # of every shortfall it contributed anything to: job 375414 rendered 0 of
+    # 409 rows with 36 truncated and 373 client-supplied, and was told to raise
+    # the token cap.  Ties keep the historical answer.
+    if written < minimum_rows and (dropped_truncated or dropped_client_supplied):
+        if dropped_client_supplied > dropped_truncated:
+            raise ClientSupervisedCorpusError(snapshot.path, counts, minimum_rows)
         raise TruncationFilteredCorpusError(snapshot.path, counts, minimum_rows)
-    if dropped_client_supplied and written < minimum_rows:
-        raise ClientSupervisedCorpusError(snapshot.path, counts, minimum_rows)
     if not written:
         raise EmptySpeculatorsDatasetError(snapshot.path)
     return counts
