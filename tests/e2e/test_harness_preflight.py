@@ -275,10 +275,16 @@ def test_gdn_detection_follows_the_requested_model_not_the_flavor_default() -> N
 
 # --------------------------------------------------------------------------
 # Check 5 -- workload compatibility
+#
+# The carrier flavor is ``idle-tuning`` rather than ``live-vllm``: check 5b
+# (workload-ignored) now refuses a --workload handed to a flavor whose test
+# never reads SPEEDLM_E2E_WORKLOAD, and live-vllm is one of those.  Both take
+# --vllm-args, so the capacity check still reads the window out of the argv
+# exactly as before.
 # --------------------------------------------------------------------------
 def test_workload_needing_more_context_than_the_launch_is_error() -> None:
     workload = FakeWorkload("long-context", FakeRequirements(min_max_model_len=8192))
-    findings, ok = preflight(config_for("live-vllm", workload=workload))
+    findings, ok = preflight(config_for("idle-tuning", workload=workload))
     assert not ok
     assert "workload-incompatible" in errors(findings)
     assert "8192" in render_findings(findings)
@@ -286,14 +292,14 @@ def test_workload_needing_more_context_than_the_launch_is_error() -> None:
 
 def test_workload_within_the_launch_context_passes() -> None:
     workload = FakeWorkload("short-context", FakeRequirements(min_max_model_len=4096))
-    findings, ok = preflight(config_for("live-vllm", workload=workload))
+    findings, ok = preflight(config_for("idle-tuning", workload=workload))
     assert ok, render_findings(findings)
     assert "workload-incompatible" not in errors(findings)
 
 
 def test_workload_without_a_context_requirement_is_not_checked() -> None:
     workload = FakeWorkload("unconstrained", FakeRequirements(min_max_model_len=None))
-    findings, ok = preflight(config_for("live-vllm", workload=workload))
+    findings, ok = preflight(config_for("idle-tuning", workload=workload))
     assert ok, render_findings(findings)
     assert "workload-incompatible" not in errors(findings)
 
@@ -315,7 +321,7 @@ def test_real_workload_spec_is_refused_below_its_window_and_accepted_above() -> 
 
     too_small = ("--max-model-len", "4096", "--gpu-memory-utilization", "0.75")
     findings, ok = preflight(
-        config_for("live-vllm", workload=spec, vllm_args=too_small)
+        config_for("idle-tuning", workload=spec, vllm_args=too_small)
     )
     assert not ok, render_findings(findings)
     assert "workload-incompatible" in errors(findings)
@@ -323,7 +329,7 @@ def test_real_workload_spec_is_refused_below_its_window_and_accepted_above() -> 
 
     big_enough = ("--max-model-len", "20480", "--gpu-memory-utilization", "0.75")
     findings, ok = preflight(
-        config_for("live-vllm", workload=spec, vllm_args=big_enough)
+        config_for("idle-tuning", workload=spec, vllm_args=big_enough)
     )
     assert ok, render_findings(findings)
     assert "workload-incompatible" not in errors(findings)
@@ -337,15 +343,100 @@ def test_workload_whose_requirements_cannot_be_read_is_an_error() -> None:
         name = "opaque"
         requirements = object()
 
-    findings, ok = preflight(config_for("live-vllm", workload=NoRequirements()))
+    findings, ok = preflight(config_for("idle-tuning", workload=NoRequirements()))
     assert not ok
     assert "workload-unreadable" in errors(findings)
 
 
 def test_no_workload_declared_is_not_an_error() -> None:
-    findings, ok = preflight(config_for("live-vllm", workload=None))
+    findings, ok = preflight(config_for("idle-tuning", workload=None))
     assert ok
     assert "workload-incompatible" not in errors(findings)
+
+
+# --------------------------------------------------------------------------
+# Check 5b -- a --workload the flavor never reads
+#
+# The defect: `speedbench preflight --flavor idle-tuning --workload
+# agentic-mixed-outcome --max-model-len 24576` answered "OK -- no findings"
+# while test_live_idle_tuning.py read SPEEDLM_E2E_PROMPT_CORPUS and nothing
+# else.  The capacity check above was doing its job; nobody was checking that
+# the job would serve the workload at all.
+# --------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "flavor",
+    ["live-vllm", "activation-capture", "hot-swap", "model-matrix", "token-fidelity"],
+)
+def test_workload_for_a_flavor_that_never_reads_it_is_error(flavor: str) -> None:
+    workload = FakeWorkload("agentic", FakeRequirements(min_max_model_len=None))
+    findings, ok = preflight(config_for(flavor, workload=workload))
+    assert not ok
+    assert "workload-ignored" in errors(findings)
+    assert "SPEEDLM_E2E_WORKLOAD" in render_findings(findings)
+
+
+@pytest.mark.parametrize("flavor", ["idle-tuning", "config-matrix"])
+def test_workload_for_a_flavor_that_reads_it_is_accepted(flavor: str) -> None:
+    workload = FakeWorkload("agentic", FakeRequirements(min_max_model_len=None))
+    findings, ok = preflight(config_for(flavor, workload=workload))
+    assert ok, render_findings(findings)
+    assert "workload-ignored" not in errors(findings)
+
+
+def test_every_flavor_records_whether_its_test_reads_the_workload_variable() -> None:
+    """The column, pinned to what grepping the tests actually finds.
+
+    Read out of the test sources rather than restated, so a flavor that grows
+    (or loses) a ``SPEEDLM_E2E_WORKLOAD`` consumer cannot leave the table saying
+    the opposite -- which is the exact shape of the bug this check exists for.
+    """
+    for name, spec in FLAVORS.items():
+        source = (REPO_ROOT / spec.test_path).read_text(encoding="utf-8")
+        reads_it = "SPEEDLM_E2E_WORKLOAD" in source
+        assert spec.consumes_workload == reads_it, (
+            f"flavor {name!r} declares consumes_workload={spec.consumes_workload} "
+            f"but {spec.test_path} {'does' if reads_it else 'does not'} mention "
+            "SPEEDLM_E2E_WORKLOAD"
+        )
+    assert {name for name, spec in FLAVORS.items() if spec.consumes_workload} == {
+        "idle-tuning",
+        "config-matrix",
+    }
+
+
+# --------------------------------------------------------------------------
+# Check 5c -- --max-model-len that contradicts the engine argv
+# --------------------------------------------------------------------------
+def test_max_model_len_that_contradicts_the_vllm_args_is_error() -> None:
+    """The option is a stand-in for the argv, so it may not disagree with one.
+
+    ``--flavor idle-tuning --max-model-len 24576`` with the launcher's default
+    vLLM args means the capacity check validates 24576 and the engine starts at
+    4096.
+    """
+    findings, ok = preflight(config_for("idle-tuning", max_model_len=24576))
+    assert not ok
+    assert "max-model-len-disagreement" in errors(findings)
+    assert "4096" in render_findings(findings)
+
+
+def test_max_model_len_agreeing_with_the_vllm_args_passes() -> None:
+    findings, ok = preflight(
+        config_for(
+            "idle-tuning",
+            max_model_len=24576,
+            vllm_args=("--max-model-len", "24576", "--gpu-memory-utilization", "0.75"),
+        )
+    )
+    assert ok, render_findings(findings)
+    assert "max-model-len-disagreement" not in errors(findings)
+
+
+def test_max_model_len_for_a_flavor_with_no_argv_is_not_second_guessed() -> None:
+    """config-matrix builds its own engine argv; the option is the only source."""
+    findings, ok = preflight(config_for("config-matrix", max_model_len=24576))
+    assert ok, render_findings(findings)
+    assert "max-model-len-disagreement" not in errors(findings)
 
 
 # --------------------------------------------------------------------------

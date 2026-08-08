@@ -506,9 +506,18 @@ messages; drop first-user messages over 4096 chars (the harness caps `max_tokens
 at 512, `:13-17`); order-preserving exact-duplicate dedup.
 
 Wired in via `SPEEDLM_E2E_PROMPT_CORPUS`, loaded by
-`_load_prompt_corpus` (`test_live_idle_tuning.py:63`), which asserts `is_file()`
-(`:67`) and parses JSONL objects with a `messages` list. Unset ⇒ the test falls
+`_load_prompt_corpus` (`test_live_idle_tuning.py`), which asserts `is_file()`
+and parses JSONL objects with a `messages` list. Unset ⇒ the test falls
 back to synthetic prompts.
+
+Each line is carried as a whole request (`SeedRequest`): the `messages` array
+verbatim plus `tools` when present, both posted as-is. Validation is strict but
+about the right thing — non-empty `messages`, every role one an
+OpenAI-compatible server accepts, every message carrying content or
+`tool_calls`, at least one user turn with text, and `tools` (when present) a
+non-empty list of objects. It deliberately does *not* require the first message
+to be a user turn: that assert was a property of the one single-turn corpus
+this test had seen, and it hard-fails on record 1 of every agentic workload.
 
 Note the **default differs by consumer**: `tests/simulation/corpus.py:32` hard-codes
 this same path as `DEFAULT_CORPUS_PATH` and uses it when the variable is unset,
@@ -699,11 +708,30 @@ flavors present on **both** — the intersection, never a best-effort union.
 
 A workload is a JSON manifest in `tests/e2e/harness/workload_specs/`
 (`workloads.spec_directory()` `tests/e2e/harness/workloads.py:410`), discovered
-by filename (`available_workloads()` `:414`). The config matrix selects one by
-name through `SPEEDLM_E2E_WORKLOAD`
+by filename (`available_workloads()` `:414`). Two flavors select one by name
+through `SPEEDLM_E2E_WORKLOAD`: the config matrix
 (`tests/e2e/test_inference_configuration_matrix.py:189-194`, default
-`generic-chat` at `:96`). Adding a workload therefore means adding a manifest
-and a corpus; no test module changes.
+`generic-chat` at `:96`) and idle-tuning
+(`tests/e2e/test_live_idle_tuning.py::_selected_workload`). Adding a workload
+therefore means adding a manifest and a corpus; no test module changes.
+
+For **idle-tuning** the default `generic-chat` means "nothing was selected" and
+keeps the historical seed path exactly — `SPEEDLM_E2E_PROMPT_CORPUS` when it is
+set, the synthetic template otherwise — because the archived runs and every
+number in `docs/benchmark-evidence.md` were measured there. Any other name
+routes the seed corpus through `verify_workload`, posts each record's
+`messages` (and `tools`) verbatim, and refuses the run when the workload's
+`requirements.min_max_model_len` exceeds the `--max-model-len` in
+`SPEEDLM_E2E_VLLM_ARGS` (via `workloads.preflight_refusals`, the same function
+the launch gate uses). Note that for this flavor the context window comes from
+`--vllm-args`, not from the launcher's `--max-model-len`; preflight refuses a
+launch where the two disagree (`max-model-len-disagreement`).
+
+Which flavors read the variable is recorded per flavor as
+`Flavor.consumes_workload` (`tests/e2e/harness/preflight.py`) and preflight
+refuses `--workload` for a flavor that does not (`workload-ignored`) — a
+validated-but-unused workload is worse than none, because the operator is told
+the configuration is fine while the run measures something else.
 
 The manifest is **not** hand-written. `scripts/build_workload.py` materializes
 the corpus into `/data/ryan.kim/speedlm-workloads/<name>/records.jsonl` and

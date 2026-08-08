@@ -637,6 +637,83 @@ def test_launcher_defaults_reproduce_the_pre_workload_behaviour(tmp_path: Path) 
 
 
 @pytest.mark.skipif(not LAUNCHER.is_file(), reason="launcher script absent")
+def test_launcher_exports_the_workload_for_idle_tuning(tmp_path: Path) -> None:
+    """The second flavor to grow a workload consumer must actually receive it.
+
+    ``--workload`` was accepted by the launcher, forwarded to preflight and
+    validated there, and then dropped: only the config-matrix branch of the
+    per-flavor ``case`` emitted ``export SPEEDLM_E2E_WORKLOAD``.  An idle-tuning
+    run asked for agentic traffic got a clean preflight and generic chat.
+    """
+    tuning_config = tmp_path / "tuning.json"
+    tuning_config.write_text("{}", encoding="utf-8")
+    text = _generate_sbatch(
+        tmp_path,
+        "--flavor", "idle-tuning",
+        "--tuning-config", str(tuning_config),
+        "--workload", "agentic-mixed-outcome",
+        # The engine argv is where this flavor's context window comes from, so
+        # the workload's 23552-token requirement has to be met there.
+        "--vllm-args",
+        '["--max-model-len","24576","--gpu-memory-utilization","0.75","--enforce-eager"]',
+    )
+    assert "export SPEEDLM_E2E_WORKLOAD=agentic-mixed-outcome" in text, (
+        "job.sbatch does not export the workload; the run would seed from "
+        "generic-chat whatever preflight was told"
+    )
+
+
+@pytest.mark.skipif(not LAUNCHER.is_file(), reason="launcher script absent")
+def test_launcher_idle_tuning_default_workload_is_the_historical_one(
+    tmp_path: Path,
+) -> None:
+    """Omitting --workload must keep the archived runs' corpus path."""
+    tuning_config = tmp_path / "tuning.json"
+    tuning_config.write_text("{}", encoding="utf-8")
+    text = _generate_sbatch(
+        tmp_path,
+        "--flavor", "idle-tuning",
+        "--tuning-config", str(tuning_config),
+    )
+    assert "export SPEEDLM_E2E_WORKLOAD=generic-chat" in text
+
+
+@pytest.mark.skipif(not LAUNCHER.is_file(), reason="launcher script absent")
+def test_launcher_refuses_a_workload_for_a_flavor_that_ignores_it(
+    tmp_path: Path,
+) -> None:
+    """The gate half: a workload handed to a non-consuming flavor blocks the launch."""
+    import subprocess
+
+    commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    run_root = tmp_path / "runs"
+    run_root.mkdir()
+    refused = subprocess.run(
+        [
+            str(LAUNCHER),
+            "--flavor", "hot-swap",
+            "--commit", commit,
+            "--run-root", str(run_root),
+            "--run-name", "ignored-workload",
+            "--workload", "agentic-mixed-outcome",
+        ],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+    )
+    assert refused.returncode != 0, "a workload no flavor code reads was accepted"
+    combined = refused.stdout + refused.stderr
+    assert "workload-ignored" in combined[-3000:], combined[-3000:]
+    assert not (run_root / "ignored-workload").exists()
+
+
+@pytest.mark.skipif(not LAUNCHER.is_file(), reason="launcher script absent")
 def test_launcher_preflight_gate_refuses_and_writes_nothing(tmp_path: Path) -> None:
     """The original silent-OOM bug: --vllm-args to a flavor that never reads it.
 

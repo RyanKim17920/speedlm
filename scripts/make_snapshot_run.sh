@@ -806,6 +806,13 @@ export SPEEDLM_E2E_TUNING_CONFIG="$tuning_config"
 EOF
         [[ -n "$tuning_profile" ]] && echo "export SPEEDLM_E2E_TUNING_PROFILE=\"$tuning_profile\""
         [[ -n "$corpus" ]] && echo "export SPEEDLM_E2E_PROMPT_CORPUS=$corpus"
+        # Without this the flavor accepted --workload, preflight validated it,
+        # and the job then seeded from generic-chat regardless: a declared
+        # option that reached nothing, blessed by a gate that could not see it.
+        # test_live_idle_tuning.py::_selected_workload reads it; the default
+        # (generic-chat) means "not selected" and keeps the historical corpus
+        # path byte-for-byte.
+        echo "export SPEEDLM_E2E_WORKLOAD=$workload"
         cat <<EOF
 export SPEEDLM_E2E_READY_TIMEOUT=1800
 export SPEEDLM_E2E_TUNING_TIMEOUT=$tuning_timeout

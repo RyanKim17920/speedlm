@@ -104,6 +104,14 @@ class Flavor:
 
     name: str
     test_path: str
+    #: Whether the test reads :data:`WORKLOAD_VAR`.  Same separation as
+    #: ``consumes_vllm_args`` and for the same reason: ``--workload`` was a
+    #: launcher option and a preflight input long before any flavor but
+    #: config-matrix looked at it, so an operator could ask for agentic traffic,
+    #: get a clean preflight, and receive generic chat.
+    consumes_workload: bool
+    #: Where that was verified (or why the answer is "no").
+    workload_evidence: str
     #: Environment variable that gates the test; unset means "skip silently".
     gate_var: str
     #: Which venv runs it.  Not a free choice: the capture/hot-swap tests import
@@ -145,6 +153,9 @@ DEFAULT_GATEWAY_VLLM_ARGS: tuple[str, ...] = (
 
 _NO_LAUNCHER_ARGS = "test spawns its own engine with hardcoded argv"
 
+#: The one variable the launcher exports ``--workload`` into.
+WORKLOAD_VAR = "SPEEDLM_E2E_WORKLOAD"
+
 #: make_snapshot_run.sh:61 and the per-flavor `interpreter=` assignments.
 _PROJECT_VENV_PYTHON = "/admin/home/ryan.kim/speedlm-fr/.venv/bin/python"
 _VLLM_VENV_PYTHON = "/admin/home/ryan.kim/speedlm/.preflight/venvs/vllm/bin/python"
@@ -153,6 +164,8 @@ FLAVORS: Mapping[str, Flavor] = {
     "idle-tuning": Flavor(
         name="idle-tuning",
         test_path="tests/e2e/test_live_idle_tuning.py",
+        consumes_workload=True,
+        workload_evidence="test_live_idle_tuning.py::_selected_workload reads SPEEDLM_E2E_WORKLOAD",
         gate_var="SPEEDLM_E2E_IDLE_TUNING",
         interpreter=_PROJECT_VENV_PYTHON,
         artifact_var="SPEEDLM_E2E_ARTIFACT_DIR",
@@ -168,6 +181,11 @@ FLAVORS: Mapping[str, Flavor] = {
     "activation-capture": Flavor(
         name="activation-capture",
         test_path="tests/e2e/test_serving_activation_capture.py",
+        consumes_workload=False,
+        workload_evidence=(
+            "no SPEEDLM_E2E_WORKLOAD read anywhere in "
+            "test_serving_activation_capture.py"
+        ),
         gate_var="SPEEDLM_E2E_ACTIVATION_CAPTURE",
         interpreter=_VLLM_VENV_PYTHON,
         artifact_var="SPEEDLM_E2E_ARTIFACT_DIR",
@@ -186,6 +204,11 @@ FLAVORS: Mapping[str, Flavor] = {
     "capture-overhead": Flavor(
         name="capture-overhead",
         test_path="tests/e2e/test_serving_activation_capture_overhead.py",
+        consumes_workload=False,
+        workload_evidence=(
+            "no SPEEDLM_E2E_WORKLOAD read anywhere in "
+            "test_serving_activation_capture_overhead.py"
+        ),
         gate_var="SPEEDLM_E2E_CAPTURE_OVERHEAD",
         interpreter=_VLLM_VENV_PYTHON,
         artifact_var="SPEEDLM_E2E_ARTIFACT_DIR",
@@ -205,6 +228,11 @@ FLAVORS: Mapping[str, Flavor] = {
     "hot-swap": Flavor(
         name="hot-swap",
         test_path="tests/e2e/test_serving_draft_hot_swap.py",
+        consumes_workload=False,
+        workload_evidence=(
+            "no SPEEDLM_E2E_WORKLOAD read anywhere in "
+            "test_serving_draft_hot_swap.py"
+        ),
         gate_var="SPEEDLM_E2E_DRAFT_HOT_SWAP",
         interpreter=_VLLM_VENV_PYTHON,
         artifact_var="SPEEDLM_E2E_ARTIFACT_DIR",
@@ -223,6 +251,11 @@ FLAVORS: Mapping[str, Flavor] = {
     "live-vllm": Flavor(
         name="live-vllm",
         test_path="tests/e2e/test_live_vllm.py",
+        consumes_workload=False,
+        workload_evidence=(
+            "no SPEEDLM_E2E_WORKLOAD read anywhere in "
+            "test_live_vllm.py"
+        ),
         gate_var="SPEEDLM_E2E",
         interpreter=_PROJECT_VENV_PYTHON,
         artifact_var="SPEEDLM_E2E_ARTIFACT_DIR",
@@ -238,6 +271,11 @@ FLAVORS: Mapping[str, Flavor] = {
     "proxy-overhead": Flavor(
         name="proxy-overhead",
         test_path="tests/e2e/test_proxy_overhead.py",
+        consumes_workload=False,
+        workload_evidence=(
+            "no SPEEDLM_E2E_WORKLOAD read anywhere in "
+            "test_proxy_overhead.py"
+        ),
         gate_var="SPEEDLM_E2E",
         interpreter=_PROJECT_VENV_PYTHON,
         artifact_var="SPEEDLM_E2E_ARTIFACT_DIR",
@@ -253,6 +291,11 @@ FLAVORS: Mapping[str, Flavor] = {
     "token-fidelity": Flavor(
         name="token-fidelity",
         test_path="tests/e2e/test_token_fidelity.py",
+        consumes_workload=False,
+        workload_evidence=(
+            "no SPEEDLM_E2E_WORKLOAD read anywhere in "
+            "test_token_fidelity.py"
+        ),
         gate_var="SPEEDLM_E2E",
         interpreter=_PROJECT_VENV_PYTHON,
         artifact_var="SPEEDLM_E2E_ARTIFACT_DIR",
@@ -269,6 +312,11 @@ FLAVORS: Mapping[str, Flavor] = {
     "model-matrix": Flavor(
         name="model-matrix",
         test_path="tests/e2e/test_model_matrix.py",
+        consumes_workload=False,
+        workload_evidence=(
+            "no SPEEDLM_E2E_WORKLOAD read anywhere in "
+            "test_model_matrix.py"
+        ),
         gate_var="SPEEDLM_E2E",
         interpreter=_PROJECT_VENV_PYTHON,
         artifact_var="SPEEDLM_MATRIX_ARTIFACT_DIR",
@@ -287,6 +335,11 @@ FLAVORS: Mapping[str, Flavor] = {
     "capture-matrix": Flavor(
         name="capture-matrix",
         test_path="tests/e2e/test_capture_harness_matrix.py",
+        consumes_workload=False,
+        workload_evidence=(
+            "no SPEEDLM_E2E_WORKLOAD read anywhere in "
+            "test_capture_harness_matrix.py"
+        ),
         gate_var="SPEEDLM_E2E",
         interpreter=_PROJECT_VENV_PYTHON,
         artifact_var="SPEEDLM_CAPTURE_ARTIFACT_DIR",
@@ -302,6 +355,11 @@ FLAVORS: Mapping[str, Flavor] = {
     "agent-harness": Flavor(
         name="agent-harness",
         test_path="tests/e2e/test_agent_harness.py",
+        consumes_workload=False,
+        workload_evidence=(
+            "no SPEEDLM_E2E_WORKLOAD read anywhere in "
+            "test_agent_harness.py"
+        ),
         gate_var="SPEEDLM_E2E",
         interpreter=_PROJECT_VENV_PYTHON,
         artifact_var="SPEEDLM_AGENT_ARTIFACT_DIR",
@@ -318,6 +376,8 @@ FLAVORS: Mapping[str, Flavor] = {
     "config-matrix": Flavor(
         name="config-matrix",
         test_path="tests/e2e/test_inference_configuration_matrix.py",
+        consumes_workload=True,
+        workload_evidence="test_inference_configuration_matrix.py:189 reads SPEEDLM_E2E_WORKLOAD",
         gate_var="SPEEDLM_E2E_CONFIG_MATRIX",
         interpreter=_PROJECT_VENV_PYTHON,
         artifact_var="SPEEDLM_CONFIG_MATRIX_ARTIFACT_DIR",
@@ -688,6 +748,67 @@ def _check_workload_compatibility(
     return []
 
 
+def _check_workload_consumed(flavor: Flavor, config: PreflightConfig) -> list[Finding]:
+    """A ``--workload`` a flavor never reads must refuse, not reassure.
+
+    The capacity check above validates the workload against the window; it says
+    nothing about whether the job will *serve* that workload.  For every flavor
+    whose test does not read :data:`WORKLOAD_VAR` the answer is no, and a
+    validated-but-unused workload is worse than no workload at all: the operator
+    is told the configuration is fine, the run measures something else, and the
+    results index records the name of traffic that was never sent.
+    """
+    if config.workload is None or flavor.consumes_workload:
+        return []
+    name = getattr(config.workload, "name", "<unnamed>")
+    return [
+        Finding(
+            Severity.ERROR,
+            "workload-ignored",
+            f"--workload {name!r} was supplied for flavor {flavor.name!r}, but that "
+            f"flavor never consumes it: {flavor.workload_evidence}. The job would "
+            "seed from whatever that test selects on its own while this preflight "
+            "blessed a configuration the run does not use. Drop --workload, or run "
+            "a flavor that reads it "
+            f"({', '.join(sorted(f.name for f in FLAVORS.values() if f.consumes_workload))}).",
+        )
+    ]
+
+
+def _check_max_model_len_agrees_with_argv(
+    flavor: Flavor, config: PreflightConfig
+) -> list[Finding]:
+    """``--max-model-len`` must not contradict the engine argv it stands in for.
+
+    ``--max-model-len`` exists for the flavors that build their own engine argv
+    and therefore have no ``--vllm-args`` for the capacity check to read.  When
+    a flavor *does* take ``--vllm-args``, the argv is what the engine gets, and
+    the capacity check prefers the explicit option -- so a mismatch means the
+    workload was validated against a window the run will not use.  That is how
+    ``--flavor idle-tuning --workload agentic-mixed-outcome --max-model-len
+    24576`` passed while the job would have served at the launcher's 4096.
+    """
+    if config.max_model_len is None:
+        return []
+    args = _effective_vllm_args(flavor, config)
+    if args is None:
+        return []
+    argv_value = _option_value(args, "--max-model-len")
+    if argv_value is None or argv_value == str(config.max_model_len):
+        return []
+    return [
+        Finding(
+            Severity.ERROR,
+            "max-model-len-disagreement",
+            f"--max-model-len {str(config.max_model_len)!r} disagrees with the "
+            f"--max-model-len {argv_value!r} in the vLLM args flavor {flavor.name!r} "
+            "will actually launch with. The engine follows the argv, so any check "
+            "made against the option was made against a window the run does not "
+            "have. Set both to the same value, or set only the vLLM args.",
+        )
+    ]
+
+
 def _check_timeouts(flavor: Flavor, config: PreflightConfig) -> list[Finding]:
     raw_time = config.slurm_time or flavor.default_time
     try:
@@ -788,6 +909,8 @@ _CHECKS = (
     _check_memory_bounds,
     _check_gdn_prefill_backend,
     _check_workload_compatibility,
+    _check_workload_consumed,
+    _check_max_model_len_agrees_with_argv,
     _check_timeouts,
     _check_silent_green,
     _check_provenance,

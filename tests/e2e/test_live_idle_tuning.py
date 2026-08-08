@@ -20,6 +20,16 @@ Optional environment:
 * ``SPEEDLM_E2E_REQUEST_TIMEOUT=1200``
 * ``SPEEDLM_E2E_SEED_REQUESTS=256``
 * ``SPEEDLM_E2E_PROMPT_CORPUS=/path/to/prompts.jsonl``
+* ``SPEEDLM_E2E_WORKLOAD=agentic-mixed-outcome``
+
+``SPEEDLM_E2E_WORKLOAD`` names a manifest under
+``tests/e2e/harness/workload_specs``.  When it is set to anything other than the
+launcher's default (``generic-chat``), the workload's *verified* records file
+becomes the seed corpus and ``SPEEDLM_E2E_PROMPT_CORPUS`` must not also be set --
+two corpora would mean the run measures neither of them.  The default keeps the
+historical path exactly: ``SPEEDLM_E2E_PROMPT_CORPUS`` if given, the synthetic
+template otherwise.  Three archived runs and every number in
+``docs/benchmark-evidence.md`` were taken on that path, so it does not move.
 
 One invocation creates an isolated ``SPEEDLM_HOME`` under the artifact root,
 so old traces, active artifacts, and scheduler state cannot satisfy assertions.
@@ -37,6 +47,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Final
 
@@ -50,56 +61,221 @@ from speedlm.profiles import (
     resolve_profile,
 )
 from speedlm.tuner.composition import declared_draft_depth
+from tests.e2e.harness import workloads
 
 # ── prompt corpus helpers ───────────────────────────────────────────────────
 
-def _load_prompt_corpus() -> list[str] | None:
-    """Load real prompts from SPEEDLM_E2E_PROMPT_CORPUS if set.
+#: The launcher's ``--workload`` default (make_snapshot_run.sh:218).  It is the
+#: value that means "the operator selected nothing", so it routes to the legacy
+#: corpus path rather than through the workload registry.
+DEFAULT_WORKLOAD: Final = "generic-chat"
 
-    Expects a JSONL file where each line is
-    ``{"messages": [{"role": "user", "content": "…"}]}``.
-    Returns ``None`` when the env var is not set.
+#: Roles an OpenAI-compatible ``/v1/chat/completions`` accepts on input.  A
+#: record carrying anything else is a corpus defect, not traffic to replay: the
+#: server would reject it mid-run, after the engine had already been paid for.
+ACCEPTED_MESSAGE_ROLES: Final[frozenset[str]] = frozenset(
+    {"system", "developer", "user", "assistant", "tool", "function"}
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SeedRequest:
+    """One seed request, carried whole.
+
+    The corpus loader used to return bare strings taken from the first message,
+    which made every corpus single-turn and silently deleted system prompts and
+    tool schemas -- i.e. exactly the parts that make agentic traffic agentic.
+    ``messages`` is the record's array verbatim; ``tools`` is its ``tools`` array
+    when it declared one.
+    """
+
+    messages: tuple[dict[str, Any], ...]
+    tools: tuple[dict[str, Any], ...] = ()
+
+
+def _user_request(text: str) -> SeedRequest:
+    """A single-user-turn request, the shape the synthetic fallback produces."""
+    return SeedRequest(messages=({"role": "user", "content": text},))
+
+
+def _build_seed_request(obj: object, *, context: str) -> SeedRequest:
+    """Validate one corpus record and carry it whole.
+
+    Strict about the right thing.  The predecessor asserted that the FIRST
+    message was a user turn, which is not a property of chat traffic at all --
+    it is a property of the one single-turn corpus this test had ever seen, and
+    it hard-fails on record 1 of every agentic workload (whose first message is
+    the system prompt).  What must hold instead: the messages are a non-empty
+    list of objects, every role is one the server accepts, every message carries
+    something to send, and the record actually asks the model for something.
+    """
+    if not isinstance(obj, dict):
+        raise AssertionError(f"{context}: record is not a JSON object")
+    messages = obj.get("messages")
+    if not isinstance(messages, list) or not messages:
+        raise AssertionError(f"{context}: record has no non-empty 'messages' list")
+    for position, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise AssertionError(f"{context}: messages[{position}] is not an object")
+        role = message.get("role")
+        if not isinstance(role, str) or role not in ACCEPTED_MESSAGE_ROLES:
+            raise AssertionError(
+                f"{context}: messages[{position}] has role {role!r}; an "
+                "OpenAI-compatible server accepts only "
+                f"{', '.join(sorted(ACCEPTED_MESSAGE_ROLES))}"
+            )
+        if "content" not in message and not message.get("tool_calls"):
+            raise AssertionError(
+                f"{context}: messages[{position}] (role {role!r}) carries neither "
+                "'content' nor 'tool_calls', so there is nothing to send"
+            )
+    if not any(
+        message.get("role") == "user"
+        and workloads.content_text(message.get("content")).strip()
+        for message in messages
+    ):
+        raise AssertionError(f"{context}: record carries no user message with content")
+
+    raw_tools = obj.get("tools")
+    tools: tuple[dict[str, Any], ...] = ()
+    if raw_tools is not None:
+        if not isinstance(raw_tools, list) or not raw_tools:
+            raise AssertionError(
+                f"{context}: 'tools' is present but is not a non-empty list"
+            )
+        for position, tool in enumerate(raw_tools):
+            if not isinstance(tool, dict):
+                raise AssertionError(f"{context}: tools[{position}] is not an object")
+        tools = tuple(dict(tool) for tool in raw_tools)
+    return SeedRequest(
+        messages=tuple(dict(message) for message in messages), tools=tools
+    )
+
+
+def _load_prompt_corpus() -> list[SeedRequest] | None:
+    """Load real requests from SPEEDLM_E2E_PROMPT_CORPUS if set.
+
+    Expects a JSONL file where each line is ``{"messages": [...]}`` and may also
+    carry ``"tools": [...]``.  Returns ``None`` when the env var is not set.
     """
     corpus_path = os.environ.get("SPEEDLM_E2E_PROMPT_CORPUS")
     if corpus_path is None:
         return None
     path = Path(corpus_path).expanduser().resolve()
     assert path.is_file(), f"SPEEDLM_E2E_PROMPT_CORPUS is not a file: {path}"
-    prompts: list[str] = []
-    for raw_line in path.read_text(encoding="utf-8").splitlines():
+    requests: list[SeedRequest] = []
+    for number, raw_line in enumerate(
+        path.read_text(encoding="utf-8").splitlines(), start=1
+    ):
         stripped = raw_line.strip()
         if not stripped:
             continue
-        obj: object = json.loads(stripped)
-        assert isinstance(obj, dict), f"corpus line is not a JSON object: {stripped[:80]}"
-        messages = obj.get("messages")
-        assert isinstance(messages, list) and messages, (
-            f"corpus line missing 'messages': {stripped[:80]}"
+        requests.append(
+            _build_seed_request(json.loads(stripped), context=f"{path}:{number}")
         )
-        first = messages[0]
-        assert isinstance(first, dict) and first.get("role") == "user", (
-            f"first message must be user role: {stripped[:80]}"
-        )
-        content = first.get("content")
-        assert isinstance(content, str) and content.strip(), (
-            f"empty user content: {stripped[:80]}"
-        )
-        prompts.append(content)
-    return prompts
+    return requests
 
 
-def _select_prompts(
-    corpus: list[str] | None, *, seed_count: int
-) -> list[str]:
-    """Return ``seed_count`` prompts, deterministically.
+def _selected_workload() -> str | None:
+    """The workload the operator asked for, or ``None`` for "not selected"."""
+    raw = (os.environ.get("SPEEDLM_E2E_WORKLOAD") or "").strip()
+    if not raw or raw == DEFAULT_WORKLOAD:
+        return None
+    return raw
+
+
+def _declared_max_model_len() -> int:
+    """The context window the engine will actually be started with.
+
+    Read from ``SPEEDLM_E2E_VLLM_ARGS`` -- the argv this test hands vLLM -- and
+    not from the launcher's ``--max-model-len``, which for this flavor reaches
+    nothing.  An unbounded engine cannot be checked against a workload's
+    requirement, so it refuses instead of guessing.
+    """
+    args = _vllm_args()
+    for index, item in enumerate(args):
+        if item == "--max-model-len" and index + 1 < len(args):
+            raw = args[index + 1]
+            break
+        if item.startswith("--max-model-len="):
+            raw = item.split("=", 1)[1]
+            break
+    else:
+        raise AssertionError(
+            "SPEEDLM_E2E_VLLM_ARGS declares no --max-model-len, so the workload's "
+            "context requirement cannot be enforced; declare the window explicitly "
+            "rather than let long prompts be truncated silently"
+        )
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise AssertionError(f"--max-model-len is not an integer: {raw!r}") from exc
+
+
+def _workload_corpus(name: str) -> list[SeedRequest]:
+    """Resolve ``SPEEDLM_E2E_WORKLOAD`` to a verified list of seed requests.
+
+    The manifest's ``requirements.min_max_model_len`` is enforced against the
+    engine argv through :func:`workloads.preflight_refusals` -- the same function
+    the launch preflight uses -- so a run that would truncate the workload dies
+    here, before the GPU is paid for, instead of producing numbers about a
+    different corpus.
+    """
+    available = workloads.available_workloads()
+    assert name in available, (
+        f"SPEEDLM_E2E_WORKLOAD={name!r} is not a declared workload; "
+        f"available: {', '.join(available)}"
+    )
+    assert not os.environ.get("SPEEDLM_E2E_PROMPT_CORPUS"), (
+        f"SPEEDLM_E2E_WORKLOAD={name!r} and SPEEDLM_E2E_PROMPT_CORPUS are both set; "
+        "the run would measure one of them and report the other"
+    )
+    spec = workloads.load_spec(name)
+    refusals = workloads.preflight_refusals(
+        spec,
+        max_model_len=_declared_max_model_len(),
+        # This test now posts the record's `tools` array verbatim, so tool
+        # support is a property of the request it sends, not a promise.
+        tool_support=True,
+    )
+    assert not refusals, "workload cannot be replayed as configured:\n  - " + (
+        "\n  - ".join(refusals)
+    )
+    records = workloads.verify_workload(spec)
+    return [
+        _build_seed_request(
+            {
+                "messages": [dict(message) for message in record.messages],
+                **({"tools": [dict(tool) for tool in record.tools]} if record.tools else {}),
+            },
+            context=f"workload {spec.name!r} record {record.id!r}",
+        )
+        for record in records
+    ]
+
+
+def _load_seed_corpus() -> list[SeedRequest] | None:
+    """The seed corpus: the selected workload, else the legacy corpus, else none."""
+    name = _selected_workload()
+    if name is not None:
+        return _workload_corpus(name)
+    return _load_prompt_corpus()
+
+
+def _select_requests(
+    corpus: list[SeedRequest] | None, *, seed_count: int
+) -> list[SeedRequest]:
+    """Return ``seed_count`` requests, deterministically.
 
     When *corpus* is ``None``, fall back to the original synthetic template.
     When the corpus is too small, raise AssertionError with a clear message.
     """
     if corpus is None:
         return [
-            f"This is idle-tuning seed request {i + 1}/{seed_count}. "
-            f"Reply with one short sentence."
+            _user_request(
+                f"This is idle-tuning seed request {i + 1}/{seed_count}. "
+                f"Reply with one short sentence."
+            )
             for i in range(seed_count)
         ]
     if len(corpus) < seed_count:
@@ -390,13 +566,16 @@ def _wait_for_gateway(
 def _post_chat(
     gateway_url: str,
     config: SpeedLMConfig,
-    prompt: str,
+    request: SeedRequest,
     *,
     timeout: float,
 ) -> tuple[JsonObject, float]:
-    payload = {
+    payload: dict[str, Any] = {
         "model": config.alias,
-        "messages": [{"role": "user", "content": prompt}],
+        # The record's own turns, verbatim.  Synthesizing a single user message
+        # here is what made every seed request single-turn no matter what the
+        # corpus said.
+        "messages": [dict(message) for message in request.messages],
         "temperature": config.sampling.temperature,
         "top_p": config.sampling.top_p,
         "seed": config.sampling.seed,
@@ -406,6 +585,8 @@ def _post_chat(
         # the tuner's training sequence length.
         "max_tokens": 512,
     }
+    if request.tools:
+        payload["tools"] = [dict(tool) for tool in request.tools]
     started = time.monotonic()
     response = httpx.post(
         f"{gateway_url}/v1/chat/completions",
@@ -935,15 +1116,15 @@ def test_live_idle_tuning_preempts_then_completes() -> None:
         assert observed_pids, "speedlm did not launch a vLLM child"
 
         traces_path = home / "traces" / "traces.jsonl"
-        prompts = _select_prompts(
-            _load_prompt_corpus(), seed_count=seed_count
+        seed_corpus = _select_requests(
+            _load_seed_corpus(), seed_count=seed_count
         )
-        assert len(prompts) == seed_count
-        for index, prompt in enumerate(prompts):
+        assert len(seed_corpus) == seed_count
+        for index, seed_request in enumerate(seed_corpus):
             body, _ = _post_chat(
                 gateway_url,
                 config,
-                prompt,
+                seed_request,
                 timeout=request_timeout,
             )
             _write_json(artifact_dir / f"seed-response-{index + 1:04d}.json", body)
@@ -976,7 +1157,9 @@ def test_live_idle_tuning_preempts_then_completes() -> None:
         queued_body, queued_seconds = _post_chat(
             gateway_url,
             config,
-            "Preempt the sleeping idle tuner, restore serving, and reply with READY.",
+            _user_request(
+                "Preempt the sleeping idle tuner, restore serving, and reply with READY."
+            ),
             timeout=request_timeout,
         )
         queued_id = queued_body.get("id")
