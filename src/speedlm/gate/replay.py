@@ -333,8 +333,44 @@ def is_truncated_finish_reason(value: str | None) -> bool:
 #:   finished response reads ``completed`` and a truncated one reads
 #:   ``incomplete`` -- the exact counterpart already carried in
 #:   :data:`TRUNCATED_FINISH_REASONS`.  This project's own gateway produces it.
+#: * ``repetition`` -- vLLM's own terminal reason for its n-gram repetition
+#:   detector firing.  Verified against the pinned build rather than assumed:
+#:   ``vllm/v1/engine/__init__.py`` declares
+#:   ``FINISH_REASON_STRINGS = ("stop", "length", "abort", "error",
+#:   "repetition")`` above the comment "These are possible values of
+#:   ``RequestOutput.finish_reason``, so form part of the external API", and
+#:   ``FinishReason`` documents it as "repetitive token pattern detected
+#:   (hallucination)".  ``vllm/v1/core/sched/utils.py`` sets
+#:   ``RequestStatus.FINISHED_REPETITION`` when ``check_sequence_repetition``
+#:   trips, and ``vllm/v1/request.py`` maps that status to
+#:   ``FinishReason.REPETITION``.  Nothing on that path raises, so it arrives
+#:   on an ordinary 200 with a completed body.
+#:
+#:   It belongs here because of the *only* question this vocabulary is asked:
+#:   did the output cap bind?  It did not -- the detector ended the generation
+#:   early, strictly before ``max_tokens``.  Counting it as truncation would
+#:   invent cap pressure that never happened; leaving it unknown makes an
+#:   all-``repetition`` arm ``UNTESTABLE`` and rejects it with
+#:   ``TRUNCATION_UNMEASURED``, a false veto on a gate that has no rollback.
+#:   Like ``content_filter``, it is not a *healthy* answer -- but health is the
+#:   ``invalid_rate`` guard's question, not this one's.
+#:
+#:   Its two siblings in that tuple are deliberately **not** here.  ``error`` is
+#:   converted to an exception by ``_raise_if_error`` in
+#:   ``vllm/entrypoints/generate/base/serving.py`` ("Invariant: always converted
+#:   to 500 Internal Server Error"), so this gate never sees it on a 200 at all.
+#:   ``abort`` means the client hung up, so there is no completed response to
+#:   classify -- and if one ever did arrive, "we cancelled it" is not evidence
+#:   the cap was slack.  Both stay unknown, which is fail-closed.
 NATURAL_STOP_FINISH_REASONS: Final = frozenset(
-    {"stop", "tool_calls", "function_call", "content_filter", "completed"}
+    {
+        "stop",
+        "tool_calls",
+        "function_call",
+        "content_filter",
+        "completed",
+        "repetition",
+    }
 )
 
 
@@ -446,11 +482,39 @@ def _extract_tool_calls(message: dict[str, Any]) -> int:
     counted as zero rather than raising: this is one field of one response, and
     losing the whole replay over it is the failure mode the ``finish_reason``
     coercion above already had to be fixed for.
+
+    "Object" is not enough on its own, though, and that gap re-hollowed the
+    guard it was written to serve.  This count is the *only* thing standing
+    between "the model surfaced no output" and "the model dispatched a tool"
+    in :func:`_validity_error`, so ``{}`` counting as a dispatch means a
+    response with ``content: null``, ``tool_calls: [{}]`` and
+    ``finish_reason: "tool_calls"`` reads as a healthy natural stop -- an
+    engine emitting nothing at all, scored as if it had answered.  The comment
+    above claimed malformed values were counted as zero; a malformed *dict* was
+    not.
+
+    So require what makes a tool call an actual dispatch rather than an empty
+    envelope: a ``function`` object carrying a non-empty ``name``.  That is the
+    field ``sse._ToolCall.to_dict`` always emits and the only part a client
+    could route on -- ``id`` is dropped there when the server never sent one and
+    ``type`` is defaulted, so neither can be required without rejecting
+    responses the capture path accepts.  Anything less is not output.
     """
     raw = message.get("tool_calls")
     if not isinstance(raw, list):
         return 0
-    return sum(1 for call in raw if isinstance(call, dict))
+    return sum(1 for call in raw if _is_dispatched_tool_call(call))
+
+
+def _is_dispatched_tool_call(call: object) -> bool:
+    """Whether one ``tool_calls`` entry names a function to actually call."""
+    if not isinstance(call, dict):
+        return False
+    function = call.get("function")
+    if not isinstance(function, dict):
+        return False
+    name = function.get("name")
+    return isinstance(name, str) and bool(name.strip())
 
 
 def _validity_error(

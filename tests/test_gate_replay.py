@@ -11,11 +11,14 @@ import pytest
 
 from speedlm.config import SamplingConfig
 from speedlm.gate.replay import (
+    FINISH_REASON_UNKNOWN,
     NATURAL_STOP_FINISH_REASONS,
     TRUNCATED_FINISH_REASONS,
     ReplayError,
     ReplayResult,
     RunResults,
+    _extract_tool_calls,
+    classify_finish_reason,
     is_truncated_finish_reason,
     replay_suite,
 )
@@ -893,6 +896,131 @@ def test_every_known_natural_stop_spelling_is_counted_as_one(
     assert run.natural_stop_count == 5
     assert run.truncated_count == 0
     assert run.finish_reason_count == 5
+
+
+def test_a_repetition_stopped_arm_is_measurable_rather_than_vetoed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """vLLM's own early stop must not read as "this run cannot be measured".
+
+    ``repetition`` is a real terminal reason on the pinned build, not a
+    hypothetical: ``vllm/v1/engine/__init__.py`` lists it in
+    ``FINISH_REASON_STRINGS`` under the comment "These are possible values of
+    ``RequestOutput.finish_reason``, so form part of the external API",
+    ``vllm/v1/core/sched/utils.py`` sets ``FINISHED_REPETITION`` when the n-gram
+    detector trips, and ``vllm/v1/request.py`` maps that to
+    ``FinishReason.REPETITION``.  Nothing on that path raises, so it lands on an
+    ordinary 200.
+
+    While it classified ``unknown`` it entered neither counter, so an arm that
+    hit the detector on every request reported a classified count of zero,
+    classified ``UNTESTABLE``, and was rejected ``TRUNCATION_UNMEASURED``.  That
+    is a false veto on a gate with no rollback -- and the cap demonstrably did
+    NOT bind, because the detector ended the generation before it.
+    """
+    _scripted(
+        monkeypatch,
+        {"message": {"content": "aaaa aaaa aaaa"}, "finish_reason": "repetition"},
+        {"prompt_tokens": 12, "completion_tokens": 40},
+        scripted=6,
+    )
+
+    run = _replay(_suite(6)).run_results[0]
+
+    assert run.finish_reason_count == 6, "the arm reported nothing to classify"
+    assert run.natural_stop_count == 6
+    assert run.truncated_count == 0
+
+
+@pytest.mark.parametrize("reason", ["error", "abort"])
+def test_vllms_other_terminal_reasons_stay_fail_closed(reason: str) -> None:
+    """Adding ``repetition`` must not smuggle in its siblings.
+
+    They sit in the same ``FINISH_REASON_STRINGS`` tuple, and neither belongs.
+    ``error`` is converted to a 500 by ``_raise_if_error``
+    (``vllm/entrypoints/generate/base/serving.py``: "Invariant: always converted
+    to 500 Internal Server Error"), so it never reaches this classifier on a
+    200 at all.  ``abort`` means the client hung up; "we cancelled it" is not
+    evidence the cap was slack.  Both must stay ``unknown``, which excludes
+    them from the denominator rather than crediting them as healthy stops --
+    the allowlist stays positive.
+    """
+    assert reason not in NATURAL_STOP_FINISH_REASONS
+    assert reason not in TRUNCATED_FINISH_REASONS
+    assert classify_finish_reason(reason) == FINISH_REASON_UNKNOWN
+
+
+def test_an_empty_tool_call_object_is_not_a_surfaced_tool_call(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``[{}]`` is an envelope, not a dispatch, and it re-hollowed the guard.
+
+    The companion above proves an empty ``tool_calls`` list is still invalid.
+    This is the same broken engine one step further along: it emits no content,
+    claims ``finish_reason: "tool_calls"``, and puts a bare object in the array.
+    Counting every dict made that a valid natural stop, so a run of pure
+    nothing scored ``invalid_rate == 0`` with a full natural-stop denominator --
+    exactly the empty-output validity guard the previous commit repaired,
+    hollowed out again by the count that guard consults.
+
+    A tool call has to name a function for anything to be dispatched.
+    """
+    _scripted(
+        monkeypatch,
+        {
+            "message": {"content": None, "tool_calls": [{}]},
+            "finish_reason": "tool_calls",
+        },
+        {"prompt_tokens": 31, "completion_tokens": 24},
+        scripted=4,
+    )
+
+    run = _replay(_suite(4)).run_results[0]
+
+    assert all(r.tool_call_count == 0 for r in run.results)
+    assert run.invalid_count == 4
+    assert all(r.error == "Empty response text" for r in run.results)
+
+
+@pytest.mark.parametrize(
+    ("call", "counted"),
+    [
+        pytest.param({}, False, id="bare-object"),
+        pytest.param({"id": "c1", "type": "function"}, False, id="no-function"),
+        pytest.param(
+            {"id": "c1", "type": "function", "function": {}},
+            False,
+            id="function-without-a-name",
+        ),
+        pytest.param(
+            {"id": "c1", "type": "function", "function": {"name": "  "}},
+            False,
+            id="blank-name",
+        ),
+        pytest.param(
+            {"id": "c1", "type": "function", "function": {"name": 7}},
+            False,
+            id="name-not-a-string",
+        ),
+        pytest.param({"function": {"name": "bash"}}, True, id="name-alone-is-enough"),
+        pytest.param(
+            {"id": "c1", "type": "function", "function": {"name": "bash"}},
+            True,
+            id="the-real-shape",
+        ),
+    ],
+)
+def test_only_a_tool_call_naming_a_function_counts(
+    call: dict[str, object], counted: bool
+) -> None:
+    """Where the line sits, and why it sits there rather than higher.
+
+    ``sse._ToolCall.to_dict`` defaults ``type`` and omits ``id`` entirely when
+    the server never sent one, so requiring either would reject responses the
+    capture path accepts.  ``function.name`` is the one field it always emits
+    and the only part a client could route on.
+    """
+    assert _extract_tool_calls({"tool_calls": [call]}) == (1 if counted else 0)
 
 
 def test_the_two_finish_reason_vocabularies_do_not_overlap() -> None:

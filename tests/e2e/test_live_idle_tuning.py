@@ -55,6 +55,12 @@ import httpx
 import pytest
 
 from speedlm.config import SpeedLMConfig, load_config
+from speedlm.gate.replay import (
+    NATURAL_STOP_FINISH_REASONS,
+    TRUNCATED_FINISH_REASONS,
+    is_natural_stop_finish_reason,
+    is_truncated_finish_reason,
+)
 from speedlm.profiles import (
     ModelProfile,
     drafter_declared_speculative_tokens,
@@ -98,6 +104,74 @@ def _user_request(text: str) -> SeedRequest:
     return SeedRequest(messages=({"role": "user", "content": text},))
 
 
+def _truthy_tool_calls(raw: object) -> bool:
+    """Whether *raw* is a tool-call list with at least one entry in it.
+
+    Separate from :func:`_check_tool_calls` because the two answer different
+    questions: this one decides whether the message has anything to send at
+    all, that one decides whether what it has is well formed.  The old code
+    used bare truthiness, so the string ``"yes"`` satisfied "this message
+    dispatches a tool".
+    """
+    return isinstance(raw, list) and bool(raw)
+
+
+def _check_message_content(content: object, *, where: str) -> None:
+    """Reject a ``content`` value an OpenAI-compatible server would not read.
+
+    A string, or a non-empty list of content parts each naming its ``type``.
+    Numbers, bare objects and empty lists are rejected: the server 400s on
+    them, and it does so mid-run.  ``None`` never reaches here -- the caller
+    treats it as absent content, which is legal only alongside a tool call.
+    """
+    if isinstance(content, str):
+        return
+    if not isinstance(content, list) or not content:
+        raise AssertionError(
+            f"{where} has 'content' of type {type(content).__name__}; an "
+            "OpenAI-compatible server accepts a string or a non-empty list of "
+            "content parts"
+        )
+    for index, part in enumerate(content):
+        if not isinstance(part, dict) or not isinstance(part.get("type"), str):
+            raise AssertionError(
+                f"{where} has content[{index}] that is not a content part "
+                "object with a string 'type'"
+            )
+
+
+def _check_tool_calls(raw: object, *, where: str) -> None:
+    """Reject a ``tool_calls`` value the server could not replay.
+
+    Held to the same standard as :func:`speedlm.gate.replay._extract_tool_calls`
+    applies on the way back: a list of objects, each naming a ``function`` with
+    a non-empty ``name``.  Assistant turns replayed into a request must also
+    carry the ``id`` the following ``tool`` turn refers to -- without it the
+    server cannot pair the two, which is a 400 on a record that used to load.
+    """
+    if not isinstance(raw, list):
+        raise AssertionError(
+            f"{where} has 'tool_calls' of type {type(raw).__name__}, not a list"
+        )
+    for index, call in enumerate(raw):
+        if not isinstance(call, dict):
+            raise AssertionError(f"{where} has tool_calls[{index}] that is not an object")
+        function = call.get("function")
+        if not isinstance(function, dict) or not isinstance(
+            function.get("name"), str
+        ):
+            raise AssertionError(
+                f"{where} has tool_calls[{index}] with no 'function' object "
+                "naming a function, so it dispatches nothing"
+            )
+        call_id = call.get("id")
+        if not isinstance(call_id, str) or not call_id.strip():
+            raise AssertionError(
+                f"{where} has tool_calls[{index}] with no non-empty string "
+                "'id'; the tool result that answers it could not be paired"
+            )
+
+
 def _build_seed_request(obj: object, *, context: str) -> SeedRequest:
     """Validate one corpus record and carry it whole.
 
@@ -107,7 +181,25 @@ def _build_seed_request(obj: object, *, context: str) -> SeedRequest:
     it hard-fails on record 1 of every agentic workload (whose first message is
     the system prompt).  What must hold instead: the messages are a non-empty
     list of objects, every role is one the server accepts, every message carries
-    something to send, and the record actually asks the model for something.
+    something the server can actually read, and the record actually asks the
+    model for something.
+
+    "Something to send" used to mean the *key* ``content`` was present, or
+    ``tool_calls`` was truthy.  That is presence, not validity, and everything
+    it waved through reaches the HTTP payload verbatim: ``content`` could be a
+    number, a bare object or ``null``; ``tool_calls`` could be the string
+    ``"yes"``; a ``tool`` turn needed no ``tool_call_id`` to answer; and a tool
+    schema needed only to be a dict, so ``{}`` passed.  Each of those is a 400
+    from the server *after* the engine has been paid for and the run is
+    underway -- which is the whole reason this validation runs up front.  The
+    predecessor was narrower but stricter; widening the shape is not a licence
+    to stop checking it.
+
+    What is deliberately NOT required: that ``content`` be a ``str``.  Real
+    agentic content is frequently a list of content parts
+    (``[{"type": "text", "text": ...}]``), which ``workloads.content_text``
+    exists to flatten, so demanding a string would reject exactly the traffic
+    this loader was widened to carry.
     """
     if not isinstance(obj, dict):
         raise AssertionError(f"{context}: record is not a JSON object")
@@ -124,11 +216,29 @@ def _build_seed_request(obj: object, *, context: str) -> SeedRequest:
                 "OpenAI-compatible server accepts only "
                 f"{', '.join(sorted(ACCEPTED_MESSAGE_ROLES))}"
             )
-        if "content" not in message and not message.get("tool_calls"):
+        where = f"{context}: messages[{position}] (role {role!r})"
+        content = message.get("content")
+        has_content = "content" in message and content is not None
+        if has_content:
+            _check_message_content(content, where=where)
+        has_tool_calls = "tool_calls" in message
+        if has_tool_calls:
+            _check_tool_calls(message.get("tool_calls"), where=where)
+        if not has_content and not _truthy_tool_calls(message.get("tool_calls")):
             raise AssertionError(
-                f"{context}: messages[{position}] (role {role!r}) carries neither "
-                "'content' nor 'tool_calls', so there is nothing to send"
+                f"{where} carries neither 'content' nor a tool call, so there "
+                "is nothing to send"
             )
+        # An OpenAI-compatible server matches a tool result back to the call it
+        # answers by id, and rejects the turn outright without one.  The old
+        # check let such a record through on the strength of its content alone.
+        if role == "tool":
+            tool_call_id = message.get("tool_call_id")
+            if not isinstance(tool_call_id, str) or not tool_call_id.strip():
+                raise AssertionError(
+                    f"{where} has no non-empty string 'tool_call_id'; a tool "
+                    "result cannot be matched to the call it answers without one"
+                )
     if not any(
         message.get("role") == "user"
         and workloads.content_text(message.get("content")).strip()
@@ -146,6 +256,23 @@ def _build_seed_request(obj: object, *, context: str) -> SeedRequest:
         for position, tool in enumerate(raw_tools):
             if not isinstance(tool, dict):
                 raise AssertionError(f"{context}: tools[{position}] is not an object")
+            # ``{}`` is an object and used to pass.  A tool schema the model
+            # cannot name is not a tool: the server rejects the request, and if
+            # it did not, the model could never emit a matching call.  Both
+            # real workloads store exactly ``{"type": "function", "function":
+            # {...}}``, so this is the shape on disk, not an invented one.
+            function = tool.get("function")
+            if tool.get("type") != "function" or not isinstance(function, dict):
+                raise AssertionError(
+                    f"{context}: tools[{position}] is not a "
+                    "{'type': 'function', 'function': {...}} schema"
+                )
+            name = function.get("name")
+            if not isinstance(name, str) or not name.strip():
+                raise AssertionError(
+                    f"{context}: tools[{position}].function has no non-empty "
+                    "string 'name', so nothing could ever call it"
+                )
         tools = tuple(dict(tool) for tool in raw_tools)
     return SeedRequest(
         messages=tuple(dict(message) for message in messages), tools=tools
@@ -601,13 +728,35 @@ def _post_chat(
     choices = body.get("choices")
     assert isinstance(choices, list) and choices, body
     assert isinstance(choices[0], dict), body
-    # Accept natural termination ("stop") or token-cap truncation ("length").
-    # A "length" finish means the response hit max_tokens — this is normal
+    # Accept any natural termination, or token-cap truncation.  A truncated
+    # finish ("length") means the response hit max_tokens — this is normal
     # serving behaviour for longer prompts (e.g. ultrachat p95 ~2751 chars) and
     # produces valid training traces.  Reject genuinely bad terminal states.
+    #
+    # The hardcoded ``("stop", "length")`` this replaces was a self-inflicted
+    # abort.  The payload above now ships the record's own tool schemas, so an
+    # agentic seed can and does make the server answer with
+    # ``finish_reason: "tool_calls"`` — a *complete* generation, the model
+    # choosing to hand off.  The first seed that picked a tool therefore killed
+    # the whole GPU run on an AssertionError, and the fix that added the tools
+    # is what created the value the assertion rejected.
+    #
+    # The vocabulary is imported from ``speedlm.gate.replay`` rather than spelled
+    # again here.  That module already owns both halves of this question, and
+    # there are three deliberately-mirrored copies of the truncated set already;
+    # ``traces.store`` documents its copy as restated "because the trace store
+    # must not depend on a training backend", which is a layering constraint
+    # this file does not have — it is a test, and importing the production
+    # vocabulary is exactly how it stays honest about what the gate accepts.
+    # So: no fourth copy, and no drift test needed for one.
     finish = choices[0].get("finish_reason")
-    assert finish in ("stop", "length"), (
-        f"unexpected finish_reason: {finish!r}; got body: {body}"
+    assert is_natural_stop_finish_reason(finish) or is_truncated_finish_reason(
+        finish
+    ), (
+        f"unexpected finish_reason: {finish!r}; a usable response ends either "
+        f"naturally ({', '.join(sorted(NATURAL_STOP_FINISH_REASONS))}) or at "
+        f"the output cap ({', '.join(sorted(TRUNCATED_FINISH_REASONS))}); "
+        f"got body: {body}"
     )
     usage = body.get("usage")
     assert isinstance(usage, dict), body

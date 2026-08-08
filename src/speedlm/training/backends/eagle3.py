@@ -403,13 +403,28 @@ _VALIDATE_DRAFT: Final = (
 
 
 class EmptySpeculatorsDatasetError(Eagle3Error):
-    """No captured record survived conversion into the Speculators contract."""
+    """No captured record survived conversion into the Speculators contract.
 
-    def __init__(self, source: Path) -> None:
+    Raised when nothing was written and no *one* filter dominates the loss --
+    including when the dominant bucket is ``dropped_untrainable``, which has no
+    dedicated remedy to print because there is no knob that makes a row without
+    an assistant turn trainable.  ``counts`` is optional only because one older
+    call site predates the reconciliation; when it is supplied the message
+    carries the full accounting, so "nothing converted" is never the *whole*
+    answer where a per-bucket breakdown exists.
+    """
+
+    def __init__(
+        self, source: Path, counts: RenderedRowCounts | None = None
+    ) -> None:
         self.source = source
-        super().__init__(
+        self.counts = counts
+        message = (
             f"no captured trace in {source} converted to a Speculators conversation"
         )
+        if counts is not None:
+            message += f". {counts.drop_accounting()}"
+        super().__init__(message)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1852,6 +1867,34 @@ class RenderedRowCounts:
             return 0.0
         return self.dropped_client_supplied / self.read
 
+    def dominant_drop_bucket(self) -> str | None:
+        """The one bucket that took strictly more rows than any other, if any.
+
+        Considers *every* bucket in :data:`_DROP_BUCKETS`, which is the whole
+        point.  The predecessor compared ``dropped_client_supplied`` against
+        ``dropped_truncated`` and nothing else, so ``dropped_untrainable`` --
+        a first-class reconciled bucket that ``drop_accounting`` has always
+        printed -- could not win no matter how large it got.  On 90 untrainable,
+        6 truncated, 4 client-supplied and 0 written, the caller raised
+        :class:`TruncationFilteredCorpusError` and told the operator to raise the
+        token cap: a remedy that would return 6 of the 100 missing rows, aimed at
+        the smallest of the three causes.
+
+        ``None`` when no bucket is strictly greatest.  A tie is not a dominant
+        cause, and the predecessor resolved one by always answering
+        "truncation", which is a coin flip wearing a diagnosis.  The caller
+        reports the full accounting instead of naming a winner that does not
+        exist -- see :class:`UnattributedCorpusShortfallError`.
+        """
+        counted = {name: int(getattr(self, name)) for name in _DROP_BUCKETS}
+        largest = max(counted.values())
+        if largest <= 0:
+            return None
+        leaders = [name for name, value in counted.items() if value == largest]
+        if len(leaders) != 1:
+            return None
+        return leaders[0]
+
     def drop_accounting(self) -> str:
         """Account for every read row, whichever filter is being blamed.
 
@@ -1970,6 +2013,48 @@ class ClientSupervisedCorpusError(Eagle3Error):
             "Supervising those turns would teach the draft head to predict "
             "another model's outputs, so dropping the row is the only "
             "representable answer."
+        )
+
+
+class UnattributedCorpusShortfallError(Eagle3Error):
+    """The corpus rendered too few rows and no single filter is to blame.
+
+    The honest answer when :meth:`RenderedRowCounts.dominant_drop_bucket` finds
+    no winner, or finds one that has no remedy of its own to offer.  Both
+    sibling failures lead with a specific fix -- raise the token cap, set
+    ``trust_untagged_assistant_messages`` -- and printing either of those for a
+    shortfall it did not cause is worse than printing neither: an operator who
+    follows it changes a setting, re-runs, and lands in exactly the same place
+    having ruled nothing out.  Job 375414 was that failure with the buckets
+    reversed.
+
+    So this one names no cause and prescribes no knob.  It reconciles ``read``
+    against ``written`` and every bucket and stops there, which is a complete
+    statement of what is known.  It earns a class of its own rather than reusing
+    a sibling precisely because the remedy paragraph is the part that must be
+    absent.
+    """
+
+    def __init__(self, source: Path, counts: RenderedRowCounts, minimum: int) -> None:
+        self.counts = counts
+        self.minimum = minimum
+        dominant = counts.dominant_drop_bucket()
+        if dominant is None:
+            cause = (
+                "no single filter dominates the loss, so there is no one remedy "
+                "to recommend"
+            )
+        else:
+            cause = (
+                f"the largest cause is that {counts.__getattribute__(dominant)} "
+                f"rows {_DROP_BUCKETS[dominant]}, which no setting on this "
+                "pipeline can recover"
+            )
+        super().__init__(
+            f"rendering {source} produced {counts.written} trainable rows, below "
+            f"the floor of {minimum}, and {cause}. {counts.drop_accounting()}. "
+            "Fixing this needs a corpus whose rows carry trainable assistant "
+            "turns, not a change to the filters that dropped them."
         )
 
 
@@ -2097,11 +2182,34 @@ def _render_speculators_dataset(
     # which is checked first.  Fixed order made truncation the reported cause
     # of every shortfall it contributed anything to: job 375414 rendered 0 of
     # 409 rows with 36 truncated and 373 client-supplied, and was told to raise
-    # the token cap.  Ties keep the historical answer.
-    if written < minimum_rows and (dropped_truncated or dropped_client_supplied):
-        if dropped_client_supplied > dropped_truncated:
+    # the token cap.
+    #
+    # The two-way comparison that replaced that fixed order was the same bug one
+    # bucket narrower.  It weighed ``dropped_client_supplied`` against
+    # ``dropped_truncated`` and ignored ``dropped_untrainable`` entirely, so a
+    # corpus losing 90 rows to untrainability, 6 to truncation and 4 to
+    # authorship still reported truncation and still prescribed the token cap --
+    # a remedy for 6 of the 100 missing rows.  And on an exact tie it always
+    # answered truncation, where by construction neither cause dominates.
+    #
+    # So: attribute across ALL buckets, and only when one genuinely dominates.
+    # A bucket with a dedicated remedy gets its own failure; anything else --
+    # untrainability, which no knob can undo, or a tie, which has no single
+    # cause -- gets the full accounting and no invented prescription.
+    if written < minimum_rows and (
+        dropped_untrainable or dropped_truncated or dropped_client_supplied
+    ):
+        dominant = counts.dominant_drop_bucket()
+        if dominant == "dropped_client_supplied":
             raise ClientSupervisedCorpusError(snapshot.path, counts, minimum_rows)
-        raise TruncationFilteredCorpusError(snapshot.path, counts, minimum_rows)
+        if dominant == "dropped_truncated":
+            raise TruncationFilteredCorpusError(snapshot.path, counts, minimum_rows)
+        # Nothing was written at all, so the long-standing "nothing converted"
+        # failure is still the truest headline -- it now carries the accounting
+        # behind it rather than leaving the breakdown unsaid.
+        if not written:
+            raise EmptySpeculatorsDatasetError(snapshot.path, counts)
+        raise UnattributedCorpusShortfallError(snapshot.path, counts, minimum_rows)
     if not written:
         raise EmptySpeculatorsDatasetError(snapshot.path)
     return counts

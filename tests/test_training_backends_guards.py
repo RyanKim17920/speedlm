@@ -33,6 +33,7 @@ from speedlm.training.backends.eagle3 import (
     SpeculatorsTrainingProcess,
     TruncatedRowPolicy,
     TruncationFilteredCorpusError,
+    UnattributedCorpusShortfallError,
     WarmStartLayerMismatchError,
     _check_warm_start_alignment,
     _checkpoint_aux_count,
@@ -1069,6 +1070,103 @@ def test_truncation_still_owns_a_shortfall_it_dominates(tmp_path: Path) -> None:
     # other filter took is named, with the knob that would return it.
     assert "raise the serving max_tokens cap" in message
     assert "trust_untagged_assistant_messages" in message
+
+
+def _untrainable(index: int) -> dict[str, object]:
+    """A row with no assistant turn at all -- nothing to supervise."""
+    return {
+        "id": f"untrainable-{index}",
+        "messages": [{"role": "user", "content": "q"}],
+    }
+
+
+def test_the_third_bucket_can_win_the_attribution(tmp_path: Path) -> None:
+    """``dropped_untrainable`` is reconciled, so it must be attributable too.
+
+    The two-way comparison could not see it.  90 untrainable, 6 truncated, 4
+    client-supplied and nothing written reported *truncation* and prescribed
+    raising the token cap -- a remedy for 6 of the 100 missing rows, and the
+    smallest of the three causes at that.  Job 375414 was this same shape one
+    bucket over; the fix for it left this one open.
+
+    Untrainability has no knob, so the honest answer names no remedy and prints
+    the whole accounting instead.
+    """
+    records: list[Mapping[str, object]] = [_untrainable(i) for i in range(90)]
+    for index in range(90, 96):
+        row = _generated(index)
+        row["finish_reason"] = "length"
+        records.append(row)
+    records.extend(_replayed(index) for index in range(96, 100))
+
+    with pytest.raises(Eagle3Error) as caught:
+        _render(tmp_path, records, policy=TruncatedRowPolicy.DROP, minimum_rows=4)
+
+    assert not isinstance(caught.value, TruncationFilteredCorpusError), (
+        "the smallest cause was reported as the dominant one"
+    )
+    message = str(caught.value)
+    assert "90 carried no trainable assistant turn" in message
+    assert "6 were truncated" in message
+    assert "4 carried an assistant turn this verifier did not produce" in message
+    assert "raise the serving max_tokens cap" not in message, (
+        "a remedy was prescribed for a cause it cannot fix"
+    )
+
+
+def test_a_shortfall_no_bucket_dominates_names_no_single_cause(
+    tmp_path: Path,
+) -> None:
+    """An exact tie is not a diagnosis, and picking one was a coin flip.
+
+    The predecessor's comment said "ties keep the historical answer", i.e. on
+    5 truncated against 5 client-supplied it blamed truncation -- for no reason
+    beyond which branch was written first.  An operator raising the token cap
+    on that advice recovers half the loss and learns nothing about the rest.
+    """
+    records: list[Mapping[str, object]] = []
+    for index in range(5):
+        row = _generated(index)
+        row["finish_reason"] = "length"
+        records.append(row)
+    records.extend(_replayed(index) for index in range(5, 10))
+
+    with pytest.raises(Eagle3Error) as caught:
+        _render(tmp_path, records, policy=TruncatedRowPolicy.DROP, minimum_rows=4)
+
+    assert not isinstance(
+        caught.value, (TruncationFilteredCorpusError, ClientSupervisedCorpusError)
+    ), "a tie was resolved in favour of one filter anyway"
+    message = str(caught.value)
+    assert "5 were truncated" in message
+    assert "5 carried an assistant turn this verifier did not produce" in message
+
+
+def test_a_partial_render_no_bucket_can_fix_is_reported_as_such(
+    tmp_path: Path,
+) -> None:
+    """Below the floor but not empty, and the dominant cause has no remedy.
+
+    The one case that is neither of the two dedicated failures nor "nothing
+    converted", so it is what earns ``UnattributedCorpusShortfallError`` its
+    own class: there is a real, quantified shortfall and deliberately no knob
+    to recommend.
+    """
+    records: list[Mapping[str, object]] = [_untrainable(i) for i in range(20)]
+    for index in range(20, 23):
+        row = _generated(index)
+        row["finish_reason"] = "length"
+        records.append(row)
+    records.extend(_generated(index) for index in range(23, 25))
+
+    with pytest.raises(UnattributedCorpusShortfallError) as caught:
+        _render(tmp_path, records, policy=TruncatedRowPolicy.DROP, minimum_rows=10)
+
+    assert caught.value.counts.written == 2
+    message = str(caught.value)
+    assert "2 trainable rows, below the floor of 10" in message
+    assert "20 carried no trainable assistant turn" in message
+    assert "no setting on this pipeline can recover" in message
 
 
 @pytest.mark.parametrize(
