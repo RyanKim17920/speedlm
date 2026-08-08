@@ -295,6 +295,57 @@ def test_override_is_the_only_way_past_a_failing_preflight_and_it_shouts(
 
 
 # ---------------------------------------------------------------------------
+# 2b -- the launcher's DEFAULT --corpus is part of the configuration preflight
+#       judges, so `--workload X` alone must be refused for idle-tuning
+#
+# Job 375376 was launched as exactly the first argv below, got "OK -- no
+# findings", and died 1m48s into its allocation on
+# test_live_idle_tuning.py:229.  Nothing at the unit level could have caught it:
+# the pair only exists because ``build_preflight_config`` fills in the corpus
+# the operator never typed.  So both halves are asserted through the CLI.
+# ---------------------------------------------------------------------------
+_IDLE_TUNING_WORKLOAD_ARGV = [
+    "preflight",
+    "--flavor",
+    "idle-tuning",
+    "--tuning-config",
+    "/dev/null",
+    "--workload",
+    "agentic-mixed-outcome",
+    "--vllm-args",
+    '["--max-model-len","24576","--gpu-memory-utilization","0.75","--enforce-eager"]',
+]
+
+
+def test_workload_alone_collides_with_the_default_corpus_for_idle_tuning(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    code, out, err = run_cli(list(_IDLE_TUNING_WORKLOAD_ARGV), capsys)
+    report = out + err
+    assert code != 0, (
+        "preflight passed the argv that burned job 375376; the corpus the "
+        f"launcher defaults in is invisible to it\n{report}"
+    )
+    assert "workload-corpus-collision" in report
+    assert "DO NOT LAUNCH" in report
+    assert "--no-corpus" in report
+
+
+def test_no_corpus_clears_the_collision_for_idle_tuning(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The pair-half: the check must accept the fixed form of the same launch.
+
+    Without this, a check that refused every idle-tuning workload would look
+    identical to a working one.
+    """
+    code, out, err = run_cli([*_IDLE_TUNING_WORKLOAD_ARGV, "--no-corpus"], capsys)
+    report = out + err
+    assert "workload-corpus-collision" not in report, report
+    assert code == 0, f"preflight refused the launchable form of the run\n{report}"
+
+
+# ---------------------------------------------------------------------------
 # 3 -- the composed argv is one the real launcher would accept
 # ---------------------------------------------------------------------------
 def launcher_accepted_options() -> set[str]:
@@ -644,6 +695,12 @@ def test_launcher_exports_the_workload_for_idle_tuning(tmp_path: Path) -> None:
     validated there, and then dropped: only the config-matrix branch of the
     per-flavor ``case`` emitted ``export SPEEDLM_E2E_WORKLOAD``.  An idle-tuning
     run asked for agentic traffic got a clean preflight and generic chat.
+
+    ``--no-corpus`` is not incidental here.  This flavor defaults ``--corpus``
+    to the ultrachat file, and ``test_live_idle_tuning.py:229`` refuses a run
+    that has both -- so ``--workload`` alone produces an sbatch that dies on a
+    GPU (job 375376, 1m48s in).  The launchable form of "seed from this
+    workload" is ``--workload X --no-corpus``, and that is what this pins.
     """
     tuning_config = tmp_path / "tuning.json"
     tuning_config.write_text("{}", encoding="utf-8")
@@ -652,6 +709,7 @@ def test_launcher_exports_the_workload_for_idle_tuning(tmp_path: Path) -> None:
         "--flavor", "idle-tuning",
         "--tuning-config", str(tuning_config),
         "--workload", "agentic-mixed-outcome",
+        "--no-corpus",
         # The engine argv is where this flavor's context window comes from, so
         # the workload's 23552-token requirement has to be met there.
         "--vllm-args",
@@ -660,6 +718,10 @@ def test_launcher_exports_the_workload_for_idle_tuning(tmp_path: Path) -> None:
     assert "export SPEEDLM_E2E_WORKLOAD=agentic-mixed-outcome" in text, (
         "job.sbatch does not export the workload; the run would seed from "
         "generic-chat whatever preflight was told"
+    )
+    assert "SPEEDLM_E2E_PROMPT_CORPUS" not in text, (
+        "job.sbatch exports a prompt corpus alongside the workload; "
+        "test_live_idle_tuning.py:229 kills that run once it holds a GPU"
     )
 
 

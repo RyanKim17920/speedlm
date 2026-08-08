@@ -112,6 +112,14 @@ class Flavor:
     consumes_workload: bool
     #: Where that was verified (or why the answer is "no").
     workload_evidence: str
+    #: Whether a ``--workload`` and a ``--corpus`` in the same launch are a
+    #: *contradiction* for this flavor -- i.e. the test treats the two variables
+    #: as rival seed sources and refuses the pair -- rather than merely both
+    #: being read.  Deliberately not "does the test read CORPUS_VAR": both
+    #: workload-consuming flavors read it, and only one of them collides.
+    corpus_collides_with_workload: bool
+    #: Where that was verified (or why the answer is "no").
+    corpus_collision_evidence: str
     #: Environment variable that gates the test; unset means "skip silently".
     gate_var: str
     #: Which venv runs it.  Not a free choice: the capture/hot-swap tests import
@@ -156,6 +164,9 @@ _NO_LAUNCHER_ARGS = "test spawns its own engine with hardcoded argv"
 #: The one variable the launcher exports ``--workload`` into.
 WORKLOAD_VAR = "SPEEDLM_E2E_WORKLOAD"
 
+#: The one the launcher exports ``--corpus`` into (make_snapshot_run.sh:808,913).
+CORPUS_VAR = "SPEEDLM_E2E_PROMPT_CORPUS"
+
 #: make_snapshot_run.sh:61 and the per-flavor `interpreter=` assignments.
 _PROJECT_VENV_PYTHON = "/admin/home/ryan.kim/speedlm-fr/.venv/bin/python"
 _VLLM_VENV_PYTHON = "/admin/home/ryan.kim/speedlm/.preflight/venvs/vllm/bin/python"
@@ -166,6 +177,12 @@ FLAVORS: Mapping[str, Flavor] = {
         test_path="tests/e2e/test_live_idle_tuning.py",
         consumes_workload=True,
         workload_evidence="test_live_idle_tuning.py::_selected_workload reads SPEEDLM_E2E_WORKLOAD",
+        corpus_collides_with_workload=True,
+        corpus_collision_evidence=(
+            "test_live_idle_tuning.py:229 asserts not "
+            "os.environ.get(CORPUS_VAR) once a workload is "
+            "selected -- the two are rival seed sources and the pair is refused"
+        ),
         gate_var="SPEEDLM_E2E_IDLE_TUNING",
         interpreter=_PROJECT_VENV_PYTHON,
         artifact_var="SPEEDLM_E2E_ARTIFACT_DIR",
@@ -185,6 +202,11 @@ FLAVORS: Mapping[str, Flavor] = {
         workload_evidence=(
             "no SPEEDLM_E2E_WORKLOAD read anywhere in "
             "test_serving_activation_capture.py"
+        ),
+        corpus_collides_with_workload=False,
+        corpus_collision_evidence=(
+            "flavor never reads SPEEDLM_E2E_WORKLOAD, so no workload/corpus "
+            "pair can arise; make_snapshot_run.sh blanks corpus for it"
         ),
         gate_var="SPEEDLM_E2E_ACTIVATION_CAPTURE",
         interpreter=_VLLM_VENV_PYTHON,
@@ -208,6 +230,11 @@ FLAVORS: Mapping[str, Flavor] = {
         workload_evidence=(
             "no SPEEDLM_E2E_WORKLOAD read anywhere in "
             "test_serving_activation_capture_overhead.py"
+        ),
+        corpus_collides_with_workload=False,
+        corpus_collision_evidence=(
+            "flavor never reads SPEEDLM_E2E_WORKLOAD, so no workload/corpus "
+            "pair can arise; make_snapshot_run.sh blanks corpus for it"
         ),
         gate_var="SPEEDLM_E2E_CAPTURE_OVERHEAD",
         interpreter=_VLLM_VENV_PYTHON,
@@ -233,6 +260,11 @@ FLAVORS: Mapping[str, Flavor] = {
             "no SPEEDLM_E2E_WORKLOAD read anywhere in "
             "test_serving_draft_hot_swap.py"
         ),
+        corpus_collides_with_workload=False,
+        corpus_collision_evidence=(
+            "flavor never reads SPEEDLM_E2E_WORKLOAD, so no workload/corpus "
+            "pair can arise; make_snapshot_run.sh blanks corpus for it"
+        ),
         gate_var="SPEEDLM_E2E_DRAFT_HOT_SWAP",
         interpreter=_VLLM_VENV_PYTHON,
         artifact_var="SPEEDLM_E2E_ARTIFACT_DIR",
@@ -256,6 +288,11 @@ FLAVORS: Mapping[str, Flavor] = {
             "no SPEEDLM_E2E_WORKLOAD read anywhere in "
             "test_live_vllm.py"
         ),
+        corpus_collides_with_workload=False,
+        corpus_collision_evidence=(
+            "flavor never reads SPEEDLM_E2E_WORKLOAD, so no workload/corpus "
+            "pair can arise; make_snapshot_run.sh blanks corpus for it"
+        ),
         gate_var="SPEEDLM_E2E",
         interpreter=_PROJECT_VENV_PYTHON,
         artifact_var="SPEEDLM_E2E_ARTIFACT_DIR",
@@ -275,6 +312,11 @@ FLAVORS: Mapping[str, Flavor] = {
         workload_evidence=(
             "no SPEEDLM_E2E_WORKLOAD read anywhere in "
             "test_proxy_overhead.py"
+        ),
+        corpus_collides_with_workload=False,
+        corpus_collision_evidence=(
+            "flavor never reads SPEEDLM_E2E_WORKLOAD, so no workload/corpus "
+            "pair can arise; make_snapshot_run.sh blanks corpus for it"
         ),
         gate_var="SPEEDLM_E2E",
         interpreter=_PROJECT_VENV_PYTHON,
@@ -296,6 +338,11 @@ FLAVORS: Mapping[str, Flavor] = {
             "no SPEEDLM_E2E_WORKLOAD read anywhere in "
             "test_token_fidelity.py"
         ),
+        corpus_collides_with_workload=False,
+        corpus_collision_evidence=(
+            "flavor never reads SPEEDLM_E2E_WORKLOAD, so no workload/corpus "
+            "pair can arise; make_snapshot_run.sh blanks corpus for it"
+        ),
         gate_var="SPEEDLM_E2E",
         interpreter=_PROJECT_VENV_PYTHON,
         artifact_var="SPEEDLM_E2E_ARTIFACT_DIR",
@@ -316,6 +363,11 @@ FLAVORS: Mapping[str, Flavor] = {
         workload_evidence=(
             "no SPEEDLM_E2E_WORKLOAD read anywhere in "
             "test_model_matrix.py"
+        ),
+        corpus_collides_with_workload=False,
+        corpus_collision_evidence=(
+            "flavor never reads SPEEDLM_E2E_WORKLOAD, so no workload/corpus "
+            "pair can arise; make_snapshot_run.sh blanks corpus for it"
         ),
         gate_var="SPEEDLM_E2E",
         interpreter=_PROJECT_VENV_PYTHON,
@@ -340,6 +392,11 @@ FLAVORS: Mapping[str, Flavor] = {
             "no SPEEDLM_E2E_WORKLOAD read anywhere in "
             "test_capture_harness_matrix.py"
         ),
+        corpus_collides_with_workload=False,
+        corpus_collision_evidence=(
+            "flavor never reads SPEEDLM_E2E_WORKLOAD, so no workload/corpus "
+            "pair can arise; make_snapshot_run.sh blanks corpus for it"
+        ),
         gate_var="SPEEDLM_E2E",
         interpreter=_PROJECT_VENV_PYTHON,
         artifact_var="SPEEDLM_CAPTURE_ARTIFACT_DIR",
@@ -360,6 +417,11 @@ FLAVORS: Mapping[str, Flavor] = {
             "no SPEEDLM_E2E_WORKLOAD read anywhere in "
             "test_agent_harness.py"
         ),
+        corpus_collides_with_workload=False,
+        corpus_collision_evidence=(
+            "flavor never reads SPEEDLM_E2E_WORKLOAD, so no workload/corpus "
+            "pair can arise; make_snapshot_run.sh blanks corpus for it"
+        ),
         gate_var="SPEEDLM_E2E",
         interpreter=_PROJECT_VENV_PYTHON,
         artifact_var="SPEEDLM_AGENT_ARTIFACT_DIR",
@@ -378,6 +440,16 @@ FLAVORS: Mapping[str, Flavor] = {
         test_path="tests/e2e/test_inference_configuration_matrix.py",
         consumes_workload=True,
         workload_evidence="test_inference_configuration_matrix.py:189 reads SPEEDLM_E2E_WORKLOAD",
+        corpus_collides_with_workload=False,
+        corpus_collision_evidence=(
+            "test_inference_configuration_matrix.py:185-188 reads "
+            "SPEEDLM_E2E_PROMPT_CORPUS only into "
+            "LiveConfiguration.legacy_prompt_corpus, which is recorded in the "
+            "manifest and never seeds anything; the workload manifest is the "
+            "sole prompt source, and make_snapshot_run.sh:503 makes --corpus "
+            "mandatory here, so the pair is the normal case rather than a "
+            "contradiction"
+        ),
         gate_var="SPEEDLM_E2E_CONFIG_MATRIX",
         interpreter=_PROJECT_VENV_PYTHON,
         artifact_var="SPEEDLM_CONFIG_MATRIX_ARTIFACT_DIR",
@@ -775,6 +847,56 @@ def _check_workload_consumed(flavor: Flavor, config: PreflightConfig) -> list[Fi
     ]
 
 
+def _check_workload_does_not_collide_with_corpus(
+    flavor: Flavor, config: PreflightConfig
+) -> list[Finding]:
+    """A workload and a prompt corpus together name two different traffics.
+
+    The idle-tuning flavor defaults ``--corpus`` to the ultrachat file, so
+    ``--workload agentic-mixed-outcome`` alone exports *both* variables and the
+    run cannot say which one it measured.  ``test_live_idle_tuning`` refuses
+    that pair at runtime -- correctly -- but it refuses it after the job has
+    been queued, scheduled and given a GPU, which is precisely the failure
+    preflight exists to move forward in time.  Job 375376 died 1m48s into an
+    allocation on exactly this.
+
+    Checked here rather than fixed by silently dropping the corpus: which
+    traffic the operator meant is not something this tool should guess.
+
+    Scoped to :attr:`Flavor.corpus_collides_with_workload`, NOT to
+    ``consumes_workload``.  Both workload-consuming flavors read
+    :data:`CORPUS_VAR`, and only idle-tuning treats it as a rival seed source.
+    config-matrix reads it into ``legacy_prompt_corpus``, records it in the
+    manifest and seeds entirely from the workload -- and its launcher arm makes
+    ``--corpus`` mandatory, so scoping on ``consumes_workload`` would refuse
+    every config-matrix launch that named a workload, including the ones the
+    launcher itself requires.
+    """
+    if config.workload is None or not flavor.corpus_collides_with_workload:
+        return []
+    # ``options`` is the modelled launcher invocation, and the caller already
+    # fills in the flavor's DEFAULT corpus there (and pops it for
+    # ``--no-corpus``), so this sees the pair the sbatch will really export --
+    # not merely the flags the operator happened to type.
+    corpus = config.options.get("--corpus")
+    if not corpus:
+        return []
+    name = getattr(config.workload, "name", "<unnamed>")
+    return [
+        Finding(
+            Severity.ERROR,
+            "workload-corpus-collision",
+            f"--workload {name!r} and --corpus {corpus!r} are both in "
+            f"effect for flavor {flavor.name!r}, which treats them as rival seed "
+            "sources and would measure one while the record named the other "
+            f"({flavor.corpus_collision_evidence}). Note this "
+            "flavor supplies a DEFAULT corpus, so supplying only --workload "
+            "still produces the pair. Pass --no-corpus to seed from the "
+            "workload, or drop --workload to seed from the corpus.",
+        )
+    ]
+
+
 def _check_max_model_len_agrees_with_argv(
     flavor: Flavor, config: PreflightConfig
 ) -> list[Finding]:
@@ -910,6 +1032,7 @@ _CHECKS = (
     _check_gdn_prefill_backend,
     _check_workload_compatibility,
     _check_workload_consumed,
+    _check_workload_does_not_collide_with_corpus,
     _check_max_model_len_agrees_with_argv,
     _check_timeouts,
     _check_silent_green,

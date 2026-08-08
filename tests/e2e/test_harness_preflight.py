@@ -405,6 +405,104 @@ def test_every_flavor_records_whether_its_test_reads_the_workload_variable() -> 
 
 
 # --------------------------------------------------------------------------
+# Check 5b-ii -- a --workload and a --corpus that name different traffic
+#
+# The defect: `speedbench preflight --flavor idle-tuning --workload
+# agentic-mixed-outcome` answered "OK -- no findings" even though the launcher
+# defaults --corpus, so the sbatch exported both variables and
+# test_live_idle_tuning.py:229 refused the pair -- 1m48s into an allocated GPU
+# (job 375376).  The pair-half of this section is the config-matrix case: it
+# also reads the corpus variable, but only to record it, and its launcher arm
+# makes --corpus mandatory, so refusing it there would refuse every legal
+# config-matrix launch.
+# --------------------------------------------------------------------------
+CORPUS = "/data/ryan.kim/speedlm-corpora/ultrachat-prompts.jsonl"
+
+
+def test_workload_together_with_a_corpus_is_error_for_idle_tuning() -> None:
+    workload = FakeWorkload("agentic", FakeRequirements(min_max_model_len=None))
+    findings, ok = preflight(
+        config_for(
+            "idle-tuning",
+            workload=workload,
+            options={"--tuning-config": "supplied", "--corpus": CORPUS},
+        )
+    )
+    assert not ok
+    assert "workload-corpus-collision" in errors(findings)
+    rendered = render_findings(findings)
+    assert "--no-corpus" in rendered, (
+        "the finding must name the flag that resolves it; the operator cannot "
+        "act on 'these two collide' alone"
+    )
+
+
+def test_workload_without_a_corpus_is_accepted_for_idle_tuning() -> None:
+    """The other half: dropping the corpus is what makes the launch legal."""
+    workload = FakeWorkload("agentic", FakeRequirements(min_max_model_len=None))
+    findings, ok = preflight(config_for("idle-tuning", workload=workload))
+    assert ok, render_findings(findings)
+    assert "workload-corpus-collision" not in errors(findings)
+
+
+def test_a_corpus_without_a_workload_is_not_a_collision() -> None:
+    """The historical idle-tuning launch -- corpus only -- must stay clean."""
+    findings, ok = preflight(
+        config_for(
+            "idle-tuning",
+            options={"--tuning-config": "supplied", "--corpus": CORPUS},
+        )
+    )
+    assert ok, render_findings(findings)
+    assert "workload-corpus-collision" not in errors(findings)
+
+
+def test_workload_together_with_a_corpus_is_accepted_for_config_matrix() -> None:
+    """config-matrix records the corpus and seeds from the workload regardless.
+
+    ``config_for`` already supplies ``--corpus`` because the flavor requires it,
+    which is the point: make_snapshot_run.sh:503 refuses ``--no-corpus`` here,
+    so a check scoped on ``consumes_workload`` would make every config-matrix
+    launch that named a workload unlaunchable by either gate.
+    """
+    workload = FakeWorkload("agentic", FakeRequirements(min_max_model_len=None))
+    config = config_for("config-matrix", workload=workload)
+    assert config.options.get("--corpus"), "the fixture stopped supplying --corpus"
+    findings, ok = preflight(config)
+    assert ok, render_findings(findings)
+    assert "workload-corpus-collision" not in errors(findings)
+
+
+def test_every_flavor_records_whether_its_test_refuses_a_workload_corpus_pair() -> None:
+    """The column, pinned to the refusal the tests actually contain.
+
+    Read out of the test sources for the same reason as the workload column:
+    the whole failure mode is a table that says something the test does not.
+    The predicate is the refusal itself, not a mention of the variable --
+    config-matrix mentions it and does not refuse.
+    """
+    refusal = 'assert not os.environ.get("SPEEDLM_E2E_PROMPT_CORPUS")'
+    for name, spec in FLAVORS.items():
+        source = (REPO_ROOT / spec.test_path).read_text(encoding="utf-8")
+        refuses = refusal in source
+        assert spec.corpus_collides_with_workload == refuses, (
+            f"flavor {name!r} declares corpus_collides_with_workload="
+            f"{spec.corpus_collides_with_workload} but {spec.test_path} "
+            f"{'does' if refuses else 'does not'} refuse a workload/corpus pair"
+        )
+    assert {
+        name for name, spec in FLAVORS.items() if spec.corpus_collides_with_workload
+    } == {"idle-tuning"}
+    # A flavor cannot collide over a variable it never selects a workload from.
+    for name, spec in FLAVORS.items():
+        if spec.corpus_collides_with_workload:
+            assert spec.consumes_workload, (
+                f"flavor {name!r} claims a workload/corpus collision but does "
+                "not consume a workload at all"
+            )
+
+
+# --------------------------------------------------------------------------
 # Check 5c -- --max-model-len that contradicts the engine argv
 # --------------------------------------------------------------------------
 def test_max_model_len_that_contradicts_the_vllm_args_is_error() -> None:
