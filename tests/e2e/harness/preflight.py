@@ -38,6 +38,7 @@ all is now an ERROR rather than a quiet success.
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -46,7 +47,9 @@ from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
 __all__ = [
+    "COMMON_LAUNCHER_OPTIONS",
     "FLAVORS",
+    "FLAVOR_OPTION_CONSUMERS",
     "Finding",
     "Flavor",
     "GitState",
@@ -469,6 +472,78 @@ FLAVORS: Mapping[str, Flavor] = {
 }
 
 
+#: Flavor-scoped launcher options and the flavors whose generated job or test
+#: actually consumes the supplied value.  Infrastructure options such as
+#: ``--commit``, ``--run-root``, ``--time`` and ``--hf-home`` are deliberately
+#: absent: the launcher itself consumes them for every flavor.
+#:
+#: WHY a positive map rather than a growing list of known-bad pairs: an option
+#: parser is shared by all eleven flavors, so every newly added flavor starts by
+#: accepting every spelling.  The failure mode is therefore omission -- the new
+#: arm forgets to export a value, or exports a variable its test never reads.
+#: Listing consumers makes omission fail closed.  ``--vllm-args`` and
+#: ``--workload`` retain their older, more detailed checks below, but live here
+#: too so this table remains the exhaustive option-to-consumer audit.
+FLAVOR_OPTION_CONSUMERS: Mapping[str, frozenset[str]] = {
+    "--tuning-timeout": frozenset({"idle-tuning"}),
+    "--tuning-config": frozenset({"idle-tuning"}),
+    "--tuning-profile": frozenset({"idle-tuning"}),
+    "--verifier": frozenset(
+        {"activation-capture", "capture-overhead", "hot-swap"}
+    ),
+    "--drafter": frozenset(
+        {"activation-capture", "capture-overhead", "hot-swap", "config-matrix"}
+    ),
+    "--candidate-drafter": frozenset({"config-matrix"}),
+    "--drafter-dir": frozenset({"activation-capture", "hot-swap"}),
+    "--inject-ms": frozenset({"capture-overhead"}),
+    "--inject-percent": frozenset({"config-matrix"}),
+    "--runner": frozenset({"activation-capture", "hot-swap"}),
+    "--prompt-set": frozenset({"activation-capture"}),
+    "--target-layer-ids": frozenset({"activation-capture"}),
+    "--hf-reference": frozenset({"activation-capture"}),
+    "--strict-verdict": frozenset({"activation-capture"}),
+    "--corpus": frozenset({"idle-tuning", "config-matrix"}),
+    "--no-corpus": frozenset({"idle-tuning"}),
+    "--model": frozenset(
+        {"live-vllm", "proxy-overhead", "capture-matrix", "agent-harness", "config-matrix"}
+    ),
+    "--matrix-cell": frozenset({"model-matrix"}),
+    "--vllm-args": frozenset(
+        {
+            "idle-tuning",
+            "live-vllm",
+            "proxy-overhead",
+            "token-fidelity",
+            "capture-matrix",
+            "agent-harness",
+        }
+    ),
+    "--workload": frozenset({"idle-tuning", "config-matrix"}),
+    "--max-model-len": frozenset({"idle-tuning", "config-matrix"}),
+}
+
+#: Options whose value the launcher infrastructure consumes for every flavor.
+#: Together with :data:`FLAVOR_OPTION_CONSUMERS`, this partitions the launcher's
+#: public option surface.  The completeness test parses the shell's real case
+#: arms, so adding an option without deciding which side it belongs to goes red.
+COMMON_LAUNCHER_OPTIONS: frozenset[str] = frozenset(
+    {
+        "--flavor",
+        "--commit",
+        "--run-name",
+        "--run-root",
+        "--time",
+        "--partition",
+        "--cpus",
+        "--pytest-k",
+        "--hf-home",
+        "--force",
+        "--skip-preflight",
+    }
+)
+
+
 # --------------------------------------------------------------------------
 # Inputs
 # --------------------------------------------------------------------------
@@ -508,6 +583,10 @@ class PreflightConfig:
     vllm_args: tuple[str, ...] | None = None
     #: Launcher options that were supplied, e.g. ``{"--matrix-cell": "..."}``.
     options: Mapping[str, str] = field(default_factory=dict)
+    #: Spellings the operator explicitly supplied.  ``options`` also contains
+    #: modeled launcher defaults (notably ``--corpus``), and treating a default
+    #: as an ignored user request would turn the consumer check into noise.
+    supplied_options: frozenset[str] = frozenset()
     model: str | None = None
     #: ``--time``; ``None`` means the flavor's default is used.
     slurm_time: str | None = None
@@ -590,6 +669,15 @@ def launcher_flavors(script_path: str | Path) -> frozenset[str]:
 # --------------------------------------------------------------------------
 MEMORY_BOUND_FLAGS: tuple[str, ...] = ("--max-model-len", "--gpu-memory-utilization")
 
+_MODEL_MATRIX_CELLS: frozenset[str] = frozenset(
+    {
+        "gpt-oss-20b-eagle3",
+        "qwen3.5-9b-mtp",
+        "qwen3.5-2b-none",
+        "qwen3.5-2b-ngram",
+    }
+)
+
 #: Flags that, set to these values, turn a real measurement into a green
 #: report about nothing.  Every one of them is a legitimate debugging aid and
 #: an illegitimate thing to spend an H100 allocation on.
@@ -650,6 +738,120 @@ def _check_required_options(flavor: Flavor, config: PreflightConfig) -> list[Fin
                     "missing-required-option",
                     f"flavor {flavor.name!r} requires {option}; it was not supplied.",
                 )
+            )
+    return findings
+
+
+def _check_options_consumed(flavor: Flavor, config: PreflightConfig) -> list[Finding]:
+    """Reject every explicitly supplied flavor option that reaches no consumer.
+
+    ``--vllm-args`` and ``--workload`` are handled by their dedicated checks,
+    which can name the exact environment variable and test evidence.  Keeping
+    them in :data:`FLAVOR_OPTION_CONSUMERS` still makes the table exhaustive;
+    avoiding a second finding keeps one defect to one diagnostic.
+    """
+    findings: list[Finding] = []
+    for option in sorted(config.supplied_options):
+        consumers = FLAVOR_OPTION_CONSUMERS.get(option)
+        if option in COMMON_LAUNCHER_OPTIONS:
+            continue
+        if consumers is None:
+            findings.append(
+                Finding(
+                    Severity.ERROR,
+                    "option-routing-unknown",
+                    f"{option} was supplied, but preflight has no consumer entry for "
+                    "it. Refusing until the launcher option is classified as common "
+                    "or assigned to the flavors that actually consume it.",
+                )
+            )
+            continue
+        if flavor.name in consumers:
+            continue
+        if option in {"--vllm-args", "--workload"}:
+            continue
+        findings.append(
+            Finding(
+                Severity.ERROR,
+                "option-ignored",
+                f"{option} was supplied for flavor {flavor.name!r}, but neither "
+                "that launcher's flavor arm nor its test consumes the value. The "
+                "job would look configured and run unchanged. This option is "
+                f"consumed only by: {', '.join(sorted(consumers))}.",
+            )
+        )
+    return findings
+
+
+def _check_option_values(flavor: Flavor, config: PreflightConfig) -> list[Finding]:
+    """Validate values whose consumer otherwise discovers the error on a GPU.
+
+    The shell already validates its scheduling syntax.  These are different:
+    they are exported verbatim and parsed only by the selected Python test.  A
+    malformed JSON layer list or unknown matrix cell therefore used to survive
+    until after allocation, even though every fact needed to reject it was in
+    the launcher argv.
+    """
+    findings: list[Finding] = []
+
+    def invalid(option: str, detail: str) -> None:
+        findings.append(
+            Finding(
+                Severity.ERROR,
+                "invalid-option",
+                f"{option} for flavor {flavor.name!r} {detail}",
+            )
+        )
+
+    for option in ("--hf-reference", "--strict-verdict"):
+        if option in config.supplied_options and config.options.get(option) not in {"0", "1"}:
+            invalid(option, "must be exactly 0 or 1")
+
+    if "--target-layer-ids" in config.supplied_options:
+        raw = config.options.get("--target-layer-ids", "")
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = None
+        if (
+            not isinstance(parsed, list)
+            or not parsed
+            or any(isinstance(value, bool) or not isinstance(value, int) for value in parsed)
+        ):
+            invalid(
+                "--target-layer-ids",
+                "must be a non-empty JSON array of integers, for example '[2,18,33]'",
+            )
+
+    if "--inject-ms" in config.supplied_options:
+        raw = config.options.get("--inject-ms", "")
+        if re.fullmatch(r"[0-9]+", raw) is None:
+            invalid("--inject-ms", "must be a non-negative integer number of milliseconds")
+
+    if "--inject-percent" in config.supplied_options:
+        raw = config.options.get("--inject-percent", "")
+        try:
+            value = float(raw)
+        except ValueError:
+            value = math.nan
+        if not math.isfinite(value) or value < 0:
+            invalid("--inject-percent", "must be a finite non-negative number")
+
+    if "--max-model-len" in config.supplied_options:
+        raw = config.options.get("--max-model-len", "")
+        try:
+            value = int(raw)
+        except ValueError:
+            value = 0
+        if value <= 0:
+            invalid("--max-model-len", "must be a positive integer")
+
+    if "--matrix-cell" in config.supplied_options:
+        value = config.options.get("--matrix-cell", "")
+        if value not in _MODEL_MATRIX_CELLS:
+            invalid(
+                "--matrix-cell",
+                "must name one of " + ", ".join(sorted(_MODEL_MATRIX_CELLS)),
             )
     return findings
 
@@ -942,7 +1144,7 @@ def _check_timeouts(flavor: Flavor, config: PreflightConfig) -> list[Finding]:
         if timeout >= wall:
             findings.append(
                 Finding(
-                    Severity.WARNING,
+                    Severity.ERROR,
                     "timeout",
                     f"timeout {label!r} is {timeout}s but the allocation is only "
                     f"{wall}s ({raw_time}); it can never fire, so the job dies by "
@@ -1028,6 +1230,8 @@ def _check_provenance(flavor: Flavor, config: PreflightConfig) -> list[Finding]:
 _CHECKS = (
     _check_vllm_args_consumed,
     _check_required_options,
+    _check_options_consumed,
+    _check_option_values,
     _check_memory_bounds,
     _check_gdn_prefill_backend,
     _check_workload_compatibility,

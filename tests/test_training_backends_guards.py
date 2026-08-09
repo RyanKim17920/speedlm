@@ -925,6 +925,30 @@ def test_every_client_supplied_turn_in_a_row_is_counted(tmp_path: Path) -> None:
     assert counts.client_supplied_turns_seen == 2
 
 
+def test_truncation_seen_counts_rows_an_earlier_filter_drops(tmp_path: Path) -> None:
+    """Evidence counters may overlap even though drop buckets are exclusive.
+
+    RED before the fix: authorship ran first and continued, so a replayed row
+    with ``finish_reason=length`` incremented ``dropped_client_supplied`` but
+    disappeared from ``truncated_seen``.  The returned accounting reconciled
+    while its truncation diagnostic understated the corpus.
+    """
+    replayed = _replayed(0)
+    replayed["finish_reason"] = "length"
+
+    counts, _ = _render(
+        tmp_path,
+        [replayed, _generated(1)],
+        policy=TruncatedRowPolicy.DROP,
+    )
+
+    assert counts.read == 2
+    assert counts.written == 1
+    assert counts.dropped_client_supplied == 1
+    assert counts.dropped_truncated == 0
+    assert counts.truncated_seen == 1
+
+
 def test_an_untagged_assistant_turn_fails_closed(tmp_path: Path) -> None:
     """An absent tag means "corpus predates tagging", not "we wrote it"."""
     records = [_conversation_row(0, [_turn("user", "q"), _turn("assistant", "a")])]

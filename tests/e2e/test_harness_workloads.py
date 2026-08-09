@@ -304,6 +304,25 @@ def test_verification_fails_when_a_record_body_is_edited_in_place(fixture_worklo
         W.verify_workload(spec)
 
 
+def test_injected_records_do_not_bypass_the_requested_digest_check(fixture_workload):
+    """Supplying already-loaded rows is an I/O optimisation, not an integrity bypass.
+
+    RED before the fix: ``verify_workload(spec, records=records)`` skipped the
+    entire source-file block, including SHA-256, whenever ``records`` was not
+    ``None``.  A caller could explicitly leave ``check_digest=True`` and verify
+    cleanly after the corpus bytes had changed underneath those rows.
+    """
+    spec, records_path, _ = fixture_workload
+    records = W.load_records(spec)
+    original = records_path.read_bytes()
+    altered = original.replace(b"request 0000", b"request 9999", 1)
+    assert altered != original and len(altered) == len(original)
+    records_path.write_bytes(altered)
+
+    with pytest.raises(W.WorkloadVerificationError, match="source.sha256"):
+        W.verify_workload(spec, records=records)
+
+
 def test_verification_fails_when_prompt_chars_disagrees_with_the_prompt(fixture_workload):
     """A stale cached length cannot hide behind the manifest.
 
@@ -418,6 +437,33 @@ def test_missing_corpus_is_an_error_not_an_empty_workload(fixture_workload):
         W.verify_workload(spec)
 
 
+@pytest.mark.parametrize(
+    ("block", "field"),
+    [
+        ("source", "sha256"),
+        ("tolerance", "percentile_relative"),
+        ("characteristics", "completion_chars"),
+    ],
+)
+def test_verification_refuses_missing_nested_manifest_fields(
+    fixture_workload, block: str, field: str
+) -> None:
+    """Top-level presence does not make a structurally incomplete block valid.
+
+    The source case previously raised a bare ``KeyError``; the tolerance case
+    silently substituted zero; and a missing nullable characteristic could be
+    indistinguishable from a legitimately declared null.
+    """
+    spec, _, _ = fixture_workload
+    del spec.manifest[block][field]
+
+    with pytest.raises(
+        W.WorkloadVerificationError,
+        match=rf"{block}\.{field} is not declared",
+    ):
+        W.verify_workload(spec)
+
+
 # ---------------------------------------------------------------------------
 # Interfaces
 # ---------------------------------------------------------------------------
@@ -474,6 +520,45 @@ def test_preflight_refuses_a_window_that_would_truncate(fixture_workload):
     assert W.preflight_refusals(spec, max_model_len=required, tool_support=True) == ()
     tool_refusals = W.preflight_refusals(spec, max_model_len=required, tool_support=False)
     assert any("tool" in reason for reason in tool_refusals)
+
+
+def test_preflight_refuses_a_digest_mismatch_before_capacity_checks(fixture_workload):
+    """A corpus-integrity preflight that never reads the corpus cannot go red.
+
+    RED before the fix: the function returned ``()`` at a compatible context
+    window after a same-size byte edit, even though the launch would later die
+    inside the paid GPU job when ``verify_workload`` finally ran.
+    """
+    spec, records_path, _ = fixture_workload
+    required = int(spec.requirements["min_max_model_len"])
+    original = records_path.read_bytes()
+    altered = original.replace(b"request 0000", b"request 9999", 1)
+    assert altered != original and len(altered) == len(original)
+    records_path.write_bytes(altered)
+
+    refusals = W.preflight_refusals(spec, max_model_len=required, tool_support=True)
+
+    assert any("source.sha256" in reason for reason in refusals), refusals
+
+
+@pytest.mark.parametrize(
+    "missing",
+    ["min_max_model_len", "output_reserve_tokens", "needs_tool_support"],
+)
+def test_preflight_refuses_missing_requirement_fields(
+    fixture_workload, missing: str
+) -> None:
+    """Missing policy fields are unknown, never equivalent to safe defaults.
+
+    RED before the fix: all three used ``dict.get``; the window check disappeared,
+    the output reserve became zero, and tool support became false respectively.
+    """
+    spec, _, _ = fixture_workload
+    del spec.manifest["requirements"][missing]
+
+    refusals = W.preflight_refusals(spec, max_model_len=1_000_000, tool_support=True)
+
+    assert any(f"requirements.{missing}" in reason for reason in refusals), refusals
 
 
 def test_adding_a_workload_needs_no_test_code_change(tmp_path: Path):

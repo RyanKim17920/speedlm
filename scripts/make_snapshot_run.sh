@@ -116,7 +116,8 @@ Optional:
                         vLLM decide.  A non-auto runner is also folded into the
                         default run name so cells do not collide.
   --prompt-set NAME     SPEEDLM_E2E_PROMPT_SET            (capture, optional)
-  --target-layer-ids C  SPEEDLM_E2E_TARGET_LAYER_IDS      (capture, optional, csv)
+  --target-layer-ids J  SPEEDLM_E2E_TARGET_LAYER_IDS      (capture, optional,
+                        non-empty JSON integer array, e.g. '[2,18,33]')
   --hf-reference 0|1    SPEEDLM_E2E_HF_REFERENCE          (capture, optional)
   --strict-verdict 0|1  SPEEDLM_E2E_STRICT_VERDICT        (capture, optional)
   --pytest-k EXPR       pytest -k EXPR                    (optional; without it
@@ -138,6 +139,12 @@ Optional:
                         option, a workload that does not fit --max-model-len).
                         Skipping it prints a loud warning and is only for
                         debugging the launcher itself.
+  --workload NAME       SPEEDLM_E2E_WORKLOAD              (idle-tuning/config-
+                        matrix; default: generic-chat)
+  --max-model-len N     context window                    (idle-tuning/config-
+                        matrix; default: 4096). For idle-tuning this is folded
+                        into the default vLLM argv; an explicit --vllm-args is
+                        authoritative and must agree.
   -h | --help           this message
 
 The snapshot lands in /data/ryan.kim/speedlm-snapshots/<full-sha>/ and is made
@@ -800,7 +807,16 @@ EOF
 
 case "$flavor" in
     idle-tuning)
-        : "${vllm_args:=$DEFAULT_GATEWAY_VLLM_ARGS}"
+        # Unlike the other gateway flavors, idle-tuning exposes a named
+        # --max-model-len because workload preflight needs the same value the
+        # engine receives.  The old arm ignored it and always exported 4096;
+        # speedbench could validate 8192 while the job still ran at 4096.  Build
+        # the default argv from the parsed value so the option has one real
+        # consumer.  Explicit --vllm-args stays authoritative, with preflight
+        # refusing a disagreement instead of silently rewriting it.
+        if [[ -z "$vllm_args" ]]; then
+            vllm_args="[ \"--max-model-len\", \"$max_model_len\", \"--gpu-memory-utilization\", \"0.75\", \"--enforce-eager\" ]"
+        fi
         cat <<EOF
 export SPEEDLM_E2E_TUNING_CONFIG="$tuning_config"
 EOF

@@ -215,7 +215,11 @@ def workload_dir(tmp_path: Path) -> Path:
             "fraction_absolute": 0.0,
             "count_absolute": 0.0,
         },
-        "requirements": {"min_max_model_len": 4096, "output_reserve_tokens": 128},
+        "requirements": {
+            "min_max_model_len": 4096,
+            "output_reserve_tokens": 128,
+            "needs_tool_support": False,
+        },
         "bands": {"short": [0.0, 0.5], "long": [0.5, 1.0]},
     }
     path = spec_dir / "fixture-chat.json"
@@ -370,13 +374,28 @@ def test_launcher_option_parsing_finds_the_real_case_arms() -> None:
     assert {"--flavor", "--vllm-args", "--no-corpus", "--force", "--skip-preflight"} <= accepted
 
 
+def test_every_launcher_option_is_classified_by_the_consumer_map() -> None:
+    """A new shell option with no routing decision must make this test red."""
+    accepted = launcher_accepted_options() - {"-h", "--help"}
+    classified = set(cli.P.COMMON_LAUNCHER_OPTIONS) | set(cli.P.FLAVOR_OPTION_CONSUMERS)
+    assert accepted == classified, {
+        "unclassified": sorted(accepted - classified),
+        "stale": sorted(classified - accepted),
+    }
+
+
 def test_launch_emits_only_options_the_launcher_parses() -> None:
     accepted = launcher_accepted_options()
     argv = ["launch", "--dry-run", "--skip-git-checks", "--flavor", "live-vllm"]
     for _dest, option in cli.LAUNCHER_OPTIONS:
         if option == "--flavor":
             continue
-        argv.extend([option, "auto" if option == "--runner" else f"value-for{option}"])
+        constrained = {
+            "--runner": "auto",
+            "--hf-reference": "1",
+            "--strict-verdict": "1",
+        }
+        argv.extend([option, constrained.get(option, f"value-for{option}")])
     argv.append("--force")
     args = cli.build_parser().parse_args(argv)
     command = cli.launcher_command(args)
@@ -406,6 +425,55 @@ def test_launch_forwards_no_corpus_which_the_launcher_also_parses() -> None:
     command = cli.launcher_command(args)
     assert "--no-corpus" in command
     assert "--no-corpus" in launcher_accepted_options()
+
+
+def test_config_matrix_preflight_uses_the_launchers_default_context_window(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Omitting the option still launches at 4096, so preflight must check 4096.
+
+    RED before the fix: speedbench represented the omitted value as ``None``;
+    the launcher represented it as 4096 and exported that to the job.  A long
+    workload therefore passed the CLI capacity gate and was refused only after
+    the allocated test read the same manifest.
+    """
+    code, out, err = run_cli(
+        [
+            "preflight",
+            "--flavor",
+            "config-matrix",
+            "--candidate-drafter",
+            "candidate/draft",
+            "--pytest-k",
+            "eager-c1-short",
+            "--workload",
+            "agentic-mixed-outcome",
+            "--skip-git-checks",
+        ],
+        capsys,
+    )
+
+    report = out + err
+    assert code != 0, report
+    assert "workload-incompatible" in report
+    assert "launch requests 4096" in report
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--flavor", "token-fidelity", "--model", "some/model"],
+        ["--flavor", "hot-swap", "--prompt-set", "minimal"],
+        ["--flavor", "live-vllm", "--runner", "v2"],
+    ],
+)
+def test_cli_preflight_rejects_launcher_options_the_flavor_drops(
+    argv: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The CLI and the launcher's own preflight share the same consumer map."""
+    code, out, err = run_cli(["preflight", *argv, "--skip-git-checks"], capsys)
+    assert code != 0, out + err
+    assert "option-ignored" in out + err
 
 
 # ---------------------------------------------------------------------------
@@ -738,6 +806,31 @@ def test_launcher_idle_tuning_default_workload_is_the_historical_one(
         "--tuning-config", str(tuning_config),
     )
     assert "export SPEEDLM_E2E_WORKLOAD=generic-chat" in text
+
+
+@pytest.mark.skipif(not LAUNCHER.is_file(), reason="launcher script absent")
+def test_launcher_idle_tuning_max_model_len_reaches_the_engine(tmp_path: Path) -> None:
+    """The named option must configure argv, not merely annotate preflight.
+
+    RED before the fix: the generated job still exported the hard-coded 4096
+    default.  Supplying the option alone either failed an agreement check or,
+    when the check was bypassed, changed nothing about the engine.
+    """
+    tuning_config = tmp_path / "tuning.json"
+    tuning_config.write_text("{}", encoding="utf-8")
+    text = _generate_sbatch(
+        tmp_path,
+        "--flavor",
+        "idle-tuning",
+        "--tuning-config",
+        str(tuning_config),
+        "--max-model-len",
+        "8192",
+    )
+
+    assert (
+        "export SPEEDLM_E2E_VLLM_ARGS='[ \"--max-model-len\", \"8192\"" in text
+    ), "job.sbatch did not put --max-model-len 8192 in the engine argv"
 
 
 @pytest.mark.skipif(not LAUNCHER.is_file(), reason="launcher script absent")

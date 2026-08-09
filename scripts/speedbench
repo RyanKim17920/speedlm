@@ -275,19 +275,6 @@ LAUNCHER_OPTIONS: tuple[tuple[str, str], ...] = (
     ("max_model_len", "--max-model-len"),
 )
 
-#: Options preflight consults by launcher spelling (``Flavor.required_options``).
-PREFLIGHT_OPTION_KEYS: tuple[str, ...] = (
-    "--tuning-config",
-    "--tuning-profile",
-    "--matrix-cell",
-    "--candidate-drafter",
-    "--corpus",
-    "--pytest-k",
-    "--drafter",
-    "--verifier",
-)
-
-
 def add_launcher_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--flavor", required=True, help="launcher flavor")
     parser.add_argument("--commit", default=None)
@@ -308,8 +295,8 @@ def add_launcher_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--runner", default=None, choices=("auto", "v1", "v2"))
     parser.add_argument("--prompt-set", default=None)
     parser.add_argument("--target-layer-ids", default=None)
-    parser.add_argument("--hf-reference", default=None)
-    parser.add_argument("--strict-verdict", default=None)
+    parser.add_argument("--hf-reference", default=None, choices=("0", "1"))
+    parser.add_argument("--strict-verdict", default=None, choices=("0", "1"))
     parser.add_argument("--pytest-k", default=None)
     parser.add_argument("--corpus", default=None)
     parser.add_argument("--no-corpus", action="store_true")
@@ -363,12 +350,30 @@ def build_preflight_config(args: argparse.Namespace) -> P.PreflightConfig:
     commit = args.commit or "HEAD"
 
     vllm_args = P.parse_vllm_args(args.vllm_args) if args.vllm_args is not None else None
+    # The shell launcher builds idle-tuning's default argv from
+    # ``--max-model-len``.  Model that generated argv here; otherwise preflight
+    # compares the option against the old static 4096 tuple and rejects the very
+    # configuration the launcher is now able to produce.  An explicit
+    # ``--vllm-args`` remains authoritative and the disagreement check below
+    # still refuses two contradictory values.
+    if args.flavor == "idle-tuning" and args.max_model_len is not None and vllm_args is None:
+        vllm_args = (
+            "--max-model-len",
+            str(args.max_model_len),
+            "--gpu-memory-utilization",
+            "0.75",
+            "--enforce-eager",
+        )
 
     options: dict[str, str] = {}
+    supplied_options: set[str] = set()
     for dest, option in LAUNCHER_OPTIONS:
         value = getattr(args, dest, None)
-        if value is not None and option in PREFLIGHT_OPTION_KEYS:
+        if value is not None:
             options[option] = str(value)
+            supplied_options.add(option)
+    if args.no_corpus:
+        supplied_options.add("--no-corpus")
     # The launcher defaults --corpus to the ultrachat file and only drops it for
     # --no-corpus, so model the same thing rather than reporting a missing
     # option the operator never had to supply.
@@ -414,6 +419,12 @@ def build_preflight_config(args: argparse.Namespace) -> P.PreflightConfig:
         workload = W.load_spec(
             args.workload, directory=Path(args.spec_dir) if args.spec_dir else None
         )
+        # Loading proves only that JSON has the top-level shape.  Verify the
+        # corpus bytes here, on the login-node side of the launch boundary.  The
+        # live tests verify again because artifacts can change between preflight
+        # and execution, but that second defence does not excuse a first check
+        # that lets a known digest mismatch queue for a GPU.
+        W.verify_workload(workload)
 
     git = (
         P.GitState(commit_exists=True, dirty_paths=())
@@ -421,16 +432,26 @@ def build_preflight_config(args: argparse.Namespace) -> P.PreflightConfig:
         else git_state(commit, REPO_ROOT)
     )
 
+    # config-matrix always exports the launcher's 4096 default even when the
+    # option is omitted.  Representing omission as ``None`` made the workload
+    # capacity check return early, so a 23k-token workload passed preflight and
+    # the generated job still launched at 4096.  Other flavors either recover
+    # the real window from vLLM argv or do not consume this option at all.
+    effective_max_model_len = args.max_model_len
+    if effective_max_model_len is None and args.flavor == "config-matrix":
+        effective_max_model_len = "4096"
+
     return P.PreflightConfig(
         flavor=args.flavor,
         vllm_args=vllm_args,
         options=options,
+        supplied_options=frozenset(supplied_options),
         model=args.model,
         slurm_time=args.time,
         timeouts=timeouts,
         env=env,
         workload=workload,
-        max_model_len=args.max_model_len,
+        max_model_len=effective_max_model_len,
         commit=commit,
         git=git,
     )

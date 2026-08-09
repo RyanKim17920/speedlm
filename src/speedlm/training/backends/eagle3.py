@@ -2128,6 +2128,17 @@ def _render_speculators_dataset(
                 if not isinstance(record, Mapping):
                     raise Eagle3Error(f"{location} is not a JSON object")
                 read += 1
+                # ``truncated_seen`` is evidence about the input, not an
+                # exclusive drop bucket.  Count it before any filter can
+                # ``continue``.  The old order checked truncation only after
+                # conversion and authorship, so a truncated replayed row was
+                # correctly charged to ``dropped_client_supplied`` yet vanished
+                # from the supposedly corpus-wide truncation counter.  Drop
+                # buckets remain exclusive and still reconcile exactly; evidence
+                # counters are allowed to overlap because causes do.
+                truncated = _is_truncated(record)
+                if truncated:
+                    truncated_seen += 1
                 converted = _speculators_record(record)
                 if converted is None:
                     dropped_untrainable += 1
@@ -2139,11 +2150,9 @@ def _render_speculators_dataset(
                     client_supplied_turns_seen += unowned
                     dropped_client_supplied += 1
                     continue
-                if _is_truncated(record):
-                    truncated_seen += 1
-                    if policy is TruncatedRowPolicy.DROP:
-                        dropped_truncated += 1
-                        continue
+                if truncated and policy is TruncatedRowPolicy.DROP:
+                    dropped_truncated += 1
+                    continue
                 output.write(json.dumps(converted, ensure_ascii=False) + "\n")
                 written += 1
     except OSError as error:

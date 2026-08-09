@@ -189,6 +189,71 @@ def test_empty_string_option_counts_as_missing() -> None:
     assert "missing-required-option" in errors(findings)
 
 
+@pytest.mark.parametrize(
+    ("flavor", "option"),
+    [
+        ("token-fidelity", "--model"),
+        ("hot-swap", "--prompt-set"),
+        ("live-vllm", "--runner"),
+        ("activation-capture", "--max-model-len"),
+    ],
+)
+def test_supplied_option_with_no_flavor_consumer_is_an_error(
+    flavor: str, option: str
+) -> None:
+    """An accepted spelling must not imply a configuration the job never uses.
+
+    Each pair above reached either a variable the selected test never reads or
+    no export at all.  RED before the fix: preflight had no representation of
+    which options the operator explicitly supplied, so every pair passed this
+    check silently.
+    """
+    findings, ok = preflight(
+        config_for(
+            flavor,
+            options={
+                **{required: "supplied" for required in FLAVORS[flavor].required_options},
+                option: "operator-value",
+            },
+            supplied_options=frozenset({option}),
+        )
+    )
+
+    assert not ok
+    assert "option-ignored" in errors(findings)
+    assert option in render_findings(findings)
+
+
+@pytest.mark.parametrize(
+    ("flavor", "option", "value"),
+    [
+        ("activation-capture", "--target-layer-ids", "2,18,33"),
+        ("activation-capture", "--hf-reference", "maybe"),
+        ("capture-overhead", "--inject-ms", "1.5"),
+        ("config-matrix", "--inject-percent", "nan"),
+        ("config-matrix", "--max-model-len", "0"),
+        ("model-matrix", "--matrix-cell", "not-a-cell"),
+    ],
+)
+def test_launcher_option_values_that_the_consumer_cannot_use_are_errors(
+    flavor: str, option: str, value: str
+) -> None:
+    """Advertised options must fail cheaply instead of inside an allocated test."""
+    findings, ok = preflight(
+        config_for(
+            flavor,
+            options={
+                **{required: "supplied" for required in FLAVORS[flavor].required_options},
+                option: value,
+            },
+            supplied_options=frozenset({option}),
+        )
+    )
+    assert not ok
+    assert "invalid-option" in errors(findings)
+    assert option in render_findings(findings)
+
+
 # --------------------------------------------------------------------------
 # Check 3 -- memory bounds
 # --------------------------------------------------------------------------
@@ -559,12 +624,13 @@ def test_timeout_inside_the_launcher_margin_passes() -> None:
     assert "timeout" not in errors(findings)
 
 
-def test_timeout_longer_than_wall_clock_warns() -> None:
+def test_timeout_at_least_as_long_as_wall_clock_is_error() -> None:
+    """The launcher rejects this outright; CLI preflight must not call it safe."""
     findings, ok = preflight(
         config_for("idle-tuning", slurm_time="02:00:00", timeouts={"tuning": 7200})
     )
-    assert ok
-    assert "timeout" in warnings(findings)
+    assert not ok
+    assert "timeout" in errors(findings)
     assert "can never fire" in render_findings(findings)
 
 

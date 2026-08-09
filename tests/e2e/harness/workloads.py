@@ -634,6 +634,65 @@ def _compare_number(
     return None
 
 
+def _manifest_structure_failures(spec: WorkloadSpec) -> list[str]:
+    """Missing nested schema fields that ``dict.get`` would otherwise invent.
+
+    ``load_spec_file`` checks the top-level blocks because that is enough to
+    construct :class:`WorkloadSpec`.  Verification needs a stronger contract:
+    source identity, tolerances, every recomputed characteristic and launch
+    requirements must be explicitly declared.  In particular, nullable
+    ``completion_chars`` must still be present -- absent and declared-null are
+    different statements.
+    """
+    failures: list[str] = []
+
+    def require(block: str, names: Sequence[str]) -> Mapping[str, Any] | None:
+        value = spec.manifest.get(block)
+        if not isinstance(value, Mapping):
+            failures.append(f"{block} is not an object")
+            return None
+        failures.extend(
+            f"{block}.{name} is not declared" for name in names if name not in value
+        )
+        return value
+
+    require("source", ("path", "sha256", "size_bytes", "format"))
+    characteristics = require(
+        "characteristics",
+        (
+            *_COUNT_KEYS,
+            *_FRACTION_KEYS,
+            "prompt_chars",
+            "prompt_tokens",
+            "completion_chars",
+            "chars_per_token",
+        ),
+    )
+    require(
+        "tolerance",
+        ("percentile_relative", "fraction_absolute", "count_absolute"),
+    )
+    require(
+        "requirements",
+        ("min_max_model_len", "output_reserve_tokens", "needs_tool_support"),
+    )
+    if characteristics is not None:
+        for block in ("prompt_chars", "prompt_tokens", "completion_chars"):
+            value = characteristics.get(block)
+            if value is None and block == "completion_chars":
+                continue
+            if not isinstance(value, Mapping):
+                # The numeric comparison below will give the declared/recomputed
+                # values; this is specifically about absent percentile fields.
+                continue
+            failures.extend(
+                f"characteristics.{block}.{key} is not declared"
+                for key in PERCENTILE_KEYS
+                if key not in value
+            )
+    return failures
+
+
 def verify_workload(
     spec: WorkloadSpec,
     *,
@@ -658,24 +717,46 @@ def verify_workload(
     the file twice.  Raises :class:`WorkloadVerificationError` listing every
     disagreement found.
     """
-    failures: list[str] = []
-    path = spec.source_path
+    failures = _manifest_structure_failures(spec)
+    source = spec.manifest.get("source")
+    if (
+        not isinstance(source, Mapping)
+        or "path" not in source
+        or not isinstance(spec.manifest.get("characteristics"), Mapping)
+        or not isinstance(spec.manifest.get("tolerance"), Mapping)
+        or not isinstance(spec.manifest.get("requirements"), Mapping)
+    ):
+        raise WorkloadVerificationError(spec.name, failures)
+    if records is None and "format" not in source:
+        raise WorkloadVerificationError(spec.name, failures)
+    path = Path(source["path"])
 
+    # ``records`` is accepted so a caller that already paid to parse the corpus
+    # can avoid doing that work twice.  It is NOT authority to skip checking the
+    # bytes those records purport to represent.  The old nesting put existence,
+    # size and digest under ``if records is None``; passing an injected sequence
+    # therefore made ``check_digest=True`` structurally incapable of checking a
+    # digest.  Keep I/O reuse and integrity orthogonal.
+    if not path.is_file():
+        raise WorkloadVerificationError(
+            spec.name, [*failures, f"corpus file is missing: {path}"]
+        )
+    if check_digest and "size_bytes" in source:
+        size = path.stat().st_size
+        declared_size = int(source["size_bytes"])
+        if size != declared_size:
+            failures.append(
+                f"source.size_bytes: declared {declared_size}, on disk {size}"
+            )
+    if check_digest and "sha256" in source:
+        digest = file_sha256(path)
+        declared_digest = str(source["sha256"])
+        if digest != declared_digest:
+            failures.append(
+                f"source.sha256: declared {declared_digest}, on disk {digest} "
+                "-- the corpus file is not the one this manifest describes"
+            )
     if records is None:
-        if not path.is_file():
-            raise WorkloadVerificationError(spec.name, [f"corpus file is missing: {path}"])
-        if check_digest:
-            size = path.stat().st_size
-            if size != spec.source_size_bytes:
-                failures.append(
-                    f"source.size_bytes: declared {spec.source_size_bytes}, on disk {size}"
-                )
-            digest = file_sha256(path)
-            if digest != spec.source_sha256:
-                failures.append(
-                    f"source.sha256: declared {spec.source_sha256}, on disk {digest} "
-                    "-- the corpus file is not the one this manifest describes"
-                )
         try:
             records = load_records(spec)
         except WorkloadError as error:
@@ -961,15 +1042,33 @@ def preflight_refusals(
     would produce numbers, just not numbers about this workload.
     """
     reasons: list[str] = []
-    required = spec.requirements.get("min_max_model_len")
+    # Preflight runs before an allocation, while verify_workload historically ran
+    # only inside the live test.  Reuse the authoritative verifier here instead
+    # of growing a weaker digest-only copy: a same-size corpus swap, missing file
+    # or stale characteristic must all refuse at the cheap boundary.
+    try:
+        verify_workload(spec)
+    except WorkloadVerificationError as error:
+        for failure in error.failures:
+            reason = f"workload {spec.name!r} failed corpus verification: {failure}"
+            if reason not in reasons:
+                reasons.append(reason)
+
+    requirements = spec.manifest.get("requirements")
+    if not isinstance(requirements, Mapping):
+        # The verifier above already supplied the precise structural reason.  No
+        # capacity or tool arithmetic is meaningful without an object to read.
+        return tuple(reasons)
+
+    required = requirements.get("min_max_model_len")
     if required is not None and int(max_model_len) < int(required):
         reasons.append(
             f"workload {spec.name!r} needs --max-model-len >= {int(required)} "
-            f"(longest prompt plus a {spec.requirements.get('output_reserve_tokens', 0)}-token "
+            f"(longest prompt plus a {requirements.get('output_reserve_tokens', 'unknown')}-token "
             f"output reserve) but the launch declares {int(max_model_len)}; "
             "prompts would be truncated"
         )
-    if spec.requirements.get("needs_tool_support") and not tool_support:
+    if requirements.get("needs_tool_support") and not tool_support:
         reasons.append(
             f"workload {spec.name!r} declares tool schemas on every request but the "
             "launch does not enable tool support"
