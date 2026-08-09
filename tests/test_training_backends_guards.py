@@ -1142,6 +1142,36 @@ def test_a_shortfall_no_bucket_dominates_names_no_single_cause(
     assert "5 carried an assistant turn this verifier did not produce" in message
 
 
+def test_a_partial_exact_tie_reaches_the_unattributed_failure(
+    tmp_path: Path,
+) -> None:
+    """The tie branch must be exercised below the floor with rows remaining.
+
+    An all-dropped tie correctly takes ``EmptySpeculatorsDatasetError`` because
+    "nothing converted" is its truest headline.  That means the companion test
+    above never reaches ``UnattributedCorpusShortfallError``'s ``dominant is
+    None`` message.  With one row written, the same tie reaches that branch --
+    and both tied filters have settings that can recover rows, so it must not
+    claim that only replacing the corpus can help.
+    """
+    records: list[Mapping[str, object]] = []
+    for index in range(3):
+        row = _generated(index)
+        row["finish_reason"] = "length"
+        records.append(row)
+    records.extend(_replayed(index) for index in range(3, 6))
+    records.append(_generated(6))
+
+    with pytest.raises(UnattributedCorpusShortfallError) as caught:
+        _render(tmp_path, records, policy=TruncatedRowPolicy.DROP, minimum_rows=4)
+
+    message = str(caught.value)
+    assert "1 trainable rows, below the floor of 4" in message
+    assert "no single filter dominates" in message
+    assert "filter settings can recover rows" in message
+    assert "not a change to the filters" not in message
+
+
 def test_a_partial_render_no_bucket_can_fix_is_reported_as_such(
     tmp_path: Path,
 ) -> None:

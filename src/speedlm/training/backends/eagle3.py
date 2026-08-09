@@ -2032,7 +2032,9 @@ class UnattributedCorpusShortfallError(Eagle3Error):
     against ``written`` and every bucket and stops there, which is a complete
     statement of what is known.  It earns a class of its own rather than reusing
     a sibling precisely because the remedy paragraph is the part that must be
-    absent.
+    absent.  A tie between remediable filters is not told that filters *cannot*
+    help, though: either setting can recover rows even though the accounting
+    supplies no principled reason to choose one.
     """
 
     def __init__(self, source: Path, counts: RenderedRowCounts, minimum: int) -> None:
@@ -2044,17 +2046,25 @@ class UnattributedCorpusShortfallError(Eagle3Error):
                 "no single filter dominates the loss, so there is no one remedy "
                 "to recommend"
             )
+            resolution = (
+                "Individual filter settings can recover rows in some tied cases, "
+                "but this accounting gives no principled reason to choose one; "
+                "inspect every bucket before changing the corpus or its filters."
+            )
         else:
             cause = (
                 f"the largest cause is that {counts.__getattribute__(dominant)} "
                 f"rows {_DROP_BUCKETS[dominant]}, which no setting on this "
                 "pipeline can recover"
             )
+            resolution = (
+                "Fixing this needs a corpus whose rows carry trainable assistant "
+                "turns, not a change to the filters that dropped them."
+            )
         super().__init__(
             f"rendering {source} produced {counts.written} trainable rows, below "
             f"the floor of {minimum}, and {cause}. {counts.drop_accounting()}. "
-            "Fixing this needs a corpus whose rows carry trainable assistant "
-            "turns, not a change to the filters that dropped them."
+            f"{resolution}"
         )
 
 

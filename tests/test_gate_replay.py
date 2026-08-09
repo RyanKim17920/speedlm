@@ -982,6 +982,39 @@ def test_an_empty_tool_call_object_is_not_a_surfaced_tool_call(
     assert all(r.error == "Empty response text" for r in run.results)
 
 
+def test_a_legacy_function_call_is_surfaced_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The allowlisted legacy finish reason must have a matching output path.
+
+    OpenAI's pre-``tool_calls`` response shape puts the dispatch directly under
+    ``message.function_call``.  ``function_call`` is deliberately still in
+    :data:`NATURAL_STOP_FINISH_REASONS`, but the extractor only inspected the
+    replacement list field.  A server returning the legacy shape therefore
+    produced a positive token count and a recognised natural stop, yet was
+    recorded as ``Empty response text`` and inflated ``invalid_rate`` -- the
+    same inversion the tool-output fix was meant to remove.
+    """
+    _scripted(
+        monkeypatch,
+        {
+            "message": {
+                "content": None,
+                "function_call": {"name": "bash", "arguments": '{"command":"pwd"}'},
+            },
+            "finish_reason": "function_call",
+        },
+        {"prompt_tokens": 31, "completion_tokens": 24},
+        scripted=4,
+    )
+
+    run = _replay(_suite(4)).run_results[0]
+
+    assert all(r.tool_call_count == 1 for r in run.results)
+    assert run.invalid_count == 0
+    assert run.natural_stop_count == 4
+
+
 @pytest.mark.parametrize(
     ("call", "counted"),
     [

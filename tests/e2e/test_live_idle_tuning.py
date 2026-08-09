@@ -143,11 +143,13 @@ def _check_message_content(content: object, *, where: str) -> None:
 def _check_tool_calls(raw: object, *, where: str) -> None:
     """Reject a ``tool_calls`` value the server could not replay.
 
-    Held to the same standard as :func:`speedlm.gate.replay._extract_tool_calls`
-    applies on the way back: a list of objects, each naming a ``function`` with
-    a non-empty ``name``.  Assistant turns replayed into a request must also
-    carry the ``id`` the following ``tool`` turn refers to -- without it the
-    server cannot pair the two, which is a 400 on a record that used to load.
+    The output-side gate needs only proof that something was surfaced, so a name
+    is its safe minimum.  This input-side check has a stricter job: the object is
+    about to be replayed verbatim.  It therefore requires the complete routing
+    envelope the pinned OpenAI/vLLM request contract requires -- ``type`` set to
+    ``function``, a non-empty ``id`` and name, and string arguments.  Without
+    the id the following tool turn cannot be paired; without the discriminator
+    or arguments the server rejects the request after the run has begun.
     """
     if not isinstance(raw, list):
         raise AssertionError(
@@ -157,12 +159,21 @@ def _check_tool_calls(raw: object, *, where: str) -> None:
         if not isinstance(call, dict):
             raise AssertionError(f"{where} has tool_calls[{index}] that is not an object")
         function = call.get("function")
-        if not isinstance(function, dict) or not isinstance(
-            function.get("name"), str
-        ):
+        if not isinstance(function, dict):
             raise AssertionError(
                 f"{where} has tool_calls[{index}] with no 'function' object "
                 "naming a function, so it dispatches nothing"
+            )
+        name = function.get("name")
+        if not isinstance(name, str) or not name.strip():
+            # Testing only ``isinstance(name, str)`` made the advertised
+            # "non-empty" check incapable of rejecting ``"   "``.  That value
+            # survives into the request but names nothing a client or server can
+            # route, which is the same empty envelope this validator rejects one
+            # level up.
+            raise AssertionError(
+                f"{where} has tool_calls[{index}] whose function.name is not a "
+                "non-empty string, so it dispatches nothing"
             )
         call_id = call.get("id")
         if not isinstance(call_id, str) or not call_id.strip():
@@ -170,6 +181,48 @@ def _check_tool_calls(raw: object, *, where: str) -> None:
                 f"{where} has tool_calls[{index}] with no non-empty string "
                 "'id'; the tool result that answers it could not be paired"
             )
+        if call.get("type") != "function":
+            # The list is a discriminated OpenAI union.  Looking only for a
+            # nested ``function`` object lets a contradictory ``type`` reach
+            # request validation, where the pinned server rejects it after the
+            # run has begun.
+            raise AssertionError(
+                f"{where} has tool_calls[{index}] whose type is not 'function'"
+            )
+        if not isinstance(function.get("arguments"), str):
+            # Arguments may be an empty or even malformed JSON string -- the
+            # model generated those bytes, and semantic validation belongs to
+            # the tool.  They may not be absent or pre-decoded, because the
+            # OpenAI/vLLM request contract requires the original string.
+            raise AssertionError(
+                f"{where} has tool_calls[{index}] whose function.arguments is "
+                "not a string"
+            )
+
+
+def _check_function_call(raw: object, *, where: str) -> None:
+    """Validate OpenAI's deprecated singular function-dispatch shape.
+
+    The modern list and this legacy object have the same replay minimum: a
+    non-blank function name and the model-generated arguments in their original
+    string form.  Validating both here matters because the object is copied onto
+    the wire verbatim; discovering a missing required field at the server would
+    turn this preflight into another green check that cannot protect the run.
+    """
+    if not isinstance(raw, dict):
+        raise AssertionError(
+            f"{where} has 'function_call' of type {type(raw).__name__}, not an object"
+        )
+    name = raw.get("name")
+    if not isinstance(name, str) or not name.strip():
+        raise AssertionError(
+            f"{where} has function_call.name that is not a non-empty string, "
+            "so it dispatches nothing"
+        )
+    if not isinstance(raw.get("arguments"), str):
+        raise AssertionError(
+            f"{where} has function_call.arguments that is not a string"
+        )
 
 
 def _build_seed_request(obj: object, *, context: str) -> SeedRequest:
@@ -221,13 +274,24 @@ def _build_seed_request(obj: object, *, context: str) -> SeedRequest:
         has_content = "content" in message and content is not None
         if has_content:
             _check_message_content(content, where=where)
-        has_tool_calls = "tool_calls" in message
-        if has_tool_calls:
-            _check_tool_calls(message.get("tool_calls"), where=where)
-        if not has_content and not _truthy_tool_calls(message.get("tool_calls")):
+        raw_tool_calls = message.get("tool_calls")
+        # The pinned vLLM input contract permits an explicit null for this
+        # optional field.  Null dispatches nothing, but it must not poison valid
+        # adjacent content merely because a serializer retained the key.
+        if raw_tool_calls is not None:
+            _check_tool_calls(raw_tool_calls, where=where)
+        raw_function_call = message.get("function_call")
+        if raw_function_call is not None:
+            _check_function_call(raw_function_call, where=where)
+        if (
+            not has_content
+            and not _truthy_tool_calls(raw_tool_calls)
+            and raw_function_call is None
+        ):
             raise AssertionError(
-                f"{where} carries neither 'content' nor a tool call, so there "
-                "is nothing to send"
+                f"{where} carries neither 'content' nor a tool call (modern "
+                "'tool_calls' or legacy 'function_call'), so there is nothing "
+                "to send"
             )
         # An OpenAI-compatible server matches a tool result back to the call it
         # answers by id, and rejects the turn outright without one.  The old

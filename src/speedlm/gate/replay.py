@@ -499,22 +499,37 @@ def _extract_tool_calls(message: dict[str, Any]) -> int:
     could route on -- ``id`` is dropped there when the server never sent one and
     ``type`` is defaulted, so neither can be required without rejecting
     responses the capture path accepts.  Anything less is not output.
+
+    The deprecated singular ``message.function_call`` shape is counted by the
+    same rule.  That is not optional compatibility trivia: ``function_call`` is
+    still an explicitly recognised natural finish reason above.  Recognising
+    the terminal state while ignoring the only output channel that accompanies
+    it makes a real legacy dispatch invalid and inflates ``invalid_rate`` -- the
+    exact false-negative this function exists to prevent.
     """
     raw = message.get("tool_calls")
-    if not isinstance(raw, list):
-        return 0
-    return sum(1 for call in raw if _is_dispatched_tool_call(call))
+    listed = (
+        sum(1 for call in raw if _is_dispatched_tool_call(call))
+        if isinstance(raw, list)
+        else 0
+    )
+    legacy = message.get("function_call")
+    return listed + (1 if _is_named_function(legacy) else 0)
+
+
+def _is_named_function(function: object) -> bool:
+    """Whether a function payload carries the name a client routes on."""
+    if not isinstance(function, dict):
+        return False
+    name = function.get("name")
+    return isinstance(name, str) and bool(name.strip())
 
 
 def _is_dispatched_tool_call(call: object) -> bool:
     """Whether one ``tool_calls`` entry names a function to actually call."""
     if not isinstance(call, dict):
         return False
-    function = call.get("function")
-    if not isinstance(function, dict):
-        return False
-    name = function.get("name")
-    return isinstance(name, str) and bool(name.strip())
+    return _is_named_function(call.get("function"))
 
 
 def _validity_error(

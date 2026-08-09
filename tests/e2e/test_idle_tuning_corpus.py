@@ -181,7 +181,11 @@ def test_assistant_tool_call_turn_without_content_is_accepted(
             {
                 "role": "assistant",
                 "tool_calls": [
-                    {"id": "c1", "type": "function", "function": {"name": "bash"}}
+                    {
+                        "id": "c1",
+                        "type": "function",
+                        "function": {"name": "bash", "arguments": "{}"},
+                    }
                 ],
             },
             {
@@ -199,6 +203,60 @@ def test_assistant_tool_call_turn_without_content_is_accepted(
     loaded = idle._load_prompt_corpus()
     assert loaded is not None
     assert [m["role"] for m in loaded[0].messages] == ["user", "assistant", "tool"]
+
+
+def test_legacy_function_call_turn_without_content_is_accepted() -> None:
+    """The deprecated singular call shape is still part of the wire contract.
+
+    The harness already accepts the legacy ``function`` role and the replay gate
+    already allowlists ``finish_reason: function_call``.  Tightening ``None``
+    content to require only the newer ``tool_calls`` list split that contract in
+    half: a valid captured legacy exchange could be classified on the way back
+    but could not be loaded on the way in.
+    """
+    request = idle._build_seed_request(
+        {
+            "messages": [
+                {"role": "user", "content": "run the tests"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "function_call": {
+                        "name": "bash",
+                        "arguments": '{"command":"pytest -q"}',
+                    },
+                },
+                {"role": "function", "name": "bash", "content": "1 passed"},
+            ]
+        },
+        context="legacy-corpus:1",
+    )
+
+    assert request.messages[1]["function_call"] == {
+        "name": "bash",
+        "arguments": '{"command":"pytest -q"}',
+    }
+
+
+def test_explicit_null_tool_calls_is_absent_when_content_is_present() -> None:
+    """vLLM's input type permits ``tool_calls: null`` on an ordinary message.
+
+    Optional response fields are often serialized explicitly as JSON null.  A
+    null list dispatches nothing, but it does not make the adjacent string
+    content invalid; treating key presence as a list assertion rejects a body
+    the pinned server's ``CustomChatCompletionMessageParam`` explicitly accepts.
+    """
+    request = idle._build_seed_request(
+        {
+            "messages": [
+                {"role": "user", "content": "hello"},
+                {"role": "assistant", "content": "hi", "tool_calls": None},
+            ]
+        },
+        context="nullable-corpus:1",
+    )
+
+    assert request.messages[1]["content"] == "hi"
 
 
 # ---------------------------------------------------------------------------
@@ -455,6 +513,63 @@ def test_a_corpus_smaller_than_the_seed_count_still_raises() -> None:
                     {"role": "user", "content": "hi"},
                     {
                         "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "c1",
+                                "type": "function",
+                                "function": {"name": "   ", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                ]
+            },
+            "function.name is not a non-empty string",
+            id="tool-call-name-is-blank",
+        ),
+        pytest.param(
+            {
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "c1",
+                                "type": "custom",
+                                "function": {"name": "bash", "arguments": "{}"},
+                            }
+                        ],
+                    },
+                ]
+            },
+            "type is not 'function'",
+            id="tool-call-type-is-not-function",
+        ),
+        pytest.param(
+            {
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {
+                                "id": "c1",
+                                "type": "function",
+                                "function": {"name": "bash"},
+                            }
+                        ],
+                    },
+                ]
+            },
+            "function.arguments is not a string",
+            id="tool-call-arguments-are-missing",
+        ),
+        pytest.param(
+            {
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
                         "tool_calls": [{"function": {"name": "bash"}}],
                     },
                 ]
@@ -472,6 +587,20 @@ def test_a_corpus_smaller_than_the_seed_count_still_raises() -> None:
             },
             "no non-empty string 'tool_call_id'",
             id="tool-result-answering-nothing",
+        ),
+        pytest.param(
+            {
+                "messages": [
+                    {"role": "user", "content": "hi"},
+                    {
+                        "role": "assistant",
+                        "content": None,
+                        "function_call": {"name": "bash"},
+                    },
+                ]
+            },
+            "function_call.arguments that is not a string",
+            id="legacy-function-call-arguments-are-missing",
         ),
         # A tool schema needed only to be a dict, so ``{}`` was a tool.
         pytest.param(
