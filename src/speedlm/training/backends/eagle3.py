@@ -29,6 +29,7 @@ from speedlm.training.backends.speculators_runner import (
     process_output,
 )
 from speedlm.training.masking import FinalAssistantMaskError, MaskPolicy
+from speedlm.training.provenance import self_play_attestation
 from speedlm.tuner.eagle3 import (
     MAX_SCRATCH_BYTES,
     REQUIRED_DRAFT_TENSORS,
@@ -538,6 +539,9 @@ class SpeculatorsPipelineConfig:
     #: offline corpus has a named opt-in rather than a corpus the authorship
     #: filter empties with no way back.
     trust_untagged_assistant_messages: bool = False
+    #: See :class:`speedlm.config.TuningConfig`. Verified, not asserted:
+    #: the snapshot is attested as self-play before any relabelling.
+    trust_self_play_assistant_turns: bool = False
     #: Extend every prepared loss-mask span one position to the left.
     #:
     #: Speculators shifts ``loss_mask`` when it constructs labels, so the mask
@@ -647,6 +651,8 @@ class SpeculatorsPipelineConfig:
             raise ValueError("require_accuracy_improvement must be a bool")
         if not isinstance(self.trust_untagged_assistant_messages, bool):
             raise ValueError("trust_untagged_assistant_messages must be a bool")
+        if not isinstance(self.trust_self_play_assistant_turns, bool):
+            raise ValueError("trust_self_play_assistant_turns must be a bool")
         if not isinstance(self.dilate_loss_mask_span_starts, bool):
             raise ValueError("dilate_loss_mask_span_starts must be a bool")
         if not isinstance(self.mask_policy, MaskPolicy):
@@ -952,6 +958,9 @@ class SpeculatorsTrainingRowRenderer:
                 minimum_rows=self.config.min_rendered_rows,
                 trust_untagged_assistant_messages=(
                     self.config.trust_untagged_assistant_messages
+                ),
+                trust_self_play_assistant_turns=(
+                    self.config.trust_self_play_assistant_turns
                 ),
             )
             self.state.rendered_rows = counts.to_dict()
@@ -1930,7 +1939,10 @@ class RenderedRowCounts:
             f"dropped, leaving {self.written}. Multi-turn and agentic traffic "
             "replays earlier assistant turns in every request, so a corpus "
             "whose messages carry no provenance_tag loses every multi-turn row "
-            "here. Set trust_untagged_assistant_messages=True if every "
+            "here. Set trust_self_play_assistant_turns=True for self-play "
+            "traffic -- it attests that every such turn reproduces one this "
+            "server generated earlier, and fails the cycle if it does not. "
+            "Set trust_untagged_assistant_messages=True only if every "
             "assistant turn in the corpus is known to be this verifier's own "
             "output."
         )
@@ -2068,6 +2080,109 @@ class UnattributedCorpusShortfallError(Eagle3Error):
         )
 
 
+
+def _snapshot_rows(snapshot: TraceSnapshot) -> list[Mapping[str, Any]]:
+    """Every record in the snapshot, in capture order.
+
+    Capture order is request order: the trace store appends one line per
+    completed response, so line order is the order the server answered.  That
+    ordering is what makes the attestation meaningful -- a prefix turn may only
+    be matched against a turn generated in an EARLIER row, and shuffling would
+    let a row attest itself.
+    """
+    rows: list[Mapping[str, Any]] = []
+    with snapshot.path.open("r", encoding="utf-8") as source:
+        for number, line in enumerate(source, start=1):
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError as error:
+                raise Eagle3Error(
+                    f"{snapshot.path} line {number} is not valid JSON"
+                ) from error
+            if not isinstance(record, Mapping):
+                raise Eagle3Error(f"{snapshot.path} line {number} is not a JSON object")
+            rows.append(record)
+    return rows
+
+
+
+def _full_capture_rows(snapshot: TraceSnapshot) -> list[Mapping[str, Any]]:
+    """The complete capture the snapshot was drawn from, as attestation evidence.
+
+    The snapshot handed to training is NOT the raw capture: a held-out split
+    removes roughly a fifth of the rows, and it removes them from the middle of
+    sessions rather than from the end. Attesting those survivors against only
+    themselves therefore orphans every prefix turn whose originating row was held
+    out, so a genuine self-play corpus reports hundreds of "foreign" turns. GPU
+    job 376291 measured exactly that: 0 unmatched of 2460 against the full
+    capture, 378 unmatched of 1974 against the training subset.
+
+    The store lives at ``<home>/traces/traces.jsonl`` while the snapshot sits at
+    ``<home>/runs/<id>/trace-snapshot/traces.jsonl``. If that relationship ever
+    stops holding, this raises rather than quietly falling back to attesting the
+    subset against itself -- the fallback would look like a working check while
+    being one that cannot pass.
+    """
+    try:
+        home = snapshot.path.parents[3]
+    except IndexError:
+        raise Eagle3Error(
+            f"cannot locate the full trace capture from snapshot {snapshot.path}: "
+            "expected it under <home>/runs/<id>/trace-snapshot/. Self-play "
+            "attestation needs the complete capture as evidence, because the "
+            "training snapshot has had held-out rows removed from the middle of "
+            "sessions."
+        ) from None
+    capture = home / "traces" / "traces.jsonl"
+    if not capture.is_file():
+        raise Eagle3Error(
+            f"self-play attestation needs the full trace capture at {capture}, "
+            "which does not exist. Attesting the training snapshot against "
+            "itself would fail on genuine self-play traffic, so this refuses "
+            "rather than guessing."
+        )
+    rows: list[Mapping[str, Any]] = []
+    lines = capture.read_text(encoding="utf-8").splitlines()
+    for number, line in enumerate(lines, start=1):
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise Eagle3Error(f"{capture} line {number} is not valid JSON") from error
+        if isinstance(record, Mapping):
+            rows.append(record)
+    return rows
+
+
+def _relabel_self_play_turns(record: Mapping[str, Any]) -> dict[str, Any]:
+    """Retag this row's client-supplied ASSISTANT turns as generated.
+
+    Only assistant turns are touched.  A ``user``, ``tool`` or ``system`` turn is
+    client-supplied as a matter of fact rather than of provenance accounting, and
+    relabelling one would corrupt the loss mask the Speculators loader derives
+    from role boundaries.
+    """
+    updated = dict(record)
+    messages = updated.get("messages")
+    if not isinstance(messages, list):
+        return updated
+    rewritten: list[Any] = []
+    for message in messages:
+        if (
+            isinstance(message, Mapping)
+            and message.get("role") == "assistant"
+            and message.get("provenance_tag") == "client_supplied"
+        ):
+            rewritten.append({**message, "provenance_tag": "generated"})
+        else:
+            rewritten.append(message)
+    updated["messages"] = rewritten
+    return updated
+
+
 def _render_speculators_dataset(
     snapshot: TraceSnapshot,
     destination: Path,
@@ -2078,6 +2193,7 @@ def _render_speculators_dataset(
     policy: TruncatedRowPolicy = TruncatedRowPolicy.KEEP,
     minimum_rows: int = 1,
     trust_untagged_assistant_messages: bool = False,
+    trust_self_play_assistant_turns: bool = False,
 ) -> RenderedRowCounts:
     """Rewrite a leased trace snapshot into the Speculators loader contract.
 
@@ -2110,6 +2226,34 @@ def _render_speculators_dataset(
     truncated_seen = 0
     dropped_client_supplied = 0
     client_supplied_turns_seen = 0
+
+    # Self-play trust is EARNED here, before a single row is rendered.
+    #
+    # ``trust_untagged_assistant_messages`` cannot serve this case twice over:
+    # it relabels only turns whose tag is ``None`` (see ``rows.py``), while the
+    # gateway tags every replayed prefix turn ``"client_supplied"`` outright, and
+    # it is an unverified promise from the operator besides.  This flag instead
+    # runs an attestation over the whole snapshot in capture order and relabels
+    # only if it passes.
+    #
+    # Failure is LOUD and terminal.  Falling back to dropping the rows would
+    # reproduce today's "3 trainable rows against a floor of 32" failure behind a
+    # message about corpus size, hiding the fact that the operator's premise --
+    # that this traffic is the verifier's own output -- was simply false.
+    attestation = None
+    if trust_self_play_assistant_turns:
+        attestation = self_play_attestation(
+            _snapshot_rows(snapshot),
+            reference_rows=_full_capture_rows(snapshot),
+        )
+        if not attestation.attested:
+            raise Eagle3Error(
+                "trust_self_play_assistant_turns is set, but this corpus is not "
+                f"self-play traffic: {attestation.detail}. Rows carrying another "
+                "model's assistant turns must not be trained on all-assistant; "
+                "either point this run at genuine self-play capture or unset the "
+                "flag and accept the client-supplied drop."
+            )
     try:
         with (
             snapshot.path.open("r", encoding="utf-8") as source,
@@ -2128,6 +2272,13 @@ def _render_speculators_dataset(
                 if not isinstance(record, Mapping):
                     raise Eagle3Error(f"{location} is not a JSON object")
                 read += 1
+                if trust_self_play_assistant_turns:
+                    # Safe as a blanket rewrite precisely because the attestation
+                    # above already proved EVERY client-supplied assistant turn in
+                    # this snapshot reproduces a turn this server generated
+                    # earlier. Relabelling per row without that proof would be the
+                    # unverified assertion this flag exists to replace.
+                    record = _relabel_self_play_turns(record)
                 # ``truncated_seen`` is evidence about the input, not an
                 # exclusive drop bucket.  Count it before any filter can
                 # ``continue``.  The old order checked truncation only after
