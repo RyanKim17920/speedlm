@@ -12,7 +12,7 @@ from collections.abc import Callable
 from contextlib import suppress
 from pathlib import Path
 
-from speedlm.gate.suite import BenchmarkSuite, persist_suite
+from speedlm.gate.suite import BenchmarkSuite, persist_suite, session_key
 from speedlm.traces.store import TraceRecord, TraceStore
 from speedlm.tuner.eagle3 import Eagle3Error, TraceSnapshot
 from speedlm.tuner.idle import TuningPreempted
@@ -132,6 +132,29 @@ class HeldOutTraceSnapshotLeaser:
         )
         if training_hashes & held_out:
             raise Eagle3Error("internal train/benchmark split leakage")
+        # Row-level disjointness is not enough for agentic traffic.  Turns of
+        # one session nest: turn N's messages contain turn N-1's verbatim, so a
+        # *different* row of a held-out session still carries the continuation
+        # the draft is benchmarked on predicting.  ``BenchmarkSuite.build``
+        # reserves whole sessions to prevent that; this guard is the boundary
+        # that fails loudly if it ever stops doing so.
+        held_out_sessions = {
+            session_key(record)
+            for record in records
+            if BenchmarkSuite._record_hash(record) in held_out
+        }
+        straddling = sorted(
+            {session_key(record) for record in training} & held_out_sessions
+        )
+        if straddling:
+            raise Eagle3Error(
+                f"agent session {straddling[0]} straddles the train/benchmark "
+                "split: a training record shares its opening exchange with a "
+                "held-out benchmark context, and because each turn's messages "
+                "nest the previous turn's verbatim that training row contains "
+                "the continuation the draft is scored on predicting. Whole "
+                "sessions must fall on one side of the split"
+            )
 
         destination.mkdir(parents=True, exist_ok=False)
         target = destination / self._source.path.name

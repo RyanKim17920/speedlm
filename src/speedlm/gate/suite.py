@@ -183,6 +183,49 @@ class FrozenContext:
         )
 
 
+def session_key(record: TraceRecord) -> str:
+    """Identify the agent session a record was captured from.
+
+    Multi-turn agentic traffic is *nested*, not independent: turn N's
+    ``messages`` list contains turn N-1's messages verbatim, so splitting such
+    records individually puts a gate context's own continuation into the
+    training corpus.  Grouping needs a session identity, but ``TraceRecord``
+    carries none -- so it is derived from the transcript itself.
+
+    A session is identified by its *opening exchange*: the first three
+    messages (system, first user, first assistant), compared on role, content
+    and tool calls only.  Bookkeeping keys such as ``provenance_tag`` are
+    ignored because they are per-capture, not per-session.  Every later turn of
+    a session re-sends that same opening verbatim, so every record of a session
+    hashes to the same key and records of different sessions do not.
+
+    Records with fewer than three messages cannot carry an opening exchange and
+    become their own session, keyed by their context hash.  That is the safe
+    direction: over-grouping only withholds more rows from training, while
+    under-grouping is the leak.  It also keeps single-turn corpora *exactly* as
+    they were -- one record per session, ranked by the same key as before.
+    """
+    messages = record.messages
+    if len(messages) < 3:
+        inputs, _ = FrozenContext._input_messages(record)
+        return _context_hash(inputs, [dict(tool) for tool in record.tools])
+    opening = [
+        {
+            "role": message.get("role"),
+            "content": message.get("content"),
+            "tool_calls": message.get("tool_calls"),
+        }
+        for message in messages[:3]
+    ]
+    canonical = json.dumps(
+        opening,
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    )
+    return "session:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
 @dataclass(frozen=True, slots=True)
 class BenchmarkSuite:
     """An immutable, content-addressed benchmark suite.
@@ -209,6 +252,16 @@ class BenchmarkSuite:
         ``ceil(unique_contexts * held_out_fraction)`` of them. The same input
         always yields the same suite, and duplicate contexts cannot straddle
         the split.
+
+        Reservation is *session-atomic*.  Records of one multi-turn agent
+        session are nested rather than independent (see :func:`session_key`),
+        so reserving a single turn while training on its siblings hands the
+        draft head the very continuation it is scored on predicting.  The
+        ranking is unchanged; what changed is that reserving a context also
+        reserves the rest of its session, and the count is then satisfied.
+        The reserved set can therefore overshoot ``held_out_fraction`` to land
+        on a session boundary.  For single-turn corpora every record is its own
+        session and the selection is byte-identical to the per-record split.
 
         Args:
             records: Ordered trace records.
@@ -247,7 +300,24 @@ class BenchmarkSuite:
                 context_hash,
             ),
         )
-        held_out_hashes = set(ranked_hashes[:held_out_count])
+        # Map every unique context onto exactly one session, then reserve by
+        # session.  A context can be reached under two keys only when one of
+        # its records lacks the provider-authored final turn and so falls
+        # below the three-message floor; ``min`` makes that tie deterministic.
+        session_of: dict[str, str] = {}
+        for rec, context_hash in zip(records, record_hashes, strict=True):
+            key = session_key(rec)
+            previous = session_of.get(context_hash)
+            session_of[context_hash] = key if previous is None else min(previous, key)
+        sessions: dict[str, set[str]] = {}
+        for context_hash, key in session_of.items():
+            sessions.setdefault(key, set()).add(context_hash)
+
+        held_out_hashes: set[str] = set()
+        for context_hash in ranked_hashes:
+            if len(held_out_hashes) >= held_out_count:
+                break
+            held_out_hashes |= sessions[session_of[context_hash]]
         contexts = tuple(
             FrozenContext.from_trace(rec)
             for rec, context_hash in zip(records, record_hashes, strict=True)
