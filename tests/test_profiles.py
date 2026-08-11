@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -734,8 +735,133 @@ def test_qwen3_8b_eagle3_profile_fields() -> None:
     assert QWEN_3_8B_EAGLE3_PROFILE.num_hidden_layers == 36
     assert QWEN_3_8B_EAGLE3_PROFILE.max_seq_len == 40_960
     assert QWEN_3_8B_EAGLE3_PROFILE.chat_template_kind == "chatml"
+    assert QWEN_3_8B_EAGLE3_PROFILE.tool_call_parser == "hermes"
     assert QWEN_3_8B_EAGLE3_PROFILE.target_layer_ids is None
     assert QWEN_3_8B_EAGLE3_PROFILE.trainable is True
+
+
+def _hf_hub_cache_roots() -> tuple[Path, ...]:
+    roots: list[Path] = []
+    if hub_cache := os.environ.get("HF_HUB_CACHE"):
+        roots.append(Path(hub_cache))
+    if hf_home := os.environ.get("HF_HOME"):
+        roots.append(Path(hf_home) / "hub")
+    roots.extend(
+        (
+            Path.home() / ".cache" / "huggingface" / "hub",
+            Path("/data/ryan.kim/hf-cache/hub"),
+        )
+    )
+    return tuple(dict.fromkeys(root.expanduser() for root in roots))
+
+
+def _cached_chat_template(model: str) -> tuple[str, Path]:
+    repository_name = "models--" + model.replace("/", "--")
+    cache_roots = _hf_hub_cache_roots()
+    for cache_root in cache_roots:
+        repository = cache_root / repository_name
+        snapshots = repository / "snapshots"
+        candidates: list[Path] = []
+        try:
+            revision = (repository / "refs" / "main").read_text(
+                encoding="utf-8"
+            )
+        except OSError:
+            revision = ""
+        if revision.strip():
+            candidates.append(snapshots / revision.strip())
+        if snapshots.is_dir():
+            candidates.extend(
+                path
+                for path in sorted(snapshots.iterdir(), reverse=True)
+                if path.is_dir()
+            )
+
+        for snapshot in dict.fromkeys(candidates):
+            standalone = snapshot / "chat_template.jinja"
+            if standalone.is_file():
+                return standalone.read_text(encoding="utf-8"), standalone
+
+            tokenizer_config = snapshot / "tokenizer_config.json"
+            if tokenizer_config.is_file():
+                payload = json.loads(tokenizer_config.read_text(encoding="utf-8"))
+                if isinstance(payload, dict):
+                    template = payload.get("chat_template")
+                    if isinstance(template, str) and template:
+                        return template, tokenizer_config
+
+    searched = ", ".join(str(root) for root in cache_roots)
+    pytest.skip(
+        f"{model} has no tokenizer-owned chat template in cached snapshots "
+        f"under: {searched}"
+    )
+
+
+def _tool_parser_template_signature(parser: str) -> tuple[tuple[str, str], ...]:
+    tool_call_start = "<" + "tool_call" + ">"
+    tool_call_end = "</" + "tool_call" + ">"
+    qwen_function_start = "<" + "function="
+    qwen_parameter_start = "<" + "parameter="
+    signatures = {
+        "hermes": (
+            ("tool-call opening wrapper", tool_call_start),
+            ("tool-call closing wrapper", tool_call_end),
+            ("JSON name field", '"name":'),
+            ("JSON arguments field", '"arguments":'),
+        ),
+        "openai": (
+            ("Harmony function recipient", "functions."),
+            ("Harmony content type", "tool_call.content_type"),
+            ("Harmony JSON arguments", "tool_call.arguments|tojson"),
+        ),
+        "qwen3_coder": (
+            ("tool-call opening wrapper", tool_call_start),
+            ("tool-call closing wrapper", tool_call_end),
+            ("function-assignment element", qwen_function_start),
+            ("parameter-assignment element", qwen_parameter_start),
+        ),
+        "qwen3_xml": (
+            ("tool-call opening wrapper", tool_call_start),
+            ("tool-call closing wrapper", tool_call_end),
+            ("function-assignment element", qwen_function_start),
+            ("parameter-assignment element", qwen_parameter_start),
+        ),
+    }
+    assert parser in signatures, f"no chat-template signature for parser {parser!r}"
+    return signatures[parser]
+
+
+@pytest.mark.parametrize(
+    "profile",
+    (GPT_OSS_EAGLE3_PROFILE, QWEN_35_9B_MTP_PROFILE, QWEN_3_8B_EAGLE3_PROFILE),
+    ids=("gpt-oss-20b", "qwen3.5-9b", "qwen3-8b"),
+)
+def test_pinned_tool_parser_matches_cached_model_template(
+    profile: ModelProfile,
+) -> None:
+    """A parser pin must match model-owned syntax, not repeat our constant.
+
+    An assertion that the profile equals an expected parser name would preserve
+    the same bad assumption in two places.  Checking only the outer tool-call
+    wrapper would also miss job 376274 because Hermes and both Qwen3 aliases
+    share it.  These body-grammar signatures make a revert to qwen3_xml fail:
+    Qwen3-8B's cached template has the Hermes JSON fields and lacks the Qwen
+    function-assignment and parameter-assignment elements.
+    """
+    parser = profile.tool_call_parser
+    assert parser is not None
+    template, template_path = _cached_chat_template(profile.verifier_model)
+
+    missing = [
+        description
+        for description, marker in _tool_parser_template_signature(parser)
+        if marker not in template
+    ]
+
+    assert not missing, (
+        f"{profile.name} pins {parser!r}, but {template_path} lacks its "
+        f"required template syntax: {', '.join(missing)}"
+    )
 
 
 def test_qwen3_8b_aux_layers_derived_not_hardcoded() -> None:

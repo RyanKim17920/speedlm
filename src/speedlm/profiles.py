@@ -1144,7 +1144,10 @@ QWEN_3_8B_EAGLE3_PROFILE: Final = ModelProfile(
     chat_template_kind="chatml",
     max_seq_len=40_960,
     num_hidden_layers=36,
-    tool_call_parser="qwen3_xml",
+    #: The model-owned template wraps a JSON object with ``name`` and
+    #: ``arguments`` fields.  Hermes consumes that body; qwen3_xml instead
+    #: requires function-assignment and parameter-assignment elements.
+    tool_call_parser="hermes",
 )
 
 BUILTIN_PROFILES: Final[Mapping[str, ModelProfile]] = MappingProxyType(
