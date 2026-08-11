@@ -15,14 +15,21 @@ from typing import Any, cast
 # ---------------------------------------------------------------------------
 from speedlm.storage import atomic_write_json
 
+#: ``speedlm_home`` is defined in :mod:`speedlm.storage`, which owns the on-disk
+#: layout rooted at it; nothing in this module uses it.  It is re-exported here
+#: only because ``speedlm.config.speedlm_home`` is the import path callers
+#: already use.  Importing it the other way round -- storage reaching back into
+#: config for it -- is what put these two modules in an import cycle.  The
+#: redundant alias is the explicit re-export form, so linters do not read this
+#: as an unused import.
+from speedlm.storage import speedlm_home as speedlm_home
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_HOME_NAME = ".speedlm"
-HOME_ENV_VAR = "SPEEDLM_HOME"
 DEFAULT_STARTUP_TIMEOUT_SECONDS = 900.0
 STARTUP_TIMEOUT_ENV_VAR = "SPEEDLM_STARTUP_TIMEOUT_SECONDS"
 DEFAULT_STARTUP_STALL_SECONDS = 600.0
@@ -154,24 +161,6 @@ def startup_stall_seconds() -> float:
     if not math.isfinite(value) or value <= 0:
         raise ConfigError(f"{STARTUP_STALL_ENV_VAR} must be > 0, got {raw!r}")
     return value
-
-
-# ---------------------------------------------------------------------------
-# speedlm_home
-# ---------------------------------------------------------------------------
-
-
-def speedlm_home() -> Path:
-    """Return the SpeedLM home directory.
-
-    Uses ``SPEEDLM_HOME`` environment variable if set (expanded and resolved
-    to an absolute path), otherwise falls back to ``~/.speedlm``.
-    Does **not** create any directories.
-    """
-    env = os.environ.get(HOME_ENV_VAR)
-    if env:
-        return Path(env).expanduser().resolve()
-    return Path.home() / DEFAULT_HOME_NAME
 
 
 # ---------------------------------------------------------------------------

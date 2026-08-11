@@ -40,6 +40,27 @@ class StorageError(RuntimeError):
 
 
 # ---------------------------------------------------------------------------
+# Home
+# ---------------------------------------------------------------------------
+
+DEFAULT_HOME_NAME = ".speedlm"
+HOME_ENV_VAR = "SPEEDLM_HOME"
+
+
+def speedlm_home() -> Path:
+    """Return the SpeedLM home directory.
+
+    Uses ``SPEEDLM_HOME`` environment variable if set (expanded and resolved
+    to an absolute path), otherwise falls back to ``~/.speedlm``.
+    Does **not** create any directories.
+    """
+    env = os.environ.get(HOME_ENV_VAR)
+    if env:
+        return Path(env).expanduser().resolve()
+    return Path.home() / DEFAULT_HOME_NAME
+
+
+# ---------------------------------------------------------------------------
 # Layout
 # ---------------------------------------------------------------------------
 
@@ -56,10 +77,9 @@ class Layout:
 def resolve_layout(home: Path | None = None) -> Layout:
     """Resolve directory paths without creating them.
 
-    When *home* is ``None``, ``config.speedlm_home()`` is used.
+    When *home* is ``None``, :func:`speedlm_home` is used.
     """
     if home is None:
-        from speedlm.config import speedlm_home
         home = speedlm_home()
     return Layout(
         root=home,

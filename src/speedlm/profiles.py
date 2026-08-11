@@ -20,7 +20,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Final, Literal, Protocol, cast
 
-from speedlm.config import speedlm_home
+from speedlm.storage import speedlm_home
 
 SpeculativeMethod = Literal["eagle3", "mtp", "medusa", "ngram", "draft_model"]
 ChatTemplateKind = Literal["harmony", "chatml", "auto"]
