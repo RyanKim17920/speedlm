@@ -38,7 +38,22 @@ from speedlm.training.masking import FinalAssistantMaskError, MaskPolicy
 # Larger models need proportionally more space.  This constant is a hard
 # safety ceiling; the per-instance scratch_quota_bytes in Eagle3Config
 # should typically be smaller.
-MAX_SCRATCH_BYTES = 20 * 1024 * 1024 * 1024
+#
+# Raised from 20 GiB after GPU job 377071.  The old ceiling was not merely
+# tight for agentic traffic, it was unreachable: shard bytes are
+# ``tokens x (num_aux_layers + 1) x hidden_size x 2``, so for Qwen3-8B
+# (hidden_size 4096, three aux layers plus the target) one token costs 32,768 B
+# and the corpus measured on job 376291 had a MEDIAN row of 2,700 tokens
+# (88.5 MB) and a maximum of 12,873 tokens (421.8 MB).  A 434-row window at that
+# median needs ~50 GB, so no agentic window of a useful size could be
+# provisioned under 20 GiB -- the same "could never have completed" shape that
+# :func:`derive_scratch_quota_bytes` documents for job 369325, one level up.
+#
+# This bounds disk, not correctness: raising it cannot make a measurement wrong,
+# only make a run occupy more of /data (5.8 TB free at the time of writing).
+# 96 GiB leaves room for a full 1,024-row agentic window without approaching the
+# filesystem.
+MAX_SCRATCH_BYTES = 96 * 1024 * 1024 * 1024
 
 #: Byte budget charged to one leased training row's hidden-state shard.
 #:

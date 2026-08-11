@@ -1196,7 +1196,7 @@ class IdleTuningConfig:
         if not 1 <= self.scratch_quota_bytes <= MAX_SCRATCH_BYTES:
             raise ConfigError(
                 f"tuning.scratch_quota_bytes must be in 1..{MAX_SCRATCH_BYTES} bytes "
-                f"(1..20 GiB), got {self.scratch_quota_bytes}"
+                f"(1..96 GiB), got {self.scratch_quota_bytes}"
             )
         _validate_float_gte(
             self.shutdown_timeout_seconds,

@@ -681,7 +681,7 @@ class SpeculatorsPipelineConfig:
             or not 0 < self.scratch_quota_bytes <= MAX_SCRATCH_BYTES
         ):
             raise ValueError(
-                "scratch_quota_bytes must be in 1..20 GiB "
+                "scratch_quota_bytes must be in 1..96 GiB "
                 "(field: tuning.scratch_quota_bytes)"
             )
         for name, patterns in (
