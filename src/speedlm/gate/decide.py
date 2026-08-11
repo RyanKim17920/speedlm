@@ -1,4 +1,9 @@
-"""Promotion decision logic for candidate speculative draft heads."""
+"""Promotion decision logic for candidate speculative draft heads.
+
+The output-correctness half of the criterion lives in
+:mod:`speedlm.gate.divergence` and is re-exported here, so this module is
+still the single import site for the whole gate.
+"""
 
 from __future__ import annotations
 
@@ -14,15 +19,63 @@ from speedlm.config import (
     PromotionConfig,
     classify_divergence_criterion,
 )
+from speedlm.gate.divergence import (
+    DIVERGENCE_ALPHA,
+    DIVERGENCE_PER_STATISTIC_ALPHA,
+    DIVERGENCE_STATISTICS,
+    ContextDivergence,
+    DecisionError,
+    DivergenceBasis,
+    DivergenceEvidence,
+    divergence_excess_p_value,
+    divergence_position_p_value,
+    evaluate_divergence,
+    first_divergence,
+)
 from speedlm.gate.metrics import MetricsDelta
-from speedlm.gate.replay import ReplayResult, RequestResult
+from speedlm.gate.replay import ReplayResult
 
-# ---------------------------------------------------------------------------
-# Exceptions
-# ---------------------------------------------------------------------------
-
-class DecisionError(ValueError):
-    """Raised when the decision cannot be computed."""
+#: Everything this module offers, including the names it re-exports from
+#: :mod:`speedlm.gate.divergence` -- listed so that moving the divergence
+#: criterion out did not move a single import site.
+__all__ = [
+    "CANDIDATE_ARM",
+    "CUDA_GRAPH_EXECUTION_MODE",
+    "ContextDivergence",
+    "DIVERGENCE_ALPHA",
+    "DIVERGENCE_PER_STATISTIC_ALPHA",
+    "DIVERGENCE_STATISTICS",
+    "Decision",
+    "DecisionError",
+    "DispersionBasis",
+    "DivergenceBasis",
+    "DivergenceEvidence",
+    "EAGER_EXECUTION_MODE",
+    "EngineExecution",
+    "FLAT_TREND_T_STATISTIC",
+    "GATING_ACCEPTANCE_CRITERION",
+    "GATING_ACCEPTANCE_STATISTIC",
+    "GATING_THROUGHPUT_STATISTIC",
+    "LEGACY_ACCEPTANCE_CRITERION",
+    "LEGACY_ACCEPTANCE_STATISTIC",
+    "LEGACY_THROUGHPUT_STATISTIC",
+    "MIN_FLAT_WINDOW",
+    "MeasurementBlock",
+    "Reason",
+    "RepeatSummary",
+    "STOCK_ARM",
+    "StationarityStatus",
+    "ThroughputStationarity",
+    "TruncationRegime",
+    "UNRECORDED_EXECUTION_MODE",
+    "Verdict",
+    "classify_truncation",
+    "decide_promotion",
+    "divergence_excess_p_value",
+    "divergence_position_p_value",
+    "evaluate_divergence",
+    "first_divergence",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +167,66 @@ def classify_truncation(*, reported: int, truncated: int) -> TruncationRegime:
     if truncated * 2 > reported:
         return TruncationRegime.MIXED
     return TruncationRegime.BOUNDED
+
+
+#: The two arms every measurement in this module is paired across, spelled once
+#: so the per-arm readings below cannot drift apart by a typo.
+STOCK_ARM: Final[str] = "stock"
+CANDIDATE_ARM: Final[str] = "candidate"
+
+
+@dataclass(frozen=True, slots=True)
+class _TruncationCounts:
+    """One arm's pooled finish-reason counts, and the three readings of them.
+
+    The counts are pooled across repeats rather than averaged, because
+    ``SATURATED`` is a statement about a *total* count of natural stops and a
+    per-repeat mean would round it away.
+    """
+
+    #: Responses whose finish reason the replay could classify.
+    reported: int
+    #: Of those, the ones the output cap ended.
+    truncated: int
+
+    @property
+    def rate(self) -> float | None:
+        """Truncated share of the reported responses, or ``None`` if unmeasured.
+
+        ``None`` rather than ``0.0`` when nothing reported a finish reason, so
+        that a record which never measured truncation cannot be read as one
+        that measured zero.
+        """
+        if self.reported <= 0:
+            return None
+        return self.truncated / self.reported
+
+    @property
+    def regime(self) -> TruncationRegime:
+        return classify_truncation(reported=self.reported, truncated=self.truncated)
+
+
+def _truncation_counts(
+    per_repeat: Sequence[RepeatSummary], arm: str
+) -> _TruncationCounts:
+    """Pool one arm's finish-reason counts out of the per-repeat array.
+
+    Both the gate and the ``Decision`` properties read the regime through here,
+    from the same array, on purpose.  ``decide_promotion`` used to sum the
+    columns itself while the record's properties summed them again: two
+    derivations of one fact, and a verdict whose own evidence contradicts it is
+    this project's recurring defect.  One reader makes that divergence
+    unrepresentable rather than merely unlikely.
+    """
+    if arm == STOCK_ARM:
+        return _TruncationCounts(
+            reported=sum(r.stock_finish_reasons for r in per_repeat),
+            truncated=sum(r.stock_truncated for r in per_repeat),
+        )
+    return _TruncationCounts(
+        reported=sum(r.candidate_finish_reasons for r in per_repeat),
+        truncated=sum(r.candidate_truncated for r in per_repeat),
+    )
 
 
 class Reason(Enum):
@@ -369,63 +482,6 @@ def _argv_int_option(tokens: Sequence[str], flag: str) -> int | None:
         return None
     return parsed if parsed >= 1 else None
 
-#: Significance level the whole output-correctness criterion is run at.
-#:
-#: **Why the criterion is a significance test at all.**  Speculative decoding is
-#: lossless by construction: the verifier accepts a drafted token only when it
-#: matches what the target model would itself have emitted, so *both* arms of
-#: this gate -- stock draft and candidate draft alike -- are sampling the same
-#: target distribution.  A better or worse draft head changes how many tokens
-#: clear the verifier per forward pass, i.e. speed.  It cannot change the token
-#: stream.  Any token-level disagreement between the two arms is therefore
-#: evidence about the *engine*, not about the head: vLLM's target forward pass
-#: is not bitwise reproducible across differing batch shapes, kernel configs are
-#: selected by nearest-``M`` lookup, block sizes and split-``k`` branch on ``M``,
-#: and at temperature 0 acceptance is exact argmax equality with no tolerance
-#: band -- so a shifted reduction order flips near-ties.  ``VLLM_BATCH_INVARIANT``
-#: exists precisely to force the invariant kernel subset and is off by default.
-#:
-#: The old criterion rejected on *any single* early divergence.  That is a
-#: hair trigger on a stochastic process.  With an intrinsic per-context
-#: divergence rate of just 1% and a 128-token correctness cap, the chance that
-#: at least one of 410 contexts happens to flip inside the first 16 tokens is
-#: ``1 - (1 - 0.01 * 16/128) ** 410`` = 40%.  At the rate actually measured on
-#: Qwen3-8B (1.46%) it is 53%; on gpt-oss-20b, whose MoE path diverged on 56%
-#: of contexts, it is indistinguishable from 1.  Every archived gpt-oss gate
-#: rejected, and no stock-versus-stock control was ever run to say what any of
-#: those numbers should have been compared against.
-#:
-#: **What replaces it.**  The gate now measures its own noise floor in the same
-#: run -- the stock arm replays the correctness suite twice and the two passes
-#: are compared against each other -- and rejects only when the
-#: candidate-versus-stock divergence count *significantly exceeds that floor*
-#: under a one-sided Fisher exact test.  Nothing about the floor is assumed, so
-#: the criterion needs no per-model or per-engine tuning: a MoE target under
-#: CUDA graphs at batch 64 measures its own large floor and is judged against
-#: it, exactly as a dense target under eager at batch 1 measures its own small
-#: one.  A genuinely broken head -- a mis-wired draft-to-target token map, a
-#: vocabulary mismatch, corrupted weights -- diverges on essentially every
-#: context at essentially the first token, which no engine noise floor reaches,
-#: so detection is unaffected.
-#:
-#: 0.01 rather than the reflexive 0.05: this gate has no rollback behind it, so
-#: a false *promote* is the expensive error, and a looser alpha buys detection
-#: power cheaply.  It is not smaller than that because the exact test is
-#: discrete -- at the five-context suites the simulation harness uses, a total
-#: corruption attains ``1/C(10,5)`` = 0.0040, and an alpha below that would make
-#: small suites structurally unable to reject anything at all.
-DIVERGENCE_ALPHA: Final[float] = 0.01
-
-#: Statistics the divergence criterion tests, and therefore the Bonferroni
-#: divisor applied to :data:`DIVERGENCE_ALPHA`.
-#:
-#: Two: the *total* divergence count and the *early* subset.  Total has the most
-#: events and so the most power against a head that is merely wrong more often.
-#: Early targets the shape a genuine corruption takes -- disagreement at the
-#: very first tokens -- and keeps power when the total rate is already saturated
-#: by engine noise, as it is on a MoE target.  Both are tested against their own
-#: separately measured floor, so neither can fire on noise.
-DIVERGENCE_STATISTICS: Final[int] = 2
 
 
 class DispersionBasis(Enum):
@@ -464,60 +520,6 @@ class DispersionBasis(Enum):
     DEGENERATE = "degenerate"
     UNSAMPLED = "unsampled"
 
-
-class DivergenceBasis(Enum):
-    """What two generations were aligned on when they were compared.
-
-    ``TOKEN`` is the model's own segmentation, recovered from the endpoint's
-    per-token logprobs; an index is then a token offset.  ``CHARACTER`` is the
-    fallback when logprobs were unavailable on either side, and an index is a
-    character offset into the response text -- coarser, and systematically
-    *larger* than the token offset it stands in for, so it is recorded rather
-    than silently mixed in with token offsets.
-    """
-
-    TOKEN = "token"
-    CHARACTER = "character"
-
-
-@dataclass(frozen=True, slots=True)
-class ContextDivergence:
-    """Where one held-out context's two generations first parted.
-
-    Persisted for every diverging context.  Before this existed the run
-    directory kept only ``decision.json`` and ``gate-metrics/*.prom.gz``, so a
-    rejection reading ``output_mismatches: 85`` was unfalsifiable after the
-    fact: there was no way to tell a drafter that broke at token 3 from float
-    noise at token 900.
-    """
-
-    context_hash: str
-    repeat_index: int
-    #: Offset of the first position at which the two generations differ, in
-    #: units of ``basis``.  Always >= 0; a context that never diverges is not
-    #: recorded at all.
-    first_divergence_index: int
-    basis: str
-    stock_length: int
-    candidate_length: int
-    #: True when the divergence is early enough to gate against, i.e.
-    #: ``first_divergence_index < promotion.min_divergence_token_index``.
-    #:
-    #: This flag classifies a divergence; on its own it no longer *disqualifies*
-    #: one.  See :data:`DIVERGENCE_ALPHA` for what the gate now compares it
-    #: against.
-    early: bool
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "context_hash": self.context_hash,
-            "repeat_index": self.repeat_index,
-            "first_divergence_index": self.first_divergence_index,
-            "basis": self.basis,
-            "stock_length": self.stock_length,
-            "candidate_length": self.candidate_length,
-            "early": self.early,
-        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -812,7 +814,7 @@ class Decision:
     #: Per-statistic significance level each p-value above was compared against,
     #: i.e. :data:`DIVERGENCE_ALPHA` over :data:`DIVERGENCE_STATISTICS`.
     divergence_alpha: float = field(
-        default=DIVERGENCE_ALPHA / DIVERGENCE_STATISTICS, compare=False
+        default=DIVERGENCE_PER_STATISTIC_ALPHA, compare=False
     )
 
     # -- the promotion criterion --------------------------------------------
@@ -1069,12 +1071,12 @@ class Decision:
     @property
     def stock_finish_reasons_reported(self) -> int:
         """Stock responses that carried a finish reason, all repeats pooled."""
-        return sum(r.stock_finish_reasons for r in self.per_repeat)
+        return _truncation_counts(self.per_repeat, STOCK_ARM).reported
 
     @property
     def candidate_finish_reasons_reported(self) -> int:
         """Candidate responses that carried a finish reason, all repeats pooled."""
-        return sum(r.candidate_finish_reasons for r in self.per_repeat)
+        return _truncation_counts(self.per_repeat, CANDIDATE_ARM).reported
 
     @property
     def stock_truncation_rate(self) -> float | None:
@@ -1083,34 +1085,22 @@ class Decision:
         ``None`` when nothing reported a finish reason, so that a record which
         never measured truncation cannot be read as one that measured zero.
         """
-        reported = self.stock_finish_reasons_reported
-        if reported <= 0:
-            return None
-        return sum(r.stock_truncated for r in self.per_repeat) / reported
+        return _truncation_counts(self.per_repeat, STOCK_ARM).rate
 
     @property
     def candidate_truncation_rate(self) -> float | None:
         """Fraction of reported candidate generations that hit the output cap."""
-        reported = self.candidate_finish_reasons_reported
-        if reported <= 0:
-            return None
-        return sum(r.candidate_truncated for r in self.per_repeat) / reported
+        return _truncation_counts(self.per_repeat, CANDIDATE_ARM).rate
 
     @property
     def stock_truncation_regime(self) -> TruncationRegime:
         """What the cap did to the stock arm; see :class:`TruncationRegime`."""
-        return classify_truncation(
-            reported=self.stock_finish_reasons_reported,
-            truncated=sum(r.stock_truncated for r in self.per_repeat),
-        )
+        return _truncation_counts(self.per_repeat, STOCK_ARM).regime
 
     @property
     def candidate_truncation_regime(self) -> TruncationRegime:
         """What the cap did to the candidate arm."""
-        return classify_truncation(
-            reported=self.candidate_finish_reasons_reported,
-            truncated=sum(r.candidate_truncated for r in self.per_repeat),
-        )
+        return _truncation_counts(self.per_repeat, CANDIDATE_ARM).regime
 
     @property
     def truncation_rate_delta(self) -> float | None:
@@ -1513,52 +1503,6 @@ def _flat_from_repeat(values: list[float]) -> int | None:
     return None
 
 
-def first_divergence(
-    stock: RequestResult,
-    candidate: RequestResult,
-) -> tuple[int | None, DivergenceBasis, int, int]:
-    """Locate where two generations of the same context first differ.
-
-    This replaces whole-string equality, which asks the wrong question.  Two
-    greedy generations of 1600 tokens that agree for 1500 of them are, by any
-    behavioural standard, the same answer; two that part at token 3 are not.
-    Equality collapses both to ``True`` and gates on the collapse.
-
-    Alignment prefers the model's own tokenisation (``output_tokens``, from the
-    endpoint's per-token logprobs) and falls back to characters when either
-    side did not capture it.  The basis is returned rather than assumed,
-    because a character offset is not comparable to a token offset.
-
-    The character fallback aligns on ``generated_text``, not ``response_text``.
-    A reasoning model bounded at ``correctness_max_tokens`` routinely never
-    closes its ``<think>`` block, which leaves ``response_text`` empty on
-    *both* arms; comparing those two empty strings returns ``None`` --
-    "identical" -- having compared nothing at all.  Folding the reasoning
-    channel in means the fallback compares the text that was actually
-    generated.
-
-    Returns:
-        ``(index, basis, stock_length, candidate_length)`` where *index* is the
-        first differing position, or ``None`` when one sequence is a prefix of
-        the other *and* they are the same length -- i.e. they are identical.
-        A shorter-but-otherwise-identical generation diverges at the end of the
-        shorter sequence, because stopping early is itself a difference.
-    """
-    if stock.output_tokens and candidate.output_tokens:
-        basis = DivergenceBasis.TOKEN
-        left: Sequence[str] = stock.output_tokens
-        right: Sequence[str] = candidate.output_tokens
-    else:
-        basis = DivergenceBasis.CHARACTER
-        left = stock.generated_text
-        right = candidate.generated_text
-
-    for index, (a, b) in enumerate(zip(left, right, strict=False)):
-        if a != b:
-            return index, basis, len(left), len(right)
-    if len(left) != len(right):
-        return min(len(left), len(right)), basis, len(left), len(right)
-    return None, basis, len(left), len(right)
 
 
 def _repeat_acceptance(
@@ -1602,241 +1546,92 @@ def _repeat_accepted_length(
     return pooled
 
 
-def _collect_divergences(
-    stock: ReplayResult,
-    candidate: ReplayResult,
+def _build_per_repeat(
+    stock_replay: ReplayResult,
+    candidate_replay: ReplayResult,
     *,
-    min_divergence_index: int,
-) -> tuple[tuple[ContextDivergence, ...], int]:
-    """Locate, classify and record every context whose generations parted.
+    num_repeats: int,
+    stock_repeat_metrics: Sequence[MetricsDelta],
+    candidate_repeat_metrics: Sequence[MetricsDelta],
+    pooled_stock: MetricsDelta,
+    pooled_candidate: MetricsDelta,
+    early_by_repeat: dict[int, int],
+) -> tuple[RepeatSummary, ...]:
+    """Summarise the paired repeats both arms actually completed.
 
-    Returns ``(divergences, trials)``.  *trials* -- the number of context pairs
-    actually compared -- is returned rather than re-derived by the caller
-    because it is the denominator of every rate the criterion computes, and a
-    count of events without the count of opportunities is not a rate.
+    Derived purely from replay data plus the per-repeat metric windows, so
+    these survive a metrics failure and keep ``num_repeats == len(per_repeat)``
+    true on every path.
     """
-    found: list[ContextDivergence] = []
-    trials = 0
-    for repeat_index in range(min(stock.num_runs, candidate.num_runs)):
-        s_run = stock.run_results[repeat_index]
-        c_run = candidate.run_results[repeat_index]
-        for s_req, c_req in zip(s_run.results, c_run.results, strict=True):
-            trials += 1
-            index, basis, s_len, c_len = first_divergence(s_req, c_req)
-            if index is None:
-                continue
-            found.append(
-                ContextDivergence(
-                    context_hash=s_req.context_hash,
-                    repeat_index=repeat_index,
-                    first_divergence_index=index,
-                    basis=basis.value,
-                    stock_length=s_len,
-                    candidate_length=c_len,
-                    early=index < min_divergence_index,
-                )
-            )
-    return tuple(found), trials
 
-
-def divergence_excess_p_value(
-    observed_events: int,
-    observed_trials: int,
-    control_events: int,
-    control_trials: int,
-) -> float:
-    """One-sided Fisher exact p-value for "the candidate diverges *more*".
-
-    The null hypothesis is the one speculative decoding's losslessness makes the
-    right one: both comparisons -- candidate-versus-stock and stock-versus-stock
-    -- are draws from the *same* per-context divergence hazard, namely the
-    engine's.  The alternative is that the candidate arm's hazard is strictly
-    larger, which is the only thing a broken head can produce.
-
-    Conditioning on the observed event total, the number landing in the
-    candidate comparison is hypergeometric, so the upper tail is exact -- no
-    normal approximation, no continuity correction, and no minimum expected-cell
-    count to violate.  That matters here because the interesting regimes are
-    both extremes at once: a handful of events out of 410 on a dense target, and
-    a near-saturated 230 out of 410 on a MoE one.
-
-    Returns 1.0 when nothing diverged anywhere, or when there were no trials --
-    "no evidence", never "significant".
-    """
-    for name, value in (
-        ("observed_events", observed_events),
-        ("observed_trials", observed_trials),
-        ("control_events", control_events),
-        ("control_trials", control_trials),
-    ):
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise DecisionError(f"{name} must be a non-negative integer, got {value!r}")
-    if observed_events > observed_trials or control_events > control_trials:
-        raise DecisionError(
-            "divergence events cannot exceed trials: "
-            f"{observed_events}/{observed_trials} observed, "
-            f"{control_events}/{control_trials} control"
+    return tuple(
+        RepeatSummary(
+            repeat_index=i,
+            stock_tok_per_sec=stock_replay.run_results[i].output_tok_per_sec,
+            candidate_tok_per_sec=candidate_replay.run_results[i].output_tok_per_sec,
+            stock_acceptance_rate=_repeat_acceptance(
+                stock_repeat_metrics, i, pooled_stock.acceptance_rate
+            ),
+            candidate_acceptance_rate=_repeat_acceptance(
+                candidate_repeat_metrics, i, pooled_candidate.acceptance_rate
+            ),
+            invalid_rate=candidate_replay.run_results[i].invalid_rate,
+            output_mismatches=early_by_repeat.get(i, 0),
+            stock_accepted_length=_repeat_accepted_length(
+                stock_repeat_metrics, i, pooled_stock.mean_accepted_length
+            ),
+            candidate_accepted_length=_repeat_accepted_length(
+                candidate_repeat_metrics, i, pooled_candidate.mean_accepted_length
+            ),
+            stock_finish_reasons=stock_replay.run_results[i].finish_reason_count,
+            candidate_finish_reasons=candidate_replay.run_results[i].finish_reason_count,
+            stock_truncated=stock_replay.run_results[i].truncated_count,
+            candidate_truncated=candidate_replay.run_results[i].truncated_count,
         )
-
-    total_events = observed_events + control_events
-    total_trials = observed_trials + control_trials
-    if total_events == 0 or total_trials == 0:
-        return 1.0
-    denominator = math.comb(total_trials, total_events)
-    numerator = sum(
-        math.comb(observed_trials, i) * math.comb(control_trials, total_events - i)
-        for i in range(observed_events, min(observed_trials, total_events) + 1)
+        for i in range(num_repeats)
     )
-    return min(1.0, numerator / denominator)
 
 
-def _binomial_upper_tail(events: int, trials: int, rate: float) -> float:
-    """``P(X >= events)`` for ``X ~ Binomial(trials, rate)``, exactly.
+def _column_stats(values: list[float], pooled: float) -> tuple[float, float]:
+    """``(mean, sample sd)`` of one per-repeat column.
 
-    Summed in log space because the gate's denominators run to hundreds of
-    trials, where ``rate ** k`` underflows to zero long before the binomial
-    coefficient it is multiplied by overflows a float.
+    The published ``*_avg_*`` figure is *exactly* the mean of the ``per_repeat``
+    column beside it, and every gated delta is exactly the delta of two such
+    means -- which is what lets a reader reconcile the verdict by hand from the
+    array.  The sample standard deviation is returned beside the mean and
+    published with it, so a reader can see how much that mean is worth without
+    re-deriving it from the array.
+
+    *pooled* stands in only when there is no column at all (a zero-sample
+    benchmark), where the whole-window scrape is the only figure there is; the
+    standard deviation is then honestly ``0.0``.
     """
-    if events <= 0:
-        return 1.0
-    if events > trials:
-        return 0.0
-    if rate <= 0.0:
-        return 0.0
-    if rate >= 1.0:
-        return 1.0
-    log_p = math.log(rate)
-    log_q = math.log1p(-rate)
-    log_n_fact = math.lgamma(trials + 1)
-    terms = [
-        math.exp(
-            log_n_fact
-            - math.lgamma(k + 1)
-            - math.lgamma(trials - k + 1)
-            + k * log_p
-            + (trials - k) * log_q
-        )
-        for k in range(events, trials + 1)
-    ]
-    return min(1.0, math.fsum(terms))
+    return (_mean(values) if values else pooled), _stdev(values)
 
 
-def divergence_position_p_value(
-    early_events: int,
-    total_events: int,
-    trials: int,
-    *,
-    min_divergence_index: int,
-    max_tokens: int,
-    control_early_rate: float = 0.0,
-) -> float:
-    """One-sided p-value for "these divergences are *front-loaded*".
+def _engine_fields(engine_execution: EngineExecution | None) -> dict[str, Any]:
+    """The engine-execution columns of a decision record.
 
-    This is the divergence statistic that does not need a control, and it is
-    the one that survives the discovery that the gate's control is not a valid
-    null for the comparison it is used against (see
-    :func:`decide_promotion`).
-
-    The null is the one greedy speculative decoding actually licenses.
-    Verification accepts a drafted token only on exact ``argmax`` equality with
-    the verifier -- no tolerance band, no probability, no RNG -- so a *sound*
-    engine emits the verifier's own greedy trajectory whatever the draft head
-    proposes.  The two arms can therefore only part where floating-point noise
-    flips an ``argmax`` at a near-tie, and near-ties are not concentrated at any
-    particular offset: the per-token flip hazard is flat.  Under a flat hazard
-    the first-divergence offset is memoryless, and the share of contexts parting
-    inside the first ``min_divergence_index`` tokens is pinned by the share
-    parting over the remaining window.
-
-    The alternative is what a genuinely broken head produces.  If verification
-    is bypassed, or a tolerance band is opened, or the served head is not the
-    head that was measured, the emitted text stops being the verifier's
-    trajectory *immediately* -- the divergences pile up at the front of the
-    window and the flat-hazard null is violated by orders of magnitude.
-
-    The hazard is calibrated from this run's own late window rather than
-    assumed, which is what makes the statistic valid across models: an engine
-    whose arms part in 2% of contexts and one whose arms part in 51% are
-    scored against their own hazards, not against a shared constant.
-
-    Args:
-        early_events: Contexts that parted before ``min_divergence_index``.
-        total_events: Contexts that parted at any offset.
-        trials: Context comparisons attempted -- the denominator.
-        min_divergence_index: Offset separating "early" from "late".
-        max_tokens: Output cap of the correctness pass, i.e. the width of the
-            window in which a divergence could have been seen at all.
-        control_early_rate: Early divergences per trial the *engine* produced
-            replaying stock against stock, when a control ran.  It raises the
-            null rate and can only ever make this test harder to reject.
-
-            That asymmetry is the point.  The gate's control is collected
-            inside a single engine incarnation while the measurement straddles
-            a restart, so it is a *lower bound* on the true floor -- which
-            makes it unusable as evidence that the candidate is at fault, and
-            perfectly usable as evidence that it is not.  Letting a control
-            exonerate but never condemn is what keeps a floor this design
-            cannot measure from being read as though it had.
-
-    Returns:
-        ``P(early >= early_events)`` under the flat-hazard null.  ``1.0``
-        whenever the run carries no usable evidence -- no divergences, no
-        trials, a window the threshold saturates, or a late window that
-        produced nothing to calibrate against.  "No evidence" is never
-        "significant".
+    ``None`` throughout when the gate was told nothing, except the mode itself,
+    which says :data:`UNRECORDED_EXECUTION_MODE` out loud: the absence of
+    knowledge is the fact worth persisting, and a ``None`` there would be
+    indistinguishable from a key a reader forgot to add.
     """
-    for name, value in (
-        ("early_events", early_events),
-        ("total_events", total_events),
-        ("trials", trials),
-        ("min_divergence_index", min_divergence_index),
-        ("max_tokens", max_tokens),
-    ):
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise DecisionError(f"{name} must be a non-negative integer, got {value!r}")
-    if not 0.0 <= control_early_rate <= 1.0:
-        raise DecisionError(
-            f"control_early_rate must lie in [0, 1], got {control_early_rate!r}"
-        )
-    if early_events > total_events:
-        raise DecisionError(
-            f"early divergences cannot exceed the total: {early_events} > {total_events}"
-        )
-    if total_events > trials:
-        raise DecisionError(
-            f"divergences cannot exceed trials: {total_events} > {trials}"
-        )
-    if early_events == 0 or trials == 0:
-        return 1.0
-    # A threshold at or beyond the cap makes every divergence "early" by
-    # construction; there is no late window left to calibrate against and no
-    # contrast left to test.  ``divergence_criterion`` already names this
-    # configuration; here it simply carries no evidence.
-    if min_divergence_index >= max_tokens:
-        return 1.0
-
-    at_risk = trials - early_events
-    late_events = total_events - early_events
-    if at_risk <= 0 or late_events <= 0:
-        # Nothing survived to the late window, or nothing parted in it.  Fall
-        # back to the small-hazard limit of the same null, where a flat hazard
-        # puts exactly ``min_divergence_index / max_tokens`` of its mass early.
-        # This is the branch a fully bypassed verifier lands in, and it must
-        # still be able to reject.
-        null_rate = min_divergence_index / max_tokens
-    elif late_events >= at_risk:
-        # Every context still alive at the threshold parted afterwards, so the
-        # calibrated hazard is unbounded and no early count is surprising.
-        return 1.0
-    else:
-        late_survival = 1.0 - late_events / at_risk
-        per_token_survival = late_survival ** (
-            1.0 / (max_tokens - min_divergence_index)
-        )
-        null_rate = 1.0 - per_token_survival**min_divergence_index
-    return _binomial_upper_tail(
-        early_events, trials, max(null_rate, control_early_rate)
-    )
+    if engine_execution is None:
+        return {
+            "engine_execution_mode": UNRECORDED_EXECUTION_MODE,
+            "engine_enforce_eager": None,
+            "engine_enable_chunked_prefill": None,
+            "engine_enable_prefix_caching": None,
+            "engine_max_num_seqs": None,
+        }
+    return {
+        "engine_execution_mode": engine_execution.execution_mode,
+        "engine_enforce_eager": engine_execution.enforce_eager,
+        "engine_enable_chunked_prefill": engine_execution.enable_chunked_prefill,
+        "engine_enable_prefix_caching": engine_execution.enable_prefix_caching,
+        "engine_max_num_seqs": engine_execution.max_num_seqs,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -1960,223 +1755,59 @@ def decide_promotion(
     min_runs = min(s_runs, c_runs)
 
     # --- Output correctness ---
-    # Compared on its own replay when the caller ran one, so that the question
-    # "do these two heads produce the same answer" is asked of a short,
-    # single-stream, bounded generation rather than of the batched throughput
-    # pass, whose whole purpose is to vary batch composition.
+    # The whole criterion -- the measured pair, the engine's own noise floor,
+    # whether that floor is a valid null, and the three channels that can reject
+    # on it -- lives in :func:`speedlm.gate.divergence.evaluate_divergence`.
     min_divergence_index = promotion_config.min_divergence_token_index
-    stock_corr = stock_correctness if stock_correctness is not None else stock_replay
-    candidate_corr = (
-        candidate_correctness if candidate_correctness is not None else candidate_replay
-    )
-    divergences, divergence_trials = _collect_divergences(
-        stock_corr,
-        candidate_corr,
+    evidence = evaluate_divergence(
+        stock_replay,
+        candidate_replay,
+        stock_correctness=stock_correctness,
+        candidate_correctness=candidate_correctness,
+        stock_correctness_control=stock_correctness_control,
         min_divergence_index=min_divergence_index,
+        correctness_max_tokens=correctness_max_tokens,
+        max_output_mismatches=max_output_mismatches,
     )
-    # The engine's own noise floor: the stock arm against a second pass of
-    # itself, scored by the identical procedure so the two counts are
-    # commensurable.  Absent one, assume a floor of zero over an equal number of
-    # trials -- the strictest assumption that is still a test.
-    if stock_correctness_control is not None:
-        control_divergences, control_trials = _collect_divergences(
-            stock_corr,
-            stock_correctness_control,
-            min_divergence_index=min_divergence_index,
-        )
-        control_available = True
-    else:
-        control_divergences = ()
-        control_trials = divergence_trials
-        control_available = False
-
-    # Is that floor a valid null for the comparison it is used against?
-    #
-    # The measured pair is stock-arm-versus-candidate-arm, and those two arms
-    # are served by two different engine incarnations -- the runner restarts
-    # vLLM to change the draft head -- so the pair straddles a weight reload, a
-    # KV and prefix cache rebuild, and a fresh kernel-autotune state.  The
-    # control pair is stock-versus-stock inside a *single* incarnation, which
-    # replays a bit-identical computation and therefore reports zero however
-    # noisy the engine is across restarts.  Testing a cross-incarnation count
-    # against a same-incarnation floor of zero is not a test: it rejects on the
-    # first divergence, whatever produced it.
-    #
-    # ``ReplayResult.session_id`` is what makes the topology visible.  Distinct
-    # non-empty ids mean two different replay invocations; an empty id is a
-    # result that carries no claim about how it was collected and must not be
-    # read as agreement.  The control is comparable only when the measured pair
-    # spans invocations *and* the control pair spans invocations too.
-    control_session = (
-        stock_correctness_control.session_id if stock_correctness_control else ""
-    )
-    control_comparable = bool(
-        control_available
-        and stock_corr.session_id
-        and candidate_corr.session_id
-        and control_session
-        and stock_corr.session_id != candidate_corr.session_id
-        and stock_corr.session_id != control_session
-    )
-
-    # The number of passes the divergence evidence above actually rests on.
-    # ``_collect_divergences`` compares ``min(num_runs)`` pairs, so that is the
-    # count -- and it is what bounds which ``per_repeat`` rows can carry a
-    # non-zero ``output_mismatches``.
-    correctness_repeats = min(stock_corr.num_runs, candidate_corr.num_runs)
-    early_by_repeat: dict[int, int] = {}
-    for d in divergences:
-        if d.early:
-            early_by_repeat[d.repeat_index] = early_by_repeat.get(d.repeat_index, 0) + 1
-    total_early = sum(early_by_repeat.values())
-    total_any = len(divergences)
-    control_early = sum(1 for d in control_divergences if d.early)
-    control_any = len(control_divergences)
-
-    # Each statistic against its own floor.  Bonferroni over the two, because
-    # rejecting on "either is significant" tests twice.
-    per_statistic_alpha = DIVERGENCE_ALPHA / DIVERGENCE_STATISTICS
-    total_p = divergence_excess_p_value(
-        total_any, divergence_trials, control_any, control_trials
-    )
-    early_p = divergence_excess_p_value(
-        total_early, divergence_trials, control_early, control_trials
-    )
-    # The control-free channel.  It asks whether the divergences sit where a
-    # sound engine's floating-point noise would put them, and it needs no floor
-    # to do it -- see :func:`divergence_position_p_value`.
-    #
-    # The window is the correctness pass's own cap when the caller declared one
-    # -- that is the pair ``divergence_criterion`` is classified from, so the
-    # two readings stay consistent.  A caller that declared none still leaves
-    # the window observable: no comparison could have found a divergence past
-    # the longest generation it actually compared.
-    divergence_window = correctness_max_tokens or max(
-        (max(d.stock_length, d.candidate_length) for d in divergences),
-        default=0,
-    )
-    position_p = divergence_position_p_value(
-        total_early,
-        total_any,
-        divergence_trials,
-        min_divergence_index=min_divergence_index,
-        max_tokens=divergence_window,
-        control_early_rate=(
-            control_early / control_trials if control_trials > 0 else 0.0
-        ),
-    )
-
-    # The allowance is a precondition, not an alternative: a statistic fires
-    # only when it clears *both* the caller's outright tolerance and its own
-    # null.
-    #
-    # The position channel always gates.  Its null holds for any model and any
-    # inference configuration -- a perfectly deterministic engine and a wildly
-    # nondeterministic one are each scored against their own measured hazard --
-    # and it is the channel a genuinely broken head trips, because bypassed or
-    # loosened verification moves the divergences to the front of the window.
-    #
-    # The two rate channels gate only against a comparable control.  Without
-    # one their null is a floor of zero collected under strictly easier
-    # conditions than the measurement, and a test against that floor rejects
-    # any nonzero count -- including the count that draft-independent
-    # floating-point noise produces on every engine that is not batch-invariant.
-    # They stay computed and recorded either way, so the evidence survives even
-    # where it does not decide.
-    position_rejects = (
-        total_early > max_output_mismatches and position_p < per_statistic_alpha
-    )
-    # Unanimity needs no distributional null.  A floor is a rate and a rate
-    # cannot exceed one, so "the candidate parted on every context while the
-    # engine's own control did not" is an excess statement that stands on the
-    # two rates alone -- no hazard model, no significance test, no assumption
-    # about how the two passes were collected.  It is also the observation the
-    # position channel cannot reach: where the threshold saturates the window
-    # every divergence is early by construction, leaving the flat-hazard null
-    # with no late window to calibrate against.  So this gates whether or not
-    # the control is comparable -- but it still defers to a control that
-    # reproduced the same unanimity, which is the engine speaking, not the head.
-    unanimous_rejects = (
-        divergence_trials > 0
-        and total_any == divergence_trials
-        and total_any > max_output_mismatches
-        and control_any < control_trials
-    )
-    rate_rejects = control_comparable and (
-        (total_any > max_output_mismatches and total_p < per_statistic_alpha)
-        or (total_early > max_output_mismatches and early_p < per_statistic_alpha)
-    )
-    divergence_rejects = position_rejects or unanimous_rejects or rate_rejects
 
     # --- Build per-repeat summaries ---
-    # Derived purely from replay data plus the per-repeat metric windows, so
-    # these survive a metrics failure and keep ``num_repeats == len(per_repeat)``
-    # true on every path.
-    per_repeat_list: list[RepeatSummary] = []
+    per_repeat_tuple = _build_per_repeat(
+        stock_replay,
+        candidate_replay,
+        num_repeats=min_runs,
+        stock_repeat_metrics=stock_repeat_metrics,
+        candidate_repeat_metrics=candidate_repeat_metrics,
+        pooled_stock=stock_metrics,
+        pooled_candidate=candidate_metrics,
+        early_by_repeat=evidence.early_by_repeat,
+    )
 
-    for i in range(min_runs):
-        s_run = stock_replay.run_results[i]
-        c_run = candidate_replay.run_results[i]
-
-        per_repeat_list.append(
-            RepeatSummary(
-                repeat_index=i,
-                stock_tok_per_sec=s_run.output_tok_per_sec,
-                candidate_tok_per_sec=c_run.output_tok_per_sec,
-                stock_acceptance_rate=_repeat_acceptance(stock_repeat_metrics, i, s_acc),
-                candidate_acceptance_rate=_repeat_acceptance(
-                    candidate_repeat_metrics, i, c_acc
-                ),
-                invalid_rate=c_run.invalid_rate,
-                output_mismatches=early_by_repeat.get(i, 0),
-                stock_accepted_length=_repeat_accepted_length(
-                    stock_repeat_metrics, i, s_mal
-                ),
-                candidate_accepted_length=_repeat_accepted_length(
-                    candidate_repeat_metrics, i, c_mal
-                ),
-                stock_finish_reasons=s_run.finish_reason_count,
-                candidate_finish_reasons=c_run.finish_reason_count,
-                stock_truncated=s_run.truncated_count,
-                candidate_truncated=c_run.truncated_count,
-            )
-        )
-
-    per_repeat_tuple = tuple(per_repeat_list)
-
-    # --- The gating throughput statistic ---
+    # --- The three gated statistics, each the mean of its own column ---
     # Both arms replayed the same suite the same number of times, so pairing the
-    # repeats and averaging the column keeps this number reconcilable by hand:
-    # ``stock_avg_tok_per_sec`` is *exactly* the mean of the ``per_repeat``
-    # stock column, and the delta below is exactly the delta of those two means.
-    # The Prometheus figures are carried alongside, clearly named, and ignored.
-    s_tps = _mean([r.stock_tok_per_sec for r in per_repeat_tuple])
-    c_tps = _mean([r.candidate_tok_per_sec for r in per_repeat_tuple])
-
-    # --- The gating acceptance statistic ---
-    # The same contract as throughput above: the published ``*_avg_acceptance``
-    # is *exactly* the mean of the ``per_repeat`` column beside it, and the
-    # gated delta is exactly the delta of those two means.  The standard
-    # deviations travel with them so a reader can see how much the mean is
-    # worth without re-deriving it from the array.
-    s_acc_series = [r.stock_acceptance_rate for r in per_repeat_tuple]
-    c_acc_series = [r.candidate_acceptance_rate for r in per_repeat_tuple]
-    s_acc_mean = _mean(s_acc_series) if s_acc_series else s_acc
-    c_acc_mean = _mean(c_acc_series) if c_acc_series else c_acc
-    s_acc_sd = _stdev(s_acc_series)
-    c_acc_sd = _stdev(c_acc_series)
-
-    # --- The gating acceptance criterion ---
-    # Same contract again, on the quantity that actually decides: mean accepted
-    # length, in tokens per verifier step.  Unlike the rate above it carries no
-    # draft depth in its denominator, so it is comparable across a k-sweep.
-    # See :data:`GATING_ACCEPTANCE_CRITERION`.
-    s_mal_series = [r.stock_accepted_length for r in per_repeat_tuple]
-    c_mal_series = [r.candidate_accepted_length for r in per_repeat_tuple]
-    s_mal_mean = _mean(s_mal_series) if s_mal_series else s_mal
-    c_mal_mean = _mean(c_mal_series) if c_mal_series else c_mal
-    s_mal_sd = _stdev(s_mal_series)
-    c_mal_sd = _stdev(c_mal_series)
+    # repeats and averaging the column keeps every reported number reconcilable
+    # by hand: ``stock_avg_tok_per_sec`` is *exactly* the mean of the
+    # ``per_repeat`` stock column, and each delta below is exactly the delta of
+    # two such means.  The Prometheus figures are carried alongside, clearly
+    # named, and ignored -- see :data:`GATING_THROUGHPUT_STATISTIC`.
+    #
+    # The acceptance *criterion* -- mean accepted length, in tokens per verifier
+    # step -- is the one that decides.  Unlike the rate beside it, it carries no
+    # draft depth in its denominator, so it is comparable across a k-sweep.  See
+    # :data:`GATING_ACCEPTANCE_CRITERION`.
+    s_tps, _ = _column_stats([r.stock_tok_per_sec for r in per_repeat_tuple], 0.0)
+    c_tps, _ = _column_stats([r.candidate_tok_per_sec for r in per_repeat_tuple], 0.0)
+    s_acc_mean, s_acc_sd = _column_stats(
+        [r.stock_acceptance_rate for r in per_repeat_tuple], s_acc
+    )
+    c_acc_mean, c_acc_sd = _column_stats(
+        [r.candidate_acceptance_rate for r in per_repeat_tuple], c_acc
+    )
+    s_mal_mean, s_mal_sd = _column_stats(
+        [r.stock_accepted_length for r in per_repeat_tuple], s_mal
+    )
+    c_mal_mean, c_mal_sd = _column_stats(
+        [r.candidate_accepted_length for r in per_repeat_tuple], c_mal
+    )
 
     def _decide(
         verdict: Verdict,
@@ -2215,44 +1846,26 @@ def decide_promotion(
             stock_acceptance_stdev=s_acc_sd,
             candidate_acceptance_stdev=c_acc_sd,
             min_divergence_token_index=min_divergence_index,
-            output_divergences=divergences,
-            divergence_trials=divergence_trials,
-            control_trials=control_trials,
-            control_divergences=control_divergences,
-            divergence_control_available=control_available,
-            divergence_control_comparable=control_comparable,
-            divergence_position_p_value=position_p if total_early else None,
-            divergence_total_p_value=total_p,
-            divergence_early_p_value=early_p,
-            divergence_alpha=per_statistic_alpha,
+            output_divergences=evidence.divergences,
+            divergence_trials=evidence.trials,
+            control_trials=evidence.control_trials,
+            control_divergences=evidence.control_divergences,
+            divergence_control_available=evidence.control_available,
+            divergence_control_comparable=evidence.control_comparable,
+            divergence_position_p_value=(
+                evidence.position_p if evidence.total_early else None
+            ),
+            divergence_total_p_value=evidence.total_p,
+            divergence_early_p_value=evidence.early_p,
+            divergence_alpha=DIVERGENCE_PER_STATISTIC_ALPHA,
             benchmark_max_tokens=benchmark_max_tokens,
             replay_concurrency=replay_concurrency,
             correctness_max_tokens=correctness_max_tokens,
-            correctness_repeats=correctness_repeats,
+            correctness_repeats=evidence.correctness_repeats,
             suite_hash=stock_replay.suite_hash or None,
             num_contexts=num_contexts,
             stock_draft=stock_draft,
-            engine_execution_mode=(
-                UNRECORDED_EXECUTION_MODE
-                if engine_execution is None
-                else engine_execution.execution_mode
-            ),
-            engine_enforce_eager=(
-                None if engine_execution is None else engine_execution.enforce_eager
-            ),
-            engine_enable_chunked_prefill=(
-                None
-                if engine_execution is None
-                else engine_execution.enable_chunked_prefill
-            ),
-            engine_enable_prefix_caching=(
-                None
-                if engine_execution is None
-                else engine_execution.enable_prefix_caching
-            ),
-            engine_max_num_seqs=(
-                None if engine_execution is None else engine_execution.max_num_seqs
-            ),
+            **_engine_fields(engine_execution),
         )
 
     def _reject(reason: Reason, **deltas: float | None) -> Decision:
@@ -2269,11 +1882,13 @@ def decide_promotion(
     # otherwise hand the gate ``0.0 - 0.0 = 0.0`` tokens/step and reject every
     # candidate under a threshold reason, hiding a missing counter behind a
     # verdict about the head.
-    if not stock_metrics.acceptance_available or not candidate_metrics.acceptance_available:
-        return _reject(Reason.ACCEPTANCE_UNAVAILABLE)
-    if (
-        not stock_metrics.accepted_length_available
-        or not candidate_metrics.accepted_length_available
+    if not all(
+        (
+            stock_metrics.acceptance_available,
+            candidate_metrics.acceptance_available,
+            stock_metrics.accepted_length_available,
+            candidate_metrics.accepted_length_available,
+        )
     ):
         return _reject(Reason.ACCEPTANCE_UNAVAILABLE)
 
@@ -2307,16 +1922,14 @@ def decide_promotion(
     # promote on ``MIXED`` while the decision it wrote derived ``SATURATED``
     # from the rows it actually persisted.  A verdict whose own evidence
     # contradicts it is this project's recurring defect; deriving both from one
-    # array makes the divergence unrepresentable rather than merely unlikely.
-    stock_truncation = classify_truncation(
-        reported=sum(r.stock_finish_reasons for r in per_repeat_tuple),
-        truncated=sum(r.stock_truncated for r in per_repeat_tuple),
+    # array makes the divergence unrepresentable rather than merely unlikely --
+    # which is what ``_truncation_counts``, the one reader both sides go
+    # through, enforces.
+    regimes = (
+        _truncation_counts(per_repeat_tuple, STOCK_ARM).regime,
+        _truncation_counts(per_repeat_tuple, CANDIDATE_ARM).regime,
     )
-    candidate_truncation = classify_truncation(
-        reported=sum(r.candidate_finish_reasons for r in per_repeat_tuple),
-        truncated=sum(r.candidate_truncated for r in per_repeat_tuple),
-    )
-    if TruncationRegime.SATURATED in (stock_truncation, candidate_truncation):
+    if TruncationRegime.SATURATED in regimes:
         return _reject(Reason.TRUNCATION_SATURATED)
 
     # --- Validation: nothing reported a finish reason at all ---
@@ -2334,7 +1947,7 @@ def decide_promotion(
     # with its strongest measurement check silently inert.  The precedent is
     # ``ACCEPTANCE_UNAVAILABLE`` a few checks up: in this codebase a missing
     # instrument rejects, it does not pass.
-    if TruncationRegime.UNTESTABLE in (stock_truncation, candidate_truncation):
+    if TruncationRegime.UNTESTABLE in regimes:
         return _reject(Reason.TRUNCATION_UNMEASURED)
 
     # --- Validation: output mismatch ---
@@ -2344,7 +1957,7 @@ def decide_promotion(
     # disagreeing with itself -- which the control pass measures directly.  See
     # :data:`DIVERGENCE_ALPHA` for the argument and the false-reject arithmetic
     # the old any-occurrence rule was producing.
-    if divergence_rejects:
+    if evidence.rejects:
         return _reject(Reason.OUTPUT_MISMATCH)
 
     # --- Validation: throughput unavailable ---
