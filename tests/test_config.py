@@ -932,6 +932,7 @@ _SENTINEL_DEFAULT: dict[str, Any] = {
         "restore_fast_path_timeout_seconds": 0.001,
         "draft_hot_swap_enabled": True,
         "trust_untagged_assistant_messages": True,
+        "trust_self_play_assistant_turns": True,
         "val_loss_prefilter": {
             "enabled": True,
             "min_improvement": 0.0,

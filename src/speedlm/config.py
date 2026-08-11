@@ -1087,6 +1087,14 @@ class IdleTuningConfig:
     #: authorship; see the field of the same name on
     #: :class:`speedlm.training.backends.eagle3.SpeculatorsPipelineConfig`.
     trust_untagged_assistant_messages: bool = False
+    #: Trust that is EARNED rather than asserted.  When set, the training
+    #: pipeline attests the whole snapshot as self-play traffic -- every
+    #: client-supplied assistant turn must reproduce a turn this server generated
+    #: in an earlier row -- and only then relabels those turns as trainable.  The
+    #: cycle fails loudly if the attestation does not hold, so unlike its
+    #: neighbour above this flag cannot quietly launder another model's tokens
+    #: into supervision.
+    trust_self_play_assistant_turns: bool = False
 
     def __post_init__(self) -> None:
         _validate_int_gte(self.min_trace_records, "tuning.min_trace_records", 2)
@@ -1217,6 +1225,11 @@ class IdleTuningConfig:
             raise ConfigError(
                 "tuning.trust_untagged_assistant_messages must be a bool, "
                 f"got {type(self.trust_untagged_assistant_messages).__name__!r}"
+            )
+        if not isinstance(self.trust_self_play_assistant_turns, bool):
+            raise ConfigError(
+                "tuning.trust_self_play_assistant_turns must be a bool, "
+                f"got {type(self.trust_self_play_assistant_turns).__name__!r}"
             )
 
 
@@ -1407,6 +1420,9 @@ class SpeedLMConfig:
             "trust_untagged_assistant_messages": (
                 self.tuning.trust_untagged_assistant_messages
             ),
+            "trust_self_play_assistant_turns": (
+                self.tuning.trust_self_play_assistant_turns
+            ),
             "val_loss_prefilter": {
                 "enabled": self.tuning.val_loss_prefilter.enabled,
                 "min_improvement": self.tuning.val_loss_prefilter.min_improvement,
@@ -1534,6 +1550,7 @@ class SpeedLMConfig:
                 "restore_fast_path_timeout_seconds",
                 "draft_hot_swap_enabled",
                 "trust_untagged_assistant_messages",
+                "trust_self_play_assistant_turns",
                 "val_loss_prefilter",
             },
         )

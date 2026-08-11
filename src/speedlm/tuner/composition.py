@@ -874,6 +874,7 @@ def create_production_tuner(
         # names the flag in the advice it prints for a replayed offline
         # corpus, so the line below is what makes that advice followable.
         trust_untagged_assistant_messages=tuning.trust_untagged_assistant_messages,
+        trust_self_play_assistant_turns=tuning.trust_self_play_assistant_turns,
     )
     backend = Eagle3Backend.from_speculators(
         pipeline,
