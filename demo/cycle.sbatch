@@ -24,7 +24,7 @@ set -euo pipefail
 # spends its hour on the part worth filming: the tuning cycle itself.
 
 repo=/admin/home/ryan.kim/speedlm-fr
-run_dir=/data/ryan.kim/speedlm-runs/demo-cycle-run3
+run_dir=/data/ryan.kim/speedlm-runs/demo-cycle-run4
 config="$repo/configs/demo-qwen8b.json"
 model="Qwen/Qwen3-8B"
 seed_traces=/data/ryan.kim/speedlm-runs/agentenv-qwen8b-run5/speedlm_home/traces/traces.jsonl
