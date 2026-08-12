@@ -226,6 +226,69 @@ def session_key(record: TraceRecord) -> str:
     return "session:" + hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def _session_components(
+    records: Sequence[TraceRecord],
+    record_hashes: Sequence[str],
+) -> dict[str, frozenset[str]]:
+    """Group context hashes into session-closed connected components.
+
+    Contexts and sessions form a *bipartite* graph: each record contributes one
+    edge joining its context hash to the session it was captured from.  A
+    context may carry several such edges, and for agentic corpora it routinely
+    does -- every trajectory in a rollout family opens with the same system
+    prompt and the same first user message, so the turn-1 requests of sibling
+    trajectories are byte-identical and hash alike, while ``session_key``
+    (which hashes ``messages[:3]``, including the model's first reply) tells
+    the trajectories apart.
+
+    Collapsing such a context onto a single session -- the ``min`` this
+    replaced -- makes reservation session-*atomic* but not session-*closed*:
+    reserving the shared opening pulls in one trajectory and leaves its
+    siblings, whose later turns nest that very opening, in the training set.
+    The straddle guard in :mod:`speedlm.training.split` then correctly refuses
+    the whole cycle.
+
+    Reserving the entire connected component is the closure that fixes it: a
+    component is a maximal set of sessions and contexts reachable from one
+    another, so taking any member takes every session that could nest it.
+
+    The result is a pure function of the *set* of edges -- union is resolved
+    toward the lexicographically smaller root, so a component's representative
+    is its minimum node no matter what order the records arrive in.  Records
+    below the three-message floor make ``session_key`` return the record's own
+    context hash, i.e. a self-edge, so single-turn corpora stay singleton
+    components and their split remains byte-identical to the per-record one.
+    """
+    parent: dict[str, str] = {}
+
+    def find(node: str) -> str:
+        root = node
+        while parent.setdefault(root, root) != root:
+            root = parent[root]
+        while parent[node] != root:
+            parent[node], node = root, parent[node]
+        return root
+
+    def union(left: str, right: str) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root == right_root:
+            return
+        if right_root < left_root:
+            left_root, right_root = right_root, left_root
+        parent[right_root] = left_root
+
+    for record, context_hash in zip(records, record_hashes, strict=True):
+        union(context_hash, session_key(record))
+
+    grouped: dict[str, set[str]] = {}
+    for context_hash in record_hashes:
+        grouped.setdefault(find(context_hash), set()).add(context_hash)
+    return {
+        context_hash: frozenset(grouped[find(context_hash)])
+        for context_hash in record_hashes
+    }
+
+
 @dataclass(frozen=True, slots=True)
 class BenchmarkSuite:
     """An immutable, content-addressed benchmark suite.
@@ -253,15 +316,20 @@ class BenchmarkSuite:
         always yields the same suite, and duplicate contexts cannot straddle
         the split.
 
-        Reservation is *session-atomic*.  Records of one multi-turn agent
+        Reservation is *session-closed*.  Records of one multi-turn agent
         session are nested rather than independent (see :func:`session_key`),
         so reserving a single turn while training on its siblings hands the
-        draft head the very continuation it is scored on predicting.  The
+        draft head the very continuation it is scored on predicting.  And a
+        single context can belong to several sessions at once, because sibling
+        trajectories of a rollout family share their opening exchange
+        verbatim -- so reserving one session is not enough either.  The
         ranking is unchanged; what changed is that reserving a context also
-        reserves the rest of its session, and the count is then satisfied.
+        reserves its whole connected component in the context/session graph
+        (see :func:`_session_components`), and the count is then satisfied.
         The reserved set can therefore overshoot ``held_out_fraction`` to land
-        on a session boundary.  For single-turn corpora every record is its own
-        session and the selection is byte-identical to the per-record split.
+        on a component boundary.  For single-turn corpora every record is its
+        own singleton component and the selection is byte-identical to the
+        per-record split.
 
         Args:
             records: Ordered trace records.
@@ -300,24 +368,17 @@ class BenchmarkSuite:
                 context_hash,
             ),
         )
-        # Map every unique context onto exactly one session, then reserve by
-        # session.  A context can be reached under two keys only when one of
-        # its records lacks the provider-authored final turn and so falls
-        # below the three-message floor; ``min`` makes that tie deterministic.
-        session_of: dict[str, str] = {}
-        for rec, context_hash in zip(records, record_hashes, strict=True):
-            key = session_key(rec)
-            previous = session_of.get(context_hash)
-            session_of[context_hash] = key if previous is None else min(previous, key)
-        sessions: dict[str, set[str]] = {}
-        for context_hash, key in session_of.items():
-            sessions.setdefault(key, set()).add(context_hash)
+        # Reserve by connected component of the context/session graph, not by
+        # a single session per context: one context can belong to several
+        # sessions at once (see :func:`_session_components`), and reserving
+        # only one of them leaves the siblings that nest it in training.
+        components = _session_components(records, record_hashes)
 
         held_out_hashes: set[str] = set()
         for context_hash in ranked_hashes:
             if len(held_out_hashes) >= held_out_count:
                 break
-            held_out_hashes |= sessions[session_of[context_hash]]
+            held_out_hashes |= components[context_hash]
         contexts = tuple(
             FrozenContext.from_trace(rec)
             for rec, context_hash in zip(records, record_hashes, strict=True)

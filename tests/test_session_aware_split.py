@@ -22,6 +22,7 @@ import pytest
 from speedlm.gate.suite import (
     BenchmarkSuite,
     FrozenContext,
+    _session_components,
     load_suite,
     session_key,
 )
@@ -76,6 +77,61 @@ def _nested_corpus(sessions: int = 4, turns: int = 3) -> tuple[TraceRecord, ...]
     return tuple(records)
 
 
+def _branch_records(family: str, branch: str, turns: int) -> list[TraceRecord]:
+    """Build one trajectory of an agent *family* as ``turns`` nested records.
+
+    Every branch of a family opens with the identical system prompt and the
+    identical first user message -- that is what a rollout family *is* -- and
+    diverges only at the model's first reply.  The turn-1 request of every
+    branch is therefore byte-identical once the provider-authored reply is
+    stripped, so all branches share one ``context_hash``, while
+    :func:`session_key` (which hashes ``messages[:3]``, reply included) keeps
+    them apart as distinct sessions.  One context, several sessions.
+    """
+    records: list[TraceRecord] = []
+    history: list[dict[str, Any]] = [
+        {"role": "system", "content": f"you are agent {family}"},
+    ]
+    for turn in range(1, turns + 1):
+        prompt = (
+            f"{family} task" if turn == 1 else f"{family}/{branch} step {turn}"
+        )
+        history.append({"role": "user", "content": prompt})
+        answer = {"role": "assistant", "content": f"{family}/{branch} reply {turn}"}
+        messages = [dict(m) for m in history]
+        messages.append({**answer, "provenance_tag": "generated"})
+        records.append(
+            TraceRecord(
+                id=f"{family}-{branch}-turn-{turn}",
+                timestamp=float(turn),
+                model="model",
+                messages=tuple(messages),
+                tool_calls=(),
+                temperature=0.0,
+                top_p=1.0,
+                seed=0,
+                prompt_tokens=10,
+                completion_tokens=5,
+            )
+        )
+        history.append(dict(answer))
+    return records
+
+
+def _family_corpus(
+    branches: int = 2,
+    others: int = 6,
+    turns: int = 3,
+) -> tuple[TraceRecord, ...]:
+    """A realistic agentic window: one rollout family plus lone sessions."""
+    records: list[TraceRecord] = []
+    for index in range(branches):
+        records.extend(_branch_records("fam", f"b{index}", turns))
+    for index in range(others):
+        records.extend(_session_records(f"s{index}", turns))
+    return tuple(records)
+
+
 def _single_turn_record(identifier: str, prompt: str) -> TraceRecord:
     return TraceRecord(
         id=identifier,
@@ -122,6 +178,83 @@ def _legacy_build(
         suite_hash=BenchmarkSuite._compute_hash(contexts),
         contexts=contexts,
     )
+
+
+def _min_session_build(
+    records: Any,
+    *,
+    held_out_fraction: float = 0.2,
+    seed: int = 42,
+) -> BenchmarkSuite:
+    """The session-*atomic* reservation this change replaced.
+
+    It maps every context onto exactly one session with ``min`` and expands a
+    reservation to that session only.  Kept here rather than in the source so
+    the "would have straddled" control is the real prior algorithm and not a
+    restatement of the new one.
+    """
+    record_hashes = [BenchmarkSuite._record_hash(rec) for rec in records]
+    unique_hashes = set(record_hashes)
+    held_out_count = math.ceil(len(unique_hashes) * held_out_fraction)
+    ranked = sorted(
+        unique_hashes,
+        key=lambda context_hash: (
+            hashlib.sha256(f"{seed}:{context_hash}".encode("ascii")).digest(),
+            context_hash,
+        ),
+    )
+    session_of: dict[str, str] = {}
+    for rec, context_hash in zip(records, record_hashes, strict=True):
+        key = session_key(rec)
+        previous = session_of.get(context_hash)
+        session_of[context_hash] = key if previous is None else min(previous, key)
+    sessions: dict[str, set[str]] = {}
+    for context_hash, key in session_of.items():
+        sessions.setdefault(key, set()).add(context_hash)
+    held_out_hashes: set[str] = set()
+    for context_hash in ranked:
+        if len(held_out_hashes) >= held_out_count:
+            break
+        held_out_hashes |= sessions[session_of[context_hash]]
+    contexts = tuple(
+        FrozenContext.from_trace(rec)
+        for rec, context_hash in zip(records, record_hashes, strict=True)
+        if context_hash in held_out_hashes
+    )
+    return BenchmarkSuite(
+        suite_hash=BenchmarkSuite._compute_hash(contexts),
+        contexts=contexts,
+    )
+
+
+def _straddling_sessions(
+    records: tuple[TraceRecord, ...],
+    suite: BenchmarkSuite,
+) -> list[str]:
+    """Sessions with rows on both sides -- exactly what the guard rejects."""
+    held_out = {ctx.context_hash for ctx in suite.contexts}
+    training = [
+        record
+        for record in records
+        if BenchmarkSuite._record_hash(record) not in held_out
+    ]
+    held_out_sessions = {
+        session_key(record)
+        for record in records
+        if BenchmarkSuite._record_hash(record) in held_out
+    }
+    return sorted(
+        {session_key(record) for record in training} & held_out_sessions
+    )
+
+
+def _context_sessions(records: tuple[TraceRecord, ...]) -> dict[str, set[str]]:
+    mapping: dict[str, set[str]] = {}
+    for record in records:
+        mapping.setdefault(BenchmarkSuite._record_hash(record), set()).add(
+            session_key(record)
+        )
+    return mapping
 
 
 @dataclass(frozen=True)
@@ -264,6 +397,187 @@ def test_the_old_row_level_split_would_have_leaked_this_corpus() -> None:
         if _shape(record.messages)[: len(reserved)] == reserved
     ]
     assert leaked, "corpus does not exercise the nesting leak"
+
+
+# ── one context, several sessions ───────────────────────────────────────────
+
+
+def test_a_rollout_family_puts_several_sessions_on_one_context() -> None:
+    """The precondition every test below depends on.
+
+    If sibling trajectories did not actually collide on a context hash, the
+    straddle they are supposed to reproduce would not exist.
+    """
+    records = _family_corpus(branches=2, others=6)
+
+    shared = {
+        context_hash: keys
+        for context_hash, keys in _context_sessions(records).items()
+        if len(keys) > 1
+    }
+
+    assert shared, "corpus does not exercise the many-sessions-per-context case"
+    assert all(len(keys) == 2 for keys in shared.values())
+    # ...and the colliding rows really are turn 1 of two distinct branches.
+    collided = next(iter(shared))
+    ids = sorted(
+        record.id
+        for record in records
+        if BenchmarkSuite._record_hash(record) == collided
+    )
+    assert ids == ["fam-b0-turn-1", "fam-b1-turn-1"]
+
+
+def test_min_collapse_straddles_where_component_closure_does_not() -> None:
+    """The bug, and the fix, side by side on one corpus.
+
+    ``min`` picks one of the two sessions sharing the opening exchange, so
+    reserving it leaves the sibling branch -- whose later turns nest the very
+    context that got reserved -- in the training set.
+    """
+    records = _family_corpus(branches=2, others=6)
+
+    legacy = _min_session_build(records, held_out_fraction=0.25)
+    fixed = BenchmarkSuite.build(records, held_out_fraction=0.25)
+
+    assert _straddling_sessions(records, legacy), (
+        "corpus does not reproduce the min() straddle"
+    )
+    assert _straddling_sessions(records, fixed) == []
+
+
+@pytest.mark.parametrize("branches", [2, 3])
+@pytest.mark.parametrize("fraction", [0.2, 0.25, 0.3])
+def test_component_closure_holds_across_shapes(
+    branches: int, fraction: float
+) -> None:
+    """Not a single lucky corpus: sweep branch count and reserved fraction."""
+    records = _family_corpus(branches=branches, others=6)
+
+    suite = BenchmarkSuite.build(records, held_out_fraction=fraction)
+
+    assert suite.contexts
+    assert _straddling_sessions(records, suite) == []
+
+
+def test_production_guard_rejects_the_min_split_and_accepts_the_fixed_one(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The real leaser, not a reimplementation of its check.
+
+    The fixed build must lease cleanly; swapping ``BenchmarkSuite.build`` back
+    to the ``min`` collapse must make the same corpus fail loudly.
+    """
+    records = _family_corpus(branches=2, others=6)
+
+    _lease(_leaser(tmp_path, records), tmp_path / "fixed" / "snapshot")
+    assert (tmp_path / "fixed" / "snapshot" / "traces.jsonl").exists()
+
+    monkeypatch.setattr(
+        split_module.BenchmarkSuite,
+        "build",
+        staticmethod(_min_session_build),
+    )
+    with pytest.raises(Eagle3Error) as excinfo:
+        _lease(_leaser(tmp_path, records), tmp_path / "legacy" / "snapshot")
+
+    message = str(excinfo.value)
+    assert "straddles" in message
+    offending = _straddling_sessions(
+        records, _min_session_build(records, held_out_fraction=0.25)
+    )
+    assert any(key in message for key in offending)
+    assert not (tmp_path / "legacy" / "snapshot").exists()
+
+
+def test_component_reservation_is_deterministic_under_the_seed() -> None:
+    """Union-find must not leak record order or set iteration order in."""
+    records = _family_corpus(branches=3, others=6)
+    shuffled = tuple(records[11:] + records[:11])
+
+    first = BenchmarkSuite.build(records, held_out_fraction=0.25, seed=42)
+    again = BenchmarkSuite.build(records, held_out_fraction=0.25, seed=42)
+    reordered = BenchmarkSuite.build(shuffled, held_out_fraction=0.25, seed=42)
+    other_seed = BenchmarkSuite.build(records, held_out_fraction=0.25, seed=7)
+
+    assert first.suite_hash == again.suite_hash
+    assert first.contexts == again.contexts
+    assert first.suite_hash == reordered.suite_hash
+    assert first.suite_hash != other_seed.suite_hash
+    # A different seed must still be component-closed.
+    assert _straddling_sessions(records, other_seed) == []
+
+
+@pytest.mark.parametrize("fraction", [0.1, 0.2, 0.25, 0.3, 0.5])
+def test_held_out_count_stays_within_one_component_of_the_target(
+    fraction: float,
+) -> None:
+    """Closure may overshoot, but only by the component that crossed the line.
+
+    The loop stops the moment the reserved set reaches the target, so the
+    reserved count is at least the target and at most ``target + (largest
+    component - 1)``: the overshoot is bounded by the single component whose
+    admission crossed the target, and cannot accumulate.  That bound is
+    derived from the algorithm rather than eyeballed, which is why no
+    arbitrary percentage tolerance appears here.
+    """
+    records = _family_corpus(branches=3, others=6)
+    unique = {BenchmarkSuite._record_hash(record) for record in records}
+    target = math.ceil(len(unique) * fraction)
+    largest_component = max(
+        len(component)
+        for component in _components_by_brute_force(records).values()
+    )
+
+    suite = BenchmarkSuite.build(records, held_out_fraction=fraction)
+
+    reserved = {ctx.context_hash for ctx in suite.contexts}
+    assert reserved  # non-empty
+    assert len(reserved) < len(unique)  # something is left to train on
+    assert target <= len(reserved) <= target + largest_component - 1
+    # And, loosely: the suite never balloons past twice the requested share.
+    assert len(reserved) / len(unique) <= 2 * fraction
+
+
+def _components_by_brute_force(
+    records: tuple[TraceRecord, ...],
+) -> dict[str, frozenset[str]]:
+    """Connected components by repeated closure -- no union-find involved."""
+    context_sessions = _context_sessions(records)
+    sessions_contexts: dict[str, set[str]] = {}
+    for context_hash, keys in context_sessions.items():
+        for key in keys:
+            sessions_contexts.setdefault(key, set()).add(context_hash)
+    components: dict[str, frozenset[str]] = {}
+    for start in context_sessions:
+        seen_contexts = {start}
+        seen_sessions: set[str] = set()
+        changed = True
+        while changed:
+            changed = False
+            for context_hash in list(seen_contexts):
+                for key in context_sessions[context_hash]:
+                    if key not in seen_sessions:
+                        seen_sessions.add(key)
+                        changed = True
+            for key in list(seen_sessions):
+                for context_hash in sessions_contexts[key]:
+                    if context_hash not in seen_contexts:
+                        seen_contexts.add(context_hash)
+                        changed = True
+        components[start] = frozenset(seen_contexts)
+    return components
+
+
+def test_union_find_agrees_with_a_brute_force_closure() -> None:
+    """Pins the implementation against an independent, obviously-correct one."""
+    records = _family_corpus(branches=3, others=4)
+    record_hashes = [BenchmarkSuite._record_hash(record) for record in records]
+
+    computed = _session_components(records, record_hashes)
+
+    assert computed == _components_by_brute_force(records)
 
 
 # ── single-turn corpora are untouched ───────────────────────────────────────
