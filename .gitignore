@@ -44,5 +44,10 @@ htmlcov/
 # Agent tooling
 .serena/
 .claude/settings.local.json
+# Sentrux writes baseline.json here for `sentrux gate`. Machine-local: it is a
+# snapshot of one checkout's metrics, so sharing it would make the regression
+# gate compare against whoever committed last rather than against your own
+# starting point.
+.sentrux/
 # E2E run artifacts (logs, SLURM output)
 /log_artifacts/
