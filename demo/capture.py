@@ -28,9 +28,9 @@ The arms run sequentially in one process on one GPU.  That is slower than racing
 two engines but it is the only way the comparison means anything: two engines on
 two GPUs differ by silicon and thermals, and two engines on one GPU contend.
 
-Usage (inside a SLURM allocation with a GPU -- see scripts/demo_capture.sbatch):
+Usage (inside a SLURM allocation with a GPU -- see demo/capture.sbatch):
 
-    python scripts/demo_capture.py \
+    python demo/capture.py \
         --suite-dir  /data/.../regate-unseen-run1/unseen-suite \
         --wiring     /data/.../regate-unseen-run1/regate_wiring.json \
         --stock-draft     RedHatAI/Qwen3-8B-speculator.eagle3 \

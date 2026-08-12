@@ -58,7 +58,7 @@ nvidia-smi || true
 # The engine argv is lifted from the gate job's own wiring snapshot rather than
 # retyped, so --enforce-eager and --max-model-len cannot drift away from the
 # settings the recorded decision was measured under.
-"$repo/.venv/bin/python" scripts/demo_capture.py \
+"$repo/.venv/bin/python" demo/capture.py \
   --suite-dir "$run_dir/unseen-suite" \
   --selection "$run_dir/unseen-suite/selection.json" \
   --trajectories /data/ryan.kim/speedlm-runs/agentenv-qwen8b-run5/traffic/trajectories \

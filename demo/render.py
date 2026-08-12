@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Replay two captured drafting timelines side by side and encode them to video.
 
-Input is what ``scripts/demo_capture.py`` wrote: one JSONL timeline per arm, each
+Input is what ``demo/capture.py`` wrote: one JSONL timeline per arm, each
 request carrying every streamed chunk and the offset at which the client saw it.
 This script puts the two arms on a single shared clock and plays them, so the
 tuned arm visibly pulls ahead over the run rather than the viewer being asked to
@@ -22,7 +22,7 @@ x 100 contexts x 2 blocks per arm.
 
 Usage:
 
-    python scripts/demo_render.py \
+    python demo/render.py \
         --capture-dir /data/.../demo-video-run1 \
         --out         /data/.../demo-video-run1/speedlm-drafting.mp4
 """
