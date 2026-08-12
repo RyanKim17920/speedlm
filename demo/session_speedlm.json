@@ -1,0 +1,99 @@
+{
+  "typing_delay": 0.026,
+  "settle": 2.0,
+  "steps": [
+    {
+      "comment": "SpeedLM, end to end. Start with the real CLI surface.",
+      "command": "./.venv/bin/speedlm --help",
+      "pause_before": 0.6,
+      "pause_after": 5.0
+    },
+    {
+      "comment": "The idea: a small draft head proposes tokens, the big model verifies.",
+      "pause_before": 0.4,
+      "pause_after": 1.6
+    },
+    {
+      "comment": "Accept more tokens per verify step and the same answer arrives sooner.",
+      "pause_after": 1.6
+    },
+    {
+      "comment": "SpeedLM tunes that draft head on YOUR traffic, while the server is idle.",
+      "pause_after": 2.2
+    },
+    {
+      "comment": "This is the tuning block of the real config that drove the run:",
+      "command": "python3 -c \"import json;c=json.load(open('configs/agentenv-qwen8b.json'));print(json.dumps({k:c[k] for k in ('tuning','buffer')},indent=2))\"",
+      "pause_before": 0.4,
+      "pause_after": 8.0
+    },
+    {
+      "comment": "Everything below reads one real completed run, already on disk.",
+      "command": "RUN=/data/ryan.kim/speedlm-runs/agentenv-qwen8b-run5; CAND=$RUN/speedlm_home/runs/7343677008da41f995f46e6a714036b4",
+      "pause_before": 0.4,
+      "pause_after": 1.2
+    },
+    {
+      "comment": "The corpus is genuine captured agent traffic, not synthetic prompts:",
+      "command": "python3 -c \"import json;R=[json.loads(l) for l in open('$RUN/speedlm_home/traces/traces.jsonl')];p=sum(r['prompt_tokens'] for r in R);c=sum(r['completion_tokens'] for r in R);print(f'{len(R)} captured turns, {p+c:,} tokens ({p:,} prompt / {c:,} completion)')\"",
+      "pause_before": 0.3,
+      "pause_after": 4.0
+    },
+    {
+      "comment": "Six task families, with the real turn and tool-call counts behind them:",
+      "command": "python3 -c \"import json;d=json.load(open('$RUN/traffic/summary.json'))['by_family'];print('%-20s %8s %6s %11s'%('family','attempts','turns','tool_calls'));[print('%-20s %8d %6d %11d'%(k,v['attempted'],v['turns'],v['tool_calls'])) for k,v in sorted(d.items())]\"",
+      "pause_before": 0.3,
+      "pause_after": 7.0
+    },
+    {
+      "comment": "The idle-tuning cycle as it actually ran -- phase machine, real timings:",
+      "command": "python3 -c \"import json,re;E=[json.loads(l) for l in open('$RUN/speedlm_home/runs/events.jsonl')];T=[e['timestamp'] for e in E];[print('%-18s -> %-18s (+%4.0fs) %s'%(e['from'] or 'start',e['to'],t-p,re.sub(r'[0-9a-f]{12,}',lambda m:m.group()[:8]+'..',e['reason']))) for e,t,p in zip(E,T,[T[0]]+T)];print('total %.0fs'%(T[-1]-T[0]))\"",
+      "pause_before": 0.4,
+      "pause_after": 9.0
+    },
+    {
+      "comment": "Recorded output of that real training run -- loss 10.8 down to about 1.0:",
+      "command": "rg -o \"train/loss=[0-9.]+|global_step=[0-9]+\" $CAND/training-logs/stdout.log | paste - - | awk 'NR<=5{print} NR==6{print \"   ...\"} NR>210{print}'",
+      "pause_before": 0.4,
+      "pause_after": 7.0
+    },
+    {
+      "comment": "And the held-out validation metrics the same run wrote out:",
+      "command": "python3 -m json.tool $CAND/draft-model/val_metrics.json",
+      "pause_before": 0.3,
+      "pause_after": 6.0
+    },
+    {
+      "comment": "Now the interesting part: never benchmark on what you trained on.",
+      "pause_before": 0.4,
+      "pause_after": 1.6
+    },
+    {
+      "comment": "Agent turns nest, so contexts are held out by SESSION, not by row.",
+      "pause_after": 1.8
+    },
+    {
+      "comment": "That suite rebuild is cheap and runs right here, on CPU:",
+      "command": "./.venv/bin/python scripts/build_unseen_session_suite.py --traces $RUN/speedlm_home/traces/traces.jsonl --original-suite-dir $CAND/held-out --out /tmp/speedlm-demo-suite --target 100 --training-window-records 512 --expect-training-records 412 2>&1 | awk '{if(length($0)>96)print substr($0,1,96) \"...\"; else print}'",
+      "pause_before": 0.4,
+      "pause_after": 9.0
+    },
+    {
+      "comment": "Zero overlap on all three checks. So the honest, session-disjoint verdict:",
+      "command": "python3 -c \"import json;d=json.load(open('/data/ryan.kim/speedlm-runs/regate-unseen-run1/decision.json'));[print('%-24s %s'%(k,d[k])) for k in ('verdict','accepted_length_delta','throughput_delta_pct','num_contexts','num_repeats','reason')]\"",
+      "pause_before": 0.4,
+      "pause_after": 8.0
+    },
+    {
+      "comment": "+0.30 accepted tokens per step, +9.9% throughput, same answers.",
+      "pause_before": 0.3,
+      "pause_after": 2.0
+    },
+    {
+      "comment": "And here is stock vs tuned drafting, side by side, on real hardware:",
+      "command": "ls -la /data/ryan.kim/speedlm-runs/demo-video-run2/speedlm-drafting.mp4",
+      "pause_before": 0.3,
+      "pause_after": 4.0
+    }
+  ]
+}
