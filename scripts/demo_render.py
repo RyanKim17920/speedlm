@@ -364,7 +364,19 @@ class Renderer:
         # Progress bar over the whole workload.
         bar_y = bottom - 16
         draw.rectangle((x + 22, bar_y, x + w - 22, bar_y + 6), fill=RULE)
-        fraction = 1.0 if state.done else min(1.0, state.index / total_contexts)
+        # Characters rather than the request index: the index only moves once per
+        # request, so it reads 0% for the whole of the first (longest) context and
+        # understates progress by up to a full request everywhere else, whereas
+        # characters advance with every token.  Both arms emit identical text, so
+        # the same denominator makes the two bars directly comparable.
+        # An arm that emitted nothing has no denominator, so it stays empty until
+        # it finishes rather than dividing by zero.
+        if state.done:
+            fraction = 1.0
+        elif arm.total_chars:
+            fraction = min(1.0, max(0.0, state.chars_done / arm.total_chars))
+        else:
+            fraction = 0.0
         if fraction > 0:
             draw.rectangle(
                 (x + 22, bar_y, x + 22 + int((w - 44) * fraction), bar_y + 6), fill=arm.accent
@@ -498,8 +510,6 @@ class Renderer:
              MUTED),
             ("+0.2989 accepted length (SE 0.0046) and +9.94% tok/s, verdict promote.",
              TUNED_ACCENT),
-            ("An earlier +0.65 / +32% figure was inflated ~2.2x by session-level leakage.",
-             WARN),
         ):
             draw.text((120, y), text, font=self.f_card, fill=colour)
             y += 44

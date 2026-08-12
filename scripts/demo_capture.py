@@ -41,6 +41,7 @@ Usage (inside a SLURM allocation with a GPU -- see scripts/demo_capture.sbatch):
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -51,7 +52,7 @@ import time
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import IO, Any
 
 import httpx
 
@@ -148,11 +149,27 @@ def build_argv(template: list[str], draft: str, port: int) -> list[str]:
     copied through untouched.
     """
     argv = list(template)
-    try:
-        spec_at = argv.index("--speculative-config") + 1
-        port_at = argv.index("--port") + 1
-    except ValueError as exc:  # pragma: no cover - wiring file is malformed
-        raise CaptureError(f"argv template is missing a required flag: {exc}") from exc
+
+    # argv.index would quietly take the FIRST occurrence, so a template that
+    # carried a flag twice would have its first copy rewritten and its second
+    # copy left alone -- vLLM honours the last one, so the engine would bind a
+    # port the client never polls and the run would die 1200s later in
+    # wait_ready with a readiness timeout that says nothing about the real
+    # cause.  Refusing a duplicated flag turns that into an immediate,
+    # self-explaining failure.
+    def value_index(flag: str) -> int:
+        occurrences = [i for i, item in enumerate(argv) if item == flag]
+        if len(occurrences) != 1:
+            raise CaptureError(
+                f"argv template must contain {flag} exactly once, found {len(occurrences)}"
+            )
+        at = occurrences[0] + 1
+        if at >= len(argv):
+            raise CaptureError(f"argv template ends with {flag}, which has no value after it")
+        return at
+
+    spec_at = value_index("--speculative-config")
+    port_at = value_index("--port")
 
     spec = json.loads(argv[spec_at])
     spec["model"] = draft
@@ -167,14 +184,33 @@ def build_argv(template: list[str], draft: str, port: int) -> list[str]:
     return argv
 
 
-def start_engine(argv: list[str], log_path: Path, env: dict[str, str]) -> subprocess.Popen[bytes]:
+@dataclass
+class Engine:
+    """A running vLLM process and the log file it is writing into.
+
+    The log handle is held here rather than dropped on the floor: the child
+    inherits the file descriptor, but the parent's copy still has to be closed or
+    the engine's final lines can be lost to an unflushed buffer when the process
+    is killed.
+    """
+
+    process: subprocess.Popen[bytes]
+    log: IO[bytes]
+
+
+def start_engine(argv: list[str], log_path: Path, env: dict[str, str]) -> Engine:
     log_path.parent.mkdir(parents=True, exist_ok=True)
     handle = log_path.open("wb")
-    # start_new_session so a stuck engine can be killed as a process group;
-    # vLLM spawns worker children that outlive a bare terminate otherwise.
-    return subprocess.Popen(
-        argv, stdout=handle, stderr=subprocess.STDOUT, env=env, start_new_session=True
-    )
+    try:
+        # start_new_session so a stuck engine can be killed as a process group;
+        # vLLM spawns worker children that outlive a bare terminate otherwise.
+        process = subprocess.Popen(
+            argv, stdout=handle, stderr=subprocess.STDOUT, env=env, start_new_session=True
+        )
+    except BaseException:
+        handle.close()
+        raise
+    return Engine(process=process, log=handle)
 
 
 def wait_ready(base_url: str, proc: subprocess.Popen[bytes], timeout: float) -> None:
@@ -195,15 +231,29 @@ def wait_ready(base_url: str, proc: subprocess.Popen[bytes], timeout: float) -> 
     raise CaptureError(f"engine was not ready within {timeout:.0f}s")
 
 
-def stop_engine(proc: subprocess.Popen[bytes]) -> None:
-    if proc.poll() is not None:
-        return
-    os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
+def _signal_group(proc: subprocess.Popen[bytes], sig: int) -> None:
+    """Signal the engine's process group, tolerating it having already exited.
+
+    stop_engine runs from a ``finally``, so a ProcessLookupError raised here --
+    which is just a race with the engine exiting on its own -- would replace the
+    real exception on the way out and hide why the capture actually failed.
+    """
+    with contextlib.suppress(ProcessLookupError):
+        os.killpg(os.getpgid(proc.pid), sig)
+
+
+def stop_engine(engine: Engine) -> None:
+    proc = engine.process
     try:
-        proc.wait(timeout=120)
-    except subprocess.TimeoutExpired:
-        os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-        proc.wait(timeout=60)
+        if proc.poll() is None:
+            _signal_group(proc, signal.SIGTERM)
+            try:
+                proc.wait(timeout=120)
+            except subprocess.TimeoutExpired:
+                _signal_group(proc, signal.SIGKILL)
+                proc.wait(timeout=60)
+    finally:
+        engine.log.close()
 
 
 # ---------------------------------------------------------------------------
@@ -219,22 +269,33 @@ def scrape(client: httpx.Client, base_url: str) -> MetricsSnapshot:
 
 def scrape_settled(
     client: httpx.Client, base_url: str, before: MetricsSnapshot, generated: int
-) -> MetricsSnapshot:
+) -> tuple[MetricsSnapshot, bool]:
     """Scrape until the request we just finished is visible in the counters.
 
     vLLM publishes counters on an interval, so a scrape taken the instant the
     stream ends can still miss the tail of the request that just completed.  A
     short poll for the generation counter to advance by the number of tokens we
     actually received turns a silently-truncated window into a correct one.
+
+    The second element of the returned pair says whether that actually happened.
+    It is False when the deadline passed with the counter still short, and also
+    when ``generated`` is not positive -- with zero tokens the ``>= generated``
+    test is trivially true, so it would report "settled" on a window that
+    contains none of the request.  An unsettled snapshot must not be differenced
+    against ``before``: the resulting window does not contain the request, so
+    every per-request number computed from it is wrong rather than merely
+    imprecise, and the caller has to record "unknown" instead.
     """
     deadline = time.monotonic() + 15.0
     after = scrape(client, base_url)
+    if generated <= 0:
+        return after, False
     while time.monotonic() < deadline:
         if after.generated_tokens - before.generated_tokens >= generated:
-            return after
+            return after, True
         time.sleep(0.5)
         after = scrape(client, base_url)
-    return after
+    return after, after.generated_tokens - before.generated_tokens >= generated
 
 
 # ---------------------------------------------------------------------------
@@ -249,7 +310,17 @@ def sse_chunks(response: httpx.Response) -> Iterator[dict[str, Any]]:
         payload = line[5:].strip()
         if payload == "[DONE]":
             return
-        yield json.loads(payload)
+        # A bare ``data:`` line is a legal SSE keep-alive and a frame that parses
+        # to something other than an object is not a chat completion chunk;
+        # either one would blow up as a JSONDecodeError or an AttributeError deep
+        # inside the chunk loop, killing a capture over a frame that carries no
+        # information anyway.  Skipping them keeps the replay running.
+        if not payload:
+            continue
+        chunk = json.loads(payload)
+        if not isinstance(chunk, dict):
+            continue
+        yield chunk
 
 
 def replay_context(
@@ -326,12 +397,30 @@ def replay_context(
     record.ttft_s = record.tokens[0].t if record.tokens else record.wall_s
     record.text = "".join(pieces)
 
-    after = scrape_settled(client, base_url, before, record.completion_tokens)
+    # The two arms must replay the identical workload for the side-by-side
+    # comparison to mean anything.  A request that streamed nothing would be
+    # written down as 0 tokens in ~0 seconds, which drags one arm's totals
+    # towards a number no engine produced and looks exactly like a fast run --
+    # this codebase's recurring defect is precisely a green measurement of
+    # nothing, so an empty response is a hard failure rather than a data point.
+    if record.completion_tokens <= 0 or not record.tokens:
+        raise CaptureError(
+            f"context {record.context_hash} (family {record.family}, order {record.order}) "
+            f"streamed no output: {record.completion_tokens} completion tokens, "
+            f"{len(record.tokens)} chunks, finish_reason {record.finish_reason!r}"
+        )
+
+    after, settled = scrape_settled(client, base_url, before, record.completion_tokens)
     try:
         delta = compute_delta(before, after)
     except CounterResetError as exc:
         raise CaptureError(f"engine counters reset mid-capture: {exc}") from exc
-    if delta.accepted_length_available:
+    # Only a settled window actually contains this request, so an unsettled
+    # scrape records "unknown" and leaves the speed fields at zero: a wrong
+    # speed number is worse than a missing one here, because a missing one is
+    # visibly dropped from the arm's mean while a wrong one is averaged in and
+    # silently moves the comparison the whole recording exists to make.
+    if settled and delta.accepted_length_available:
         record.metrics_available = True
         record.accepted_length = delta.mean_accepted_length
         record.acceptance_rate = delta.acceptance_rate
@@ -477,10 +566,10 @@ def run_arm(
 
     print(f"[{arm}] launching engine with draft {draft}", flush=True)
     print(f"[{arm}] argv: {' '.join(argv)}", flush=True)
-    proc = start_engine(argv, log_path, env)
+    engine = start_engine(argv, log_path, env)
     records: list[RequestRecord] = []
     try:
-        wait_ready(base_url, proc, startup_timeout)
+        wait_ready(base_url, engine.process, startup_timeout)
         print(f"[{arm}] engine ready", flush=True)
 
         with httpx.Client(timeout=httpx.Timeout(600.0, connect=30.0)) as client:
@@ -513,7 +602,7 @@ def run_arm(
                 )
             arm_wall = time.perf_counter() - arm_started
     finally:
-        stop_engine(proc)
+        stop_engine(engine)
 
     timeline_path = out_dir / f"timeline-{arm}.jsonl"
     with timeline_path.open("w") as handle:
