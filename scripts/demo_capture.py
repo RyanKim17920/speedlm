@@ -32,10 +32,11 @@ Usage (inside a SLURM allocation with a GPU -- see scripts/demo_capture.sbatch):
 
     python scripts/demo_capture.py \
         --suite-dir  /data/.../regate-unseen-run1/unseen-suite \
-        --selection  /data/.../regate-unseen-run1/unseen-suite/selection.json \
+        --wiring     /data/.../regate-unseen-run1/regate_wiring.json \
         --stock-draft     RedHatAI/Qwen3-8B-speculator.eagle3 \
         --candidate-draft /data/.../runs/<id>/draft-model \
-        --out-dir    /data/.../demo-video-run1
+        --out-dir    /data/.../demo-video-run1 \
+        --selection  /data/.../regate-unseen-run1/unseen-suite/selection.json
 """
 
 from __future__ import annotations
@@ -66,14 +67,15 @@ from speedlm.gate.metrics import (  # noqa: E402
 )
 from speedlm.gate.suite import FrozenContext, load_suite  # noqa: E402
 
-# The gate's own sampling block (configs/agentenv-qwen8b.json).  Hard-coded
-# rather than re-read so that a config edit cannot silently make this recording
-# non-comparable with the decision it illustrates; --config overrides it and
-# records the override in the manifest.
+# The gate's own sampling block (configs/agentenv-qwen8b.json), pinned here
+# rather than re-read from that config, and deliberately not overridable from the
+# command line.  Both halves of that matter: re-reading the config would let an
+# unrelated edit silently make this recording non-comparable with the decision it
+# illustrates, and a flag would let the operator do the same thing on purpose.
+# The recording is only worth anything if it ran under the gate's sampling, so
+# there is no supported way to run it under anything else.
 GATE_SAMPLING = {"temperature": 0.0, "top_p": 1.0, "seed": 0}
 GATE_MAX_TOKENS = 512
-
-ARMS = ("stock", "candidate")
 
 
 class CaptureError(RuntimeError):
@@ -91,15 +93,16 @@ class TokenEvent:
 
     ``t`` is seconds since the request was issued, not since the arm started, so
     the renderer can lay requests out however it likes.  Chunks are recorded as
-    vLLM emitted them; a chunk is usually one token but the renderer must not
-    assume that, which is why ``index`` counts chunks and the token totals come
-    from the usage block instead.
+    vLLM emitted them, and a chunk is NOT a token: under speculative decoding an
+    accepted block arrives as one SSE frame, so the recorded timelines in
+    demo-video-run2 average ~5 completion tokens per chunk (median ~3) and no
+    request in either arm ever hit one token per chunk.  Every token total
+    downstream therefore comes from the usage block rather than from counting
+    these events.
     """
 
-    index: int
     t: float
     text: str
-    reasoning: bool = False
 
 
 @dataclass
@@ -109,12 +112,10 @@ class RequestRecord:
     context_hash: str
     family: str
     order: int
-    prompt_chars: int
     turn_depth: int
 
     # Client-side wall clock.  This is what the video plays back and what
     # "how long did it take" means to a user watching the terminal.
-    t_start: float = 0.0
     ttft_s: float = 0.0
     wall_s: float = 0.0
 
@@ -143,10 +144,10 @@ class RequestRecord:
 def build_argv(template: list[str], draft: str, port: int) -> list[str]:
     """Rewrite the recorded vLLM argv for one arm.
 
-    Exactly two things change: the model inside ``--speculative-config`` and the
-    port.  Everything else -- notably ``--enforce-eager``, which is what makes
-    the recorded throughput comparable with the gate's eager-mode decision -- is
-    copied through untouched.
+    Two values are rewritten -- the model inside ``--speculative-config`` and the
+    port -- and ``--enable-sleep-mode`` is dropped (see below).  Everything else,
+    notably ``--enforce-eager``, which is what makes the recorded throughput
+    comparable with the gate's eager-mode decision, is copied through untouched.
     """
     argv = list(template)
 
@@ -188,10 +189,13 @@ def build_argv(template: list[str], draft: str, port: int) -> list[str]:
 class Engine:
     """A running vLLM process and the log file it is writing into.
 
-    The log handle is held here rather than dropped on the floor: the child
-    inherits the file descriptor, but the parent's copy still has to be closed or
-    the engine's final lines can be lost to an unflushed buffer when the process
-    is killed.
+    The log handle is held here rather than dropped on the floor purely for
+    descriptor hygiene.  The child does its own buffering on the inherited file
+    descriptor, so the parent's copy has nothing of the engine's output in it and
+    closing it flushes nothing; what it does do is release the parent's fd, which
+    would otherwise leak one per engine (two per run) until the garbage collector
+    happened to reclaim it.  stop_engine closes it explicitly instead of relying
+    on that.
     """
 
     process: subprocess.Popen[bytes]
@@ -278,18 +282,15 @@ def scrape_settled(
     actually received turns a silently-truncated window into a correct one.
 
     The second element of the returned pair says whether that actually happened.
-    It is False when the deadline passed with the counter still short, and also
-    when ``generated`` is not positive -- with zero tokens the ``>= generated``
-    test is trivially true, so it would report "settled" on a window that
-    contains none of the request.  An unsettled snapshot must not be differenced
-    against ``before``: the resulting window does not contain the request, so
-    every per-request number computed from it is wrong rather than merely
-    imprecise, and the caller has to record "unknown" instead.
+    The caller guarantees ``generated > 0`` by rejecting an empty response before
+    it ever gets here, so the only way a scrape comes back unsettled is the
+    deadline expiring with the counter still short.  An unsettled snapshot must
+    not be differenced against ``before``: the resulting window does not contain
+    the request, so every per-request number computed from it is wrong rather
+    than merely imprecise, and the caller has to record "unknown" instead.
     """
     deadline = time.monotonic() + 15.0
     after = scrape(client, base_url)
-    if generated <= 0:
-        return after, False
     while time.monotonic() < deadline:
         if after.generated_tokens - before.generated_tokens >= generated:
             return after, True
@@ -354,14 +355,12 @@ def replay_context(
         context_hash=context.context_hash,
         family=family,
         order=order,
-        prompt_chars=sum(len(str(m.get("content") or "")) for m in messages),
         turn_depth=len(messages),
     )
 
     before = scrape(client, base_url)
     pieces: list[str] = []
     started = time.perf_counter()
-    record.t_start = started
 
     with client.stream("POST", f"{base_url}/v1/chat/completions", json=payload) as response:
         response.raise_for_status()
@@ -373,22 +372,19 @@ def replay_context(
                 record.completion_tokens = int(usage.get("completion_tokens") or 0)
             for choice in chunk.get("choices") or ():
                 delta = choice.get("delta") or {}
-                # Qwen3 emits its chain-of-thought through reasoning_content, and
-                # ~89% of this corpus's drafted text is exactly that.  Recording
-                # which stream a chunk came from lets the renderer dim the
-                # monologue instead of pretending it is answer text.
-                for key, is_reasoning in (("reasoning_content", True), ("content", False)):
+                # The engine argv carries no --reasoning-parser, so Qwen3's
+                # chain-of-thought arrives as ordinary content with the <think>
+                # tags still in it -- every one of the 49 responses in each arm
+                # of demo-video-run2 has those literal tags in its recorded
+                # text, which a reasoning parser would have stripped.  Both keys
+                # are read anyway: enabling a reasoning parser would move the
+                # bulk of the tokens onto the other key, and reading only one
+                # would silently drop most of the response rather than fail.
+                for key in ("reasoning_content", "content"):
                     text = delta.get(key)
                     if not text:
                         continue
-                    record.tokens.append(
-                        TokenEvent(
-                            index=len(record.tokens),
-                            t=now,
-                            text=text,
-                            reasoning=is_reasoning,
-                        )
-                    )
+                    record.tokens.append(TokenEvent(t=now, text=text))
                     pieces.append(text)
                 if choice.get("finish_reason"):
                     record.finish_reason = str(choice["finish_reason"])
@@ -501,11 +497,21 @@ def choose_contexts(
 ) -> list[FrozenContext]:
     """Pick the contexts worth watching, deterministically.
 
-    Half of this suite's held-out turns are a bare tool call -- an empty think
-    block and ~4 tokens of JSON.  Those are perfectly good gate material and
-    completely unwatchable, so contexts whose reference continuation is that
-    short are dropped and the rest are ranked longest-prompt-first.  Selection
-    is a pure function of the suite, so both arms and any re-run agree.
+    51 of this suite's 100 held-out turns have a reference continuation that is
+    nothing but an empty think block -- literally ``<think>\\n</think>\\n\\n`` or
+    an unterminated ``<think>\\n``, 18 or 8 characters, no prose at all (the tool
+    call those turns actually made lives in a structured field the suite does not
+    record as text).  Those are perfectly good gate material and completely
+    unwatchable, so contexts whose reference continuation is shorter than
+    ``min_expected_chars`` are dropped -- at the default of 400 that leaves
+    exactly the 49 remaining -- and the rest are ranked longest-prompt-first.
+
+    The SET of chosen contexts is a pure function of the suite and the two
+    thresholds, so it reproduces exactly.  The ORDER is not: the round-robin
+    below deals by family, and ``families`` comes from ``--selection`` and
+    ``--trajectories``, so a re-run without those flags yields the same contexts
+    in a different order.  That never endangers the comparison, because the list
+    is resolved once in main and both arms replay that one list verbatim.
     """
     watchable = [
         context
@@ -524,9 +530,10 @@ def choose_contexts(
     chosen = ranked[:count]
 
     # Deal the chosen contexts round-robin across families, so the video opens
-    # with six different tasks rather than nine consecutive bugfix-localize runs
-    # -- a viewer reading "the same prompt again" as "the same work again" is a
-    # fair reading of a grouped ordering.
+    # with six different tasks rather than one family's whole block back to back
+    # (at the defaults the largest is 12 consecutive call-chain-trace runs) -- a
+    # viewer reading "the same prompt again" as "the same work again" is a fair
+    # reading of a grouped ordering.
     by_family: dict[str, list[FrozenContext]] = {}
     for context in chosen:
         by_family.setdefault(families.get(context.context_hash, "unknown"), []).append(context)
@@ -573,10 +580,14 @@ def run_arm(
         print(f"[{arm}] engine ready", flush=True)
 
         with httpx.Client(timeout=httpx.Timeout(600.0, connect=30.0)) as client:
-            # One throwaway pass over the first context, discarded.  The first
-            # request into a cold engine pays for CUDA graph capture and cache
-            # warmup, and charging that to the stock arm alone (it runs first)
-            # would hand the tuned arm a free win.
+            # One throwaway pass over the first context, discarded.  The engine
+            # runs under --enforce-eager, so there is no CUDA graph capture to
+            # pay for; what the first request into a cold engine still pays for
+            # is one-time work that never recurs -- lazily initialised kernels
+            # and their JIT/autotune, the first allocations out of the caching
+            # allocator and the KV cache, and first-touch page faults.  Charging
+            # that to the stock arm alone (it runs first) would hand the tuned
+            # arm a free win.
             print(f"[{arm}] warmup", flush=True)
             replay_context(
                 client, base_url, model, contexts[0],
@@ -611,10 +622,17 @@ def run_arm(
 
     total_tokens = sum(r.completion_tokens for r in records)
     weighted_accepted = [r for r in records if r.metrics_available]
+    # None, not 0.0, when no record carried engine metrics.  A zero here would be
+    # indistinguishable from a real measured result of zero, and the whole point
+    # of this recording is a comparison: a reader seeing 0.0 next to the gated
+    # +0.2989 would conclude the tuned head did nothing, when in fact nothing was
+    # measured at all.  ``metrics_contexts`` says how much of ``contexts``
+    # actually backs the two means.
     summary = {
         "arm": arm,
         "draft": draft,
         "contexts": len(records),
+        "metrics_contexts": len(weighted_accepted),
         "total_completion_tokens": total_tokens,
         "total_wall_seconds": arm_wall,
         "wall_tok_per_sec": total_tokens / arm_wall if arm_wall > 0 else 0.0,
@@ -622,17 +640,25 @@ def run_arm(
         "mean_accepted_length": (
             sum(r.accepted_length for r in weighted_accepted) / len(weighted_accepted)
             if weighted_accepted
-            else 0.0
+            else None
         ),
         "mean_engine_tok_per_sec": (
             sum(r.engine_tok_per_sec for r in weighted_accepted) / len(weighted_accepted)
             if weighted_accepted
-            else 0.0
+            else None
         ),
         "truncated": sum(1 for r in records if r.finish_reason == "length"),
         "timeline": str(timeline_path),
     }
     print(f"[{arm}] {json.dumps(summary, indent=2)}", flush=True)
+    if not weighted_accepted:
+        print(
+            f"[{arm}] WARNING: the engine never advanced its speculative counters over "
+            f"{len(records)} contexts, so accepted length and engine tok/s are "
+            f"UNAVAILABLE for this arm -- the recorded nulls are a missing "
+            f"measurement, not a measured zero.",
+            flush=True,
+        )
     return summary
 
 
@@ -741,8 +767,17 @@ def main(argv_in: list[str] | None = None) -> int:
         )
 
     stock, candidate_summary = summaries["stock"], summaries["candidate"]
+    # The engine deltas are only defined when BOTH arms actually recorded
+    # speculative counters on at least one context.  Reporting 0.0 for an arm
+    # that measured nothing would put a fabricated "no speedup" right next to
+    # gated_result_reference's +0.2989 and read as a refutation of it; null plus
+    # this flag makes the absence impossible to misread as a result.
+    engine_metrics_available = (
+        stock["metrics_contexts"] > 0 and candidate_summary["metrics_contexts"] > 0
+    )
     comparison = {
         "arms": summaries,
+        "engine_metrics_available": engine_metrics_available,
         "wall_seconds_stock": stock["total_wall_seconds"],
         "wall_seconds_candidate": candidate_summary["total_wall_seconds"],
         "wall_speedup_pct": (
@@ -753,12 +788,14 @@ def main(argv_in: list[str] | None = None) -> int:
         ),
         "accepted_length_delta": (
             candidate_summary["mean_accepted_length"] - stock["mean_accepted_length"]
+            if engine_metrics_available
+            else None
         ),
         "engine_tok_per_sec_delta_pct": (
             (candidate_summary["mean_engine_tok_per_sec"] - stock["mean_engine_tok_per_sec"])
             / stock["mean_engine_tok_per_sec"] * 100.0
-            if stock["mean_engine_tok_per_sec"] > 0
-            else 0.0
+            if engine_metrics_available and stock["mean_engine_tok_per_sec"] > 0
+            else None
         ),
         # A single sequential pass, NOT the gated measurement.  See the module
         # docstring: docs/agentic-selfplay-result.md holds the number to cite.

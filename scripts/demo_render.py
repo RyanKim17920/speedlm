@@ -15,9 +15,10 @@ identically, and leaving it in would inflate both totals with time the engine
 spent idle. Everything inside a request -- time to first token, and the arrival
 of every chunk after it -- is played back exactly as measured.
 
-The video is deliberately captioned with the GATED numbers, not this recording's
-numbers. One sequential pass over a few dozen contexts is an illustration; the
-promotion decision came from 5 repeats x 100 contexts x 2 blocks per arm.
+The totals the video shows are this recording's own, but every caption quotes the
+GATED numbers alongside them and says which is which. One sequential pass over a
+few dozen contexts is an illustration; the promotion decision came from 5 repeats
+x 100 contexts x 2 blocks per arm.
 
 Usage:
 
@@ -29,6 +30,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import itertools
 import json
 import subprocess
 import sys
@@ -57,7 +59,6 @@ DIM = (110, 118, 129)
 MUTED = (139, 148, 158)
 STOCK_ACCENT = (210, 153, 34)
 TUNED_ACCENT = (63, 185, 80)
-WARN = (248, 81, 73)
 
 FONT_DIR = Path("/usr/share/fonts/truetype/dejavu")
 INTRO_SECONDS = 5.0
@@ -79,12 +80,10 @@ def font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
 class Chunk:
     t: float          # absolute seconds on the arm's own clock
     text: str
-    reasoning: bool
 
 
 @dataclass
 class Request:
-    order: int
     family: str
     context_hash: str
     turn_depth: int
@@ -92,14 +91,13 @@ class Request:
     end: float
     tokens: int
     accepted_length: float
-    finish_reason: str
     chunks: list[Chunk]
     text: str
+    total_chars: int  # len of all chunk text, precomputed: state_at needs it every frame
 
 
 @dataclass
 class Arm:
-    name: str
     label: str
     draft: str
     accent: tuple[int, int, int]
@@ -138,13 +136,20 @@ class Arm:
         return sum(r.tokens for r in self.requests)
 
     @property
-    def mean_accepted_length(self) -> float:
+    def mean_accepted_length(self) -> float | None:
+        # None, not 0.0, when the engine never advanced its speculative counters
+        # over any request in this arm.  A measured zero and an unmeasured value
+        # must not render the same: this figure is printed on the summary card
+        # directly beside the gated +0.2989, so a reader who saw 0.000 would take
+        # it as a refutation of the gated result rather than as the absence of a
+        # measurement.  The capture side writes null for exactly this reason, and
+        # flattening it back to a number here would undo that.
         measured = [r.accepted_length for r in self.requests if r.accepted_length > 0]
-        return sum(measured) / len(measured) if measured else 0.0
+        return sum(measured) / len(measured) if measured else None
 
 
 def load_arm(
-    path: Path, name: str, label: str, draft: str, accent: tuple[int, int, int]
+    path: Path, label: str, draft: str, accent: tuple[int, int, int]
 ) -> Arm:
     """Lay one arm's requests back to back on a single clock."""
     requests: list[Request] = []
@@ -154,13 +159,12 @@ def load_arm(
             row = json.loads(line)
             start = cursor
             chunks = [
-                Chunk(t=start + float(c["t"]), text=c["text"], reasoning=bool(c["reasoning"]))
+                Chunk(t=start + float(c["t"]), text=c["text"])
                 for c in row["tokens"]
             ]
             end = start + float(row["wall_s"])
             requests.append(
                 Request(
-                    order=int(row["order"]),
                     family=str(row["family"]),
                     context_hash=str(row["context_hash"]),
                     turn_depth=int(row["turn_depth"]),
@@ -168,15 +172,15 @@ def load_arm(
                     end=end,
                     tokens=int(row["completion_tokens"]),
                     accepted_length=float(row["accepted_length"]),
-                    finish_reason=str(row["finish_reason"]),
                     chunks=chunks,
                     text=str(row["text"]),
+                    total_chars=sum(len(c.text) for c in chunks),
                 )
             )
             cursor = end
     if not requests:
         raise SystemExit(f"{path} contains no requests")
-    return Arm(name=name, label=label, draft=draft, accent=accent, requests=requests)
+    return Arm(label=label, draft=draft, accent=accent, requests=requests)
 
 
 @dataclass
@@ -186,11 +190,9 @@ class ArmFrameState:
     index: int              # 0-based request currently on screen
     done: bool
     elapsed: float
-    finished_at: float | None
     tokens_done: int        # tokens completed across all requests so far
     chars_done: int         # characters of output emitted so far, across all requests
-    reasoning: str
-    content: str
+    text: str
     request: Request
 
 
@@ -215,29 +217,26 @@ def state_at(arm: Arm, t: float) -> ArmFrameState:
         # readout between arms: both emit identical text but the faster arm packs
         # more tokens into each chunk, so it would appear to have emitted fewer.
         seen = sum(len(c.text) for c in request.chunks if c.t <= t)
-        total = sum(len(c.text) for c in request.chunks)
+        total = request.total_chars
         tokens_done += int(request.tokens * seen / total) if total else 0
 
-    reasoning_parts: list[str] = []
-    content_parts: list[str] = []
+    parts: list[str] = []
     for chunk in request.chunks:
         if chunk.t > t and not done:
             break
-        (reasoning_parts if chunk.reasoning else content_parts).append(chunk.text)
+        parts.append(chunk.text)
 
     return ArmFrameState(
         index=idx,
         done=done,
         elapsed=min(t, arm.duration),
-        finished_at=arm.duration if done else None,
         tokens_done=tokens_done,
         chars_done=(
             arm.total_chars
             if done
             else (arm.chars_at[k - 1] if (k := bisect_right(arm.chunk_times, t)) else 0)
         ),
-        reasoning="".join(reasoning_parts),
-        content="".join(content_parts),
+        text="".join(parts),
         request=request,
     )
 
@@ -247,23 +246,25 @@ def state_at(arm: Arm, t: float) -> ArmFrameState:
 # ---------------------------------------------------------------------------
 
 
-def wrap_tail(reasoning: str, content: str, columns: int, rows: int) -> list[tuple[str, bool]]:
-    """Wrap the visible text and keep only the last ``rows`` lines.
+def accepted_text(value: float | None) -> str:
+    """Render an accepted length, showing an unmeasured one as ``n/a``.
 
-    Returns (line, is_reasoning) so the renderer can dim the chain-of-thought.
-    ~89% of what this corpus drafts is reasoning monologue, and showing it in the
-    same colour as the answer would misrepresent what the speedup is speeding up.
+    Kept in one place so the card, the pane and the stdout summary cannot drift
+    into disagreeing about what a missing engine measurement looks like.
     """
-    lines: list[tuple[str, bool]] = []
-    for blob, is_reasoning in ((reasoning, True), (content, False)):
-        for raw in blob.split("\n"):
-            if not raw:
-                lines.append(("", is_reasoning))
-                continue
-            for piece in textwrap.wrap(
-                raw, width=columns, replace_whitespace=False, drop_whitespace=False
-            ) or [""]:
-                lines.append((piece, is_reasoning))
+    return "n/a" if value is None else f"{value:.3f}"
+
+
+def wrap_tail(text: str, columns: int, rows: int) -> list[str]:
+    """Wrap ``text`` to ``columns`` and return only its last ``rows`` lines."""
+    lines: list[str] = []
+    for raw in text.split("\n"):
+        if not raw:
+            lines.append("")
+            continue
+        lines.extend(textwrap.wrap(
+            raw, width=columns, replace_whitespace=False, drop_whitespace=False
+        ) or [""])
     return lines[-rows:]
 
 
@@ -275,8 +276,9 @@ class Renderer:
         # Greedy decoding should make the two arms emit the same text: a draft
         # head changes how many tokens are proposed per step, not which tokens
         # survive verification.  Counting the agreement rather than asserting it
-        # is what lets the summary card claim it, and would expose the arms
-        # having quietly drifted apart into an unfair comparison.
+        # is what lets the summary card report it as a measurement, and it is
+        # what lead() checks before claiming the stock arm is behind "the same
+        # output": arms that had quietly drifted apart would show up here first.
         self.identical = sum(
             1
             for a, b in zip(stock.requests, tuned.requests, strict=True)
@@ -303,7 +305,10 @@ class Renderer:
         # has to clear pane_top + 144 or a long first line strikes through it.
         self.body_top = self.pane_top + 154
         self.line_h = 19
-        self.body_rows = (self.pane_bottom - 24 - self.body_top) // self.line_h
+        # The body stops 14px above the progress bar, which itself sits 16px above
+        # the pane floor.  Fixed for every pane and every frame, so it is resolved
+        # here rather than per frame.
+        self.body_rows = max(1, (self.pane_bottom - 30 - self.body_top) // self.line_h)
         # DejaVu Sans Mono advance is 0.602 em.
         self.columns = int((self.pane_w - 44) / (15 * 0.602))
 
@@ -343,11 +348,17 @@ class Renderer:
         # Live statistics row.  Rate is tokens over elapsed on this arm's clock,
         # which is the rate a user waiting on the stream actually experiences.
         rate = state.tokens_done / state.elapsed if state.elapsed > 0 else 0.0
+        # The capture leaves accepted_length at zero when the engine's speculative
+        # counters did not advance for this request, and a real mean accepted
+        # length is never below one.  So zero here means unmeasured, and printing
+        # it as 0.00 beside the gated figure in the footer would read as a
+        # measured collapse rather than as a missing measurement.
+        accepted = state.request.accepted_length
         stats = [
             ("elapsed", f"{state.elapsed:6.1f}s"),
             ("tokens", f"{state.tokens_done:5d}"),
             ("tok/s", f"{rate:5.1f}"),
-            ("accepted len", f"{state.request.accepted_length:4.2f}"),
+            ("accepted len", f"{accepted:4.2f}" if accepted > 0 else " n/a"),
         ]
         col = x + 22
         for label, value in stats:
@@ -382,16 +393,13 @@ class Renderer:
                 (x + 22, bar_y, x + 22 + int((w - 44) * fraction), bar_y + 6), fill=arm.accent
             )
 
-        body_bottom = bar_y - 14
-        rows = max(1, (body_bottom - self.body_top) // self.line_h)
         y = self.body_top
-        for line, is_reasoning in wrap_tail(state.reasoning, state.content, self.columns, rows):
-            draw.text((x + 22, y), line, font=self.f_body,
-                      fill=DIM if is_reasoning else TEXT)
+        for line in wrap_tail(state.text, self.columns, self.body_rows):
+            draw.text((x + 22, y), line, font=self.f_body, fill=TEXT)
             y += self.line_h
 
-        if state.done and state.finished_at is not None:
-            badge = f"  FINISHED  {state.finished_at:.1f}s  "
+        if state.done:
+            badge = f"  FINISHED  {arm.duration:.1f}s  "
             box = draw.textbbox((0, 0), badge, font=self.f_stat)
             bx, by = x + w - (box[2] - box[0]) - 26, top + 22
             draw.rectangle(
@@ -405,13 +413,16 @@ class Renderer:
         draw: ImageDraw.ImageDraw,
         stock_state: ArmFrameState,
         tuned_state: ArmFrameState,
-        total_contexts: int,
     ) -> None:
-        """Show how far ahead the tuned arm is, in contexts and in seconds.
+        """Show how far ahead the tuned arm is, in seconds.
 
-        The seconds figure is the honest one to quote: it is how long the stock
-        arm still needs to reach the context the tuned arm is on right now, read
-        straight off the stock arm's own recorded timeline.
+        Both figures are read straight off the stock arm's own recorded timeline
+        rather than extrapolated from a rate.  Once the tuned arm has finished it
+        is the wall time the stock arm still has left to run; before that it is
+        how much longer the stock arm needs to catch up to the text the tuned arm
+        has already emitted, matched by character count rather than by request,
+        so the caption keeps moving inside a long context instead of stepping
+        once per request.
         """
         if tuned_state.done and not stock_state.done:
             seconds = self.stock.duration - stock_state.elapsed
@@ -462,7 +473,10 @@ class Renderer:
         for text, colour in lines:
             draw.text((120, y), text, font=self.f_card, fill=colour)
             y += 46
-        self.footer(draw, "docs/agentic-selfplay-result.md · job 378546 · session-disjoint suite")
+        self.footer(
+            draw,
+            "docs/agentic-selfplay-result.md · job 378546 · unseen-session suite, 61 sessions",
+        )
         return image
 
     def outro(self) -> Image.Image:
@@ -489,7 +503,8 @@ class Renderer:
              f"{self.stock.total_tokens / stock_s:.1f}" if stock_s else "-",
              f"{self.tuned.total_tokens / tuned_s:.1f}" if tuned_s else "-"),
             ("mean accepted length (engine)",
-             f"{self.stock.mean_accepted_length:.3f}", f"{self.tuned.mean_accepted_length:.3f}"),
+             accepted_text(self.stock.mean_accepted_length),
+             accepted_text(self.tuned.mean_accepted_length)),
             ("identical output text",
              f"{self.identical}/{len(self.stock.requests)}",
              f"{self.identical}/{len(self.tuned.requests)}"),
@@ -538,7 +553,7 @@ class Renderer:
             tuned_state = state_at(self.tuned, t)
             self.pane(draw, self.stock, stock_state, self.pane_x[0], n_contexts)
             self.pane(draw, self.tuned, tuned_state, self.pane_x[1], n_contexts)
-            self.lead(draw, stock_state, tuned_state, n_contexts)
+            self.lead(draw, stock_state, tuned_state)
             self.footer(
                 draw,
                 "gated result: +0.2989 accepted length / +9.94% tok/s on the session-disjoint suite"
@@ -585,16 +600,6 @@ def encode(frames: Iterator[Image.Image], out: Path, crf: int) -> None:
     print(f"  {written} frames total ({written / FPS:.1f}s)", flush=True)
 
 
-def repeat(image: Image.Image, seconds: float) -> Iterator[Image.Image]:
-    for _ in range(int(seconds * FPS)):
-        yield image
-
-
-def chain(*parts: Iterator[Image.Image]) -> Iterator[Image.Image]:
-    for part in parts:
-        yield from part
-
-
 # ---------------------------------------------------------------------------
 
 
@@ -609,9 +614,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     capture: Path = args.capture_dir
     manifest = json.loads((capture / "capture_manifest.json").read_text())
-    stock = load_arm(capture / "timeline-stock.jsonl", "stock", "STOCK",
+    stock = load_arm(capture / "timeline-stock.jsonl", "STOCK",
                      manifest["stock_draft"], STOCK_ACCENT)
-    tuned = load_arm(capture / "timeline-candidate.jsonl", "candidate", "IDLE-TUNED",
+    tuned = load_arm(capture / "timeline-candidate.jsonl", "IDLE-TUNED",
                      Path(manifest["candidate_draft"]).parent.name + "/draft-model", TUNED_ACCENT)
 
     if len(stock.requests) != len(tuned.requests):
@@ -628,9 +633,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     renderer = Renderer(stock, tuned, manifest)
     print(f"stock  {stock.duration:.1f}s  {stock.total_tokens} tok  "
-          f"accepted {stock.mean_accepted_length:.3f}")
+          f"accepted {accepted_text(stock.mean_accepted_length)}")
     print(f"tuned  {tuned.duration:.1f}s  {tuned.total_tokens} tok  "
-          f"accepted {tuned.mean_accepted_length:.3f}")
+          f"accepted {accepted_text(tuned.mean_accepted_length)}")
 
     if args.frames_only:
         out_dir = args.out.parent / "frames"
@@ -647,10 +652,10 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     encode(
-        chain(
-            repeat(renderer.intro(), INTRO_SECONDS),
+        itertools.chain(
+            itertools.repeat(renderer.intro(), int(INTRO_SECONDS * FPS)),
             renderer.replay_frames(),
-            repeat(renderer.outro(), OUTRO_SECONDS),
+            itertools.repeat(renderer.outro(), int(OUTRO_SECONDS * FPS)),
         ),
         args.out,
         args.crf,
