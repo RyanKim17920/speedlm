@@ -56,7 +56,10 @@ export const LossChart: React.FC<{
   return (
     <ChartCard
       title="Draft training loss"
-      subtitle={`${train.length} steps · 3 epochs`}
+      // Read off the data, never typed in: the corpus (and so the epoch count)
+      // changes between cycles, and a stale "3 epochs" over an 8-epoch curve is
+      // a caption that contradicts the line it sits above.
+      subtitle={`${train.length} steps · ${(train[train.length - 1]?.epoch ?? 0) + 1} epochs`}
       legend={
         <>
           <LegendItem color={SERIES_BLUE} label="train/loss" />

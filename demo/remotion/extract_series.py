@@ -9,8 +9,9 @@ Reads only real artifacts produced by a cycle run:
 and writes ``src/data.json`` next to this script.
 
 The two are deliberately decoupled. The loss curve belongs to the run that did
-the training (run5); the gate numbers belong to the run that measured it
-honestly on held-out traffic (regate-unseen-run1). See DEFAULT_DECISION.
+the training (bigcycle-run1, 8 epochs over the 3758-record corpus); the gate
+numbers belong to the run that measured that head honestly on held-out traffic
+(regate-big-run1). See DEFAULT_DECISION.
 
 Nothing is synthesised. If an artifact is missing the script fails loudly rather
 than emitting placeholder numbers.
@@ -43,20 +44,29 @@ import sys
 from pathlib import Path
 
 DEFAULT_RUN_ROOTS = [
-    # The fast cut reads run5's completed training log off disk.
+    # The fast cut reads bigcycle-run1's completed training log off disk: 3758
+    # captured records, a 1024-record lease, 652 rendered rows, 8 epochs / 922
+    # optimizer steps. Longer and more informative than the earlier 3-epoch runs.
+    Path("/data/ryan.kim/speedlm-runs/bigcycle-run1"),
     Path("/data/ryan.kim/speedlm-runs/agentenv-qwen8b-run5"),
     Path("/data/ryan.kim/speedlm-runs/demo-cycle-run10"),
     Path("/data/ryan.kim/speedlm-runs/demo-cycle-run4"),
 ]
 
-# The gate numbers do NOT come from the training run's own decision.json. run5's
-# in-run gate scored the candidate on contexts drawn from the same sessions it
-# trained on (+0.653 accepted length / +32.25% tok/s); that number is inflated by
-# leakage and is superseded. regate-unseen-run1 re-ran the same candidate against
-# 100 session-disjoint contexts x 5 repeats and is the honest result
-# (+0.2989 accepted length / +9.94% tok/s, verdict promote). It is also exactly
-# what the fast cut's terminal prints, so the bars and the terminal agree.
-DEFAULT_DECISION = Path("/data/ryan.kim/speedlm-runs/regate-unseen-run1/decision.json")
+# The gate numbers do NOT come from the training run's own decision.json.
+# bigcycle-run1's in-run gate was VETOED on a non-stationary throughput delta and
+# the cycle rolled back, so charting it would caption a rollback as a promotion.
+# regate-big-run1 re-ran the same head against that run's own 287-context,
+# session-disjoint held-out suite (5 scored repeats after 3 warmups, greedy) and
+# is the honest result: +0.3402 accepted length (SE 0.0028), +11.34pp acceptance
+# (SE 0.09), +19.91% tok/s (SE +/-5.56pp, and NOT stationary -- see below),
+# verdict promote, vetoed false. It is also exactly what the fast cut's terminal
+# prints, so the bars and the terminal agree.
+#
+# Two figures deliberately appear NOWHERE: run5's session-overlapping +0.653 /
+# +32.25% (superseded by ~2.2x leakage inflation) and bigcycle-run1's own vetoed
+# in-run +14.76%.
+DEFAULT_DECISION = Path("/data/ryan.kim/speedlm-runs/regate-big-run1/decision.json")
 
 # The recording the composition composites, and the renderer's timing sidecar.
 DEFAULT_CAST = Path("/data/ryan.kim/speedlm-runs/demo-fast/session_fast.cast")
@@ -207,6 +217,12 @@ def parse_decision(path: Path) -> dict:
             "tuned": d["candidate_avg_tok_per_sec"],
             "delta_pct": d.get("throughput_delta_pct"),
             "delta_standard_error_pct": d.get("throughput_delta_standard_error_pct"),
+            # Whether the delta held still across repeats. On regate-big-run1 it
+            # did NOT (the node was contended and both arms slowed in later
+            # repeats), which is why the chart has to draw the interval rather
+            # than a point estimate -- see ThroughputChart.
+            "stationary": (d.get("throughput_stationarity") or {}).get("stationary"),
+            "stationarity_status": (d.get("throughput_stationarity") or {}).get("status"),
         },
         "accepted_length": {
             "stock": d["stock_avg_accepted_length"],
@@ -218,6 +234,7 @@ def parse_decision(path: Path) -> dict:
             "stock": d.get("stock_avg_acceptance"),
             "tuned": d.get("candidate_avg_acceptance"),
             "delta_pp": d.get("acceptance_delta_pp"),
+            "delta_standard_error_pp": d.get("acceptance_delta_standard_error_pp"),
         },
         "per_repeat": [
             {
@@ -520,13 +537,20 @@ def main() -> None:
     t = gate["throughput"]
     print(
         f"throughput    : stock {t['stock']:.2f} vs tuned {t['tuned']:.2f} tok/s "
-        f"({t['delta_pct']:+.2f}%)",
+        f"({t['delta_pct']:+.2f}% +/-{t['delta_standard_error_pct']:.2f}pp SE, "
+        f"stationary={t['stationary']} {t['stationarity_status']})",
         file=sys.stderr,
     )
     al = gate["accepted_length"]
     print(
-        f"accepted len  : stock {al['stock']:.3f} vs tuned {al['tuned']:.3f} "
-        f"({al['delta']:+.3f})",
+        f"accepted len  : stock {al['stock']:.4f} vs tuned {al['tuned']:.4f} "
+        f"({al['delta']:+.4f} SE {al['delta_standard_error']:.4f})",
+        file=sys.stderr,
+    )
+    ar = gate["acceptance_rate"]
+    print(
+        f"acceptance    : stock {ar['stock']:.3f} vs tuned {ar['tuned']:.3f} "
+        f"({ar['delta_pp']:+.2f}pp SE {ar['delta_standard_error_pp']:.2f})",
         file=sys.stderr,
     )
     print(f"verdict       : {gate['verdict']}", file=sys.stderr)

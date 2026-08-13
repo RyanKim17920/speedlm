@@ -150,7 +150,7 @@ class Arm:
         # None, not 0.0, when the engine never advanced its speculative counters
         # over any request in this arm.  A measured zero and an unmeasured value
         # must not render the same: this figure is printed on the summary card
-        # directly beside the gated +0.2989, so a reader who saw 0.000 would take
+        # directly beside the gated +0.3402, so a reader who saw 0.000 would take
         # it as a refutation of the gated result rather than as the absence of a
         # measurement.  The capture side writes null for exactly this reason, and
         # flattening it back to a number here would undo that.
@@ -515,7 +515,8 @@ class Renderer:
             ("Every context comes from an agent session the tuned head never trained on.",
              MUTED),
             ("", TEXT),
-            ("Gated result: +0.2989 accepted length, +9.94% tok/s.", TUNED_ACCENT),
+            ("The mechanism's current gated result, on a later and larger corpus:", MUTED),
+            ("+0.3402 accepted length (SE 0.0028), verdict promote.", TUNED_ACCENT),
         ]
         y = 300
         for text, colour in lines:
@@ -523,7 +524,8 @@ class Renderer:
             y += 46
         self.footer(
             draw,
-            "docs/agentic-selfplay-result.md · job 378546 · unseen-session suite, 61 sessions",
+            "replay: capture job 378546, an earlier idle-tuned head  ·  "
+            "gate figures: regate-big-run1, 287-context session-disjoint suite",
         )
         return image
 
@@ -568,18 +570,25 @@ class Renderer:
         y += 40
         draw.line((120, y - 20, WIDTH - 120, y - 20), fill=RULE, width=1)
         for text, colour in (
-            ("This replay is one sequential pass, shown because it is watchable.", MUTED),
-            ("The number to cite is the gated one: 5 repeats x 100 contexts x 2 blocks per arm,",
+            ("This replay is one sequential pass of an earlier head, shown because it is"
+             " watchable.",
              MUTED),
-            ("+0.2989 accepted length (SE 0.0046) and +9.94% tok/s, verdict promote.",
+            ("The number to cite is the current gate, regate-big-run1: 5 repeats x 287 contexts,",
+             MUTED),
+            ("+0.3402 accepted length (SE 0.0028) and +11.34pp acceptance (SE 0.09),",
              TUNED_ACCENT),
+            ("verdict promote, not vetoed.", TUNED_ACCENT),
+            ("Throughput there was +19.9%, but SE +/-5.6pp on a non-stationary (contended)",
+             MUTED),
+            ("run -- read it as a range, not as a settled number.", MUTED),
         ):
             draw.text((120, y), text, font=self.f_card, fill=colour)
             y += 44
 
         self.footer(
             draw,
-            "docs/agentic-selfplay-result.md · job 378546 · unseen-session suite, 61 sessions",
+            "replay: capture job 378546, an earlier idle-tuned head  ·  "
+            "gate figures: regate-big-run1, 287-context session-disjoint suite",
         )
         return image
 
@@ -612,7 +621,8 @@ class Renderer:
             self.lead(draw, stock_state, tuned_state)
             self.footer(
                 draw,
-                "gated result: +0.2989 accepted length / +9.94% tok/s on the session-disjoint suite"
+                "gated result: +0.3402 accepted length (SE 0.0028) on the 287-context "
+                "session-disjoint suite"
                 "   ·   inter-request instrumentation gaps removed from both arms",
             )
             # Only when the clock is actually scaled: a "1x SPEED" pill on an

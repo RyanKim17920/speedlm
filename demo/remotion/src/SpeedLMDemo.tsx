@@ -210,10 +210,13 @@ export const SpeedLMDemo: React.FC = () => {
           background: PANEL,
           borderLeft: `1px solid ${RULE}`,
           boxSizing: "border-box",
-          padding: "30px 32px 28px",
+          padding: "26px 32px 18px",
           display: "flex",
           flexDirection: "column",
-          gap: 20,
+          // Tightened from 20: the gate card now carries a ±1 SE row and the
+          // non-stationarity caveat under the throughput group, and at 20 the
+          // accepted-length bars fell off the bottom of the panel.
+          gap: 12,
         }}
       >
         <header style={{ display: "flex", flexDirection: "column", gap: 6, flexShrink: 0 }}>
@@ -243,11 +246,14 @@ export const SpeedLMDemo: React.FC = () => {
             stock: data.gate.throughput.stock,
             tuned: data.gate.throughput.tuned,
             delta_pct: data.gate.throughput.delta_pct,
+            delta_standard_error_pct: data.gate.throughput.delta_standard_error_pct,
+            stationary: data.gate.throughput.stationary,
           }}
           acceptedLength={{
             stock: data.gate.accepted_length.stock,
             tuned: data.gate.accepted_length.tuned,
             delta: data.gate.accepted_length.delta,
+            delta_standard_error: data.gate.accepted_length.delta_standard_error,
           }}
           verdict={data.gate.verdict}
           contexts={data.gate.num_contexts}

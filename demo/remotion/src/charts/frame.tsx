@@ -19,7 +19,7 @@ export const ChartCard: React.FC<{
     style={{
       display: "flex",
       flexDirection: "column",
-      gap: 10,
+      gap: 7,
       flex: 1,
       minHeight: 0,
     }}
