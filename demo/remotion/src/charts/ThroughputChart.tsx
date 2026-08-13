@@ -20,14 +20,19 @@ type Measure = {
   format: (v: number) => string;
   delta: string;
   /**
-   * ±1 standard error of the delta, expressed in the SAME units as `stock` /
-   * `tuned` so it can be drawn on the tuned bar. Undefined = the gate did not
-   * measure dispersion for this measure, and nothing is drawn (an absent
-   * interval must not read as a tight one).
+   * The delta's interval, as the two ABSOLUTE endpoints it puts on the tuned
+   * bar, in the same units as `stock` / `tuned`. Asymmetric on purpose: for
+   * accepted length these are mean ±1 SE (sub-pixel), for throughput they are
+   * the lowest and highest per-repeat delta actually observed, which is not
+   * symmetric about the central estimate. Undefined = the gate measured no
+   * dispersion for this measure, and nothing is drawn (an absent interval must
+   * not read as a tight one).
    */
-  errorAbs?: number;
+  intervalAbs?: readonly [number, number];
   /** Shown under the group when the measure is not safe to read as settled. */
   caveat?: string;
+  /** Second line under the group: what the number MEANS, in one clause. */
+  note?: string;
 };
 
 /**
@@ -71,9 +76,12 @@ const Group: React.FC<{ m: Measure; progress: number }> = ({ m, progress }) => {
           const y = i * (ROW_H + GAP);
           const mid = y + ROW_H / 2;
           const end = LABEL_W + w(value);
-          const err = name === "tuned" && m.errorAbs ? px(m.errorAbs) * progress : 0;
-          const lo = Math.max(LABEL_W, end - err);
-          const hi = end + err;
+          const iv = name === "tuned" ? m.intervalAbs : undefined;
+          // Interpolated from the bar's own end so the whisker grows with it and
+          // never floats away from the mark it qualifies.
+          const err = iv && progress > 0.02 ? 1 : 0;
+          const lo = iv ? Math.max(LABEL_W, end - (px(value) - px(iv[0])) * progress) : end;
+          const hi = iv ? end + (px(iv[1]) - px(value)) * progress : end;
           return (
             <g key={name}>
               <text
@@ -129,6 +137,17 @@ const Group: React.FC<{ m: Measure; progress: number }> = ({ m, progress }) => {
           );
         })}
       </svg>
+      {m.note ? (
+        <div
+          style={{
+            font: `600 14px ${MONO}`,
+            color: TEXT,
+            opacity: progress > 0.98 ? 1 : 0,
+          }}
+        >
+          {m.note}
+        </div>
+      ) : null}
       {m.caveat ? (
         <div
           style={{
@@ -162,39 +181,44 @@ export const ThroughputChart: React.FC<{
     delta: number;
     delta_standard_error?: number | null;
   };
+  perRepeat?: ReadonlyArray<{ stock_tok_per_sec: number; tuned_tok_per_sec: number }>;
   verdict: string;
   contexts: number;
   repeats: number;
   progress: number;
-}> = ({ throughput, acceptedLength, verdict, contexts, repeats, progress }) => {
-  // The throughput SE is quoted in percentage POINTS of the delta, so it has to
-  // be pushed back through the delta's own definition to land in tok/s:
-  //   delta_pct = (tuned - stock) / stock * 100  =>  d(tuned) = stock * dpct/100
+}> = ({ throughput, acceptedLength, perRepeat, verdict, contexts, repeats, progress }) => {
+  const notStationary = throughput.stationary === false;
+
+  // The throughput interval is NOT ±1 SE about the central estimate. The gate
+  // vetoed this measure precisely because the per-repeat delta moved, so the
+  // honest interval is the spread that actually occurred: the lowest and highest
+  // per-repeat delta, mapped back onto the tuned bar through the delta's own
+  // definition (tuned = stock * (1 + delta/100)). Falling back to ±1 SE when no
+  // per-repeat rows are present keeps an interval on screen either way.
+  const deltas = (perRepeat ?? []).map(
+    (r) => (r.tuned_tok_per_sec / r.stock_tok_per_sec - 1) * 100,
+  );
   const tokSE =
     throughput.delta_standard_error_pct == null
       ? undefined
       : (throughput.stock * throughput.delta_standard_error_pct) / 100;
-  const notStationary = throughput.stationary === false;
+  const tokInterval: readonly [number, number] | undefined = deltas.length
+    ? [
+        throughput.stock * (1 + Math.min(...deltas) / 100),
+        throughput.stock * (1 + Math.max(...deltas) / 100),
+      ]
+    : tokSE === undefined
+      ? undefined
+      : [throughput.tuned - tokSE, throughput.tuned + tokSE];
+
+  // The headline, stated the way a reader can use it: a 15% lift in how much of
+  // each draft survives verification. Derived, not typed in.
+  const acceptedPct =
+    acceptedLength.delta == null || !acceptedLength.stock
+      ? undefined
+      : (acceptedLength.delta / acceptedLength.stock) * 100;
 
   const measures: Measure[] = [
-    {
-      label: "decode throughput",
-      unit: "tok/s",
-      stock: throughput.stock,
-      tuned: throughput.tuned,
-      // 2dp, matching the `decode tok/s 141.31 117.85` line the terminal prints
-      // on the left -- rounding to 1dp here made the two halves disagree.
-      format: (v) => v.toFixed(2),
-      delta:
-        `${throughput.delta_pct >= 0 ? "+" : ""}${throughput.delta_pct.toFixed(2)}%` +
-        (throughput.delta_standard_error_pct == null
-          ? ""
-          : ` ± ${throughput.delta_standard_error_pct.toFixed(2)}pp`),
-      errorAbs: tokSE,
-      caveat: notStationary
-        ? "not stationary: the node was contended and both arms slowed in later repeats. Read the range, not the point."
-        : undefined,
-    },
     {
       label: "accepted length",
       unit: "tokens/step",
@@ -205,8 +229,39 @@ export const ThroughputChart: React.FC<{
         `${acceptedLength.delta >= 0 ? "+" : ""}${acceptedLength.delta.toFixed(4)}` +
         (acceptedLength.delta_standard_error == null
           ? ""
-          : ` ± ${acceptedLength.delta_standard_error.toFixed(4)}`),
-      errorAbs: acceptedLength.delta_standard_error ?? undefined,
+          : ` ± ${acceptedLength.delta_standard_error.toFixed(4)} SE`),
+      intervalAbs:
+        acceptedLength.delta_standard_error == null
+          ? undefined
+          : [
+              acceptedLength.tuned - acceptedLength.delta_standard_error,
+              acceptedLength.tuned + acceptedLength.delta_standard_error,
+            ],
+      note:
+        acceptedPct === undefined
+          ? undefined
+          : `+${acceptedPct.toFixed(1)}% more tokens accepted per verifier step — reproduced three times`,
+    },
+    {
+      label: "decode throughput",
+      unit: "tok/s",
+      stock: throughput.stock,
+      tuned: throughput.tuned,
+      // 2dp, matching the `decode tok/s 144.71 124.59` line the terminal prints
+      // on the left -- rounding to 1dp here made the two halves disagree.
+      format: (v) => v.toFixed(2),
+      // A range, never a settled point: the delta is quoted by its observed
+      // per-repeat extremes with the central estimate in parentheses.
+      delta: deltas.length
+        ? `+${Math.min(...deltas).toFixed(1)}% to +${Math.max(...deltas).toFixed(1)}%  (central +${throughput.delta_pct.toFixed(1)}%)`
+        : `${throughput.delta_pct >= 0 ? "+" : ""}${throughput.delta_pct.toFixed(2)}%`,
+      intervalAbs: tokInterval,
+      caveat: notStationary
+        // One line, because the panel has exactly one line of room here: any
+        // second line falls off the bottom of the 1080p frame. It has to name
+        // the veto, the cause, and which arm moved -- so it does, in numbers.
+        ? "vetoed, not stationary: STOCK drifted 127->121 tok/s; tuned flat 143-147"
+        : undefined,
     },
   ];
 
@@ -229,7 +284,7 @@ export const ThroughputChart: React.FC<{
                 fill="none"
               />
             </svg>
-            <span style={{ font: `400 15px/1 ${MONO}`, color: MUTED }}>±1 SE of delta</span>
+            <span style={{ font: `400 15px/1 ${MONO}`, color: MUTED }}>delta interval</span>
           </span>
           <span
             style={{

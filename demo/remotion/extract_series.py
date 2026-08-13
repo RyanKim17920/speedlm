@@ -11,7 +11,7 @@ and writes ``src/data.json`` next to this script.
 The two are deliberately decoupled. The loss curve belongs to the run that did
 the training (bigcycle-run1, 8 epochs over the 3758-record corpus); the gate
 numbers belong to the run that measured that head honestly on held-out traffic
-(regate-big-run1). See DEFAULT_DECISION.
+(regate-big-run2). See DEFAULT_DECISION.
 
 Nothing is synthesised. If an artifact is missing the script fails loudly rather
 than emitting placeholder numbers.
@@ -56,17 +56,25 @@ DEFAULT_RUN_ROOTS = [
 # The gate numbers do NOT come from the training run's own decision.json.
 # bigcycle-run1's in-run gate was VETOED on a non-stationary throughput delta and
 # the cycle rolled back, so charting it would caption a rollback as a promotion.
-# regate-big-run1 re-ran the same head against that run's own 287-context,
-# session-disjoint held-out suite (5 scored repeats after 3 warmups, greedy) and
-# is the honest result: +0.3402 accepted length (SE 0.0028), +11.34pp acceptance
-# (SE 0.09), +19.91% tok/s (SE +/-5.56pp, and NOT stationary -- see below),
-# verdict promote, vetoed false. It is also exactly what the fast cut's terminal
-# prints, so the bars and the terminal agree.
+# regate-big-run2 is the DEFINITIVE measurement of that head: the same 287-context,
+# session-disjoint held-out suite, but 8 scored repeats after 3 warmups on a
+# less-contended node. It supersedes regate-big-run1 (5 repeats, heavily contended).
 #
-# Two figures deliberately appear NOWHERE: run5's session-overlapping +0.653 /
-# +32.25% (superseded by ~2.2x leakage inflation) and bigcycle-run1's own vetoed
-# in-run +14.76%.
-DEFAULT_DECISION = Path("/data/ryan.kim/speedlm-runs/regate-big-run1/decision.json")
+#   accepted length  2.3051 -> 2.6507   +0.3457 (SE 0.0029) = +15.0% per verifier step
+#   acceptance rate                     +11.52pp (SE 0.10)
+#   decode tok/s     124.59 -> 144.71   central +16.15%, per-repeat range +12.9%..+20.7%
+#   final_verdict    reject, vetoed=true, reason throughput_not_stationary
+#
+# The veto is real and the video shows it. Its cause is the BASELINE, not the head:
+# the candidate arm was flat from repeat 0 (+0.051%/repeat, 143-147 tok/s throughout)
+# while stock drifted -0.821%/repeat (127 -> 121 tok/s) and only settled at repeat 5.
+# So the throughput figure is presented as a caused RANGE, never as a settled point,
+# and no promote verdict is attached to it anywhere in the cut.
+#
+# Figures that deliberately appear NOWHERE: run5's session-overlapping +0.653 /
+# +32.25% (superseded by ~2.2x leakage inflation), bigcycle-run1's own vetoed in-run
+# +14.76%, the earlier clean +0.2989 / +9.94% gate, and regate-big-run1's +19.91%.
+DEFAULT_DECISION = Path("/data/ryan.kim/speedlm-runs/regate-big-run2/decision.json")
 
 # The recording the composition composites, and the renderer's timing sidecar.
 DEFAULT_CAST = Path("/data/ryan.kim/speedlm-runs/demo-fast/session_fast.cast")
@@ -217,12 +225,17 @@ def parse_decision(path: Path) -> dict:
             "tuned": d["candidate_avg_tok_per_sec"],
             "delta_pct": d.get("throughput_delta_pct"),
             "delta_standard_error_pct": d.get("throughput_delta_standard_error_pct"),
-            # Whether the delta held still across repeats. On regate-big-run1 it
-            # did NOT (the node was contended and both arms slowed in later
-            # repeats), which is why the chart has to draw the interval rather
-            # than a point estimate -- see ThroughputChart.
+            # Whether the delta held still across repeats. On regate-big-run2 it
+            # did NOT -- and the trend fields below say WHOSE fault that is: the
+            # candidate arm is flat from repeat 0 while the stock baseline drifts
+            # downward on a shared node. That is why the chart draws a caused
+            # range rather than a point estimate -- see ThroughputChart.
             "stationary": (d.get("throughput_stationarity") or {}).get("stationary"),
             "stationarity_status": (d.get("throughput_stationarity") or {}).get("status"),
+            "stock_trend_pct_per_repeat": d.get("stock_throughput_trend_pct_per_repeat"),
+            "tuned_trend_pct_per_repeat": d.get("candidate_throughput_trend_pct_per_repeat"),
+            "stock_flat_from_repeat": d.get("stock_throughput_flat_from_repeat"),
+            "tuned_flat_from_repeat": d.get("candidate_throughput_flat_from_repeat"),
         },
         "accepted_length": {
             "stock": d["stock_avg_accepted_length"],

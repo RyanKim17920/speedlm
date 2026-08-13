@@ -6,11 +6,11 @@ export const FPS = 30;
 
 /**
  * Length of the recorded terminal capture (public/terminal.mp4).
- * demo-fast/session_fast.mp4 is 54.533s -> 1636 frames at 30fps (probed with
- * ffprobe -count_frames; it agrees with demo-fast/timing.json's total_frames).
+ * demo-fast/session_fast.mp4 is 56.433s -> 1693 frames at 30fps (the renderer
+ * reports it, and it agrees with demo-fast/timing.json's total_frames).
  * Swap in a different capture and update this to match its real frame count.
  */
-export const DURATION_IN_FRAMES = 1636;
+export const DURATION_IN_FRAMES = 1693;
 
 export const RemotionRoot: React.FC = () => (
   <Composition

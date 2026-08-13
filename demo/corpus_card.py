@@ -24,7 +24,7 @@ FONT_DIR = Path("/usr/share/fonts/truetype/dejavu")
 
 RUN = Path("/data/ryan.kim/speedlm-runs/bigcycle-run1")
 RUN_ID = "e7004c4c0c7548fba65b05a924aa57ea"
-DEC = Path("/data/ryan.kim/speedlm-runs/regate-big-run1/decision.json")
+DEC = Path("/data/ryan.kim/speedlm-runs/regate-big-run2/decision.json")
 SECONDS = float(sys.argv[2]) if len(sys.argv) > 2 else 2.5
 
 
@@ -95,7 +95,7 @@ for line, colour in body:
 draw.line((40, HEIGHT - 74, WIDTH - 40, HEIGHT - 74), fill=RULE, width=1)
 draw.text(
     (40, HEIGHT - 56),
-    "bigcycle-run1  ·  Qwen/Qwen3-8B  ·  gate: regate-big-run1  ·  greedy, max 512 new tokens",
+    "bigcycle-run1  ·  Qwen/Qwen3-8B  ·  gate: regate-big-run2  ·  greedy, max 512 new tokens",
     font=f_small,
     fill=DIM,
 )

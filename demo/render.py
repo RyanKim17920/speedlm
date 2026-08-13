@@ -150,7 +150,7 @@ class Arm:
         # None, not 0.0, when the engine never advanced its speculative counters
         # over any request in this arm.  A measured zero and an unmeasured value
         # must not render the same: this figure is printed on the summary card
-        # directly beside the gated +0.3402, so a reader who saw 0.000 would take
+        # directly beside the gated +0.3457, so a reader who saw 0.000 would take
         # it as a refutation of the gated result rather than as the absence of a
         # measurement.  The capture side writes null for exactly this reason, and
         # flattening it back to a number here would undo that.
@@ -515,8 +515,10 @@ class Renderer:
             ("Every context comes from an agent session the tuned head never trained on.",
              MUTED),
             ("", TEXT),
-            ("The mechanism's current gated result, on a later and larger corpus:", MUTED),
-            ("+0.3402 accepted length (SE 0.0028), verdict promote.", TUNED_ACCENT),
+            ("The mechanism's definitive gated result, on a later and larger corpus:", MUTED),
+            ("+0.3457 accepted length (SE 0.0029) -- +15.0% per verifier step.", TUNED_ACCENT),
+            ("That run's verdict was REJECT: its throughput delta drifted and was vetoed.",
+             MUTED),
         ]
         y = 300
         for text, colour in lines:
@@ -525,7 +527,7 @@ class Renderer:
         self.footer(
             draw,
             "replay: capture job 378546, an earlier idle-tuned head  ·  "
-            "gate figures: regate-big-run1, 287-context session-disjoint suite",
+            "gate figures: regate-big-run2, 287-context session-disjoint suite",
         )
         return image
 
@@ -573,14 +575,18 @@ class Renderer:
             ("This replay is one sequential pass of an earlier head, shown because it is"
              " watchable.",
              MUTED),
-            ("The number to cite is the current gate, regate-big-run1: 5 repeats x 287 contexts,",
+            ("The number to cite is the definitive gate, regate-big-run2: 8 repeats x 287"
+             " contexts,", MUTED),
+            ("+0.3457 accepted length (SE 0.0029) = +15.0% per verifier step, +11.52pp"
+             " acceptance.", TUNED_ACCENT),
+            ("Throughput there ranged +13% to +20% (central +16.1%) -- that spread is the STOCK",
              MUTED),
-            ("+0.3402 accepted length (SE 0.0028) and +11.34pp acceptance (SE 0.09),",
-             TUNED_ACCENT),
-            ("verdict promote, not vetoed.", TUNED_ACCENT),
-            ("Throughput there was +19.9%, but SE +/-5.6pp on a non-stationary (contended)",
+            ("baseline drifting 127->121 tok/s on a shared node, not the head, which held 143-147.",
              MUTED),
-            ("run -- read it as a range, not as a settled number.", MUTED),
+            ("Gate verdict: REJECT, vetoed on throughput_not_stationary -- it refused to certify",
+             MUTED),
+            ("a throughput number it could not measure stationarily. The length lift stands.",
+             MUTED),
         ):
             draw.text((120, y), text, font=self.f_card, fill=colour)
             y += 44
@@ -588,7 +594,7 @@ class Renderer:
         self.footer(
             draw,
             "replay: capture job 378546, an earlier idle-tuned head  ·  "
-            "gate figures: regate-big-run1, 287-context session-disjoint suite",
+            "gate figures: regate-big-run2, 287-context session-disjoint suite",
         )
         return image
 
@@ -621,7 +627,7 @@ class Renderer:
             self.lead(draw, stock_state, tuned_state)
             self.footer(
                 draw,
-                "gated result: +0.3402 accepted length (SE 0.0028) on the 287-context "
+                "gated result: +0.3457 accepted length (SE 0.0029) on the 287-context "
                 "session-disjoint suite"
                 "   ·   inter-request instrumentation gaps removed from both arms",
             )

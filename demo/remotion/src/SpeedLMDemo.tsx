@@ -210,13 +210,14 @@ export const SpeedLMDemo: React.FC = () => {
           background: PANEL,
           borderLeft: `1px solid ${RULE}`,
           boxSizing: "border-box",
-          padding: "26px 32px 18px",
+          padding: "22px 32px 10px",
           display: "flex",
           flexDirection: "column",
-          // Tightened from 20: the gate card now carries a ±1 SE row and the
-          // non-stationarity caveat under the throughput group, and at 20 the
-          // accepted-length bars fell off the bottom of the panel.
-          gap: 12,
+          // Tightened from 20 -> 12 -> 9 as the gate card grew: it now carries
+          // the "+15.0% per verifier step" reading under accepted length AND a
+          // two-line caused-range caveat under throughput. At 12 the caveat's
+          // second line fell off the bottom of the panel.
+          gap: 9,
         }}
       >
         <header style={{ display: "flex", flexDirection: "column", gap: 6, flexShrink: 0 }}>
@@ -255,6 +256,7 @@ export const SpeedLMDemo: React.FC = () => {
             delta: data.gate.accepted_length.delta,
             delta_standard_error: data.gate.accepted_length.delta_standard_error,
           }}
+          perRepeat={data.gate.per_repeat}
           verdict={data.gate.verdict}
           contexts={data.gate.num_contexts}
           repeats={data.gate.num_repeats}
