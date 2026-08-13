@@ -11,7 +11,7 @@ set -euo pipefail
 #
 # Nothing here is faked or stubbed: real vLLM, real Eagle3 head training with
 # real optimizer steps, real benchmark gate.  The only differences from
-# production are size (configs/demo-qwen8b.json: 96-record corpus, 1 epoch,
+# production are size (demo/demo-qwen8b.json: 96-record corpus, 1 epoch,
 # 3 benchmark repeats -- the validator's HARD FLOOR -- 0 warmup, 128/64-token
 # benchmark and correctness caps) and where the corpus comes from.
 #
@@ -24,8 +24,8 @@ set -euo pipefail
 # spends its hour on the part worth filming: the tuning cycle itself.
 
 repo=/admin/home/ryan.kim/speedlm-fr
-run_dir=/data/ryan.kim/speedlm-runs/demo-cycle-run4
-config="$repo/configs/demo-qwen8b.json"
+run_dir=${DEMO_RUN_DIR:-/data/ryan.kim/speedlm-runs/demo-cycle-run1}
+config="$repo/demo/demo-qwen8b.json"
 model="Qwen/Qwen3-8B"
 seed_traces=/data/ryan.kim/speedlm-runs/agentenv-qwen8b-run5/speedlm_home/traces/traces.jsonl
 
@@ -133,7 +133,7 @@ trap cleanup EXIT TERM INT
 
 # --- wait for readiness WITHOUT generating gateway traffic ------------------
 # DO NOT poll the gateway.  This is the trap that killed run1 (job 379744).
-# 8150 is wrapper.host/wrapper.port from configs/demo-qwen8b.json -- the gateway
+# 8150 is wrapper.host/wrapper.port from demo/demo-qwen8b.json -- the gateway
 # -- and src/speedlm/gateway/app.py has NO /health special case: the only route
 # is the catch-all `route_all` (app.py:106-112), which hands every request
 # straight to `proxy.handle`, whose first act is `admission.try_begin()` ->

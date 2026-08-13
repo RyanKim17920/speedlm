@@ -20,11 +20,21 @@ GATED numbers alongside them and says which is which. One sequential pass over a
 few dozen contexts is an illustration; the promotion decision came from 5 repeats
 x 100 contexts x 2 blocks per arm.
 
+``--speed`` exists because this segment closes a longer demo and has to land in
+under a minute.  It scales the shared replay clock rather than the recording: no
+chunk is dropped and neither arm is re-timed, so the gap between the arms keeps
+its true shape.  Everything the panes print -- elapsed, tokens, tok/s, accepted
+length -- and every total on the summary card stays in the recording's own real
+seconds; only the wall time you spend watching it changes.  A badge on every
+replay frame says so, since otherwise a real 123.4s timer running out in 31s of
+video would read as a bug.
+
 Usage:
 
     python demo/render.py \
         --capture-dir /data/.../demo-video-run1 \
-        --out         /data/.../demo-video-run1/speedlm-drafting.mp4
+        --out         /data/.../demo-video-run1/speedlm-drafting.mp4 \
+        --speed       4
 """
 
 from __future__ import annotations
@@ -269,10 +279,21 @@ def wrap_tail(text: str, columns: int, rows: int) -> list[str]:
 
 
 class Renderer:
-    def __init__(self, stock: Arm, tuned: Arm, manifest: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        stock: Arm,
+        tuned: Arm,
+        manifest: dict[str, Any],
+        speed: float = 1.0,
+    ) -> None:
         self.stock = stock
         self.tuned = tuned
         self.manifest = manifest
+        # How many seconds of recorded time the replay clock advances per second
+        # of video.  This scales the clock only: no recorded chunk is dropped and
+        # no arm's timeline is re-timed, so the two arms keep their exact relative
+        # shape and every token the capture recorded still appears on screen.
+        self.speed = speed
         # Greedy decoding should make the two arms emit the same text: a draft
         # head changes how many tokens are proposed per step, not which tokens
         # survive verification.  Counting the agreement rather than asserting it
@@ -448,6 +469,33 @@ class Renderer:
         box = draw.textbbox((0, 0), text, font=self.f_sub)
         draw.text((WIDTH - 40 - box[2], 92), text, font=self.f_sub, fill=TUNED_ACCENT)
 
+    def speed_badge(self, draw: ImageDraw.ImageDraw) -> None:
+        """Stamp the replay clock's scale factor on the frame.
+
+        This is drawn on every replay frame, not just the first few, because the
+        panes show each arm's own elapsed wall clock and those numbers are real
+        seconds.  A viewer who joined halfway through and could not see that the
+        replay clock is scaled would read a pane ticking to 123.4s over 31s of
+        video as the timers being wrong, or worse, take the video's own running
+        time as the measured result.  The badge is what keeps the real seconds on
+        screen legible as real seconds.
+
+        It sits at the right end of the footer row: the header's right side is
+        already taken by the lead readout, and each pane's top right is where the
+        FINISHED badge lands, so this is the one piece of chrome-free margin that
+        is present on every frame.
+        """
+        text = f"{self.speed:g}x SPEED"
+        # box[2] rather than box[2] - box[0], for the same reason lead() does it:
+        # the left bearing is part of where the glyphs land, so subtracting it
+        # would push the pill past the right margin.
+        box = draw.textbbox((0, 0), text, font=self.f_stat)
+        w, h = box[2], box[3] - box[1]
+        x = WIDTH - 52 - w
+        y = HEIGHT - 58
+        draw.rectangle((x - 12, y - 7, x + w + 12, y + h + 9), fill=TUNED_ACCENT)
+        draw.text((x, y), text, font=self.f_stat, fill=BG)
+
     # -- cards -------------------------------------------------------------
 
     def intro(self) -> Image.Image:
@@ -538,15 +586,23 @@ class Renderer:
     # -- the replay --------------------------------------------------------
 
     def replay_frames(self) -> Iterator[Image.Image]:
-        total = max(self.stock.duration, self.tuned.duration) + TAIL_SECONDS
+        replay_seconds = max(self.stock.duration, self.tuned.duration)
         n_contexts = len(self.stock.requests)
         subtitle = (
             f"{n_contexts} held-out agent contexts · greedy · "
             f"{self.manifest.get('model', '')} · one GPU, sequential"
         )
-        frames = int(total * FPS)
-        for i in range(frames):
-            t = i / FPS
+        # The replay is shortened by advancing the shared clock self.speed seconds
+        # per second of video, never by skipping frames or resampling the arms:
+        # each frame still asks state_at for the exact state at its own instant,
+        # so every recorded chunk is still rendered, just sooner.  The trailing
+        # hold keeps its real duration -- it is a static frame like the cards, and
+        # a 1.5s beat before the summary is already the shortest it can usefully be.
+        frames = int(replay_seconds / self.speed * FPS)
+        for i in range(frames + int(TAIL_SECONDS * FPS)):
+            # Clamped so the hold sits on the true end of the replay rather than
+            # running the clock past it; state_at saturates there in any case.
+            t = min(i / FPS * self.speed, replay_seconds)
             image, draw = self.frame()
             self.header(draw, subtitle)
             stock_state = state_at(self.stock, t)
@@ -559,6 +615,10 @@ class Renderer:
                 "gated result: +0.2989 accepted length / +9.94% tok/s on the session-disjoint suite"
                 "   ·   inter-request instrumentation gaps removed from both arms",
             )
+            # Only when the clock is actually scaled: a "1x SPEED" pill on an
+            # unscaled render would be chrome that tells the viewer nothing.
+            if self.speed != 1.0:
+                self.speed_badge(draw)
             yield image
 
 
@@ -608,9 +668,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--capture-dir", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--crf", type=int, default=20)
+    parser.add_argument("--speed", type=float, default=1.0,
+                        help="replay the drafting segment this many times faster; the "
+                             "intro and outro cards keep their real duration, and the "
+                             "numbers on screen stay real measured seconds")
     parser.add_argument("--frames-only", type=int, default=0,
                         help="render only the first N replay frames as PNGs, for a quick look")
     args = parser.parse_args(argv)
+    if args.speed <= 0:
+        raise SystemExit("--speed must be positive")
 
     capture: Path = args.capture_dir
     manifest = json.loads((capture / "capture_manifest.json").read_text())
@@ -631,7 +697,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if mismatched:
         raise SystemExit(f"arms replayed different contexts, first: {mismatched[0]}")
 
-    renderer = Renderer(stock, tuned, manifest)
+    renderer = Renderer(stock, tuned, manifest, speed=args.speed)
     print(f"stock  {stock.duration:.1f}s  {stock.total_tokens} tok  "
           f"accepted {accepted_text(stock.mean_accepted_length)}")
     print(f"tuned  {tuned.duration:.1f}s  {tuned.total_tokens} tok  "

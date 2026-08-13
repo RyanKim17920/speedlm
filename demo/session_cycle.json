@@ -1,0 +1,96 @@
+{
+  "typing_delay": 0.018,
+  "settle": 2.0,
+  "steps": [
+    {
+      "comment": "SpeedLM is a drop-in for vLLM. The whole launch, verbatim:",
+      "command": "sed -n '100,108p' demo/cycle.sbatch",
+      "pause_before": 0.6,
+      "pause_after": 5.0
+    },
+    {
+      "comment": "You wrote 'vllm serve MODEL'. Now: 'speedlm vllm serve MODEL'.",
+      "pause_after": 1.6
+    },
+    {
+      "comment": "Every other flag is stock vLLM. The new one: --enable-idle-tuning.",
+      "pause_after": 1.6
+    },
+    {
+      "comment": "That command is running right now, on a real GPU node:",
+      "command": "squeue -u ryan.kim --name=speedlm-demo-cycle -o \"%.9i %.10T %.8M %.6D %.6N %j\"",
+      "pause_before": 0.4,
+      "pause_after": 4.0
+    },
+    {
+      "command": "export RUN=/data/ryan.kim/speedlm-runs/demo-cycle-run10; export H=$RUN/speedlm_home",
+      "pause_before": 0.3,
+      "pause_after": 1.2
+    },
+    {
+      "comment": "Before the cycle: real captured traffic, no trained draft yet.",
+      "command": "echo \"traces      $(wc -l < $H/traces/traces.jsonl) captured records\"; echo \"tuner state $(jq -r '.state+\"  (\"+.reason+\")\"' $H/runs/state.json 2>/dev/null || echo 'starting up')\"; echo \"draft head  $(jq -r .artifact_id $H/runs/active.json 2>/dev/null || echo 'none - serving the stock Eagle3 head')\"",
+      "pause_before": 0.4,
+      "pause_after": 5.0
+    },
+    {
+      "comment": "A plain vLLM server would now sit idle doing nothing. Watch this.",
+      "pause_after": 1.5
+    },
+    {
+      "comment": "Live phase machine. It arms itself when traffic stops.",
+      "command": "timeout 205 tail -F -n +1 $H/runs/events.jsonl 2>/dev/null | jq --unbuffered -r '\"\\(.timestamp|floor|todate|.[11:19])  \\(.from//\"-\") -> \\(.to)  \\(.reason[0:44])\"' | awk '{print;fflush()} /> TRAINING/{exit}'",
+      "pause_before": 0.5,
+      "pause_after": 215.0
+    },
+    {
+      "comment": "vLLM is asleep. The GPU is now training a real Eagle3 head.",
+      "pause_after": 2.0
+    },
+    {
+      "comment": "Real optimizer steps, streaming out of the trainer as they happen:",
+      "command": "timeout 340 bash -c 'until S=$(ls $H/runs/*/training-logs/stdout.log 2>/dev/null); [ -n \"$S\" ]; do sleep 2; done; exec tail -F -n +1 $S' | awk 'match($0,/train.loss=[0-9.]+/){L=substr($0,RSTART+11,RLENGTH-11)} match($0,/global_step=[0-9]+/){N=substr($0,RSTART+12,RLENGTH-12)+0; if(N%3==0){printf \"  step %-3d  train/loss = %s\\n\",N,L;fflush()}} match($0,/val.loss_epoch=[0-9.]+/){E++;printf \"EPOCH %d done   val/loss_epoch = %s\\n\",E,substr($0,RSTART+15,RLENGTH-15);fflush();if(E==3)exit}'",
+      "pause_before": 0.5,
+      "pause_after": 350.0
+    },
+    {
+      "comment": "Loss fell for real. Does the new head actually serve faster?",
+      "pause_after": 2.0
+    },
+    {
+      "comment": "Back to the live phase machine for the benchmark and the gate:",
+      "command": "timeout 480 tail -F -n +6 $H/runs/events.jsonl 2>/dev/null | jq --unbuffered -r '\"\\(.timestamp|floor|todate|.[11:19])  \\(.from//\"-\") -> \\(.to)  \\(.reason[0:44])\"' | awk '{print;fflush()} /-> READY/{exit}'",
+      "pause_before": 0.5,
+      "pause_after": 492.0
+    },
+    {
+      "comment": "The whole arc, with the real wall time each phase took:",
+      "command": "CAND=$(dirname $(ls $H/runs/*/decision.json | head -1)); jq -r '[.timestamp,(.from//\"START\"),.to,.reason]|@tsv' $H/runs/events.jsonl | awk -F'\\t' 'NR==1{t0=$1;p=$1} {d=$1-p;p=$1;printf \"%-18s -> %-18s %7.1fs  %s\\n\",$2,$3,d,substr($4,1,42)} END{printf \"%-18s    %-18s %7.1fs  %s\\n\",\"\",\"TOTAL\",$1-t0,\"wall clock\"}'",
+      "pause_before": 0.5,
+      "pause_after": 10.0
+    },
+    {
+      "comment": "The training loss the run wrote to disk, start to finish:",
+      "command": "awk 'match($0,/train.loss=[0-9.]+/){L=substr($0,RSTART+11,RLENGTH-11)} match($0,/global_step=[0-9]+/){N=substr($0,RSTART+12,RLENGTH-12)+0; if(N%3==0)printf \"  step %-3d  train/loss = %s\\n\",N,L} match($0,/val.loss_epoch=[0-9.]+/){E++;printf \"EPOCH %d done   val/loss_epoch = %s\\n\",E,substr($0,RSTART+15,RLENGTH-15)}' $CAND/training-logs/stdout.log",
+      "pause_before": 0.5,
+      "pause_after": 9.0
+    },
+    {
+      "comment": "Held-out validation metrics for that head:",
+      "command": "jq -r 'to_entries[]|\"  \\(.key)\\t\\(.value*10000|round/10000)\"' $CAND/draft-model/val_metrics.json | column -t -s$'\\t'",
+      "pause_before": 0.4,
+      "pause_after": 8.0
+    },
+    {
+      "comment": "The gate verdict -- benchmarked against the stock head:",
+      "command": "jq -r 'def r2:(.*100|round/100); def r3:(.*1000|round/1000); def p(n):(tostring+\"              \")[0:n]; \"VERDICT              \\(.verdict|ascii_upcase)   (\\(.reason))\", \"criterion            \\(.acceptance_criterion)\", \"\", \"                     \\(\"candidate\"|p(12))\\(\"stock\"|p(11))\\(\"delta\"|p(11))threshold\", \"accepted length      \\(.candidate_avg_accepted_length|r3|p(12))\\(.stock_avg_accepted_length|r3|p(11))\\(\"\\(.accepted_length_delta|r3)\"|p(11))>= \\(.min_accepted_length_delta)\", \"acceptance rate      \\(.candidate_avg_acceptance|r3|p(12))\\(.stock_avg_acceptance|r3|p(11))\\(\"\\(.acceptance_delta_pp|r2)pp\"|p(11))>= \\(.min_acceptance_delta_pp)pp\", \"tok/s (replay)       \\(.candidate_avg_tok_per_sec|r2|p(12))\\(.stock_avg_tok_per_sec|r2|p(11))\\(\"\\(.throughput_delta_pct|r2)%\"|p(11))>= \\(.min_throughput_delta_pct)%\", \"tok/s (prometheus)   \\(.candidate_prometheus_decode_tok_per_sec|r2|p(12))\\(.stock_prometheus_decode_tok_per_sec|r2|p(11))\\(\"\\(.prometheus_throughput_delta_pct|r2)%\"|p(11))\", \"\", \"suite                \\(.num_contexts) contexts x \\(.num_repeats) repeats, max_tokens=\\(.benchmark_max_tokens)\", \"output divergences   \\(.output_total_divergences)/\\(.divergence_trials)  (p=\\(.divergence_total_p_value|r3))\", \"stock draft          \\(.stock_draft)\"' $CAND/decision.json | cut -c1-99",
+      "pause_before": 0.5,
+      "pause_after": 12.0
+    },
+    {
+      "comment": "One idle window. No traffic lost, no operator. A faster server.",
+      "pause_before": 0.4,
+      "pause_after": 3.0
+    }
+  ]
+}
