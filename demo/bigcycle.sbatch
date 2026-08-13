@@ -24,10 +24,13 @@ set -euo pipefail
 # 2,277 tokens = 74.6 MB.  A 1536 window leases ~1,120 rows and renders ~1,010,
 # i.e. ~75 GB of shards -- comfortably inside 92 GiB.  A 2048 window would
 # render ~1,500 rows (~112 GiB) and abort mid-extraction, and 3072 is rejected
-# outright by derive_scratch_quota_bytes.  Note that derive_scratch_quota_bytes'
-# own 32 MiB/row budget is a ~2.3x UNDER-estimate for this traffic -- it was
-# fitted on gpt-oss-20b shards -- so the quota here is set from the measured
-# token distribution, not from that formula.
+# outright by derive_scratch_quota_bytes.  That function is now model-aware --
+# it takes hidden_size / num_aux_layers / tokens_per_row and reproduces the
+# expression above, instead of the flat 32 MiB/row it used to charge, which was
+# fitted on gpt-oss-20b and under-estimated this traffic by ~2.3x.  The quota
+# here is still set from the measured token distribution rather than from the
+# function's defaults, because those default to 4,096 tokens/row (~1.5x this
+# corpus's mean) and would price the full 1536-record ceiling above 96 GiB.
 
 repo=/admin/home/ryan.kim/speedlm-fr
 run_dir=${BIGCYCLE_RUN_DIR:-/data/ryan.kim/speedlm-runs/bigcycle-run1}

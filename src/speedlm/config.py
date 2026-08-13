@@ -1024,11 +1024,19 @@ class IdleTuningConfig:
     #: per leased training row, and the lease is bounded by
     #: ``training_window_records``.  This default is
     #: ``speedlm.tuner.eagle3.derive_scratch_quota_bytes(256)`` -- the default
-    #: window -- written out as a literal because importing that module at
-    #: class-definition time would invert the existing lazy import in
-    #: ``__post_init__``::
+    #: window at that function's default geometry -- written out as a literal
+    #: because importing that module at class-definition time would invert the
+    #: existing lazy import in ``__post_init__``::
     #:
-    #:     256 rows x 32 MiB/row + 1 GiB headroom = 9 GiB = 9,663,676,416
+    #:     256 rows x 128 MiB/row + 1 GiB headroom = 33 GiB = 35,433,480,192
+    #:
+    #: The per-row term is the widest builtin verifier geometry (hidden_size
+    #: 4096, three aux layers plus the target, 4,096 tokens/row at bf16), not
+    #: the flat 32 MiB this default used to carry.  That constant was fitted on
+    #: gpt-oss-20b and under-charged Qwen3-8B by 2.3x, and because the quota is
+    #: fail-closed the shortfall surfaced as a cycle dying mid-extraction rather
+    #: than as a config error.  A model-specific run should pass its real
+    #: geometry to ``derive_scratch_quota_bytes`` and set the tighter number.
     #:
     #: The previous default was a flat 5 GiB, and job 369325 died on it: every
     #: archived real run had overridden it to 20 GiB, so the one run that
@@ -1038,7 +1046,7 @@ class IdleTuningConfig:
     #:
     #: A run that raises ``training_window_records`` must raise this with it;
     #: ``derive_scratch_quota_bytes`` is the function that says by how much.
-    scratch_quota_bytes: int = 9 * 1024 * 1024 * 1024
+    scratch_quota_bytes: int = 33 * 1024 * 1024 * 1024
     shutdown_timeout_seconds: float = 30.0
     #: Budget for ``restore``'s wake-instead-of-respawn fast path.
     #:

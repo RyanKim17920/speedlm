@@ -55,21 +55,57 @@ from speedlm.training.masking import FinalAssistantMaskError, MaskPolicy
 # filesystem.
 MAX_SCRATCH_BYTES = 96 * 1024 * 1024 * 1024
 
-#: Byte budget charged to one leased training row's hidden-state shard.
+#: Floor on the byte budget charged to one leased training row's shard.
 #:
 #: Extraction writes exactly one ``hs_<index>.safetensors`` per leased row --
 #: ``data_generation_offline.py --max-samples`` is the leased row count -- and a
 #: shard is ``tokens_in_row x (num_aux_layers + 1) x hidden_size x 2`` bytes.
-#: For gpt-oss-20b (``hidden_size`` 2880, three aux layers plus the appended
-#: target layer) that is ``4 x 2880 x 2 = 23,040`` bytes per token, so 32 MiB
-#: buys a ~1,456-token row.  The number is not a guess: job 369325's failure
-#: inventory sampled 64 shards with a mean of 15.8 MB and a **maximum of
-#: 31,460,688 B**, and 32 MiB is that maximum rounded up to a power of two.
+#: This constant is what that expression evaluated to for the *one* model it was
+#: ever fitted on: job 369325's failure inventory sampled 64 gpt-oss-20b shards
+#: (``hidden_size`` 2880, three aux layers plus the appended target layer, so
+#: ``4 x 2880 x 2 = 23,040`` bytes per token) with a mean of 15.8 MB and a
+#: **maximum of 31,460,688 B**, and 32 MiB is that maximum rounded up to a power
+#: of two.
 #:
-#: It is a budget, not a bound.  ``sequence_length`` permits rows several times
-#: longer, which is what :data:`SCRATCH_HEADROOM_BYTES` and the
-#: :data:`MAX_SCRATCH_BYTES` ceiling above it are for.
+#: It is no longer the budget.  A flat per-row constant cannot survive a change
+#: of model: Qwen3-8B has ``hidden_size`` 4096, i.e. 32,768 bytes per token, and
+#: the agentic corpus measured by job 380039 has a mean row of 2,277 tokens =
+#: 74.6 MB -- a 2.3x under-estimate that killed a 96-record window against a
+#: 4 GiB cap mid-extraction.  :func:`shard_bytes_per_row` computes the budget
+#: from geometry instead; this constant survives only as its *floor*, so that
+#: no model can ever be provisioned below the one figure that was measured.
 SHARD_BYTES_PER_ROW = 32 * 1024 * 1024
+
+#: Width of one hidden-state element as extraction writes it (bf16).
+HIDDEN_STATE_DTYPE_BYTES: Final = 2
+
+#: Aux hidden states captured when nothing pins the count.
+#:
+#: The same fallback :func:`speedlm.profiles.resolve_target_layer_ids` uses, and
+#: for the same reason -- it is vLLM's default when the drafter config declares
+#: neither ``num_aux_hidden_states`` nor ``eagle_aux_hidden_state_layer_ids``.
+DEFAULT_AUX_LAYER_COUNT: Final = 3
+
+#: ``hidden_size`` charged when the verifier's own config cannot be read.
+#:
+#: The widest verifier among the builtin profiles (Qwen3-8B, 4096; gpt-oss-20b
+#: is 2880, Llama-3.1-8B 4096).  Deliberately the widest and not the mean: an
+#: unknown model must be charged *more* than it probably needs, never less.
+DEFAULT_HIDDEN_SIZE: Final = 4096
+
+#: Tokens charged to one row when the corpus has not been measured.
+#:
+#: Rows are not uniform and the quota bounds their *sum*, so the honest input
+#: here is a mean-with-margin rather than a maximum: the largest mean observed
+#: across the measured corpora is 2,700 tokens (job 376291; job 380039's
+#: agentic corpus is 2,277), and 4,096 is that rounded up hard -- ~1.5x the
+#: worst measured mean.  ``sequence_length`` caps individual rows far higher
+#: (16,384 by default, and job 376291 saw a 12,873-token row), but charging
+#: every row the cap would price a 256-row window at 137 GB and make the
+#: default window unprovisionable, which is not conservatism, it is a broken
+#: default.  Callers that have measured their traffic should pass
+#: ``tokens_per_row`` and tighten this.
+DEFAULT_TOKENS_PER_ROW: Final = 4096
 
 #: Scratch occupied by everything that is not a hidden-state shard.
 #:
@@ -83,7 +119,81 @@ SHARD_BYTES_PER_ROW = 32 * 1024 * 1024
 SCRATCH_HEADROOM_BYTES = 1024 * 1024 * 1024
 
 
-def derive_scratch_quota_bytes(training_window_records: int) -> int:
+def _positive_int_arg(value: int, name: str) -> int:
+    """Return *value*, or raise ``ValueError`` naming *name* if it is not > 0."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ValueError(f"{name} must be a positive integer")
+    if value <= 0:
+        raise ValueError(f"{name} must be a positive integer, got {value}")
+    return value
+
+
+def shard_bytes_per_row(
+    *,
+    hidden_size: int = DEFAULT_HIDDEN_SIZE,
+    num_aux_layers: int = DEFAULT_AUX_LAYER_COUNT,
+    tokens_per_row: int = DEFAULT_TOKENS_PER_ROW,
+    sequence_length: int | None = None,
+    dtype_bytes: int = HIDDEN_STATE_DTYPE_BYTES,
+) -> int:
+    """Return the scratch charged to one leased row, from the model's geometry.
+
+    Extraction writes one ``hs_<index>.safetensors`` per leased row holding the
+    aux hidden states *plus* the final target hidden state, so::
+
+        bytes_per_row = tokens_per_row
+                        x (num_aux_layers + 1)
+                        x hidden_size
+                        x dtype_bytes
+
+    **Direction of error: this over-estimates, deliberately.**  It guards a
+    fail-closed limit -- exceeding the quota aborts a cycle mid-extraction,
+    after the GPU time has already been spent -- so an over-estimate costs disk
+    on a filesystem with terabytes free, while an under-estimate costs the run.
+    Three separate choices all round the same way: ``tokens_per_row`` defaults
+    to ~1.5x the worst measured mean row, ``hidden_size`` defaults to the widest
+    builtin verifier, and the result is floored at :data:`SHARD_BYTES_PER_ROW`
+    so no geometry can ever be charged less than the one shard size that was
+    actually measured on disk.
+
+    Args:
+        hidden_size: the verifier's ``hidden_size``.  See
+            :func:`verifier_hidden_size` for reading it off the snapshot.
+        num_aux_layers: how many aux hidden states are captured, i.e.
+            ``len(target_layer_ids)``.  The ``+ 1`` for the final hidden state
+            is applied here, not by the caller.
+        tokens_per_row: tokens charged to each row.
+        sequence_length: the training truncation cap, when known.  A row cannot
+            be longer than it, so it tightens *tokens_per_row* -- it never
+            raises it.
+        dtype_bytes: width of one hidden-state element.
+
+    Returns:
+        The per-row byte budget, never below :data:`SHARD_BYTES_PER_ROW`.
+
+    Raises:
+        ValueError: if any argument is not a positive integer.
+    """
+    _positive_int_arg(hidden_size, "hidden_size")
+    _positive_int_arg(num_aux_layers, "num_aux_layers")
+    _positive_int_arg(tokens_per_row, "tokens_per_row")
+    _positive_int_arg(dtype_bytes, "dtype_bytes")
+    if sequence_length is not None:
+        _positive_int_arg(sequence_length, "sequence_length")
+        tokens_per_row = min(tokens_per_row, sequence_length)
+    derived = tokens_per_row * (num_aux_layers + 1) * hidden_size * dtype_bytes
+    return max(derived, SHARD_BYTES_PER_ROW)
+
+
+def derive_scratch_quota_bytes(
+    training_window_records: int,
+    *,
+    hidden_size: int = DEFAULT_HIDDEN_SIZE,
+    num_aux_layers: int = DEFAULT_AUX_LAYER_COUNT,
+    tokens_per_row: int = DEFAULT_TOKENS_PER_ROW,
+    sequence_length: int | None = None,
+    dtype_bytes: int = HIDDEN_STATE_DTYPE_BYTES,
+) -> int:
     """Return the scratch quota a *training_window_records*-row cycle needs.
 
     The quota is derived from the one thing that actually sizes scratch --
@@ -91,46 +201,103 @@ def derive_scratch_quota_bytes(training_window_records: int) -> int:
     training rows, which is bounded above by ``tuning.training_window_records``
     -- rather than picked as a round number::
 
-        quota = training_window_records * SHARD_BYTES_PER_ROW
+        quota = training_window_records * shard_bytes_per_row(<geometry>)
                 + SCRATCH_HEADROOM_BYTES
 
-    Job 369325 is the worked example of getting this wrong.  It leased 409 rows
-    against a 5 GiB (5,368,709,120 B) quota and aborted at 5,384,048,233 B, a
-    0.29 % overshoot that read like a rounding accident.  It was not: at the
-    observed 15.8 MB mean shard those 409 rows needed ``409 x 15.8 MB =
-    6.47 GB``, so the run was ~21 % under-provisioned on the mean and would
-    have needed ``512 x 15.8 MB = 8.09 GB`` had the window filled.  The quota
-    was not marginally too small, it could never have completed.
+    The per-row term is **model-aware** (see :func:`shard_bytes_per_row`) and
+    errs high; it used to be the flat 32 MiB :data:`SHARD_BYTES_PER_ROW`, which
+    was fitted on gpt-oss-20b and under-estimated Qwen3-8B's shards by 2.3x.
+    Because the quota is fail-closed and enforced on every stage tick, that
+    under-estimate did not show up as a warning at composition time -- it killed
+    cycles mid-extraction with ``scratch quota exceeded``.
+
+    Job 369325 is the worked example of getting this wrong in the other
+    direction.  It leased 409 rows against a 5 GiB (5,368,709,120 B) quota and
+    aborted at 5,384,048,233 B, a 0.29 % overshoot that read like a rounding
+    accident.  It was not: at the observed 15.8 MB mean shard those 409 rows
+    needed ``409 x 15.8 MB = 6.47 GB``, so the run was ~21 % under-provisioned
+    on the mean and would have needed ``512 x 15.8 MB = 8.09 GB`` had the window
+    filled.  The quota was not marginally too small, it could never have
+    completed.
 
     Args:
         training_window_records: the configured lease ceiling in records.
+        hidden_size: see :func:`shard_bytes_per_row`.
+        num_aux_layers: see :func:`shard_bytes_per_row`.
+        tokens_per_row: see :func:`shard_bytes_per_row`.
+        sequence_length: see :func:`shard_bytes_per_row`.
+        dtype_bytes: see :func:`shard_bytes_per_row`.
 
     Returns:
         The derived quota in bytes.
 
     Raises:
-        ValueError: if *training_window_records* is not a positive integer, or
-            if the derived quota exceeds :data:`MAX_SCRATCH_BYTES` -- a window
-            that cannot be provisioned within the hard ceiling is a
-            configuration error, not something to silently clamp.
+        ValueError: if any argument is not a positive integer, or if the derived
+            quota exceeds :data:`MAX_SCRATCH_BYTES` -- a window that cannot be
+            provisioned within the hard ceiling is a configuration error, not
+            something to silently clamp.  This is the early, cheap failure that
+            replaces dying mid-extraction, so its message names the geometry
+            that produced the number and the window size that would fit.
     """
-    if isinstance(training_window_records, bool) or not isinstance(
-        training_window_records, int
-    ):
-        raise ValueError("training_window_records must be a positive integer")
-    if training_window_records <= 0:
-        raise ValueError(
-            f"training_window_records must be a positive integer, "
-            f"got {training_window_records}"
-        )
-    derived = training_window_records * SHARD_BYTES_PER_ROW + SCRATCH_HEADROOM_BYTES
+    _positive_int_arg(training_window_records, "training_window_records")
+    per_row = shard_bytes_per_row(
+        hidden_size=hidden_size,
+        num_aux_layers=num_aux_layers,
+        tokens_per_row=tokens_per_row,
+        sequence_length=sequence_length,
+        dtype_bytes=dtype_bytes,
+    )
+    derived = training_window_records * per_row + SCRATCH_HEADROOM_BYTES
     if derived > MAX_SCRATCH_BYTES:
+        charged_tokens = (
+            tokens_per_row
+            if sequence_length is None
+            else min(tokens_per_row, sequence_length)
+        )
+        fits = (MAX_SCRATCH_BYTES - SCRATCH_HEADROOM_BYTES) // per_row
         raise ValueError(
             f"a {training_window_records}-record window needs {derived} bytes of "
             f"scratch, which exceeds MAX_SCRATCH_BYTES ({MAX_SCRATCH_BYTES}); "
-            f"lower tuning.training_window_records or raise the ceiling"
+            f"geometry: hidden_size={hidden_size}, num_aux_layers={num_aux_layers} "
+            f"(+1 target), {charged_tokens} tokens/row at {dtype_bytes} B/element "
+            f"= {per_row} bytes per row. Lower tuning.training_window_records to "
+            f"at most {fits}, or raise the ceiling"
         )
     return derived
+
+
+def verifier_hidden_size(model: str) -> int | None:
+    """Return *model*'s ``hidden_size`` from its cached snapshot, or ``None``.
+
+    Best-effort by design, unlike its strict sibling
+    :func:`verifier_vocab_size`:
+    an unreadable vocab mapping must abort a publish, but an unreadable
+    ``hidden_size`` only means the caller falls back to
+    :data:`DEFAULT_HIDDEN_SIZE`, which is the widest builtin verifier and
+    therefore errs towards a *larger* quota.  Failing the cycle over it would
+    trade a safe over-estimate for an outage.
+
+    Multimodal verifiers nest the text geometry under ``text_config``; the same
+    unwrapping :func:`verifier_vocab_size` does is applied here.
+    """
+    directory = cached_snapshot_dir(model)
+    if directory is None:
+        return None
+    try:
+        payload = json.loads(
+            (directory / _DRAFT_CONFIG_NAME).read_text(encoding="utf-8")
+        )
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    text_config = payload.get("text_config")
+    if isinstance(text_config, dict) and "hidden_size" in text_config:
+        payload = text_config
+    size = payload.get("hidden_size")
+    if isinstance(size, bool) or not isinstance(size, int) or size <= 0:
+        return None
+    return size
 
 
 AbortCheck = Callable[[], bool]

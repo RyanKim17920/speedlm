@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import tempfile
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -33,10 +34,12 @@ from speedlm.training.backends.speculators_runner import (
 )
 from speedlm.training.check_prepared_dataset import _column
 from speedlm.tuner.eagle3 import (
+    DEFAULT_TOKENS_PER_ROW,
     SCRATCH_HEADROOM_BYTES,
     SHARD_BYTES_PER_ROW,
     derive_scratch_quota_bytes,
     scratch_usage,
+    shard_bytes_per_row,
 )
 from speedlm.tuner.idle import TuningPreempted
 
@@ -1531,14 +1534,154 @@ def test_a_tree_whose_contents_reappear_is_retried_then_still_raises(
 
 def test_the_scratch_quota_is_derived_from_the_shard_count() -> None:
     """One shard per leased row, plus a fixed non-shard headroom."""
-    assert derive_scratch_quota_bytes(1) == SHARD_BYTES_PER_ROW + SCRATCH_HEADROOM_BYTES
-    assert derive_scratch_quota_bytes(256) == 256 * SHARD_BYTES_PER_ROW + (
-        SCRATCH_HEADROOM_BYTES
-    )
+    per_row = shard_bytes_per_row()
+    assert derive_scratch_quota_bytes(1) == per_row + SCRATCH_HEADROOM_BYTES
+    assert derive_scratch_quota_bytes(256) == 256 * per_row + SCRATCH_HEADROOM_BYTES
     #: The arithmetic that job 369325 needed and did not have: its window was
-    #: 512 records, so 512 x 32 MiB + 1 GiB = 17 GiB.
-    assert derive_scratch_quota_bytes(512) == 17 * 1024**3
+    #: 512 records, and at the default geometry a row costs 128 MiB, so
+    #: 512 x 128 MiB + 1 GiB = 65 GiB.
+    assert derive_scratch_quota_bytes(512) == 65 * 1024**3
     assert derive_scratch_quota_bytes(512) <= MAX_SCRATCH_BYTES
+
+
+# ---------------------------------------------------------------------------
+# ... and the per-row term is the model's geometry, not a constant.
+#
+# The constant it replaced (32 MiB) was fitted on gpt-oss-20b shards and
+# under-charged Qwen3-8B by 2.3x.  Because the quota is fail-closed and checked
+# on every stage tick, that shortfall could not surface as a configuration
+# error -- it killed cycles mid-extraction, after the GPU time was spent.
+# ---------------------------------------------------------------------------
+
+
+def _measured_row_bytes(*, hidden_size: int, aux_layers: int, tokens: int) -> int:
+    """Shard bytes as extraction actually writes them, for one measured row."""
+    return tokens * (aux_layers + 1) * hidden_size * 2
+
+
+def test_qwen3_8b_rows_cost_far_more_than_the_old_flat_budget() -> None:
+    """The bug: a per-row constant cannot follow a change of hidden_size.
+
+    Job 380039's agentic corpus measured a mean Qwen3-8B row of 2,277 tokens.
+    With hidden_size 4096 and three aux layers plus the target that is
+    ``2,277 x 4 x 4096 x 2 = 74.6 MB`` -- 2.2x the 32 MiB the old derivation
+    charged, so a 96-record window "fitted" a 4 GiB cap on paper and then
+    aborted mid-extraction.
+    """
+    measured = _measured_row_bytes(hidden_size=4096, aux_layers=3, tokens=2_277)
+    assert measured > 2 * SHARD_BYTES_PER_ROW, "the old budget was not merely tight"
+
+    derived = shard_bytes_per_row(hidden_size=4096, num_aux_layers=3)
+    assert derived >= measured, "the per-row budget must cover the measured row"
+
+    #: The incident, arithmetically: 96 records against a 4 GiB cap.
+    window = 96
+    assert window * measured > 4 * 1024**3, "the window really did overrun 4 GiB"
+    assert derive_scratch_quota_bytes(window, hidden_size=4096, num_aux_layers=3) > (
+        window * measured
+    )
+    #: And what the old derivation would have provisioned for that same window.
+    old_quota = window * SHARD_BYTES_PER_ROW + SCRATCH_HEADROOM_BYTES
+    assert old_quota < window * measured, "the old quota could never have completed"
+
+
+def test_gpt_oss_20b_does_not_regress_under_the_new_derivation() -> None:
+    """The model the old constant was fitted on must not lose provisioning.
+
+    Under-estimating is the dangerous direction, so the new value has to be
+    >= the old one for gpt-oss-20b (hidden_size 2880, three aux layers plus the
+    target) at every window size -- otherwise something that used to fit would
+    now die.
+    """
+    gpt_oss_per_row = shard_bytes_per_row(hidden_size=2880, num_aux_layers=3)
+    assert gpt_oss_per_row >= SHARD_BYTES_PER_ROW
+
+    #: The largest shard job 369325 actually inventoried, still covered.
+    assert gpt_oss_per_row >= 31_460_688
+
+    for window in (1, 96, 256, 512):
+        old = window * SHARD_BYTES_PER_ROW + SCRATCH_HEADROOM_BYTES
+        new = derive_scratch_quota_bytes(
+            window, hidden_size=2880, num_aux_layers=3
+        )
+        assert new >= old, f"{window}-record gpt-oss window lost scratch"
+
+
+def test_a_narrow_geometry_never_falls_below_the_one_measured_shard_size() -> None:
+    """The floor: a tiny model cannot be charged less than we ever measured."""
+    tiny = shard_bytes_per_row(hidden_size=64, num_aux_layers=1, tokens_per_row=8)
+    assert tiny == SHARD_BYTES_PER_ROW
+
+
+def test_sequence_length_tightens_the_row_budget_but_never_raises_it() -> None:
+    """A row cannot exceed the truncation cap, so the cap is an upper bound."""
+    short = shard_bytes_per_row(
+        hidden_size=4096, num_aux_layers=3, sequence_length=1_024
+    )
+    unbounded = shard_bytes_per_row(hidden_size=4096, num_aux_layers=3)
+    assert short < unbounded
+
+    #: A cap above the charged token count changes nothing -- it must not be
+    #: read as permission to charge less than DEFAULT_TOKENS_PER_ROW.
+    generous = shard_bytes_per_row(
+        hidden_size=4096,
+        num_aux_layers=3,
+        sequence_length=DEFAULT_TOKENS_PER_ROW * 4,
+    )
+    assert generous == unbounded
+
+
+def test_more_aux_layers_cost_more_scratch() -> None:
+    """The ``+ 1`` target hidden state is part of the shard, and counted."""
+    three = shard_bytes_per_row(hidden_size=4096, num_aux_layers=3)
+    seven = shard_bytes_per_row(hidden_size=4096, num_aux_layers=7)
+    assert seven == 2 * three  # (7 + 1) / (3 + 1)
+
+
+def test_an_unprovisionable_geometry_fails_early_and_names_the_geometry() -> None:
+    """The ceiling failure has to be actionable, not just fatal.
+
+    Failing here is the cheap failure: it happens at composition time instead
+    of part-way through hidden-state extraction, so the message must carry the
+    geometry that produced the number and a window size that would fit.
+    """
+    with pytest.raises(ValueError) as excinfo:
+        derive_scratch_quota_bytes(1_024, hidden_size=4096, num_aux_layers=3)
+
+    message = str(excinfo.value)
+    assert "exceeds MAX_SCRATCH_BYTES" in message
+    assert "hidden_size=4096" in message
+    assert "num_aux_layers=3" in message
+    assert f"{DEFAULT_TOKENS_PER_ROW} tokens/row" in message
+    assert "bytes per row" in message
+
+    #: The suggested window must actually fit, or the advice is noise.
+    match = re.search(r"at most (\d+)", message)
+    assert match is not None, message
+    suggested = int(match.group(1))
+    assert suggested > 0
+    assert (
+        derive_scratch_quota_bytes(suggested, hidden_size=4096, num_aux_layers=3)
+        <= MAX_SCRATCH_BYTES
+    )
+    with pytest.raises(ValueError, match="exceeds MAX_SCRATCH_BYTES"):
+        derive_scratch_quota_bytes(
+            suggested + 1, hidden_size=4096, num_aux_layers=3
+        )
+
+
+def test_geometry_arguments_are_validated_like_the_window_is() -> None:
+    """Garbage geometry must not silently produce a garbage budget."""
+    for kwargs in (
+        {"hidden_size": 0},
+        {"num_aux_layers": -1},
+        {"tokens_per_row": 0},
+        {"dtype_bytes": 0},
+        {"sequence_length": 0},
+        {"hidden_size": True},
+    ):
+        with pytest.raises(ValueError, match="must be a positive integer"):
+            shard_bytes_per_row(**kwargs)  # type: ignore[arg-type]
 
 
 def test_the_derived_quota_covers_what_job_369325_actually_wrote() -> None:
