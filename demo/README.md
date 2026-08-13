@@ -85,12 +85,20 @@ sbatch demo/cycle.sbatch
 .venv/bin/python demo/session_render.py \
     /data/ryan.kim/speedlm-runs/demo-cycle-run10/speedlm-cycle.cast \
     /data/ryan.kim/speedlm-runs/demo-cycle-run10/speedlm-cycle.mp4 \
-    --max-gap 3.0
+    --max-gap 3.0 \
+    --timing-out /data/ryan.kim/speedlm-runs/demo-cycle-run10/speedlm-cycle.timing.json
 ```
 
 `--max-gap 3.0` is what produced the shipped 149.97s cut from a 1215.2s recording
 (16 gaps compressed). `--max-gap 0` disables compression and plays the recording
 at its real pace.
+
+`--timing-out` writes a JSON sidecar stating how the clock was bent: piecewise-linear
+`[cast_t, video_t]` breakpoints plus the compressed gaps and their real durations.
+Only the renderer knows that mapping, and without it nothing can put an overlay on the
+frame where a line appeared. `demo/remotion/extract_series.py` reads it (together with
+the `.cast`) to stamp every chart datum with that frame; the flag is additive, and
+omitting it changes nothing about the video.
 
 ### Segment 2 — stock vs tuned, side by side
 

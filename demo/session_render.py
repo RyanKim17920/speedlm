@@ -51,7 +51,7 @@ Usage:
 
     python demo/session_render.py session.cast session.mp4 \\
         [--fps 30] [--font-size 28] [--width 1920] [--height 1080] \\
-        [--max-gap 2.0] [--speed 1.0]
+        [--max-gap 2.0] [--speed 1.0] [--timing-out session.timing.json]
 
 ``--max-gap 0`` disables gap compression entirely and plays the recording at its
 real pace.  The default is 2.0 seconds, because unbounded dead air is never what
@@ -187,12 +187,17 @@ class Gap:
 
     ``start`` and ``end`` are on the *rendered* clock, which is what the frame
     loop counts in; ``real`` is the wall time the recording actually spent
-    there, which is what the marker has to say out loud.
+    there, which is what the marker has to say out loud.  ``cast_start`` and
+    ``cast_end`` are the same stretch on the recording's own clock, kept so the
+    timing sidecar can state the mapping in both directions rather than only in
+    the one the frame loop happens to need.
     """
 
     start: float
     end: float
     real: float
+    cast_start: float
+    cast_end: float
 
 
 def format_duration(seconds: float) -> str:
@@ -231,11 +236,98 @@ def compress_timeline(
         idle = t - prev
         if max_gap > 0 and idle > max_gap:
             start = prev - removed
-            gaps.append(Gap(start=start / speed, end=(start + max_gap) / speed, real=idle))
+            gaps.append(
+                Gap(
+                    start=start / speed,
+                    end=(start + max_gap) / speed,
+                    real=idle,
+                    cast_start=prev,
+                    cast_end=t,
+                )
+            )
             removed += idle - max_gap
         shifted.append(((t - removed) / speed, data))
         prev = t
     return shifted, gaps
+
+
+def timing_sidecar(
+    *,
+    cast: Path,
+    out: Path,
+    gaps: list[Gap],
+    fps: int,
+    max_gap: float,
+    speed: float,
+    tail: float,
+    total_cast_seconds: float,
+    total_video_seconds: float,
+    n_frames: int,
+) -> dict:
+    """Describe the cast-clock -> video-clock mapping this render applied.
+
+    Why this exists at all: anything that wants to draw *over* the video at the
+    moment a particular line hit the terminal -- a chart that fills in as the
+    numbers scroll past, a caption pinned to an event -- has to know where that
+    moment landed, and after gap compression the two clocks are no longer
+    related by a constant.  Only the renderer knows how the clock was bent, so
+    only the renderer can say; a consumer guessing from ratios of the two
+    durations will be wrong by however much dead air happened to sit before the
+    event.  Emitting the mapping is what keeps such an overlay a measurement
+    instead of a guess.
+
+    The mapping is exactly piecewise linear, so ``breakpoints`` -- ``[cast_t,
+    video_t]`` knots, in order -- states it without loss and in a handful of
+    entries: linearly interpolate between the bracketing pair.  The knots sit at
+    the edges of every compressed gap (the only places the slope changes), plus
+    the origin and the last event.  Inside a gap the interpolation spreads the
+    real elapsed time uniformly across the shortened stretch, which is the same
+    thing the on-screen marker claims; no event is fed to the emulator there, so
+    nothing observable depends on the choice.
+
+    Times are seconds.  ``video_t * fps`` is the frame the moment lands on, and
+    frames past ``total_video_seconds`` are the held tail, not recorded time.
+    """
+    knots: list[tuple[float, float]] = [(0.0, 0.0)]
+    for gap in gaps:
+        knots.append((gap.cast_start, gap.start))
+        knots.append((gap.cast_end, gap.end))
+    knots.append((total_cast_seconds, total_video_seconds - tail))
+
+    # A gap that opens at t=0 duplicates the origin knot; a strictly increasing
+    # list is what makes interpolation on the consumer side unambiguous.
+    breakpoints: list[list[float]] = []
+    for cast_t, video_t in knots:
+        if breakpoints and cast_t <= breakpoints[-1][0]:
+            continue
+        breakpoints.append([round(cast_t, 6), round(video_t, 6)])
+    if breakpoints[0][0] > 0.0:
+        breakpoints.insert(0, [0.0, 0.0])
+
+    doc = {
+        "schema": "speedlm-session-timing/1",
+        "cast": str(cast),
+        "video": str(out),
+        "fps": fps,
+        "max_gap": max_gap,
+        "speed": speed,
+        "tail_seconds": tail,
+        "total_cast_seconds": round(total_cast_seconds, 6),
+        "total_video_seconds": round(total_video_seconds, 6),
+        "total_frames": n_frames,
+        "breakpoints": breakpoints,
+        "gaps": [
+            {
+                "cast_start": round(g.cast_start, 6),
+                "cast_end": round(g.cast_end, 6),
+                "video_start": round(g.start, 6),
+                "video_end": round(g.end, 6),
+                "real_seconds": round(g.real, 6),
+            }
+            for g in gaps
+        ],
+    }
+    return doc
 
 
 def snapshot(screen: pyte.Screen) -> tuple[tuple, tuple[int, int] | None]:
@@ -426,6 +518,13 @@ def main() -> None:
              "0 disables compression and plays the recording at its real pace",
     )
     ap.add_argument(
+        "--timing-out",
+        type=Path,
+        default=None,
+        help="also write a JSON sidecar mapping recording time to video time, "
+             "for overlays that must land on the frame where a line appeared",
+    )
+    ap.add_argument(
         "--speed",
         type=float,
         default=1.0,
@@ -519,6 +618,24 @@ def main() -> None:
         rc = proc.wait()
     if rc != 0:
         raise SystemExit(f"ffmpeg exited {rc}")
+
+    if args.timing_out is not None:
+        doc = timing_sidecar(
+            cast=args.cast,
+            out=args.out,
+            gaps=gaps,
+            fps=args.fps,
+            max_gap=args.max_gap,
+            speed=args.speed,
+            tail=args.tail,
+            total_cast_seconds=real_duration,
+            total_video_seconds=duration,
+            n_frames=n_frames,
+        )
+        args.timing_out.parent.mkdir(parents=True, exist_ok=True)
+        args.timing_out.write_text(json.dumps(doc, indent=2) + "\n")
+        print(f"wrote {args.timing_out}: {len(doc['breakpoints'])} breakpoints, "
+              f"{len(doc['gaps'])} gap(s)")
 
     named = sorted(c for c in renderer.colors_seen if c in PALETTE)
     hexed = sorted(c for c in renderer.colors_seen if c not in PALETTE)

@@ -1,0 +1,22 @@
+{
+  "name": "speedlm-demo-remotion",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Remotion composition: the real SpeedLM terminal capture on the left, live charts from real run artifacts on the right.",
+  "scripts": {
+    "start": "remotion studio",
+    "build": "remotion render SpeedLMDemo out/speedlm-demo.mp4",
+    "preview": "remotion render SpeedLMDemo out/preview.mp4 --frames=0-120",
+    "data": "python3 extract_series.py"
+  },
+  "dependencies": {
+    "@remotion/cli": "4.0.509",
+    "react": "19.0.0",
+    "react-dom": "19.0.0",
+    "remotion": "4.0.509"
+  },
+  "devDependencies": {
+    "@types/react": "19.0.0",
+    "typescript": "5.6.3"
+  }
+}

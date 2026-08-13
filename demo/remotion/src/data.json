@@ -1,0 +1,4227 @@
+{
+  "source": {
+    "run_root": "/data/ryan.kim/speedlm-runs/agentenv-qwen8b-run5",
+    "training_log": "/data/ryan.kim/speedlm-runs/agentenv-qwen8b-run5/speedlm_home/runs/7343677008da41f995f46e6a714036b4/training-logs/stdout.log",
+    "decision": "/data/ryan.kim/speedlm-runs/regate-unseen-run1/decision.json"
+  },
+  "anchors": {
+    "cast": "/data/ryan.kim/speedlm-runs/demo-fast/session_fast.cast",
+    "fps": 30,
+    "total_frames": 1523,
+    "total_cast_seconds": 74.241123,
+    "anchored_terminal": 11,
+    "anchored_inherited": 207,
+    "unanchored": 0,
+    "gate_frame": 1348,
+    "timing": "/data/ryan.kim/speedlm-runs/demo-fast/timing.json"
+  },
+  "training": {
+    "train": [
+      {
+        "step": 0,
+        "epoch": 0,
+        "loss": 10.836,
+        "lr": 0.0,
+        "full_acc": [
+          0.653,
+          0.391,
+          0.206
+        ],
+        "cond_acc": [
+          0.653,
+          0.598,
+          0.527
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "terminal"
+      },
+      {
+        "step": 1,
+        "epoch": 0,
+        "loss": 10.766,
+        "lr": 5e-05,
+        "full_acc": [
+          0.652,
+          0.388,
+          0.2
+        ],
+        "cond_acc": [
+          0.652,
+          0.595,
+          0.516
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 2,
+        "epoch": 0,
+        "loss": 7.594,
+        "lr": 0.0001,
+        "full_acc": [
+          0.737,
+          0.528,
+          0.347
+        ],
+        "cond_acc": [
+          0.737,
+          0.716,
+          0.657
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 3,
+        "epoch": 0,
+        "loss": 8.945,
+        "lr": 9.95e-05,
+        "full_acc": [
+          0.661,
+          0.372,
+          0.186
+        ],
+        "cond_acc": [
+          0.661,
+          0.562,
+          0.501
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 4,
+        "epoch": 0,
+        "loss": 8.43,
+        "lr": 9.91e-05,
+        "full_acc": [
+          0.661,
+          0.359,
+          0.169
+        ],
+        "cond_acc": [
+          0.661,
+          0.543,
+          0.469
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 5,
+        "epoch": 0,
+        "loss": 8.586,
+        "lr": 9.86e-05,
+        "full_acc": [
+          0.662,
+          0.37,
+          0.176
+        ],
+        "cond_acc": [
+          0.662,
+          0.559,
+          0.472
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 6,
+        "epoch": 0,
+        "loss": 6.789,
+        "lr": 9.81e-05,
+        "full_acc": [
+          0.731,
+          0.487,
+          0.307
+        ],
+        "cond_acc": [
+          0.731,
+          0.667,
+          0.625
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 7,
+        "epoch": 0,
+        "loss": 7.469,
+        "lr": 9.77e-05,
+        "full_acc": [
+          0.701,
+          0.441,
+          0.254
+        ],
+        "cond_acc": [
+          0.701,
+          0.629,
+          0.573
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 8,
+        "epoch": 0,
+        "loss": 7.25,
+        "lr": 9.72e-05,
+        "full_acc": [
+          0.71,
+          0.454,
+          0.268
+        ],
+        "cond_acc": [
+          0.71,
+          0.639,
+          0.589
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 9,
+        "epoch": 0,
+        "loss": 6.789,
+        "lr": 9.67e-05,
+        "full_acc": [
+          0.722,
+          0.467,
+          0.284
+        ],
+        "cond_acc": [
+          0.722,
+          0.647,
+          0.608
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 10,
+        "epoch": 0,
+        "loss": 6.773,
+        "lr": 9.63e-05,
+        "full_acc": [
+          0.714,
+          0.46,
+          0.269
+        ],
+        "cond_acc": [
+          0.714,
+          0.643,
+          0.585
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 11,
+        "epoch": 0,
+        "loss": 6.672,
+        "lr": 9.58e-05,
+        "full_acc": [
+          0.725,
+          0.474,
+          0.293
+        ],
+        "cond_acc": [
+          0.725,
+          0.654,
+          0.618
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 12,
+        "epoch": 0,
+        "loss": 5.535,
+        "lr": 9.53e-05,
+        "full_acc": [
+          0.777,
+          0.563,
+          0.392
+        ],
+        "cond_acc": [
+          0.777,
+          0.724,
+          0.696
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 13,
+        "epoch": 0,
+        "loss": 5.039,
+        "lr": 9.49e-05,
+        "full_acc": [
+          0.793,
+          0.588,
+          0.422
+        ],
+        "cond_acc": [
+          0.793,
+          0.742,
+          0.717
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 14,
+        "epoch": 0,
+        "loss": 5.719,
+        "lr": 9.44e-05,
+        "full_acc": [
+          0.751,
+          0.52,
+          0.336
+        ],
+        "cond_acc": [
+          0.751,
+          0.693,
+          0.646
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 15,
+        "epoch": 0,
+        "loss": 5.223,
+        "lr": 9.39e-05,
+        "full_acc": [
+          0.768,
+          0.54,
+          0.365
+        ],
+        "cond_acc": [
+          0.768,
+          0.704,
+          0.676
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 16,
+        "epoch": 0,
+        "loss": 4.996,
+        "lr": 9.35e-05,
+        "full_acc": [
+          0.786,
+          0.579,
+          0.411
+        ],
+        "cond_acc": [
+          0.786,
+          0.737,
+          0.71
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 17,
+        "epoch": 0,
+        "loss": 5.145,
+        "lr": 9.3e-05,
+        "full_acc": [
+          0.79,
+          0.571,
+          0.393
+        ],
+        "cond_acc": [
+          0.79,
+          0.722,
+          0.688
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 18,
+        "epoch": 0,
+        "loss": 4.559,
+        "lr": 9.25e-05,
+        "full_acc": [
+          0.798,
+          0.584,
+          0.407
+        ],
+        "cond_acc": [
+          0.798,
+          0.732,
+          0.696
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 19,
+        "epoch": 0,
+        "loss": 4.273,
+        "lr": 9.21e-05,
+        "full_acc": [
+          0.817,
+          0.62,
+          0.442
+        ],
+        "cond_acc": [
+          0.817,
+          0.759,
+          0.713
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 20,
+        "epoch": 0,
+        "loss": 4.707,
+        "lr": 9.16e-05,
+        "full_acc": [
+          0.788,
+          0.573,
+          0.398
+        ],
+        "cond_acc": [
+          0.788,
+          0.728,
+          0.695
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 21,
+        "epoch": 0,
+        "loss": 4.496,
+        "lr": 9.11e-05,
+        "full_acc": [
+          0.803,
+          0.604,
+          0.442
+        ],
+        "cond_acc": [
+          0.803,
+          0.753,
+          0.731
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 22,
+        "epoch": 0,
+        "loss": 5.352,
+        "lr": 9.07e-05,
+        "full_acc": [
+          0.77,
+          0.558,
+          0.388
+        ],
+        "cond_acc": [
+          0.77,
+          0.725,
+          0.694
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 23,
+        "epoch": 0,
+        "loss": 3.918,
+        "lr": 9.02e-05,
+        "full_acc": [
+          0.818,
+          0.629,
+          0.461
+        ],
+        "cond_acc": [
+          0.818,
+          0.769,
+          0.733
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 24,
+        "epoch": 0,
+        "loss": 3.602,
+        "lr": 8.97e-05,
+        "full_acc": [
+          0.836,
+          0.67,
+          0.511
+        ],
+        "cond_acc": [
+          0.836,
+          0.801,
+          0.763
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 25,
+        "epoch": 0,
+        "loss": 4.781,
+        "lr": 8.93e-05,
+        "full_acc": [
+          0.792,
+          0.571,
+          0.395
+        ],
+        "cond_acc": [
+          0.792,
+          0.721,
+          0.692
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 26,
+        "epoch": 0,
+        "loss": 4.703,
+        "lr": 8.88e-05,
+        "full_acc": [
+          0.792,
+          0.588,
+          0.419
+        ],
+        "cond_acc": [
+          0.792,
+          0.742,
+          0.713
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 27,
+        "epoch": 0,
+        "loss": 4.887,
+        "lr": 8.83e-05,
+        "full_acc": [
+          0.795,
+          0.592,
+          0.434
+        ],
+        "cond_acc": [
+          0.795,
+          0.744,
+          0.732
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 28,
+        "epoch": 0,
+        "loss": 3.816,
+        "lr": 8.79e-05,
+        "full_acc": [
+          0.826,
+          0.629,
+          0.465
+        ],
+        "cond_acc": [
+          0.826,
+          0.761,
+          0.739
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 29,
+        "epoch": 0,
+        "loss": 4.141,
+        "lr": 8.74e-05,
+        "full_acc": [
+          0.811,
+          0.621,
+          0.453
+        ],
+        "cond_acc": [
+          0.811,
+          0.766,
+          0.729
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 30,
+        "epoch": 0,
+        "loss": 4.66,
+        "lr": 8.69e-05,
+        "full_acc": [
+          0.797,
+          0.592,
+          0.419
+        ],
+        "cond_acc": [
+          0.797,
+          0.743,
+          0.708
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "terminal"
+      },
+      {
+        "step": 31,
+        "epoch": 0,
+        "loss": 4.059,
+        "lr": 8.64e-05,
+        "full_acc": [
+          0.817,
+          0.629,
+          0.47
+        ],
+        "cond_acc": [
+          0.817,
+          0.77,
+          0.748
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 32,
+        "epoch": 0,
+        "loss": 4.211,
+        "lr": 8.6e-05,
+        "full_acc": [
+          0.813,
+          0.618,
+          0.446
+        ],
+        "cond_acc": [
+          0.813,
+          0.759,
+          0.722
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 33,
+        "epoch": 0,
+        "loss": 3.07,
+        "lr": 8.55e-05,
+        "full_acc": [
+          0.866,
+          0.714,
+          0.564
+        ],
+        "cond_acc": [
+          0.866,
+          0.825,
+          0.79
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 34,
+        "epoch": 0,
+        "loss": 4.062,
+        "lr": 8.5e-05,
+        "full_acc": [
+          0.822,
+          0.639,
+          0.482
+        ],
+        "cond_acc": [
+          0.822,
+          0.778,
+          0.755
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 35,
+        "epoch": 0,
+        "loss": 3.301,
+        "lr": 8.46e-05,
+        "full_acc": [
+          0.859,
+          0.702,
+          0.554
+        ],
+        "cond_acc": [
+          0.859,
+          0.817,
+          0.79
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 36,
+        "epoch": 0,
+        "loss": 2.73,
+        "lr": 8.41e-05,
+        "full_acc": [
+          0.881,
+          0.755,
+          0.633
+        ],
+        "cond_acc": [
+          0.881,
+          0.857,
+          0.839
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 37,
+        "epoch": 0,
+        "loss": 3.406,
+        "lr": 8.36e-05,
+        "full_acc": [
+          0.849,
+          0.688,
+          0.543
+        ],
+        "cond_acc": [
+          0.849,
+          0.811,
+          0.789
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 38,
+        "epoch": 0,
+        "loss": 3.289,
+        "lr": 8.32e-05,
+        "full_acc": [
+          0.849,
+          0.696,
+          0.561
+        ],
+        "cond_acc": [
+          0.849,
+          0.82,
+          0.806
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 39,
+        "epoch": 0,
+        "loss": 3.609,
+        "lr": 8.27e-05,
+        "full_acc": [
+          0.836,
+          0.66,
+          0.505
+        ],
+        "cond_acc": [
+          0.836,
+          0.79,
+          0.764
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 40,
+        "epoch": 0,
+        "loss": 3.531,
+        "lr": 8.22e-05,
+        "full_acc": [
+          0.841,
+          0.67,
+          0.515
+        ],
+        "cond_acc": [
+          0.841,
+          0.796,
+          0.769
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 41,
+        "epoch": 0,
+        "loss": 3.285,
+        "lr": 8.18e-05,
+        "full_acc": [
+          0.851,
+          0.692,
+          0.547
+        ],
+        "cond_acc": [
+          0.851,
+          0.813,
+          0.79
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 42,
+        "epoch": 0,
+        "loss": 2.1,
+        "lr": 8.13e-05,
+        "full_acc": [
+          0.901,
+          0.788,
+          0.68
+        ],
+        "cond_acc": [
+          0.901,
+          0.875,
+          0.862
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 43,
+        "epoch": 0,
+        "loss": 2.143,
+        "lr": 8.08e-05,
+        "full_acc": [
+          0.903,
+          0.795,
+          0.687
+        ],
+        "cond_acc": [
+          0.903,
+          0.881,
+          0.864
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 44,
+        "epoch": 0,
+        "loss": 1.875,
+        "lr": 8.04e-05,
+        "full_acc": [
+          0.917,
+          0.813,
+          0.701
+        ],
+        "cond_acc": [
+          0.917,
+          0.886,
+          0.863
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 45,
+        "epoch": 0,
+        "loss": 2.027,
+        "lr": 7.99e-05,
+        "full_acc": [
+          0.906,
+          0.802,
+          0.695
+        ],
+        "cond_acc": [
+          0.906,
+          0.885,
+          0.867
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 46,
+        "epoch": 0,
+        "loss": 2.953,
+        "lr": 7.94e-05,
+        "full_acc": [
+          0.857,
+          0.703,
+          0.571
+        ],
+        "cond_acc": [
+          0.857,
+          0.82,
+          0.812
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 47,
+        "epoch": 0,
+        "loss": 2.373,
+        "lr": 7.9e-05,
+        "full_acc": [
+          0.893,
+          0.77,
+          0.649
+        ],
+        "cond_acc": [
+          0.893,
+          0.862,
+          0.844
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 48,
+        "epoch": 0,
+        "loss": 2.248,
+        "lr": 7.85e-05,
+        "full_acc": [
+          0.9,
+          0.789,
+          0.682
+        ],
+        "cond_acc": [
+          0.9,
+          0.877,
+          0.865
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 49,
+        "epoch": 0,
+        "loss": 3.135,
+        "lr": 7.8e-05,
+        "full_acc": [
+          0.853,
+          0.692,
+          0.544
+        ],
+        "cond_acc": [
+          0.853,
+          0.811,
+          0.786
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 50,
+        "epoch": 0,
+        "loss": 1.92,
+        "lr": 7.76e-05,
+        "full_acc": [
+          0.912,
+          0.809,
+          0.705
+        ],
+        "cond_acc": [
+          0.912,
+          0.887,
+          0.871
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 51,
+        "epoch": 0,
+        "loss": 1.727,
+        "lr": 7.71e-05,
+        "full_acc": [
+          0.918,
+          0.822,
+          0.73
+        ],
+        "cond_acc": [
+          0.918,
+          0.895,
+          0.888
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 52,
+        "epoch": 0,
+        "loss": 1.91,
+        "lr": 7.66e-05,
+        "full_acc": [
+          0.914,
+          0.814,
+          0.718
+        ],
+        "cond_acc": [
+          0.914,
+          0.891,
+          0.883
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 53,
+        "epoch": 0,
+        "loss": 2.912,
+        "lr": 7.62e-05,
+        "full_acc": [
+          0.869,
+          0.72,
+          0.577
+        ],
+        "cond_acc": [
+          0.869,
+          0.829,
+          0.802
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 54,
+        "epoch": 0,
+        "loss": 1.996,
+        "lr": 7.57e-05,
+        "full_acc": [
+          0.905,
+          0.799,
+          0.694
+        ],
+        "cond_acc": [
+          0.905,
+          0.883,
+          0.868
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 55,
+        "epoch": 0,
+        "loss": 2.666,
+        "lr": 7.52e-05,
+        "full_acc": [
+          0.874,
+          0.734,
+          0.609
+        ],
+        "cond_acc": [
+          0.874,
+          0.84,
+          0.829
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 56,
+        "epoch": 0,
+        "loss": 1.481,
+        "lr": 7.48e-05,
+        "full_acc": [
+          0.927,
+          0.847,
+          0.769
+        ],
+        "cond_acc": [
+          0.927,
+          0.913,
+          0.908
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 57,
+        "epoch": 0,
+        "loss": 2.359,
+        "lr": 7.43e-05,
+        "full_acc": [
+          0.887,
+          0.762,
+          0.644
+        ],
+        "cond_acc": [
+          0.887,
+          0.858,
+          0.846
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 58,
+        "epoch": 0,
+        "loss": 2.289,
+        "lr": 7.38e-05,
+        "full_acc": [
+          0.895,
+          0.77,
+          0.657
+        ],
+        "cond_acc": [
+          0.895,
+          0.86,
+          0.853
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 59,
+        "epoch": 0,
+        "loss": 2.068,
+        "lr": 7.34e-05,
+        "full_acc": [
+          0.902,
+          0.792,
+          0.684
+        ],
+        "cond_acc": [
+          0.902,
+          0.878,
+          0.864
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 60,
+        "epoch": 0,
+        "loss": 2.191,
+        "lr": 7.29e-05,
+        "full_acc": [
+          0.895,
+          0.775,
+          0.664
+        ],
+        "cond_acc": [
+          0.895,
+          0.866,
+          0.856
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "terminal"
+      },
+      {
+        "step": 61,
+        "epoch": 0,
+        "loss": 1.848,
+        "lr": 7.24e-05,
+        "full_acc": [
+          0.906,
+          0.811,
+          0.719
+        ],
+        "cond_acc": [
+          0.906,
+          0.895,
+          0.887
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 62,
+        "epoch": 0,
+        "loss": 2.467,
+        "lr": 7.2e-05,
+        "full_acc": [
+          0.886,
+          0.767,
+          0.65
+        ],
+        "cond_acc": [
+          0.886,
+          0.866,
+          0.848
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 63,
+        "epoch": 0,
+        "loss": 2.766,
+        "lr": 7.15e-05,
+        "full_acc": [
+          0.87,
+          0.726,
+          0.598
+        ],
+        "cond_acc": [
+          0.87,
+          0.834,
+          0.823
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 64,
+        "epoch": 0,
+        "loss": 3.535,
+        "lr": 7.1e-05,
+        "full_acc": [
+          0.842,
+          0.684,
+          0.544
+        ],
+        "cond_acc": [
+          0.842,
+          0.812,
+          0.795
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 65,
+        "epoch": 0,
+        "loss": 1.539,
+        "lr": 7.06e-05,
+        "full_acc": [
+          0.927,
+          0.849,
+          0.767
+        ],
+        "cond_acc": [
+          0.927,
+          0.916,
+          0.903
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 66,
+        "epoch": 0,
+        "loss": 1.996,
+        "lr": 7.01e-05,
+        "full_acc": [
+          0.903,
+          0.798,
+          0.682
+        ],
+        "cond_acc": [
+          0.903,
+          0.884,
+          0.854
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 67,
+        "epoch": 0,
+        "loss": 1.116,
+        "lr": 6.96e-05,
+        "full_acc": [
+          0.943,
+          0.879,
+          0.812
+        ],
+        "cond_acc": [
+          0.943,
+          0.932,
+          0.924
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 68,
+        "epoch": 0,
+        "loss": 1.438,
+        "lr": 6.92e-05,
+        "full_acc": [
+          0.929,
+          0.849,
+          0.767
+        ],
+        "cond_acc": [
+          0.929,
+          0.914,
+          0.903
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 69,
+        "epoch": 0,
+        "loss": 3.332,
+        "lr": 6.87e-05,
+        "full_acc": [
+          0.849,
+          0.694,
+          0.551
+        ],
+        "cond_acc": [
+          0.849,
+          0.818,
+          0.794
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 70,
+        "epoch": 0,
+        "loss": 2.391,
+        "lr": 6.82e-05,
+        "full_acc": [
+          0.893,
+          0.771,
+          0.646
+        ],
+        "cond_acc": [
+          0.893,
+          0.863,
+          0.839
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 71,
+        "epoch": 0,
+        "loss": 3.131,
+        "lr": 6.78e-05,
+        "full_acc": [
+          0.854,
+          0.707,
+          0.571
+        ],
+        "cond_acc": [
+          0.854,
+          0.827,
+          0.808
+        ],
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 72,
+        "epoch": 1,
+        "loss": 2.164,
+        "lr": 6.73e-05,
+        "full_acc": [
+          0.893,
+          0.778,
+          0.66
+        ],
+        "cond_acc": [
+          0.893,
+          0.871,
+          0.848
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 73,
+        "epoch": 1,
+        "loss": 2.057,
+        "lr": 6.68e-05,
+        "full_acc": [
+          0.895,
+          0.78,
+          0.67
+        ],
+        "cond_acc": [
+          0.895,
+          0.871,
+          0.86
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 74,
+        "epoch": 1,
+        "loss": 0.925,
+        "lr": 6.64e-05,
+        "full_acc": [
+          0.953,
+          0.895,
+          0.836
+        ],
+        "cond_acc": [
+          0.953,
+          0.939,
+          0.934
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 75,
+        "epoch": 1,
+        "loss": 1.03,
+        "lr": 6.59e-05,
+        "full_acc": [
+          0.945,
+          0.881,
+          0.812
+        ],
+        "cond_acc": [
+          0.945,
+          0.932,
+          0.922
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 76,
+        "epoch": 1,
+        "loss": 1.286,
+        "lr": 6.54e-05,
+        "full_acc": [
+          0.934,
+          0.86,
+          0.781
+        ],
+        "cond_acc": [
+          0.934,
+          0.921,
+          0.908
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 77,
+        "epoch": 1,
+        "loss": 1.869,
+        "lr": 6.5e-05,
+        "full_acc": [
+          0.913,
+          0.81,
+          0.704
+        ],
+        "cond_acc": [
+          0.913,
+          0.887,
+          0.87
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 78,
+        "epoch": 1,
+        "loss": 1.592,
+        "lr": 6.45e-05,
+        "full_acc": [
+          0.92,
+          0.838,
+          0.756
+        ],
+        "cond_acc": [
+          0.92,
+          0.91,
+          0.903
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 79,
+        "epoch": 1,
+        "loss": 1.352,
+        "lr": 6.4e-05,
+        "full_acc": [
+          0.933,
+          0.859,
+          0.782
+        ],
+        "cond_acc": [
+          0.933,
+          0.921,
+          0.91
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 80,
+        "epoch": 1,
+        "loss": 0.877,
+        "lr": 6.36e-05,
+        "full_acc": [
+          0.953,
+          0.899,
+          0.843
+        ],
+        "cond_acc": [
+          0.953,
+          0.944,
+          0.937
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 81,
+        "epoch": 1,
+        "loss": 1.729,
+        "lr": 6.31e-05,
+        "full_acc": [
+          0.913,
+          0.807,
+          0.707
+        ],
+        "cond_acc": [
+          0.913,
+          0.885,
+          0.876
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 82,
+        "epoch": 1,
+        "loss": 1.554,
+        "lr": 6.26e-05,
+        "full_acc": [
+          0.924,
+          0.83,
+          0.733
+        ],
+        "cond_acc": [
+          0.924,
+          0.898,
+          0.884
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 83,
+        "epoch": 1,
+        "loss": 2.387,
+        "lr": 6.21e-05,
+        "full_acc": [
+          0.884,
+          0.762,
+          0.653
+        ],
+        "cond_acc": [
+          0.884,
+          0.863,
+          0.856
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 84,
+        "epoch": 1,
+        "loss": 1.824,
+        "lr": 6.17e-05,
+        "full_acc": [
+          0.907,
+          0.798,
+          0.685
+        ],
+        "cond_acc": [
+          0.907,
+          0.879,
+          0.859
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 85,
+        "epoch": 1,
+        "loss": 2.32,
+        "lr": 6.12e-05,
+        "full_acc": [
+          0.884,
+          0.767,
+          0.65
+        ],
+        "cond_acc": [
+          0.884,
+          0.868,
+          0.847
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 86,
+        "epoch": 1,
+        "loss": 1.467,
+        "lr": 6.07e-05,
+        "full_acc": [
+          0.924,
+          0.842,
+          0.751
+        ],
+        "cond_acc": [
+          0.924,
+          0.911,
+          0.891
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 87,
+        "epoch": 1,
+        "loss": 1.574,
+        "lr": 6.03e-05,
+        "full_acc": [
+          0.918,
+          0.835,
+          0.749
+        ],
+        "cond_acc": [
+          0.918,
+          0.909,
+          0.897
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 88,
+        "epoch": 1,
+        "loss": 2.176,
+        "lr": 5.98e-05,
+        "full_acc": [
+          0.897,
+          0.783,
+          0.68
+        ],
+        "cond_acc": [
+          0.897,
+          0.873,
+          0.868
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 89,
+        "epoch": 1,
+        "loss": 0.812,
+        "lr": 5.93e-05,
+        "full_acc": [
+          0.959,
+          0.91,
+          0.857
+        ],
+        "cond_acc": [
+          0.959,
+          0.948,
+          0.942
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 90,
+        "epoch": 1,
+        "loss": 0.858,
+        "lr": 5.89e-05,
+        "full_acc": [
+          0.954,
+          0.899,
+          0.842
+        ],
+        "cond_acc": [
+          0.954,
+          0.943,
+          0.936
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "terminal"
+      },
+      {
+        "step": 91,
+        "epoch": 1,
+        "loss": 1.664,
+        "lr": 5.84e-05,
+        "full_acc": [
+          0.914,
+          0.82,
+          0.726
+        ],
+        "cond_acc": [
+          0.914,
+          0.897,
+          0.886
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 92,
+        "epoch": 1,
+        "loss": 0.742,
+        "lr": 5.79e-05,
+        "full_acc": [
+          0.96,
+          0.913,
+          0.861
+        ],
+        "cond_acc": [
+          0.96,
+          0.951,
+          0.944
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 93,
+        "epoch": 1,
+        "loss": 0.79,
+        "lr": 5.75e-05,
+        "full_acc": [
+          0.962,
+          0.917,
+          0.867
+        ],
+        "cond_acc": [
+          0.962,
+          0.953,
+          0.946
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 94,
+        "epoch": 1,
+        "loss": 1.727,
+        "lr": 5.7e-05,
+        "full_acc": [
+          0.914,
+          0.813,
+          0.716
+        ],
+        "cond_acc": [
+          0.914,
+          0.889,
+          0.881
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 95,
+        "epoch": 1,
+        "loss": 1.364,
+        "lr": 5.65e-05,
+        "full_acc": [
+          0.933,
+          0.85,
+          0.777
+        ],
+        "cond_acc": [
+          0.933,
+          0.911,
+          0.914
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 96,
+        "epoch": 1,
+        "loss": 1.549,
+        "lr": 5.61e-05,
+        "full_acc": [
+          0.921,
+          0.831,
+          0.74
+        ],
+        "cond_acc": [
+          0.921,
+          0.902,
+          0.89
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 97,
+        "epoch": 1,
+        "loss": 0.836,
+        "lr": 5.56e-05,
+        "full_acc": [
+          0.954,
+          0.901,
+          0.85
+        ],
+        "cond_acc": [
+          0.954,
+          0.945,
+          0.943
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 98,
+        "epoch": 1,
+        "loss": 1.087,
+        "lr": 5.51e-05,
+        "full_acc": [
+          0.941,
+          0.875,
+          0.808
+        ],
+        "cond_acc": [
+          0.941,
+          0.93,
+          0.923
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 99,
+        "epoch": 1,
+        "loss": 0.442,
+        "lr": 5.47e-05,
+        "full_acc": [
+          0.972,
+          0.941,
+          0.911
+        ],
+        "cond_acc": [
+          0.972,
+          0.968,
+          0.968
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 100,
+        "epoch": 1,
+        "loss": 1.6,
+        "lr": 5.42e-05,
+        "full_acc": [
+          0.919,
+          0.829,
+          0.745
+        ],
+        "cond_acc": [
+          0.919,
+          0.903,
+          0.898
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 101,
+        "epoch": 1,
+        "loss": 1.6,
+        "lr": 5.37e-05,
+        "full_acc": [
+          0.918,
+          0.832,
+          0.75
+        ],
+        "cond_acc": [
+          0.918,
+          0.906,
+          0.901
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 102,
+        "epoch": 1,
+        "loss": 0.945,
+        "lr": 5.33e-05,
+        "full_acc": [
+          0.95,
+          0.897,
+          0.843
+        ],
+        "cond_acc": [
+          0.95,
+          0.944,
+          0.939
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 103,
+        "epoch": 1,
+        "loss": 1.198,
+        "lr": 5.28e-05,
+        "full_acc": [
+          0.938,
+          0.871,
+          0.81
+        ],
+        "cond_acc": [
+          0.938,
+          0.928,
+          0.929
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 104,
+        "epoch": 1,
+        "loss": 1.021,
+        "lr": 5.23e-05,
+        "full_acc": [
+          0.945,
+          0.878,
+          0.813
+        ],
+        "cond_acc": [
+          0.945,
+          0.93,
+          0.926
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 105,
+        "epoch": 1,
+        "loss": 0.558,
+        "lr": 5.19e-05,
+        "full_acc": [
+          0.971,
+          0.934,
+          0.901
+        ],
+        "cond_acc": [
+          0.971,
+          0.962,
+          0.965
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 106,
+        "epoch": 1,
+        "loss": 0.93,
+        "lr": 5.14e-05,
+        "full_acc": [
+          0.947,
+          0.887,
+          0.83
+        ],
+        "cond_acc": [
+          0.947,
+          0.937,
+          0.935
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 107,
+        "epoch": 1,
+        "loss": 1.097,
+        "lr": 5.09e-05,
+        "full_acc": [
+          0.938,
+          0.874,
+          0.803
+        ],
+        "cond_acc": [
+          0.938,
+          0.931,
+          0.919
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 108,
+        "epoch": 1,
+        "loss": 1.149,
+        "lr": 5.05e-05,
+        "full_acc": [
+          0.938,
+          0.875,
+          0.809
+        ],
+        "cond_acc": [
+          0.938,
+          0.932,
+          0.924
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 109,
+        "epoch": 1,
+        "loss": 1.809,
+        "lr": 5e-05,
+        "full_acc": [
+          0.912,
+          0.816,
+          0.726
+        ],
+        "cond_acc": [
+          0.912,
+          0.894,
+          0.89
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 110,
+        "epoch": 1,
+        "loss": 0.477,
+        "lr": 4.95e-05,
+        "full_acc": [
+          0.974,
+          0.944,
+          0.915
+        ],
+        "cond_acc": [
+          0.974,
+          0.969,
+          0.97
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 111,
+        "epoch": 1,
+        "loss": 0.901,
+        "lr": 4.91e-05,
+        "full_acc": [
+          0.951,
+          0.896,
+          0.844
+        ],
+        "cond_acc": [
+          0.951,
+          0.942,
+          0.943
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 112,
+        "epoch": 1,
+        "loss": 1.662,
+        "lr": 4.86e-05,
+        "full_acc": [
+          0.91,
+          0.818,
+          0.722
+        ],
+        "cond_acc": [
+          0.91,
+          0.899,
+          0.883
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 113,
+        "epoch": 1,
+        "loss": 1.153,
+        "lr": 4.81e-05,
+        "full_acc": [
+          0.94,
+          0.877,
+          0.816
+        ],
+        "cond_acc": [
+          0.94,
+          0.933,
+          0.931
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 114,
+        "epoch": 1,
+        "loss": 0.808,
+        "lr": 4.77e-05,
+        "full_acc": [
+          0.952,
+          0.904,
+          0.856
+        ],
+        "cond_acc": [
+          0.952,
+          0.949,
+          0.947
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 115,
+        "epoch": 1,
+        "loss": 0.733,
+        "lr": 4.72e-05,
+        "full_acc": [
+          0.958,
+          0.909,
+          0.864
+        ],
+        "cond_acc": [
+          0.958,
+          0.95,
+          0.95
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 116,
+        "epoch": 1,
+        "loss": 1.775,
+        "lr": 4.67e-05,
+        "full_acc": [
+          0.915,
+          0.827,
+          0.753
+        ],
+        "cond_acc": [
+          0.915,
+          0.903,
+          0.91
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 117,
+        "epoch": 1,
+        "loss": 1.662,
+        "lr": 4.63e-05,
+        "full_acc": [
+          0.914,
+          0.824,
+          0.731
+        ],
+        "cond_acc": [
+          0.914,
+          0.901,
+          0.887
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 118,
+        "epoch": 1,
+        "loss": 0.537,
+        "lr": 4.58e-05,
+        "full_acc": [
+          0.969,
+          0.931,
+          0.896
+        ],
+        "cond_acc": [
+          0.969,
+          0.962,
+          0.962
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 119,
+        "epoch": 1,
+        "loss": 0.694,
+        "lr": 4.53e-05,
+        "full_acc": [
+          0.961,
+          0.92,
+          0.879
+        ],
+        "cond_acc": [
+          0.961,
+          0.957,
+          0.956
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 120,
+        "epoch": 1,
+        "loss": 1.059,
+        "lr": 4.49e-05,
+        "full_acc": [
+          0.938,
+          0.872,
+          0.802
+        ],
+        "cond_acc": [
+          0.938,
+          0.929,
+          0.92
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "terminal"
+      },
+      {
+        "step": 121,
+        "epoch": 1,
+        "loss": 0.27,
+        "lr": 4.44e-05,
+        "full_acc": [
+          0.983,
+          0.961,
+          0.94
+        ],
+        "cond_acc": [
+          0.983,
+          0.977,
+          0.979
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 122,
+        "epoch": 1,
+        "loss": 1.664,
+        "lr": 4.39e-05,
+        "full_acc": [
+          0.917,
+          0.828,
+          0.743
+        ],
+        "cond_acc": [
+          0.917,
+          0.903,
+          0.897
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 123,
+        "epoch": 1,
+        "loss": 1.316,
+        "lr": 4.35e-05,
+        "full_acc": [
+          0.927,
+          0.852,
+          0.779
+        ],
+        "cond_acc": [
+          0.927,
+          0.919,
+          0.914
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 124,
+        "epoch": 1,
+        "loss": 1.256,
+        "lr": 4.3e-05,
+        "full_acc": [
+          0.934,
+          0.866,
+          0.802
+        ],
+        "cond_acc": [
+          0.934,
+          0.928,
+          0.925
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 125,
+        "epoch": 1,
+        "loss": 0.607,
+        "lr": 4.25e-05,
+        "full_acc": [
+          0.966,
+          0.925,
+          0.885
+        ],
+        "cond_acc": [
+          0.966,
+          0.958,
+          0.956
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 126,
+        "epoch": 1,
+        "loss": 0.878,
+        "lr": 4.21e-05,
+        "full_acc": [
+          0.95,
+          0.897,
+          0.844
+        ],
+        "cond_acc": [
+          0.95,
+          0.944,
+          0.941
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 127,
+        "epoch": 1,
+        "loss": 1.085,
+        "lr": 4.16e-05,
+        "full_acc": [
+          0.937,
+          0.87,
+          0.804
+        ],
+        "cond_acc": [
+          0.937,
+          0.928,
+          0.924
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 128,
+        "epoch": 1,
+        "loss": 1.008,
+        "lr": 4.11e-05,
+        "full_acc": [
+          0.944,
+          0.885,
+          0.827
+        ],
+        "cond_acc": [
+          0.944,
+          0.938,
+          0.935
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 129,
+        "epoch": 1,
+        "loss": 1.198,
+        "lr": 4.07e-05,
+        "full_acc": [
+          0.932,
+          0.862,
+          0.791
+        ],
+        "cond_acc": [
+          0.932,
+          0.925,
+          0.918
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 130,
+        "epoch": 1,
+        "loss": 0.233,
+        "lr": 4.02e-05,
+        "full_acc": [
+          0.985,
+          0.969,
+          0.951
+        ],
+        "cond_acc": [
+          0.985,
+          0.983,
+          0.981
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 131,
+        "epoch": 1,
+        "loss": 1.117,
+        "lr": 3.97e-05,
+        "full_acc": [
+          0.938,
+          0.874,
+          0.81
+        ],
+        "cond_acc": [
+          0.938,
+          0.932,
+          0.927
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 132,
+        "epoch": 1,
+        "loss": 1.461,
+        "lr": 3.93e-05,
+        "full_acc": [
+          0.919,
+          0.845,
+          0.769
+        ],
+        "cond_acc": [
+          0.919,
+          0.919,
+          0.91
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 133,
+        "epoch": 1,
+        "loss": 0.556,
+        "lr": 3.88e-05,
+        "full_acc": [
+          0.966,
+          0.932,
+          0.897
+        ],
+        "cond_acc": [
+          0.966,
+          0.964,
+          0.963
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 134,
+        "epoch": 1,
+        "loss": 0.618,
+        "lr": 3.83e-05,
+        "full_acc": [
+          0.962,
+          0.926,
+          0.89
+        ],
+        "cond_acc": [
+          0.962,
+          0.962,
+          0.961
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 135,
+        "epoch": 1,
+        "loss": 0.918,
+        "lr": 3.79e-05,
+        "full_acc": [
+          0.949,
+          0.895,
+          0.839
+        ],
+        "cond_acc": [
+          0.949,
+          0.943,
+          0.938
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 136,
+        "epoch": 1,
+        "loss": 0.864,
+        "lr": 3.74e-05,
+        "full_acc": [
+          0.949,
+          0.898,
+          0.847
+        ],
+        "cond_acc": [
+          0.949,
+          0.946,
+          0.943
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 137,
+        "epoch": 1,
+        "loss": 0.506,
+        "lr": 3.69e-05,
+        "full_acc": [
+          0.969,
+          0.935,
+          0.901
+        ],
+        "cond_acc": [
+          0.969,
+          0.965,
+          0.964
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 138,
+        "epoch": 1,
+        "loss": 0.739,
+        "lr": 3.64e-05,
+        "full_acc": [
+          0.954,
+          0.91,
+          0.864
+        ],
+        "cond_acc": [
+          0.954,
+          0.954,
+          0.95
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 139,
+        "epoch": 1,
+        "loss": 0.772,
+        "lr": 3.6e-05,
+        "full_acc": [
+          0.96,
+          0.913,
+          0.869
+        ],
+        "cond_acc": [
+          0.96,
+          0.951,
+          0.951
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 140,
+        "epoch": 1,
+        "loss": 1.274,
+        "lr": 3.55e-05,
+        "full_acc": [
+          0.934,
+          0.863,
+          0.795
+        ],
+        "cond_acc": [
+          0.934,
+          0.924,
+          0.921
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 141,
+        "epoch": 1,
+        "loss": 0.757,
+        "lr": 3.5e-05,
+        "full_acc": [
+          0.952,
+          0.904,
+          0.855
+        ],
+        "cond_acc": [
+          0.952,
+          0.95,
+          0.946
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 142,
+        "epoch": 1,
+        "loss": 1.208,
+        "lr": 3.46e-05,
+        "full_acc": [
+          0.936,
+          0.867,
+          0.803
+        ],
+        "cond_acc": [
+          0.936,
+          0.926,
+          0.926
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 143,
+        "epoch": 2,
+        "loss": 0.742,
+        "lr": 3.41e-05,
+        "full_acc": [
+          0.951,
+          0.902,
+          0.853
+        ],
+        "cond_acc": [
+          0.951,
+          0.948,
+          0.946
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 144,
+        "epoch": 2,
+        "loss": 0.571,
+        "lr": 3.36e-05,
+        "full_acc": [
+          0.967,
+          0.931,
+          0.895
+        ],
+        "cond_acc": [
+          0.967,
+          0.962,
+          0.962
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 145,
+        "epoch": 2,
+        "loss": 0.453,
+        "lr": 3.32e-05,
+        "full_acc": [
+          0.972,
+          0.942,
+          0.912
+        ],
+        "cond_acc": [
+          0.972,
+          0.97,
+          0.968
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 146,
+        "epoch": 2,
+        "loss": 0.689,
+        "lr": 3.27e-05,
+        "full_acc": [
+          0.958,
+          0.915,
+          0.874
+        ],
+        "cond_acc": [
+          0.958,
+          0.955,
+          0.955
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 147,
+        "epoch": 2,
+        "loss": 0.654,
+        "lr": 3.22e-05,
+        "full_acc": [
+          0.955,
+          0.912,
+          0.87
+        ],
+        "cond_acc": [
+          0.955,
+          0.955,
+          0.954
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 148,
+        "epoch": 2,
+        "loss": 1.146,
+        "lr": 3.18e-05,
+        "full_acc": [
+          0.937,
+          0.868,
+          0.806
+        ],
+        "cond_acc": [
+          0.937,
+          0.926,
+          0.929
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 149,
+        "epoch": 2,
+        "loss": 1.175,
+        "lr": 3.13e-05,
+        "full_acc": [
+          0.936,
+          0.866,
+          0.808
+        ],
+        "cond_acc": [
+          0.936,
+          0.926,
+          0.933
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 150,
+        "epoch": 2,
+        "loss": 0.45,
+        "lr": 3.08e-05,
+        "full_acc": [
+          0.972,
+          0.945,
+          0.915
+        ],
+        "cond_acc": [
+          0.972,
+          0.972,
+          0.968
+        ],
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "terminal"
+      },
+      {
+        "step": 151,
+        "epoch": 2,
+        "loss": 0.656,
+        "lr": 3.04e-05,
+        "full_acc": [
+          0.958,
+          0.915,
+          0.871
+        ],
+        "cond_acc": [
+          0.958,
+          0.955,
+          0.952
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 152,
+        "epoch": 2,
+        "loss": 0.66,
+        "lr": 2.99e-05,
+        "full_acc": [
+          0.956,
+          0.914,
+          0.871
+        ],
+        "cond_acc": [
+          0.956,
+          0.955,
+          0.953
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 153,
+        "epoch": 2,
+        "loss": 0.585,
+        "lr": 2.94e-05,
+        "full_acc": [
+          0.966,
+          0.926,
+          0.889
+        ],
+        "cond_acc": [
+          0.966,
+          0.959,
+          0.959
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 154,
+        "epoch": 2,
+        "loss": 1.846,
+        "lr": 2.9e-05,
+        "full_acc": [
+          0.906,
+          0.809,
+          0.72
+        ],
+        "cond_acc": [
+          0.906,
+          0.893,
+          0.889
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 155,
+        "epoch": 2,
+        "loss": 0.577,
+        "lr": 2.85e-05,
+        "full_acc": [
+          0.964,
+          0.928,
+          0.89
+        ],
+        "cond_acc": [
+          0.964,
+          0.964,
+          0.958
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 156,
+        "epoch": 2,
+        "loss": 0.336,
+        "lr": 2.8e-05,
+        "full_acc": [
+          0.976,
+          0.95,
+          0.927
+        ],
+        "cond_acc": [
+          0.976,
+          0.973,
+          0.975
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 157,
+        "epoch": 2,
+        "loss": 0.774,
+        "lr": 2.76e-05,
+        "full_acc": [
+          0.956,
+          0.909,
+          0.863
+        ],
+        "cond_acc": [
+          0.956,
+          0.951,
+          0.949
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 158,
+        "epoch": 2,
+        "loss": 0.55,
+        "lr": 2.71e-05,
+        "full_acc": [
+          0.964,
+          0.931,
+          0.895
+        ],
+        "cond_acc": [
+          0.964,
+          0.966,
+          0.962
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 159,
+        "epoch": 2,
+        "loss": 0.581,
+        "lr": 2.66e-05,
+        "full_acc": [
+          0.964,
+          0.929,
+          0.891
+        ],
+        "cond_acc": [
+          0.964,
+          0.963,
+          0.96
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 160,
+        "epoch": 2,
+        "loss": 0.941,
+        "lr": 2.62e-05,
+        "full_acc": [
+          0.946,
+          0.887,
+          0.831
+        ],
+        "cond_acc": [
+          0.946,
+          0.937,
+          0.937
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 161,
+        "epoch": 2,
+        "loss": 0.952,
+        "lr": 2.57e-05,
+        "full_acc": [
+          0.94,
+          0.884,
+          0.825
+        ],
+        "cond_acc": [
+          0.94,
+          0.94,
+          0.934
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 162,
+        "epoch": 2,
+        "loss": 0.727,
+        "lr": 2.52e-05,
+        "full_acc": [
+          0.955,
+          0.908,
+          0.866
+        ],
+        "cond_acc": [
+          0.955,
+          0.95,
+          0.953
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 163,
+        "epoch": 2,
+        "loss": 0.38,
+        "lr": 2.48e-05,
+        "full_acc": [
+          0.977,
+          0.952,
+          0.928
+        ],
+        "cond_acc": [
+          0.977,
+          0.975,
+          0.975
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 164,
+        "epoch": 2,
+        "loss": 0.614,
+        "lr": 2.43e-05,
+        "full_acc": [
+          0.964,
+          0.924,
+          0.884
+        ],
+        "cond_acc": [
+          0.964,
+          0.959,
+          0.957
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 165,
+        "epoch": 2,
+        "loss": 0.446,
+        "lr": 2.38e-05,
+        "full_acc": [
+          0.975,
+          0.942,
+          0.91
+        ],
+        "cond_acc": [
+          0.975,
+          0.965,
+          0.966
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 166,
+        "epoch": 2,
+        "loss": 0.959,
+        "lr": 2.34e-05,
+        "full_acc": [
+          0.942,
+          0.886,
+          0.828
+        ],
+        "cond_acc": [
+          0.942,
+          0.94,
+          0.935
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 167,
+        "epoch": 2,
+        "loss": 0.543,
+        "lr": 2.29e-05,
+        "full_acc": [
+          0.969,
+          0.934,
+          0.899
+        ],
+        "cond_acc": [
+          0.969,
+          0.964,
+          0.963
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 168,
+        "epoch": 2,
+        "loss": 1.078,
+        "lr": 2.24e-05,
+        "full_acc": [
+          0.941,
+          0.881,
+          0.824
+        ],
+        "cond_acc": [
+          0.941,
+          0.936,
+          0.935
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 169,
+        "epoch": 2,
+        "loss": 0.598,
+        "lr": 2.2e-05,
+        "full_acc": [
+          0.968,
+          0.931,
+          0.897
+        ],
+        "cond_acc": [
+          0.968,
+          0.961,
+          0.964
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 170,
+        "epoch": 2,
+        "loss": 0.611,
+        "lr": 2.15e-05,
+        "full_acc": [
+          0.962,
+          0.921,
+          0.885
+        ],
+        "cond_acc": [
+          0.962,
+          0.957,
+          0.96
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 171,
+        "epoch": 2,
+        "loss": 0.185,
+        "lr": 2.1e-05,
+        "full_acc": [
+          0.987,
+          0.971,
+          0.957
+        ],
+        "cond_acc": [
+          0.987,
+          0.983,
+          0.986
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 172,
+        "epoch": 2,
+        "loss": 0.238,
+        "lr": 2.06e-05,
+        "full_acc": [
+          0.986,
+          0.969,
+          0.953
+        ],
+        "cond_acc": [
+          0.986,
+          0.983,
+          0.983
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 173,
+        "epoch": 2,
+        "loss": 0.334,
+        "lr": 2.01e-05,
+        "full_acc": [
+          0.98,
+          0.956,
+          0.933
+        ],
+        "cond_acc": [
+          0.98,
+          0.976,
+          0.975
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 174,
+        "epoch": 2,
+        "loss": 0.791,
+        "lr": 1.96e-05,
+        "full_acc": [
+          0.949,
+          0.898,
+          0.853
+        ],
+        "cond_acc": [
+          0.949,
+          0.946,
+          0.95
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 175,
+        "epoch": 2,
+        "loss": 0.492,
+        "lr": 1.92e-05,
+        "full_acc": [
+          0.968,
+          0.935,
+          0.903
+        ],
+        "cond_acc": [
+          0.968,
+          0.966,
+          0.966
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 176,
+        "epoch": 2,
+        "loss": 0.573,
+        "lr": 1.87e-05,
+        "full_acc": [
+          0.967,
+          0.926,
+          0.891
+        ],
+        "cond_acc": [
+          0.967,
+          0.958,
+          0.963
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 177,
+        "epoch": 2,
+        "loss": 0.898,
+        "lr": 1.82e-05,
+        "full_acc": [
+          0.947,
+          0.892,
+          0.841
+        ],
+        "cond_acc": [
+          0.947,
+          0.942,
+          0.942
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 178,
+        "epoch": 2,
+        "loss": 0.896,
+        "lr": 1.78e-05,
+        "full_acc": [
+          0.952,
+          0.903,
+          0.863
+        ],
+        "cond_acc": [
+          0.952,
+          0.949,
+          0.956
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 179,
+        "epoch": 2,
+        "loss": 0.658,
+        "lr": 1.73e-05,
+        "full_acc": [
+          0.959,
+          0.92,
+          0.882
+        ],
+        "cond_acc": [
+          0.959,
+          0.959,
+          0.959
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 180,
+        "epoch": 2,
+        "loss": 0.75,
+        "lr": 1.68e-05,
+        "full_acc": [
+          0.957,
+          0.913,
+          0.873
+        ],
+        "cond_acc": [
+          0.957,
+          0.954,
+          0.957
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "terminal"
+      },
+      {
+        "step": 181,
+        "epoch": 2,
+        "loss": 0.552,
+        "lr": 1.64e-05,
+        "full_acc": [
+          0.967,
+          0.932,
+          0.901
+        ],
+        "cond_acc": [
+          0.967,
+          0.964,
+          0.966
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 182,
+        "epoch": 2,
+        "loss": 0.569,
+        "lr": 1.59e-05,
+        "full_acc": [
+          0.963,
+          0.925,
+          0.889
+        ],
+        "cond_acc": [
+          0.963,
+          0.961,
+          0.961
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 183,
+        "epoch": 2,
+        "loss": 0.591,
+        "lr": 1.54e-05,
+        "full_acc": [
+          0.965,
+          0.926,
+          0.889
+        ],
+        "cond_acc": [
+          0.965,
+          0.96,
+          0.96
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 184,
+        "epoch": 2,
+        "loss": 0.712,
+        "lr": 1.5e-05,
+        "full_acc": [
+          0.957,
+          0.912,
+          0.87
+        ],
+        "cond_acc": [
+          0.957,
+          0.953,
+          0.953
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 185,
+        "epoch": 2,
+        "loss": 0.424,
+        "lr": 1.45e-05,
+        "full_acc": [
+          0.974,
+          0.947,
+          0.922
+        ],
+        "cond_acc": [
+          0.974,
+          0.972,
+          0.974
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 186,
+        "epoch": 2,
+        "loss": 0.503,
+        "lr": 1.4e-05,
+        "full_acc": [
+          0.971,
+          0.936,
+          0.907
+        ],
+        "cond_acc": [
+          0.971,
+          0.964,
+          0.969
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 187,
+        "epoch": 2,
+        "loss": 0.332,
+        "lr": 1.36e-05,
+        "full_acc": [
+          0.978,
+          0.953,
+          0.928
+        ],
+        "cond_acc": [
+          0.978,
+          0.974,
+          0.974
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 188,
+        "epoch": 2,
+        "loss": 0.502,
+        "lr": 1.31e-05,
+        "full_acc": [
+          0.966,
+          0.929,
+          0.897
+        ],
+        "cond_acc": [
+          0.966,
+          0.961,
+          0.966
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 189,
+        "epoch": 2,
+        "loss": 1.061,
+        "lr": 1.26e-05,
+        "full_acc": [
+          0.941,
+          0.881,
+          0.823
+        ],
+        "cond_acc": [
+          0.941,
+          0.937,
+          0.934
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 190,
+        "epoch": 2,
+        "loss": 0.522,
+        "lr": 1.21e-05,
+        "full_acc": [
+          0.971,
+          0.935,
+          0.906
+        ],
+        "cond_acc": [
+          0.971,
+          0.963,
+          0.969
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 191,
+        "epoch": 2,
+        "loss": 0.753,
+        "lr": 1.17e-05,
+        "full_acc": [
+          0.956,
+          0.905,
+          0.859
+        ],
+        "cond_acc": [
+          0.956,
+          0.947,
+          0.949
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 192,
+        "epoch": 2,
+        "loss": 0.495,
+        "lr": 1.12e-05,
+        "full_acc": [
+          0.973,
+          0.941,
+          0.909
+        ],
+        "cond_acc": [
+          0.973,
+          0.967,
+          0.966
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 193,
+        "epoch": 2,
+        "loss": 1.037,
+        "lr": 1.07e-05,
+        "full_acc": [
+          0.945,
+          0.892,
+          0.841
+        ],
+        "cond_acc": [
+          0.945,
+          0.944,
+          0.944
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 194,
+        "epoch": 2,
+        "loss": 0.813,
+        "lr": 1.03e-05,
+        "full_acc": [
+          0.954,
+          0.906,
+          0.858
+        ],
+        "cond_acc": [
+          0.954,
+          0.949,
+          0.947
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 195,
+        "epoch": 2,
+        "loss": 0.666,
+        "lr": 9.81e-06,
+        "full_acc": [
+          0.959,
+          0.916,
+          0.878
+        ],
+        "cond_acc": [
+          0.959,
+          0.956,
+          0.958
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 196,
+        "epoch": 2,
+        "loss": 0.413,
+        "lr": 9.35e-06,
+        "full_acc": [
+          0.974,
+          0.946,
+          0.919
+        ],
+        "cond_acc": [
+          0.974,
+          0.972,
+          0.971
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 197,
+        "epoch": 2,
+        "loss": 0.383,
+        "lr": 8.88e-06,
+        "full_acc": [
+          0.977,
+          0.95,
+          0.922
+        ],
+        "cond_acc": [
+          0.977,
+          0.972,
+          0.971
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 198,
+        "epoch": 2,
+        "loss": 1.377,
+        "lr": 8.41e-06,
+        "full_acc": [
+          0.925,
+          0.855,
+          0.786
+        ],
+        "cond_acc": [
+          0.925,
+          0.924,
+          0.919
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 199,
+        "epoch": 2,
+        "loss": 1.316,
+        "lr": 7.94e-06,
+        "full_acc": [
+          0.929,
+          0.863,
+          0.8
+        ],
+        "cond_acc": [
+          0.929,
+          0.93,
+          0.927
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 200,
+        "epoch": 2,
+        "loss": 0.584,
+        "lr": 7.48e-06,
+        "full_acc": [
+          0.968,
+          0.931,
+          0.896
+        ],
+        "cond_acc": [
+          0.968,
+          0.962,
+          0.963
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 201,
+        "epoch": 2,
+        "loss": 0.744,
+        "lr": 7.01e-06,
+        "full_acc": [
+          0.958,
+          0.911,
+          0.869
+        ],
+        "cond_acc": [
+          0.958,
+          0.951,
+          0.954
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 202,
+        "epoch": 2,
+        "loss": 0.538,
+        "lr": 6.54e-06,
+        "full_acc": [
+          0.964,
+          0.926,
+          0.891
+        ],
+        "cond_acc": [
+          0.964,
+          0.96,
+          0.963
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 203,
+        "epoch": 2,
+        "loss": 0.596,
+        "lr": 6.07e-06,
+        "full_acc": [
+          0.958,
+          0.919,
+          0.881
+        ],
+        "cond_acc": [
+          0.958,
+          0.959,
+          0.959
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 204,
+        "epoch": 2,
+        "loss": 0.678,
+        "lr": 5.61e-06,
+        "full_acc": [
+          0.958,
+          0.916,
+          0.872
+        ],
+        "cond_acc": [
+          0.958,
+          0.957,
+          0.952
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 205,
+        "epoch": 2,
+        "loss": 0.344,
+        "lr": 5.14e-06,
+        "full_acc": [
+          0.979,
+          0.955,
+          0.934
+        ],
+        "cond_acc": [
+          0.979,
+          0.976,
+          0.977
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 206,
+        "epoch": 2,
+        "loss": 0.464,
+        "lr": 4.67e-06,
+        "full_acc": [
+          0.971,
+          0.94,
+          0.913
+        ],
+        "cond_acc": [
+          0.971,
+          0.967,
+          0.972
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 207,
+        "epoch": 2,
+        "loss": 1.068,
+        "lr": 4.21e-06,
+        "full_acc": [
+          0.937,
+          0.876,
+          0.817
+        ],
+        "cond_acc": [
+          0.937,
+          0.935,
+          0.932
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 208,
+        "epoch": 2,
+        "loss": 1.196,
+        "lr": 3.74e-06,
+        "full_acc": [
+          0.936,
+          0.873,
+          0.813
+        ],
+        "cond_acc": [
+          0.936,
+          0.933,
+          0.931
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 209,
+        "epoch": 2,
+        "loss": 0.187,
+        "lr": 3.27e-06,
+        "full_acc": [
+          0.989,
+          0.976,
+          0.962
+        ],
+        "cond_acc": [
+          0.989,
+          0.987,
+          0.986
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 210,
+        "epoch": 2,
+        "loss": 0.562,
+        "lr": 2.8e-06,
+        "full_acc": [
+          0.963,
+          0.927,
+          0.894
+        ],
+        "cond_acc": [
+          0.963,
+          0.962,
+          0.964
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "terminal"
+      },
+      {
+        "step": 211,
+        "epoch": 2,
+        "loss": 0.446,
+        "lr": 2.34e-06,
+        "full_acc": [
+          0.976,
+          0.948,
+          0.921
+        ],
+        "cond_acc": [
+          0.976,
+          0.971,
+          0.972
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 212,
+        "epoch": 2,
+        "loss": 0.767,
+        "lr": 1.87e-06,
+        "full_acc": [
+          0.95,
+          0.905,
+          0.858
+        ],
+        "cond_acc": [
+          0.95,
+          0.954,
+          0.947
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 213,
+        "epoch": 2,
+        "loss": 0.859,
+        "lr": 1.4e-06,
+        "full_acc": [
+          0.945,
+          0.896,
+          0.848
+        ],
+        "cond_acc": [
+          0.945,
+          0.948,
+          0.946
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      },
+      {
+        "step": 214,
+        "epoch": 2,
+        "loss": 1.023,
+        "lr": 9.35e-07,
+        "full_acc": [
+          0.94,
+          0.88,
+          0.827
+        ],
+        "cond_acc": [
+          0.94,
+          0.936,
+          0.94
+        ],
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "inherited"
+      }
+    ],
+    "val": [
+      {
+        "epoch": 0,
+        "loss": 1.958,
+        "full_acc": [
+          0.901,
+          0.791,
+          0.688
+        ],
+        "cond_acc": [
+          0.901,
+          0.877,
+          0.87
+        ],
+        "step": 71,
+        "cast_t": 42.453,
+        "frame": 894,
+        "anchor": "terminal"
+      },
+      {
+        "epoch": 1,
+        "loss": 1.137,
+        "full_acc": [
+          0.94,
+          0.877,
+          0.819
+        ],
+        "cond_acc": [
+          0.94,
+          0.933,
+          0.934
+        ],
+        "step": 142,
+        "cast_t": 42.454,
+        "frame": 894,
+        "anchor": "terminal"
+      },
+      {
+        "epoch": 2,
+        "loss": 0.986,
+        "full_acc": [
+          0.945,
+          0.889,
+          0.838
+        ],
+        "cond_acc": [
+          0.945,
+          0.941,
+          0.942
+        ],
+        "step": 214,
+        "cast_t": 42.455,
+        "frame": 894,
+        "anchor": "terminal"
+      }
+    ]
+  },
+  "gate": {
+    "verdict": "promote",
+    "reason": "both_thresholds_met",
+    "throughput": {
+      "stock": 130.66289069031558,
+      "tuned": 143.65339170880026,
+      "delta_pct": 9.941997264757822,
+      "delta_standard_error_pct": 0.6379092647075041
+    },
+    "accepted_length": {
+      "stock": 2.3106880518379342,
+      "tuned": 2.609556600154183,
+      "delta": 0.29886854831624854,
+      "delta_standard_error": 0.004648025774888542
+    },
+    "acceptance_rate": {
+      "stock": 0.43689601727931143,
+      "tuned": 0.5365188667180608,
+      "delta_pp": 9.962284943874938
+    },
+    "per_repeat": [
+      {
+        "repeat": 0,
+        "stock_tok_per_sec": 131.88518540127356,
+        "tuned_tok_per_sec": 142.8800880879985,
+        "stock_accepted_length": 2.3036116044997037,
+        "tuned_accepted_length": 2.6030920964947355
+      },
+      {
+        "repeat": 1,
+        "stock_tok_per_sec": 131.80610621980216,
+        "tuned_tok_per_sec": 142.69699280554582,
+        "stock_accepted_length": 2.3234795250787497,
+        "tuned_accepted_length": 2.605620418137388
+      },
+      {
+        "repeat": 2,
+        "stock_tok_per_sec": 130.87253287380662,
+        "tuned_tok_per_sec": 144.61419326218737,
+        "stock_accepted_length": 2.302347983142685,
+        "tuned_accepted_length": 2.6166151364430705
+      },
+      {
+        "repeat": 3,
+        "stock_tok_per_sec": 128.523545072502,
+        "tuned_tok_per_sec": 145.37045930398145,
+        "stock_accepted_length": 2.308467741935484,
+        "tuned_accepted_length": 2.613193604729276
+      },
+      {
+        "repeat": 4,
+        "stock_tok_per_sec": 130.22708388419352,
+        "tuned_tok_per_sec": 142.70522508428803,
+        "stock_accepted_length": 2.3155334045330482,
+        "tuned_accepted_length": 2.6092617449664433
+      }
+    ],
+    "num_contexts": 100,
+    "num_repeats": 5,
+    "stock_draft": "RedHatAI/Qwen3-8B-speculator.eagle3",
+    "cast_t": 64.368,
+    "frame": 1348,
+    "anchor": "terminal"
+  }
+}

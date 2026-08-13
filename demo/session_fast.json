@@ -1,0 +1,73 @@
+{
+  "typing_delay": 0.006,
+  "settle": 2.5,
+  "steps": [
+    {
+      "comment": "1. This is a normal vLLM server. The command you already run:",
+      "command": "echo 'vllm serve Qwen/Qwen3-8B --max-model-len 24576 --gpu-memory-utilization 0.85 --enforce-eager'",
+      "pause_before": 0.3,
+      "pause_after": 3.0
+    },
+    {
+      "comment": "2. This is the SpeedLM vLLM -- verbatim from the script that ran it:",
+      "command": "sed -n '100,108p' demo/cycle.sbatch",
+      "pause_before": 0.3,
+      "pause_after": 4.5
+    },
+    {
+      "comment": "Same model, same vLLM flags. One new thing: --enable-idle-tuning.",
+      "pause_after": 2.0
+    },
+    {
+      "comment": "Everything below reads ONE real completed run, already on disk:",
+      "command": "export R=/data/ryan.kim/speedlm-runs/agentenv-qwen8b-run5 D=/data/ryan.kim/speedlm-runs/regate-unseen-run1; export C=$R/speedlm_home/runs/7343677008da41f995f46e6a714036b4 T=$R/speedlm_home/traces/traces.jsonl E=$R/speedlm_home/runs/events.jsonl",
+      "pause_before": 0.3,
+      "pause_after": 1.2
+    },
+    {
+      "comment": "3. Here is us giving it prompts. Real captured turns, verbatim:",
+      "command": "python3 -c \"import json;R=[json.loads(l) for l in open('$T')];W=lambda s,n:' '.join((s or '').split())[:n];S={};_=[S.setdefault(r['messages'][-2]['content'][:40],r) for r in R if len(r['messages'])==3];_=[print('user  >',W(r['messages'][-2]['content'],88)+chr(10)+'model > '+('tool_call '+r['tool_calls'][0]['function']['name']+'('+W(r['tool_calls'][0]['function']['arguments'],46)+')' if r.get('tool_calls') else W(r['messages'][-1].get('content'),88))+chr(10)) for r in list(S.values())[:3]]\"",
+      "pause_before": 0.3,
+      "pause_after": 5.5
+    },
+    {
+      "comment": "4. Then, here is us stopping. The client goes away:",
+      "command": "python3 -c \"import json,datetime as D;R=[json.loads(l) for l in open('$T')];t=max(float(r['timestamp']) for r in R);print('%d requests captured. last one at %s. then: nothing.'%(len(R),D.datetime.fromtimestamp(t).strftime('%H:%M:%S')))\"",
+      "pause_before": 0.3,
+      "pause_after": 3.5
+    },
+    {
+      "comment": "5. 6.9s after that last request the idle threshold trips, on its own:",
+      "command": "jq -r '\"idle_threshold_seconds = \\(.idle_threshold_seconds)   (nobody is watching)\"' configs/agentenv-qwen8b.json; jq -r 'select(.sequence<5)|\"  \\(.timestamp|floor|todate|.[11:19])   \\(.from//\"start\") -> \\(.to)   \\(.reason)\"' $E",
+      "pause_before": 0.3,
+      "pause_after": 5.0
+    },
+    {
+      "comment": "6. It trains a draft head on that traffic. Real optimizer steps:",
+      "command": "awk 'match($0,/train.loss=[0-9.]+/){L=substr($0,RSTART+11,RLENGTH-11)} match($0,/global_step=[0-9]+/){N=substr($0,RSTART+12,RLENGTH-12)+0; if(N%30==0)printf \"  step %-3d   train/loss = %s\\n\",N,L} match($0,/val.loss_epoch=[0-9.]+/){E++;printf \"  EPOCH %d    val/loss_epoch = %s\\n\",E,substr($0,RSTART+15,RLENGTH-15)}' $C/training-logs/stdout.log",
+      "pause_before": 0.3,
+      "pause_after": 5.0
+    },
+    {
+      "comment": "10.8 down to 0.99. But a lower loss is not a faster server. So:",
+      "pause_after": 2.0
+    },
+    {
+      "comment": "7. It benchmarks itself before it trusts the result:",
+      "command": "jq -r '\"held-out contexts     \\(.num_contexts)  (session-disjoint: none seen in the training window)\", \"repeats per arm       \\(.num_repeats), max_tokens=\\(.benchmark_max_tokens), warmup=\\(.warmup_repeats)\", \"stock baseline        \\(.stock_draft)\", \"promote only if       \\(.acceptance_criterion)\", \"thresholds            length >= \\(.min_accepted_length_delta), acceptance >= \\(.min_acceptance_delta_pp)pp, tok/s >= \\(.min_throughput_delta_pct)%\"' $D/decision.json",
+      "pause_before": 0.3,
+      "pause_after": 5.0
+    },
+    {
+      "comment": "8. Stock draft head vs the head it just trained, side by side:",
+      "command": "jq -r 'def r3:(.*1000|round/1000); def r2:(.*100|round/100); def p(n):(tostring+\"            \")[0:n]; \"                      \\(\"tuned\"|p(11))\\(\"stock\"|p(11))delta\", \"accepted length       \\(.candidate_avg_accepted_length|r3|p(11))\\(.stock_avg_accepted_length|r3|p(11))+\\(.accepted_length_delta|r3)\", \"acceptance rate       \\(.candidate_avg_acceptance|r3|p(11))\\(.stock_avg_acceptance|r3|p(11))+\\(.acceptance_delta_pp|r2)pp\", \"decode tok/s          \\(.candidate_avg_tok_per_sec|r2|p(11))\\(.stock_avg_tok_per_sec|r2|p(11))+\\(.throughput_delta_pct|r2)%\", \"\", \"VERDICT               \\(.verdict|ascii_upcase)   (\\(.reason))\", \"same answers          \\(.output_total_divergences) divergences / \\(.divergence_trials) trials  (p=\\(.divergence_total_p_value|r3))\"' $D/decision.json",
+      "pause_before": 0.3,
+      "pause_after": 6.0
+    },
+    {
+      "comment": "One idle window, no operator. Same answers, a faster server.",
+      "pause_before": 0.3,
+      "pause_after": 3.0
+    }
+  ]
+}

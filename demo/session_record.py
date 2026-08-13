@@ -15,8 +15,8 @@ demo content can change without anyone touching the recorder.  The schema is
 deliberately small::
 
     {
-      "typing_delay": 0.028,      // optional, seconds between keystrokes
-      "settle": 1.4,              // optional, default pause_after for a step
+      "typing_delay": 0.006,      // optional, seconds between keystrokes
+      "settle": 1.0,              // optional, default pause_after for a step
       "prompt": "...",            // optional, PS1 for the recorded shell
       "steps": [
         {
@@ -79,11 +79,11 @@ from typing import Any
 # ---------------------------------------------------------------------------
 
 # Fast enough not to bore the viewer, slow enough to read as a person typing.
-DEFAULT_TYPING_DELAY = 0.028
+DEFAULT_TYPING_DELAY = 0.006
 
 # How long to hold after Enter before typing the next thing.  This is the knob
 # that decides whether the video is legible, so it is per-step overridable.
-DEFAULT_SETTLE = 1.4
+DEFAULT_SETTLE = 1.0
 
 # A short, coloured prompt.  It is set through PS1 in the child's environment
 # rather than through a dotfile, because the shell is started with --norc so
@@ -92,8 +92,12 @@ DEFAULT_PROMPT = r"\[\033[1;34m\]speedlm\[\033[0m\]:\[\033[36m\]\w\[\033[0m\]$ "
 
 # Time given to the shell to draw its first prompt before typing starts, and to
 # flush the last of its output after "exit" is sent.
-STARTUP_SETTLE = 1.0
-SHUTDOWN_SETTLE = 1.0
+STARTUP_SETTLE = 0.6
+SHUTDOWN_SETTLE = 0.6
+
+# Beat between a typed "# ..." narration line and the command it introduces.
+# Long enough to read the narration, short enough not to pad every step.
+COMMENT_SETTLE = 0.2
 
 READ_CHUNK = 65536
 
@@ -333,7 +337,7 @@ def record(script: SessionScript, out_path: Path, cwd: Path, cols: int, rows: in
             # echoes and then ignores.  No caption is drawn over the video.
             comment = step.comment if step.comment.startswith("#") else f"# {step.comment}"
             rec.type_line(comment, script.typing_delay)
-            rec.pump(time.time() + 0.35)
+            rec.pump(time.time() + COMMENT_SETTLE)
         if step.command:
             rec.type_line(step.command, script.typing_delay)
         rec.pump(time.time() + step.pause_after)
