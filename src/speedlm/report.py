@@ -38,6 +38,7 @@ from speedlm.gate.decide import (
     ContextDivergence,
     Decision,
     DispersionBasis,
+    DivergenceSampling,
     MeasurementBlock,
     Reason,
     RepeatSummary,
@@ -93,6 +94,13 @@ UNMEASURED_REASONS: Final[frozenset[Reason]] = frozenset(
         # reason: its record carries no `acceptance_delta_pp` to require.
         Reason.TRUNCATION_UNMEASURED,
     }
+)
+
+#: Why a decision whose thresholds were met still reads ``reject``.  Not a
+#: :class:`Reason` member on purpose -- see :attr:`Decision.final_reason`.
+_VETO_EXPLANATION: Final = (
+    "the arm-to-arm throughput delta was still drifting, so the measurement the "
+    "thresholds were met on is not one a promotion may rest on"
 )
 
 _REASON_EXPLANATIONS: Final[Mapping[Reason, str]] = {
@@ -1175,6 +1183,7 @@ def parse_decision(record: Mapping[str, Any], *, source: Path) -> Decision:
         arm_blocks=_optional_int(record.get("arm_blocks")),
         block_schedule=_parse_block_schedule(record, source),
         throughput_stationarity=_parse_stationarity(record, source),
+        divergence_sampling=_parse_divergence_sampling(record, source),
         **_parse_throughput_statistic(record, source, measured=measured),
     )
 
@@ -1201,6 +1210,30 @@ def _parse_block_schedule(
             )
         )
     return tuple(blocks)
+
+
+def _parse_divergence_sampling(
+    record: Mapping[str, Any], source: Path
+) -> DivergenceSampling | None:
+    """Recover the divergence pass's sampling, or ``None`` when unrecorded.
+
+    ``None`` for every record written before the gate pinned the correctness
+    pass greedy -- which is the honest reading, because those runs inherited
+    whatever ``config.sampling`` served under and the record cannot say what
+    that was.  Never defaulted to greedy: that would invent the very
+    precondition this field exists to evidence.
+    """
+    raw = record.get("divergence_sampling")
+    if raw is None:
+        return None
+    if not isinstance(raw, Mapping):
+        raise ReportError(f"{source}: 'divergence_sampling' must be an object")
+    return DivergenceSampling(
+        temperature=_require_float(raw, "temperature", source),
+        top_p=_require_float(raw, "top_p", source),
+        configured_temperature=_require_float(raw, "configured_temperature", source),
+        configured_top_p=_require_float(raw, "configured_top_p", source),
+    )
 
 
 def _parse_stationarity(
@@ -1505,9 +1538,19 @@ class GainReport:
         if decision is None:
             return result
 
-        result["verdict"] = decision.verdict.value
-        result["reason"] = decision.reason.value
-        result["reason_detail"] = _REASON_EXPLANATIONS[decision.reason]
+        # The outcome, not the threshold comparison.  A promotion the runner
+        # vetoed did not happen, and this field is what every consumer reads.
+        result["verdict"] = decision.final_verdict.value
+        result["reason"] = decision.final_reason
+        # What the numbers alone said, kept beside it: a vetoed run is a
+        # different fact from a run that missed its bars, and collapsing the two
+        # would lose the evidence the veto was applied *to*.
+        result["threshold_verdict"] = decision.verdict.value
+        result["threshold_reason"] = decision.reason.value
+        result["vetoed"] = decision.vetoed
+        result["reason_detail"] = (
+            _VETO_EXPLANATION if decision.vetoed else _REASON_EXPLANATIONS[decision.reason]
+        )
         result["num_repeats"] = decision.num_repeats
         result["thresholds"] = {
             "min_acceptance_delta_pp": decision.min_acceptance_delta_pp,
@@ -1787,11 +1830,22 @@ class GainReport:
             lines.append(self.detail)
             return "\n".join(lines)
 
-        lines.append(f"verdict           : {decision.verdict.value}")
-        lines.append(
-            f"reason            : {decision.reason.value} "
-            f"({_REASON_EXPLANATIONS[decision.reason]})"
-        )
+        lines.append(f"verdict           : {decision.final_verdict.value}")
+        if decision.vetoed:
+            lines.append(
+                f"reason            : {decision.final_reason} ({_VETO_EXPLANATION})"
+            )
+            # The thresholds are still reported -- they are the evidence the
+            # veto was applied to -- but never as the headline.
+            lines.append(
+                f"thresholds        : {decision.reason.value} "
+                f"({_REASON_EXPLANATIONS[decision.reason]})"
+            )
+        else:
+            lines.append(
+                f"reason            : {decision.reason.value} "
+                f"({_REASON_EXPLANATIONS[decision.reason]})"
+            )
         lines.append(f"repeats           : {decision.num_repeats}")
         lines.extend(self._measurement_context_lines(decision))
 
@@ -1915,6 +1969,14 @@ class GainReport:
 def _gain_detail(decision: Decision) -> str:
     reason = decision.reason
     explanation = _REASON_EXPLANATIONS[reason]
+    # Checked before the reason branches below: a vetoed run's *reason* is
+    # ``both_thresholds_met``, and reporting that as the outcome is the defect.
+    if decision.vetoed:
+        return (
+            "Verdict: the candidate draft was NOT promoted. Both thresholds were met, "
+            f"but {_VETO_EXPLANATION}. The gate vetoed the promotion and the cycle "
+            "rolled back."
+        )
     if reason is Reason.COUNTER_RESET:
         return (
             "No gain can be reported: a vLLM counter reset invalidated the benchmark "
@@ -1927,7 +1989,7 @@ def _gain_detail(decision: Decision) -> str:
         )
     if reason in UNMEASURED_REASONS:
         return f"No gain can be reported: {explanation}."
-    if decision.verdict is Verdict.PROMOTE:
+    if decision.final_verdict is Verdict.PROMOTE:
         return "Verdict: the candidate draft was promoted on measured gains."
     return f"Verdict: the candidate draft was rejected because {explanation}."
 

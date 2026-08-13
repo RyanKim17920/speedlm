@@ -1,0 +1,32 @@
+{
+  "typing_delay": 0.006,
+  "settle": 1.2,
+  "prompt": "\\[\\033[1;34m\\]speedlm\\[\\033[0m\\]:\\[\\033[36m\\]\\w\\[\\033[0m\\]$ ",
+  "steps": [
+    {
+      "comment": "addendum to session_live.cast: why the gate refused a real +14.8% speedup.",
+      "command": "R=/data/ryan.kim/speedlm-runs/bigcycle-run1; H=$R/speedlm_home; D=$(ls -d $H/runs/*/decision.json | tail -1)",
+      "pause_after": 2.0
+    },
+    {
+      "comment": "on quality the candidate won outright -- longer accepted drafts, same answers.",
+      "command": "jq '{verdict,reason,accepted_length_delta,acceptance_delta_pp,throughput_delta_pct,divergence_rate,num_contexts,num_repeats}' $D",
+      "pause_after": 9.0
+    },
+    {
+      "comment": "but a speed number only counts if it holds still. this one did not.",
+      "command": "jq '.throughput_stationarity|{stationary,status,vetoed,candidate_trend_pct_per_repeat,stock_trend_pct_per_repeat,delta_shift_pct,delta_shift_t_statistic,min_shift_t_statistic,required_for_promotion}' $D",
+      "pause_after": 10.0
+    },
+    {
+      "comment": "candidate tok/s climbed every repeat while stock sat flat -- that is drift.",
+      "command": "jq -r '.per_repeat[]|\"repeat \\(.repeat_index)  cand \\(.candidate_tok_per_sec|floor) tok/s   stock \\(.stock_tok_per_sec|floor) tok/s\"' $D",
+      "pause_after": 9.0
+    },
+    {
+      "comment": "so the tuner threw away its own win rather than report a number it distrusts.",
+      "command": "jq -r '\"\\(.from) -> \\(.to)   \\(.reason)\"' $H/runs/events.jsonl | tail -3",
+      "pause_after": 8.0
+    }
+  ]
+}

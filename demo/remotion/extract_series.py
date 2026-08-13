@@ -144,6 +144,40 @@ def parse_training_log(path: Path) -> dict:
     return {"train": train, "val": val}
 
 
+#: ``final_reason`` a vetoed record carries.  Mirrors
+#: ``speedlm.gate.decide.VETO_REASON_NON_STATIONARY``.
+NON_STATIONARY_REASON = "throughput_not_stationary"
+
+
+def _vetoed(d: dict) -> bool:
+    """Whether a post-decision veto overrode this record's promotion.
+
+    Prefers the persisted answer.  Falls back to re-deriving it from the
+    stationarity block, so records written before ``final_verdict`` existed --
+    bigcycle-run1 among them -- still read as the rollbacks they were.
+    """
+    if "vetoed" in d:
+        return bool(d["vetoed"])
+    stationarity = d.get("throughput_stationarity")
+    if not isinstance(stationarity, dict):
+        return False
+    return (
+        d.get("verdict") == "promote"
+        and bool(stationarity.get("required_for_promotion"))
+        and stationarity.get("status") == "non_stationary"
+    )
+
+
+def _final_verdict(d: dict) -> str:
+    return d.get("final_verdict") or ("reject" if _vetoed(d) else d["verdict"])
+
+
+def _final_reason(d: dict) -> str | None:
+    if d.get("final_reason"):
+        return str(d["final_reason"])
+    return NON_STATIONARY_REASON if _vetoed(d) else d.get("reason")
+
+
 def parse_decision(path: Path) -> dict:
     d = json.loads(path.read_text())
     required = [
@@ -158,8 +192,16 @@ def parse_decision(path: Path) -> dict:
         raise SystemExit(f"{path} is missing required keys: {missing}")
 
     return {
-        "verdict": d["verdict"],
-        "reason": d.get("reason"),
+        # The OUTCOME, not the threshold comparison.  ``verdict`` is what the
+        # numbers said; a promotion the gate vetoed on a non-stationary
+        # throughput delta still records ``verdict: promote`` while the cycle
+        # rolled back, so charting that field captions a rollback as a
+        # promotion.  Derived for archived records written before the gate
+        # persisted the outcome; see ``_final_verdict``.
+        "verdict": _final_verdict(d),
+        "reason": _final_reason(d),
+        "threshold_verdict": d["verdict"],
+        "threshold_reason": d.get("reason"),
         "throughput": {
             "stock": d["stock_avg_tok_per_sec"],
             "tuned": d["candidate_avg_tok_per_sec"],

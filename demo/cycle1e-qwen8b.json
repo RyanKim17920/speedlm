@@ -39,7 +39,7 @@
     "training_python": "/admin/home/ryan.kim/speedlm/.preflight/venvs/speculators/bin/python",
     "vllm_python": "/admin/home/ryan.kim/speedlm/.preflight/venvs/vllm/bin/python",
     "sequence_length": 16384,
-    "epochs": 8,
+    "epochs": 1,
     "training_port": 8181,
     "scratch_quota_bytes": 103079215104,
     "shutdown_timeout_seconds": 120.0,

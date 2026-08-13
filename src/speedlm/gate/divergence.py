@@ -492,6 +492,19 @@ def evaluate_divergence(
     "do these two heads produce the same answer" is asked of a short,
     single-stream, bounded generation rather than of the batched throughput
     pass, whose whole purpose is to vary batch composition.
+
+    **Precondition: that replay is greedy.**  Every null below -- the Fisher
+    excess test and the flat-hazard position test alike -- rests on speculative
+    decoding being output-preserving, which holds only where verification is
+    exact ``argmax`` equality.  At temperature > 0 the two arms sample
+    independently, they part for reasons that have nothing to do with the draft
+    head, and each p-value here becomes a statement about the sampler.  The
+    caller is responsible for the precondition:
+    :meth:`speedlm.gate.runner.BenchmarkGateRunner._correctness_replay` pins
+    the correctness pass to :data:`speedlm.gate.runner.DIVERGENCE_TEMPERATURE`
+    whatever ``config.sampling`` serves under, and records both in
+    :class:`speedlm.gate.decide.DivergenceSampling` so the record evidences the
+    precondition rather than assuming it.
     """
 
     stock_corr = stock_correctness if stock_correctness is not None else stock_replay

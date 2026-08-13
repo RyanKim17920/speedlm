@@ -63,6 +63,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="How many seeded instances of each family to run.",
     )
     parser.add_argument(
+        "--seed-start",
+        type=int,
+        default=0,
+        help=(
+            "First seed; instances run over [seed-start, seed-start+seeds). "
+            "Task instances are a pure function of the seed, so concurrent "
+            "shards MUST take disjoint windows or they generate identical work."
+        ),
+    )
+    parser.add_argument(
         "--families",
         default="",
         help=(
@@ -107,7 +117,9 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     families = tuple(name for name in args.families.split(",") if name) or None
-    instances = all_instances(seeds=args.seeds, families=families)
+    instances = all_instances(
+        seeds=args.seeds, families=families, seed_start=args.seed_start
+    )
     out = args.out
     (out / "trajectories").mkdir(parents=True, exist_ok=True)
     (out / "workspaces").mkdir(parents=True, exist_ok=True)
@@ -257,6 +269,7 @@ def _report(summaries: list[dict[str, Any]], args: argparse.Namespace) -> dict[s
             "base_url": args.base_url,
             "model": args.model,
             "seeds": args.seeds,
+            "seed_start": args.seed_start,
             "families": args.families or "all",
             "max_turns": args.max_turns,
             "max_output_tokens": args.max_output_tokens,

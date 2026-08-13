@@ -1,0 +1,80 @@
+{
+  "typing_delay": 0.006,
+  "settle": 1.2,
+  "prompt": "\\[\\033[1;34m\\]speedlm\\[\\033[0m\\]:\\[\\033[36m\\]\\w\\[\\033[0m\\]$ ",
+  "steps": [
+    {
+      "comment": "SpeedLM: a vLLM server that retrains its own speculative decoder while idle.",
+      "pause_after": 2.0
+    },
+    {
+      "comment": "this is how you serve Qwen3-8B on plain vLLM.",
+      "command": "echo 'vllm serve Qwen/Qwen3-8B --max-model-len 24576 --gpu-memory-utilization 0.85'",
+      "pause_after": 3.0
+    },
+    {
+      "comment": "this is SpeedLM. same server, same model, one added flag.",
+      "command": "sed -n '132,140p' demo/bigcycle.sbatch",
+      "pause_after": 5.0
+    },
+    {
+      "comment": "that flag is running right now, as SLURM job 380450.",
+      "command": "R=/data/ryan.kim/speedlm-runs/bigcycle-run1; H=$R/speedlm_home; echo $H",
+      "pause_after": 2.0
+    },
+    {
+      "comment": "it needs traffic first. we drove 430 real agentic-coding trajectories at it.",
+      "command": "tail -n 19 /data/ryan.kim/speedlm-runs/bigcorpus-run1/traffic.log",
+      "pause_after": 7.0
+    },
+    {
+      "comment": "that left a corpus of real request/response records -- nothing synthetic.",
+      "command": "wc -l /data/ryan.kim/speedlm-runs/bigcorpus-run1/speedlm_home/traces/traces.jsonl",
+      "pause_after": 4.0
+    },
+    {
+      "comment": "then the traffic stopped. the tuner noticed, slept vLLM, and took the GPU.",
+      "command": "jq -r '[.from//\"START\",.to,(.timestamp|tostring),.reason]|@tsv' $H/runs/events.jsonl | awk -F'\\t' 'NR==1{p=$3} {printf \"%-18s -> %-18s +%5.0fs  %s\\n\",$1,$2,$3-p,substr($4,1,26); p=$3}'",
+      "pause_after": 6.0
+    },
+    {
+      "comment": "it rendered training rows out of a 1024-record window and started fitting.",
+      "command": "L=$(ls -d $H/runs/*/training-logs/stdout.log | tail -1); echo $L",
+      "pause_after": 2.5
+    },
+    {
+      "comment": "every loss below is being written by the trainer, live, as you watch it.",
+      "command": "timeout 7200 tail --pid=$(pgrep -f speculators/scripts/train.py | head -1) -F -n +1 \"$L\" 2>/dev/null | grep --line-buffered -oE 'epoch [0-9]+/8 started|train/loss=[0-9.]+|val/loss_epoch=[0-9.]+, epoch=[0-9]+'",
+      "pause_after": 3.0
+    },
+    {
+      "comment": "training done. now the gate -- is it actually faster, and does it still agree?",
+      "command": "timeout 5400 tail -F -n +1 $H/runs/events.jsonl | jq --unbuffered -r '\"\\(.from) -> \\(.to)   \\(.reason)\"' | stdbuf -oL awk '{print substr($0,1,96)} /-> READY/&&NR>1{exit}'",
+      "pause_after": 3.0
+    },
+    {
+      "comment": "the tuner's own verdict line:",
+      "command": "grep -F 'idle tuning cycle completed' $R/gateway-and-vllm.log",
+      "pause_after": 4.0
+    },
+    {
+      "comment": "and the numbers the gate decided on -- measured, not claimed.",
+      "command": "D=$(ls -d $H/runs/*/decision.json | tail -1); jq '{verdict:(.final_verdict // .verdict),reason:(.final_reason // .reason),threshold_verdict:.verdict,stock_avg_accepted_length,candidate_avg_accepted_length,accepted_length_delta,acceptance_delta_pp,throughput_delta_pct,divergence_rate,num_contexts,num_repeats}' $D",
+      "pause_after": 10.0
+    },
+    {
+      "comment": "quality passed. but the speed number has to hold still to count -- it did not.",
+      "command": "jq '.throughput_stationarity|{stationary,status,vetoed,candidate_trend_pct_per_repeat,stock_trend_pct_per_repeat,delta_shift_pct,delta_shift_t_statistic,min_shift_t_statistic,required_for_promotion}' $D",
+      "pause_after": 10.0
+    },
+    {
+      "comment": "candidate tok/s climbed every repeat while stock sat flat. so: rolled back.",
+      "command": "jq -r '.per_repeat[]|\"repeat \\(.repeat_index)  cand \\(.candidate_tok_per_sec|floor) tok/s   stock \\(.stock_tok_per_sec|floor) tok/s\"' $D",
+      "pause_after": 8.0
+    },
+    {
+      "comment": "one flag. the server tuned itself, measured itself, and refused its own win.",
+      "pause_after": 3.0
+    }
+  ]
+}

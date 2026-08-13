@@ -402,6 +402,56 @@ def test_gain_no_benchmark_json_shape(home: Path) -> None:
     assert payload["deltas_measured"] is False
 
 
+def _vetoed_stationarity() -> dict[str, Any]:
+    """A stationarity block whose evidence vetoes an otherwise-promotion."""
+    return {
+        "testable": True,
+        "stationary": False,
+        "required_for_promotion": True,
+        "min_repeats": 4,
+        "delta_shift_pct": -14.2,
+        "delta_shift_t_statistic": 9.4,
+        "min_shift_t_statistic": 4.0,
+        "materiality_pct": 2.0,
+        "stock_flat_from_repeat": None,
+        "candidate_flat_from_repeat": None,
+        "stock_trend_pct_per_repeat": -0.27,
+        "candidate_trend_pct_per_repeat": 3.69,
+        "status": "non_stationary",
+        "vetoed": True,
+    }
+
+
+def test_gain_reports_a_vetoed_promotion_as_a_rejection(home: Path) -> None:
+    """``speedlm gain`` must not announce a promotion that was rolled back.
+
+    This is the shape bigcycle-run1 wrote: ``verdict: promote``,
+    ``reason: both_thresholds_met``, and a non-stationary throughput veto that
+    sent the cycle to ``ROLLING_BACK``.  The veto is applied after
+    ``decide_promotion`` returns, so the headline verdict on the record was the
+    threshold comparison rather than the outcome.
+    """
+    payload = _decision_dict()
+    payload["throughput_stationarity"] = _vetoed_stationarity()
+    _write_decision(home, payload)
+
+    report = build_gain_report(now=1_000.0)
+    rendered = json.loads(report.to_json())
+
+    assert report.decision is not None
+    assert report.decision.verdict is Verdict.PROMOTE
+    assert report.decision.final_verdict is Verdict.REJECT
+    assert rendered["verdict"] == "reject"
+    assert rendered["threshold_verdict"] == "promote"
+    assert rendered["vetoed"] is True
+    text = report.render_text()
+    assert "verdict           : reject" in text
+    assert "throughput_not_stationary" in text
+    # The one sentence a skimming operator reads must not claim a promotion.
+    assert "was promoted" not in text
+    assert "was NOT promoted" in text
+
+
 def test_gain_unreadable_decision(home: Path) -> None:
     run_dir = home / "runs" / "run-1"
     run_dir.mkdir(parents=True)

@@ -38,14 +38,36 @@ for path in sorted(glob.glob(DECISION_GLOB)):
         # from no decision at all, and reporting it as absence hides a bug.
         unreadable.append("%s: %s: %s" % (path, type(exc).__name__, exc))
         continue
-    entry["decision"] = {k: d.get(k) for k in (
+    # The OUTCOME first. "verdict" is only what the thresholds said: a promotion
+    # the gate vetoed for a non-stationary throughput delta is written as
+    # verdict=promote while the cycle rolls back, so a ledger keyed off it
+    # records promotions that never happened. Derived here for records written
+    # before the gate persisted "final_verdict".
+    stationarity = d.get("throughput_stationarity")
+    vetoed = d.get("vetoed")
+    if vetoed is None:
+        vetoed = bool(
+            d.get("verdict") == "promote"
+            and isinstance(stationarity, dict)
+            and stationarity.get("required_for_promotion")
+            and stationarity.get("status") == "non_stationary"
+        )
+    entry["decision"] = {
+        "final_verdict": d.get("final_verdict") or ("reject" if vetoed else d.get("verdict")),
+        "final_reason": (
+            d.get("final_reason")
+            or ("throughput_not_stationary" if vetoed else d.get("reason"))
+        ),
+        "vetoed": bool(vetoed),
+    }
+    entry["decision"].update({k: d.get(k) for k in (
         "verdict", "reason", "accepted_length_delta", "acceptance_delta_pp",
         "throughput_delta_pct", "stock_avg_accepted_length",
         "stock_avg_tok_per_sec", "candidate_avg_tok_per_sec",
         "stock_truncation_regime", "candidate_truncation_regime",
         "acceptance_dispersion", "num_contexts", "num_repeats",
         "divergence_rate", "control_divergence_rate",
-        "divergence_control_comparable")}
+        "divergence_control_comparable", "divergence_sampling")})
     break
 
 if "decision" not in entry:

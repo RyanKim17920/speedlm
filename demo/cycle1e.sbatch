@@ -1,21 +1,36 @@
 #!/bin/bash
-#SBATCH --job-name=speedlm-bigcycle
+#SBATCH --job-name=speedlm-cycle1e
 #SBATCH --partition=n
 #SBATCH --gres=gpu:1
-#SBATCH --time=08:00:00
-#SBATCH --cpus-per-task=16
-#SBATCH --output=/data/ryan.kim/speedlm-runs/slurm-bigcycle-%j.out
+#SBATCH --time=03:00:00
+#SBATCH --cpus-per-task=8
+#SBATCH --output=/data/ryan.kim/speedlm-runs/slurm-cycle1e-%j.out
 set -euo pipefail
 
-# A REAL idle-tuning cycle at the largest size this machine can provision.
+# A REAL idle-tuning cycle at ONE epoch over the big corpus.
 #
-# This is demo/cycle.sbatch with the size knobs opened up: it seeds from the
-# BIG corpus captured by job 380039 (~4600 records) instead of run5's 1065, and
-# runs demo/bigcycle-qwen8b.json -- a 1024-record training window, 8 epochs,
-# and run5's real gate settings (5 benchmark repeats, 512-token benchmark cap).
-# Everything hard-won in cycle.sbatch is kept verbatim: the log-grep readiness
-# check, the full-corpus seed, the group-wide cleanup trap.
+# This is demo/bigcycle.sbatch with exactly one knob moved: tuning.epochs 8 -> 1
+# (demo/cycle1e-qwen8b.json).  Everything else -- the 1024-record training
+# window, the same seed corpus, run5's real gate settings (5 benchmark repeats,
+# 512-token benchmark cap, held_out_fraction 0.2) -- is held fixed, so the
+# comparison against the 8-epoch run is a clean single-variable one.
 #
+# Why: the 8-epoch run overfit.  It drove val full_acc_0 to 0.988 while
+# ON-POLICY acceptance FELL to 0.549, below run5's 0.612 at a val acc of 0.945,
+# and it was rolled back for throughput_not_stationary.  Epochs are an arbitrary
+# knob a user should never have to tune; the scaling axis is DATA, not passes
+# over it.  One epoch over 1024 records is the honest default, and this run is
+# the measurement of what that default actually buys.
+#
+# Everything hard-won in cycle.sbatch/bigcycle.sbatch is kept verbatim: the
+# log-grep readiness check, the full-corpus seed, the group-wide cleanup trap.
+#
+# --cpus-per-task=8 (not 16) and --time=03:00:00 (not 08:00:00) are deliberate:
+# the cluster is saturated and this is sized to fit a backfill window.  One
+# epoch is ~1/8th the training work, so 3h is ample.
+#
+# The window is UNCHANGED at 1024, so the sizing math below still governs, and
+# epochs do not change it: shards are extracted once, before the epoch loop.
 # Why 1024 and not 1536/2048/3072: scratch, not data, is the binding constraint.
 # eagle3.py's MAX_SCRATCH_BYTES is 96 GiB and the quota is fail-closed
 # (_check -> scratch_usage(work_dir) > scratch_quota_bytes on every stage tick).
@@ -42,8 +57,8 @@ set -euo pipefail
 # the ceiling costs nothing when actual usage is ~55 GB.
 
 repo=/admin/home/ryan.kim/speedlm-fr
-run_dir=${BIGCYCLE_RUN_DIR:-/data/ryan.kim/speedlm-runs/bigcycle-run1}
-config="$repo/demo/bigcycle-qwen8b.json"
+run_dir=${CYCLE1E_RUN_DIR:-/data/ryan.kim/speedlm-runs/cycle1e-run1}
+config="$repo/demo/cycle1e-qwen8b.json"
 model="Qwen/Qwen3-8B"
 seed_traces=/data/ryan.kim/speedlm-runs/bigcorpus-run1/speedlm_home/traces/traces.jsonl
 

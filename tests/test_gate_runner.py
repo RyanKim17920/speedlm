@@ -37,6 +37,7 @@ from speedlm.gate.runner import (
     _stationarity,
 )
 from speedlm.gate.suite import BenchmarkSuite, FrozenContext, SuiteError
+from speedlm.report import parse_decision
 from speedlm.traces.store import TraceRecord
 from speedlm.tuner.orchestrator import GateFailure, derive_benchmark_timeout
 
@@ -118,6 +119,11 @@ class FakeReplayExecutor:
     seen_suite_ids: list[int] = field(default_factory=list)
     #: ``(concurrency, max_tokens, capture_tokens)`` per call, in call order.
     seen_options: list[tuple[int | None, int | None, bool]] = field(default_factory=list)
+    #: The sampling parameters each call was actually issued under, in call
+    #: order.  Recorded rather than asserted in place: the correctness pass and
+    #: the throughput pass are entitled to *different* sampling, so a blanket
+    #: assertion here could only ever encode one of them.
+    seen_sampling: list[SamplingConfig] = field(default_factory=list)
     #: Text each request should return, keyed by whether the call is the
     #: correctness pass.  Lets a test make the arms disagree on the correctness
     #: pass while agreeing on the throughput pass, which is the real shape.
@@ -152,9 +158,7 @@ class FakeReplayExecutor:
         assert endpoint_url == "http://not-used.test/"
         assert timeout_seconds > 0
         assert repeats >= 1
-        assert sampling.temperature == 0.0
-        assert sampling.top_p == 1.0
-        assert sampling.seed == 0
+        self.seen_sampling.append(sampling)
         self.calls += 1
         self.seen_repeats.append(repeats)
         self.seen_suite_ids.append(id(suite))
@@ -1028,6 +1032,109 @@ def test_correctness_pass_runs_single_stream_whatever_the_benchmark_degree(
         "max_tokens": DEFAULT_CORRECTNESS_MAX_TOKENS,
         "repeats": CORRECTNESS_REPEATS,
     }
+
+
+def test_the_divergence_pass_replays_greedy_even_when_serving_samples(
+    tmp_path: Path,
+) -> None:
+    """The exact-match divergence criterion is only licensed by greedy decoding.
+
+    ``divergence.py``'s two nulls both rest on speculative decoding being
+    *output-preserving*, which it is only under ``argmax`` verification: at
+    temperature > 0 the two arms draw from the target distribution
+    independently of one another and part for reasons that have nothing to do
+    with the draft head.  ``config.sampling`` is an operator knob -- a
+    deployment that mirrors its production traffic sets it to that traffic's
+    temperature -- and before this the correctness pass inherited it verbatim,
+    so the gate would emit an authoritative-looking p-value measuring RNG.
+
+    The throughput/acceptance pass keeps the configured sampling: that one is
+    an arm-to-arm ratio and is meant to look like production.
+    """
+    replay_executor = FakeReplayExecutor()
+    served = SamplingConfig(temperature=0.7, top_p=0.95, seed=0)
+    runner = BenchmarkGateRunner(
+        config=SpeedLMConfig(model="model", sampling=served),
+        trace_source=FakeTraceSource((_trace(),)),
+        suite_dir=tmp_path / "suite",
+        stock_draft="stock",
+        endpoint=FakeEndpoint(),
+        metrics_source=FakeMetricsSource(_normal_scrapes()),
+        replay_executor=replay_executor,
+        training_context_hashes=frozenset(),
+        clock=FakeClock(),
+    )
+
+    result = runner.benchmark(
+        tmp_path / "candidate",
+        timeout_seconds=30,
+        should_abort=lambda: False,
+    )
+
+    paired = list(
+        zip(replay_executor.seen_options, replay_executor.seen_sampling, strict=True)
+    )
+    correctness = [sampling for options, sampling in paired if options[2]]
+    throughput = [sampling for options, sampling in paired if not options[2]]
+    assert correctness, "no correctness pass ran"
+    assert correctness == [SamplingConfig(temperature=0.0, top_p=1.0, seed=0)] * len(
+        correctness
+    )
+    assert throughput == [served] * len(throughput)
+
+    # And the record says which sampling produced the divergence numbers, so a
+    # reader never has to assume the gate's soundness precondition held.
+    assert result.decision is not None
+    assert result.decision.to_dict()["divergence_sampling"] == {
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "configured_temperature": 0.7,
+        "configured_top_p": 0.95,
+        "greedy": True,
+        "forced_greedy": True,
+    }
+
+
+def test_a_vetoed_promotion_is_persisted_as_a_rejection(tmp_path: Path) -> None:
+    """``decision.json`` must not say ``promote`` for a run that rolled back.
+
+    The thresholds are met and the stationarity veto fires afterwards, in the
+    runner.  Before this the veto reached only
+    ``throughput_stationarity.vetoed``, so the record's headline verdict --
+    the field ``speedlm gain``, the demo and every archive reader key off --
+    claimed a promotion that never happened.
+    """
+    runner, _, _ = _blocked_runner(
+        tmp_path,
+        arm_blocks=2,
+        run_latencies=_stepped_latencies(15, step_at=12),
+    )
+
+    result = runner.benchmark(
+        tmp_path / "candidate", timeout_seconds=30, should_abort=lambda: False
+    )
+
+    decision = result.decision
+    assert decision is not None
+    # What the numbers said is still recorded, unchanged.
+    assert decision.verdict is Verdict.PROMOTE
+    assert decision.reason is Reason.BOTH_THRESHOLDS_MET
+    # What actually happened is recorded too, and it is a rejection.
+    assert decision.vetoed is True
+    assert decision.final_verdict is Verdict.REJECT
+    assert decision.final_reason == NON_STATIONARY_REASON
+    assert result.passed is False
+
+    payload = decision.to_dict()
+    assert payload["verdict"] == "promote"
+    assert payload["final_verdict"] == "reject"
+    assert payload["final_reason"] == NON_STATIONARY_REASON
+    assert payload["vetoed"] is True
+
+    # Through the reader every consumer goes through, not just in memory.
+    reloaded = parse_decision(payload, source=tmp_path / "decision.json")
+    assert reloaded.final_verdict is Verdict.REJECT
+    assert reloaded.final_reason == NON_STATIONARY_REASON
 
 
 def test_correctness_max_tokens_is_configurable(tmp_path: Path) -> None:

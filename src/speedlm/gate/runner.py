@@ -19,7 +19,9 @@ from typing import TYPE_CHECKING, Final, Protocol, TypeVar
 from speedlm.config import SamplingConfig, SpeedLMConfig
 from speedlm.gate.decide import (
     UNRECORDED_EXECUTION_MODE,
+    VETO_REASON_NON_STATIONARY,
     Decision,
+    DivergenceSampling,
     EngineExecution,
     MeasurementBlock,
     ThroughputStationarity,
@@ -249,8 +251,29 @@ INTERLEAVED_ARM_BLOCKS: Final = 2
 PROMOTION_REQUIRES_STATIONARITY: Final = True
 
 #: ``GateResult.reason`` when the numbers cleared every threshold but the
-#: measurement they came from was still drifting.
-NON_STATIONARY_REASON: Final = "throughput_not_stationary"
+#: measurement they came from was still drifting.  Alias of
+#: :data:`speedlm.gate.decide.VETO_REASON_NON_STATIONARY`, which the persisted
+#: decision uses for the same fact: the two must be one string, or the record
+#: and the cycle log can name the same veto differently.
+NON_STATIONARY_REASON: Final = VETO_REASON_NON_STATIONARY
+
+#: Sampling the correctness/divergence pass is pinned to, whatever
+#: ``config.sampling`` serves under.
+#:
+#: The output-correctness criterion compares the two arms for exact equality,
+#: and its nulls hold only where speculative decoding is output-preserving --
+#: greedy verification, where acceptance is exact ``argmax`` equality with no
+#: tolerance band and no RNG.  ``config.sampling`` exists to mirror production
+#: traffic and may be anything; inheriting it here would let the gate publish a
+#: p-value measuring the sampler.  See :class:`speedlm.gate.decide.DivergenceSampling`.
+#:
+#: Forcing greedy rather than refusing to run keeps the criterion alive: it is
+#: the gate's only guard against a mis-wired or bypassed verifier, and a broken
+#: head is broken at temperature 0 too.  The seed is carried through unchanged
+#: -- it is not a stochasticity knob under greedy decoding, and pinning it
+#: would silently change the prefix-cache behaviour a run was configured for.
+DIVERGENCE_TEMPERATURE: Final = 0.0
+DIVERGENCE_TOP_P: Final = 1.0
 
 #: ``|shift| / SE(shift)`` above which the arm-to-arm delta is held to have
 #: moved during the run rather than jittered.
@@ -932,8 +955,13 @@ class BenchmarkGateRunner:
                 arm_blocks=self._arm_blocks,
                 block_schedule=tuple(blocks_run),
                 throughput_stationarity=stationarity,
+                divergence_sampling=self._divergence_sampling_record(),
             )
-            promoted = decision.verdict is Verdict.PROMOTE and not stationarity.vetoed
+            # Read off the record rather than recomputed here.  The veto used to
+            # live only in this local, so ``decision.json`` said ``promote`` for
+            # a cycle that rolled back; ``final_verdict`` is now the one place
+            # the outcome is derived, and it is persisted.
+            promoted = decision.final_verdict is Verdict.PROMOTE
 
             # The last block of the schedule leaves *its* arm serving.  A
             # promotion is the one case that needs the candidate back: the
@@ -979,11 +1007,9 @@ class BenchmarkGateRunner:
             passed=promoted,
             # A vetoed promotion must not report the reason the *numbers* gave,
             # or the cycle log would say "gate rejected: both thresholds met".
-            reason=(
-                decision.reason.value
-                if promoted or decision.verdict is not Verdict.PROMOTE
-                else NON_STATIONARY_REASON
-            ),
+            # ``final_reason`` is that rule, moved onto the record so the cycle
+            # log and ``decision.json`` cannot disagree about the same veto.
+            reason=decision.final_reason,
             metrics={
                 "suite_hash": suite.suite_hash,
                 "engine_execution": _engine_execution_dict(
@@ -1292,11 +1318,16 @@ class BenchmarkGateRunner:
         under this same cap and this same concurrency, because a floor measured
         under different conditions from the measurement is not that
         measurement's floor.
+
+        The sampling is pinned greedy here for the same reason the concurrency
+        is pinned: ``config.sampling`` is a *serving* knob, and letting it reach
+        this pass is the conflation that would make the equality check
+        meaningless.  See :data:`DIVERGENCE_TEMPERATURE`.
         """
         return self._replay_executor.replay(
             suite,
             self._endpoint.url,
-            self._config.sampling,
+            self._divergence_sampling(),
             repeats=(
                 CORRECTNESS_REPEATS + CORRECTNESS_CONTROL_REPEATS
                 if control
@@ -1307,6 +1338,25 @@ class BenchmarkGateRunner:
             concurrency=CORRECTNESS_REPLAY_CONCURRENCY,
             max_tokens=self._correctness_max_tokens,
             capture_tokens=True,
+        )
+
+    def _divergence_sampling(self) -> SamplingConfig:
+        """The configured sampling, forced greedy.  See :data:`DIVERGENCE_TEMPERATURE`."""
+        return replace(
+            self._config.sampling,
+            temperature=DIVERGENCE_TEMPERATURE,
+            top_p=DIVERGENCE_TOP_P,
+        )
+
+    def _divergence_sampling_record(self) -> DivergenceSampling:
+        """What the two passes replayed under, for the persisted decision."""
+        used = self._divergence_sampling()
+        configured = self._config.sampling
+        return DivergenceSampling(
+            temperature=used.temperature,
+            top_p=used.top_p,
+            configured_temperature=configured.temperature,
+            configured_top_p=configured.top_p,
         )
 
     def _warmup(

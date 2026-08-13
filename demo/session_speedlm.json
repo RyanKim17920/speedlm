@@ -80,7 +80,7 @@
     },
     {
       "comment": "Zero overlap on all three checks. So the honest, session-disjoint verdict:",
-      "command": "python3 -c \"import json;d=json.load(open('/data/ryan.kim/speedlm-runs/regate-unseen-run1/decision.json'));[print('%-24s %s'%(k,d[k])) for k in ('verdict','accepted_length_delta','throughput_delta_pct','num_contexts','num_repeats','reason')]\"",
+      "command": "python3 -c \"import json;d=json.load(open('/data/ryan.kim/speedlm-runs/regate-unseen-run1/decision.json'));d['verdict']=d.get('final_verdict',d['verdict']);d['reason']=d.get('final_reason',d['reason']);[print('%-24s %s'%(k,d[k])) for k in ('verdict','accepted_length_delta','throughput_delta_pct','num_contexts','num_repeats','reason')]\"",
       "pause_before": 0.4,
       "pause_after": 8.0
     },

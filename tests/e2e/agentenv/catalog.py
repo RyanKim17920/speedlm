@@ -1002,11 +1002,29 @@ def task_by_name(name: str) -> Task:
     raise KeyError(f"unknown task {name!r}; available: {known}")
 
 
-def all_instances(*, seeds: int, families: tuple[str, ...] | None = None) -> list[TaskInstance]:
-    """``seeds`` instances of every selected family, in a stable order."""
+def all_instances(
+    *,
+    seeds: int,
+    families: tuple[str, ...] | None = None,
+    seed_start: int = 0,
+) -> list[TaskInstance]:
+    """``seeds`` instances of every selected family, in a stable order.
+
+    Seeds run over ``range(seed_start, seed_start + seeds)``.  ``seed_start``
+    exists so that concurrent traffic shards can each take a DISJOINT seed
+    window: ``instance(seed)`` is a pure function of the seed, so two shards
+    both left at the default ``seed_start=0`` would plant byte-identical
+    workspaces and prompts and merely duplicate each other's corpus.
+    """
     if seeds < 1:
         raise ValueError("seeds must be at least 1")
+    if seed_start < 0:
+        raise ValueError("seed_start must be non-negative")
     chosen = [task for task in TASKS if families is None or task.name in families]
     if not chosen:
         raise ValueError(f"no task matched families={families!r}")
-    return [task.instance(seed) for seed in range(seeds) for task in chosen]
+    return [
+        task.instance(seed)
+        for seed in range(seed_start, seed_start + seeds)
+        for task in chosen
+    ]

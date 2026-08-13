@@ -679,9 +679,83 @@ class ThroughputStationarity:
         }
 
 
+#: ``GateResult.reason`` -- and :attr:`Decision.final_reason` -- when the
+#: numbers cleared every threshold but the measurement they came from was still
+#: drifting.  Defined here rather than in :mod:`speedlm.gate.runner`, which
+#: imports it, because the persisted decision has to be able to name the veto
+#: that overrode it; ``runner.NON_STATIONARY_REASON`` is an alias of this.
+VETO_REASON_NON_STATIONARY: Final = "throughput_not_stationary"
+
+
+@dataclass(frozen=True, slots=True)
+class DivergenceSampling:
+    """The sampling parameters the divergence comparison actually ran under.
+
+    The output-correctness criterion in :mod:`speedlm.gate.divergence` compares
+    the two arms for *exact* equality and reads any disagreement as evidence
+    about the engine.  Both of its nulls are licensed by one premise:
+    speculative decoding is output-preserving, which holds only under greedy
+    verification, where acceptance is exact ``argmax`` equality with no
+    tolerance band and no RNG.  At temperature > 0 the two arms sample
+    independently, they part for reasons that have nothing to do with the draft
+    head, and the resulting p-value measures the random number generator.
+
+    ``config.sampling`` is an operator knob whose whole purpose is to mirror
+    production traffic, so nothing stops it being stochastic.  The gate
+    therefore replays its *correctness* pass greedily whatever is configured --
+    see :meth:`speedlm.gate.runner.BenchmarkGateRunner._correctness_replay` --
+    and records both numbers here, so a reader never has to assume the
+    criterion's precondition held.  The throughput/acceptance pass keeps the
+    configured sampling: that statistic is an arm-to-arm ratio and is meant to
+    look like production.
+    """
+
+    #: What the correctness/divergence pass replayed under.
+    temperature: float
+    top_p: float
+    #: What ``config.sampling`` asked for, i.e. what the throughput pass used.
+    configured_temperature: float
+    configured_top_p: float
+
+    @staticmethod
+    def _is_greedy(temperature: float, top_p: float) -> bool:
+        return temperature == 0.0 and top_p >= 1.0
+
+    @property
+    def greedy(self) -> bool:
+        """Whether the divergence comparison's null was licensed at all."""
+        return self._is_greedy(self.temperature, self.top_p)
+
+    @property
+    def forced_greedy(self) -> bool:
+        """Whether the gate had to override stochastic serving sampling."""
+        return self.greedy and not self._is_greedy(
+            self.configured_temperature, self.configured_top_p
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "temperature": self.temperature,
+            "top_p": self.top_p,
+            "configured_temperature": self.configured_temperature,
+            "configured_top_p": self.configured_top_p,
+            "greedy": self.greedy,
+            "forced_greedy": self.forced_greedy,
+        }
+
+
 @dataclass(frozen=True, slots=True)
 class Decision:
-    """The promotion decision with full reporting."""
+    """The promotion decision with full reporting.
+
+    :attr:`verdict` and :attr:`reason` are what the *thresholds* said.  They are
+    not always what happened: the runner applies a stationarity veto after this
+    type is built, and a vetoed promotion is a rollback.  :attr:`final_verdict`
+    and :attr:`final_reason` are the outcome, and they are what a reader of
+    ``decision.json`` -- ``speedlm gain``, the demo, an archive sweep -- must
+    key off.  Both pairs are persisted, because "the numbers cleared the bar and
+    the measurement was still moving" is two facts, not one.
+    """
 
     verdict: Verdict
     reason: Reason
@@ -918,6 +992,49 @@ class Decision:
     #: Whether the columns this decision was computed from had stopped moving.
     #: ``None`` means the record predates the test, never "it was stationary".
     throughput_stationarity: ThroughputStationarity | None = None
+    #: The sampling the divergence comparison ran under, beside the sampling the
+    #: throughput pass ran under.  ``None`` means the record predates the field,
+    #: never "it was greedy" -- see :class:`DivergenceSampling`.
+    divergence_sampling: DivergenceSampling | None = None
+
+    # -- the outcome, as against what the thresholds said --------------------
+
+    @property
+    def vetoed(self) -> bool:
+        """Whether a post-decision veto overrode an otherwise-promotion.
+
+        Only the stationarity veto exists today.  It is a property of *how the
+        measurement was taken*, so it is applied by the runner after
+        :func:`decide_promotion` returns -- which is exactly why it has to be
+        reflected here: the record is the only thing that reaches disk.
+        """
+        stationarity = self.throughput_stationarity
+        return (
+            self.verdict is Verdict.PROMOTE
+            and stationarity is not None
+            and stationarity.vetoed
+        )
+
+    @property
+    def final_verdict(self) -> Verdict:
+        """What actually happened, vetoes included.
+
+        Read this, not :attr:`verdict`, to answer "was the candidate
+        promoted".  ``bigcycle-run1`` wrote ``verdict: promote`` for a cycle
+        that rolled back on a non-stationary throughput delta; the only place
+        the truth appeared was ``events.jsonl``.
+        """
+        return Verdict.REJECT if self.vetoed else self.verdict
+
+    @property
+    def final_reason(self) -> str:
+        """Why :attr:`final_verdict` reads the way it does.
+
+        A string rather than a :class:`Reason`, because a veto is not one of
+        the reasons the thresholds can produce and inventing an enum member for
+        it would make every archived record's ``reason`` ambiguous.
+        """
+        return VETO_REASON_NON_STATIONARY if self.vetoed else self.reason.value
 
     # -- dispersion of the gated statistics ---------------------------------
     # Derived from ``per_repeat`` rather than stored, so an archived decision
@@ -1202,8 +1319,16 @@ class Decision:
 
     def to_dict(self) -> dict[str, Any]:
         return {
+            # What the thresholds said.  Unchanged, and still first, so every
+            # archived reader keeps loading what it always loaded.
             "verdict": self.verdict.value,
             "reason": self.reason.value,
+            # What actually happened.  These differ from the pair above exactly
+            # when a post-decision veto fired; see :attr:`final_verdict`.  A
+            # reader asking "was it promoted" must use these.
+            "final_verdict": self.final_verdict.value,
+            "final_reason": self.final_reason,
+            "vetoed": self.vetoed,
             "acceptance_delta_pp": self.acceptance_delta_pp,
             "throughput_statistic": self.throughput_statistic,
             "throughput_delta_pct": self.throughput_delta_pct,
@@ -1278,6 +1403,14 @@ class Decision:
             # test that judged them.  Without these a reader cannot tell a head
             # that broke from an engine that is not bitwise reproducible; see
             # ``DIVERGENCE_ALPHA``.
+            # The sampling that evidence was collected under.  The exact-match
+            # criterion is only sound when this reads greedy; see
+            # :class:`DivergenceSampling`.
+            "divergence_sampling": (
+                None
+                if self.divergence_sampling is None
+                else self.divergence_sampling.to_dict()
+            ),
             "divergence_control_available": self.divergence_control_available,
             "divergence_control_comparable": self.divergence_control_comparable,
             "divergence_position_p_value": self.divergence_position_p_value,
