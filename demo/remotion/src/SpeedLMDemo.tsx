@@ -213,10 +213,9 @@ export const SpeedLMDemo: React.FC = () => {
           padding: "22px 32px 10px",
           display: "flex",
           flexDirection: "column",
-          // Tightened from 20 -> 12 -> 9 as the gate card grew: it now carries
-          // the "+15.0% per verifier step" reading under accepted length AND a
-          // two-line caused-range caveat under throughput. At 12 the caveat's
-          // second line fell off the bottom of the panel.
+          // Tightened from 20 -> 12 -> 9 as the gate card grew: it now leads with
+          // a 52px hero figure for the accepted-length result and still carries
+          // the throughput line and the veto note underneath it.
           gap: 9,
         }}
       >
@@ -257,6 +256,7 @@ export const SpeedLMDemo: React.FC = () => {
             delta_standard_error: data.gate.accepted_length.delta_standard_error,
           }}
           perRepeat={data.gate.per_repeat}
+          reproductions={data.gate.reproductions}
           verdict={data.gate.verdict}
           contexts={data.gate.num_contexts}
           repeats={data.gate.num_repeats}

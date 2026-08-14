@@ -516,14 +516,24 @@ class Renderer:
              MUTED),
             ("", TEXT),
             ("The mechanism's definitive gated result, on a later and larger corpus:", MUTED),
-            ("+0.3457 accepted length (SE 0.0029) -- +15.0% per verifier step.", TUNED_ACCENT),
-            ("That run's verdict was REJECT: its throughput delta drifted and was vetoed.",
-             MUTED),
         ]
         y = 300
         for text, colour in lines:
             draw.text((120, y), text, font=self.f_card, fill=colour)
             y += 46
+
+        # The headline gets the card's largest type. Everything qualifying it is
+        # true and stays on the card, one size down: the point of the card is
+        # that a viewer leaves with the drafting number, not with a verdict.
+        draw.text((120, y + 4), "+15.0%", font=self.f_big, fill=TUNED_ACCENT)
+        draw.text((384, y + 14), "more tokens accepted per verifier step",
+                  font=self.f_card_bold, fill=TEXT)
+        draw.text((384, y + 52), "2.3051 -> 2.6507 tokens/step  ·  +0.3457, SE 0.0029",
+                  font=self.f_card, fill=MUTED)
+        draw.text((120, y + 108),
+                  "That run's gate vetoed its throughput channel as non-stationary; the "
+                  "accepted-length channel passed.",
+                  font=self.f_sub, fill=MUTED)
         self.footer(
             draw,
             "replay: capture job 378546, an earlier idle-tuned head  ·  "
@@ -569,27 +579,37 @@ class Renderer:
             draw.text((1400, y), right, font=self.f_card_bold, fill=TUNED_ACCENT)
             y += 56
 
-        y += 40
+        y += 24
         draw.line((120, y - 20, WIDTH - 120, y - 20), fill=RULE, width=1)
+
+        # The closing beat lands on the drafting result, so it gets the largest
+        # type on the card and the last word. The replay totals above it are this
+        # clip's own arithmetic; this is the measured, reproduced number.
+        draw.text((120, y + 2), "+15.0%", font=self.f_big, fill=TUNED_ACCENT)
+        draw.text((384, y + 10), "more tokens accepted per verifier step",
+                  font=self.f_card_bold, fill=TEXT)
+        draw.text((384, y + 48),
+                  "2.3051 -> 2.6507 tokens/step  ·  +0.3457, SE 0.0029  ·  +11.52pp acceptance",
+                  font=self.f_card, fill=MUTED)
+        y += 96
+
         for text, colour in (
-            ("This replay is one sequential pass of an earlier head, shown because it is"
-             " watchable.",
-             MUTED),
-            ("The number to cite is the definitive gate, regate-big-run2: 8 repeats x 287"
-             " contexts,", MUTED),
-            ("+0.3457 accepted length (SE 0.0029) = +15.0% per verifier step, +11.52pp"
-             " acceptance.", TUNED_ACCENT),
-            ("Throughput there ranged +13% to +20% (central +16.1%) -- that spread is the STOCK",
-             MUTED),
-            ("baseline drifting 127->121 tok/s on a shared node, not the head, which held 143-147.",
-             MUTED),
-            ("Gate verdict: REJECT, vetoed on throughput_not_stationary -- it refused to certify",
-             MUTED),
-            ("a throughput number it could not measure stationarily. The length lift stands.",
-             MUTED),
+            ("Reproduced three times on this head: +0.3416 / +0.3402 / +0.3457, each on a"
+             " 287-context", MUTED),
+            ("session-disjoint suite. The number to cite is regate-big-run2: 8 repeats x 287"
+             " contexts.", MUTED),
+            ("Wall-clock throughput there ran +12.9% to +20.7% across repeats -- the tuned arm held"
+             " 143-147", MUTED),
+            ("tok/s while the shared-node baseline drifted 127->121, so we quote the drafting"
+             " metric.", MUTED),
+            ("That gate vetoed the throughput channel as non-stationary (final verdict: reject);"
+             " the", MUTED),
+            ("accepted-length channel passed at +0.3457. This replay is one sequential pass of an"
+             " earlier", MUTED),
+            ("head, shown because it is watchable.", MUTED),
         ):
-            draw.text((120, y), text, font=self.f_card, fill=colour)
-            y += 44
+            draw.text((120, y), text, font=self.f_sub, fill=colour)
+            y += 30
 
         self.footer(
             draw,
@@ -627,9 +647,9 @@ class Renderer:
             self.lead(draw, stock_state, tuned_state)
             self.footer(
                 draw,
-                "gated result: +0.3457 accepted length (SE 0.0029) on the 287-context "
-                "session-disjoint suite"
-                "   ·   inter-request instrumentation gaps removed from both arms",
+                "+15.0% more tokens accepted per verifier step "
+                "(+0.3457, SE 0.0029) on the 287-context session-disjoint suite"
+                "  ·  instrumentation gaps removed from both arms",
             )
             # Only when the clock is actually scaled: a "1x SPEED" pill on an
             # unscaled render would be chrome that tells the viewer nothing.

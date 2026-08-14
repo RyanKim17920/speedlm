@@ -20,7 +20,7 @@
     },
     {
       "comment": "Everything below reads ONE real completed run, already on disk:",
-      "command": "export R=/data/ryan.kim/speedlm-runs/bigcycle-run1 D=/data/ryan.kim/speedlm-runs/regate-big-run2; export C=$R/speedlm_home/runs/e7004c4c0c7548fba65b05a924aa57ea T=$R/speedlm_home/traces/traces.jsonl E=$R/speedlm_home/runs/events.jsonl",
+      "command": "export R=/data/ryan.kim/speedlm-runs/bigcycle-run1 D=/data/ryan.kim/speedlm-runs/regate-big-run2; export C=$R/speedlm_home/runs/e7004c4c0c7548fba65b05a924aa57ea T=$R/speedlm_home/traces/traces.jsonl E=$R/speedlm_home/runs/events.jsonl G=/data/ryan.kim/speedlm-runs/regate-big-run1/decision.json",
       "pause_before": 0.3,
       "pause_after": 1.2
     },
@@ -59,13 +59,19 @@
       "pause_after": 5.0
     },
     {
-      "comment": "8. Stock draft head vs the head it just trained, side by side:",
-      "command": "jq -r 'def r4:(.*10000|round/10000); def r3:(.*1000|round/1000); def r2:(.*100|round/100); def r1:(.*10|round/10); def pc1:((.*10|round) as $t|\"\\($t/10|floor).\\($t%10)\"); def p(n):(tostring+\"            \")[0:n]; def dl:[.per_repeat[]|(.candidate_tok_per_sec/.stock_tok_per_sec-1)*100|r1]; \"                      \\(\"tuned\"|p(11))\\(\"stock\"|p(11))delta\", \"accepted length       \\(.candidate_avg_accepted_length|r4|p(11))\\(.stock_avg_accepted_length|r4|p(11))+\\(.accepted_length_delta|r4)  (SE \\(.accepted_length_delta_standard_error|r4))  = +\\(.accepted_length_delta/.stock_avg_accepted_length*100|pc1)% per step\", \"acceptance rate       \\(.candidate_avg_acceptance|r3|p(11))\\(.stock_avg_acceptance|r3|p(11))+\\(.acceptance_delta_pp|r2)pp  (SE \\(.acceptance_delta_standard_error_pp|r2)pp)\", \"decode tok/s          \\(.candidate_avg_tok_per_sec|r2|p(11))\\(.stock_avg_tok_per_sec|r2|p(11))+\\(.throughput_delta_pct|r2)% central, NOT settled\", \"                      per-repeat range +\\(dl|min|pc1)% to +\\(dl|max|pc1)%; the tuned arm was flat,\", \"                      the STOCK baseline drifted \\(.per_repeat[0].stock_tok_per_sec|round)->\\(.per_repeat[-1].stock_tok_per_sec|round) tok/s. Lead on length.\", \"\", \"VERDICT               \\(((.final_verdict // .verdict))|ascii_upcase)   (\\(.final_reason // .reason))   vetoed=\\(.vetoed)\", \"identical outputs     \\(.divergence_trials - .output_total_divergences) / \\(.divergence_trials) greedy trials  (\\(.output_total_divergences) divergences)\"' $D/decision.json",
+      "comment": "8. The head it just trained vs the stock draft head, on that suite:",
+      "command": "jq -r 'def r4:(.*10000|round/10000); def r3:(.*1000|round/1000); def r2:(.*100|round/100); def r1:(.*10|round/10); def pc1:((.*10|round) as $t|\"\\($t/10|floor).\\($t%10)\"); def p(n):(tostring+\"            \")[0:n]; def dl:[.per_repeat[]|(.candidate_tok_per_sec/.stock_tok_per_sec-1)*100|r1]; \"                      \\(\"tuned\"|p(11))\\(\"stock\"|p(11))delta\", \"accepted length       \\(.candidate_avg_accepted_length|r4|p(11))\\(.stock_avg_accepted_length|r4|p(11))+\\(.accepted_length_delta|r4)  (SE \\(.accepted_length_delta_standard_error|r4))\", \"                                             = +\\(.accepted_length_delta/.stock_avg_accepted_length*100|pc1)% more tokens accepted per step\", \"acceptance rate       \\(.candidate_avg_acceptance|r3|p(11))\\(.stock_avg_acceptance|r3|p(11))+\\(.acceptance_delta_pp|r2)pp  (SE \\(.acceptance_delta_standard_error_pp|r2)pp)\", \"decode tok/s          \\(.candidate_avg_tok_per_sec|r2|p(11))\\(.stock_avg_tok_per_sec|r2|p(11))+\\(dl|min|pc1)% to +\\(dl|max|pc1)% across repeats\", \"\", \"identical outputs     \\(.divergence_trials - .output_total_divergences) / \\(.divergence_trials) greedy trials  (\\(.output_total_divergences) divergences)\", \"gate verdict          \\(.final_verdict // .verdict), vetoed on \\(.final_reason // .reason) -- that is the\", \"                      throughput channel; accepted length passed at +\\(.accepted_length_delta|r4).\"' $D/decision.json",
       "pause_before": 0.3,
       "pause_after": 6.0
     },
     {
-      "comment": "One idle window, no operator: +0.3457 tokens/step (+15.0%). Gate still said REJECT.",
+      "comment": "And it is not a one-off. Three independent gates of this same head:",
+      "command": "jq -r 'def r4:(.*10000|round/10000); \"  \\(input_filename|split(\"/\")|.[4]|(.+\"              \")[0:16])\\(.num_contexts) contexts x \\(.num_repeats) repeats   accepted length +\\(.accepted_length_delta|r4)\"' $C/decision.json $G $D/decision.json",
+      "pause_before": 0.3,
+      "pause_after": 4.0
+    },
+    {
+      "comment": "One idle window, no operator: +15.0% more tokens accepted per verifier step.",
       "pause_before": 0.3,
       "pause_after": 3.0
     }

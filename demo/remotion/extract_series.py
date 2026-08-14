@@ -76,6 +76,26 @@ DEFAULT_RUN_ROOTS = [
 # +14.76%, the earlier clean +0.2989 / +9.94% gate, and regate-big-run1's +19.91%.
 DEFAULT_DECISION = Path("/data/ryan.kim/speedlm-runs/regate-big-run2/decision.json")
 
+# Independent gates of the SAME head, in the order they were run. The strongest
+# property of the headline is that it REPRODUCED: three separate measurements on
+# the 287-context session-disjoint suite land within 0.006 tokens/step of each
+# other. The chart says "reproduced Nx" off the length of this list and prints
+# each delta, so the claim is read out of real records rather than typed in --
+# if a record goes missing the count drops instead of the claim standing.
+#
+# Note what is deliberately NOT carried across from these earlier records: their
+# throughput deltas (+14.76%, +19.91%) are superseded and appear nowhere.
+_RUNS = Path("/data/ryan.kim/speedlm-runs")
+CORROBORATING_DECISIONS: list[tuple[str, Path]] = [
+    (
+        "bigcycle-run1",
+        _RUNS / "bigcycle-run1/speedlm_home/runs"
+        / "e7004c4c0c7548fba65b05a924aa57ea/decision.json",
+    ),
+    ("regate-big-run1", _RUNS / "regate-big-run1/decision.json"),
+    ("regate-big-run2", DEFAULT_DECISION),
+]
+
 # The recording the composition composites, and the renderer's timing sidecar.
 DEFAULT_CAST = Path("/data/ryan.kim/speedlm-runs/demo-fast/session_fast.cast")
 DEFAULT_TIMING = Path("/data/ryan.kim/speedlm-runs/demo-fast/timing.json")
@@ -194,6 +214,42 @@ def _final_reason(d: dict) -> str | None:
     if d.get("final_reason"):
         return str(d["final_reason"])
     return NON_STATIONARY_REASON if _vetoed(d) else d.get("reason")
+
+
+def parse_reproductions(entries: list[tuple[str, Path]]) -> list[dict]:
+    """Read each corroborating gate's accepted-length delta off its own record.
+
+    Records that are absent, or that never measured the delta, are skipped rather
+    than guessed at -- a missing file must lower the reproduction count, never
+    invent one.  Only same-suite measurements count, so a record scored on a
+    different number of held-out contexts is dropped with a warning.
+    """
+    out: list[dict] = []
+    for label, path in entries:
+        if not path.is_file():
+            print(f"warning: corroborating gate missing: {path}", file=sys.stderr)
+            continue
+        d = json.loads(path.read_text())
+        delta = d.get("accepted_length_delta")
+        if delta is None:
+            print(f"warning: {label} records no accepted_length_delta", file=sys.stderr)
+            continue
+        out.append(
+            {
+                "run": label,
+                "delta": delta,
+                "standard_error": d.get("accepted_length_delta_standard_error"),
+                "num_contexts": d.get("num_contexts"),
+                "num_repeats": d.get("num_repeats"),
+            }
+        )
+    suites = {r["num_contexts"] for r in out}
+    if len(suites) > 1:
+        raise SystemExit(
+            "corroborating gates disagree on suite size "
+            f"({sorted(suites)}); they are not reproductions of one measurement"
+        )
+    return out
 
 
 def parse_decision(path: Path) -> dict:
@@ -377,7 +433,13 @@ def anchor_series(training: dict, gate: dict, cast: Path, timing: dict) -> dict:
         patterns[f"val:{i}"] = re.compile(
             rf"EPOCH\s+{p['epoch'] + 1}\s+(?:done\s+)?val/loss_epoch\s*=\s*{_num(p['loss'])}"
         )
-    patterns["gate"] = re.compile(rf"VERDICT\s+{re.escape(gate['verdict'].upper())}")
+    # Case-insensitive: the fast session prints the outcome as a lowercase
+    # `gate verdict   reject` row inside the result block rather than as a
+    # shouted `VERDICT REJECT` banner, because the verdict is no longer the
+    # headline. The anchor still keys off the same field either way.
+    patterns["gate"] = re.compile(
+        rf"verdict\s+{re.escape(gate['verdict'])}", re.IGNORECASE
+    )
 
     found = scan_cast(cast, patterns)
 
@@ -498,6 +560,7 @@ def main() -> None:
         raise SystemExit(f"gate decision not found: {decision_path}")
     training = parse_training_log(log_path)
     gate = parse_decision(decision_path)
+    gate["reproductions"] = parse_reproductions(CORROBORATING_DECISIONS)
 
     cast = args.cast or DEFAULT_CAST
     timing_path = args.timing or DEFAULT_TIMING
@@ -564,6 +627,13 @@ def main() -> None:
     print(
         f"acceptance    : stock {ar['stock']:.3f} vs tuned {ar['tuned']:.3f} "
         f"({ar['delta_pp']:+.2f}pp SE {ar['delta_standard_error_pp']:.2f})",
+        file=sys.stderr,
+    )
+    reps = gate["reproductions"]
+    print(
+        "reproduced    : "
+        + ", ".join(f"{r['run']} {r['delta']:+.4f}" for r in reps)
+        + f"  ({len(reps)}x)",
         file=sys.stderr,
     )
     print(f"verdict       : {gate['verdict']}", file=sys.stderr)
