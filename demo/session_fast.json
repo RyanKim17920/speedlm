@@ -1,22 +1,24 @@
 {
-  "typing_delay": 0.006,
+  "typing_delay": 0.0025,
   "settle": 2.5,
   "steps": [
     {
       "comment": "1. This is a normal vLLM server. The command you already run:",
-      "command": "echo 'vllm serve Qwen/Qwen3-8B --max-model-len 24576 --gpu-memory-utilization 0.85 --enforce-eager'",
+      "command": "printf '%s\\n' 'vllm serve Qwen/Qwen3-8B \\' '  --max-model-len 24576 --gpu-memory-utilization 0.85 \\' '  --enforce-eager --enable-auto-tool-choice --tool-call-parser hermes'",
       "pause_before": 0.3,
-      "pause_after": 3.0
+      "pause_after": 3.5
     },
     {
-      "comment": "2. This is the SpeedLM vLLM -- verbatim from the script that ran it:",
-      "command": "sed -n '100,108p' demo/cycle.sbatch",
+      "comment": "2. This is the SpeedLM one. Same command, one prefix and one flag:",
+      "command": "printf '%s\\n' 'speedlm vllm serve Qwen/Qwen3-8B \\' '  --max-model-len 24576 --gpu-memory-utilization 0.85 \\' '  --enforce-eager --enable-auto-tool-choice --tool-call-parser hermes \\' '  --enable-idle-tuning --config demo/bigcycle-qwen8b.json'",
       "pause_before": 0.3,
-      "pause_after": 4.5
+      "pause_after": 5.0
     },
     {
-      "comment": "Same model, same vLLM flags. One new thing: --enable-idle-tuning.",
-      "pause_after": 2.0
+      "comment": "Not a slide -- that is the flag the filmed run really launched with:",
+      "command": "grep -n 'enable-idle-tuning' demo/bigcycle.sbatch",
+      "pause_before": 0.3,
+      "pause_after": 3.5
     },
     {
       "comment": "Everything below reads ONE real completed run, already on disk:",
