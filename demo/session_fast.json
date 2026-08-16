@@ -22,7 +22,7 @@
     },
     {
       "comment": "Everything below reads ONE real completed run, already on disk:",
-      "command": "export R=/data/ryan.kim/speedlm-runs/bigcycle-run1 D=/data/ryan.kim/speedlm-runs/regate-big-run2; export C=$R/speedlm_home/runs/e7004c4c0c7548fba65b05a924aa57ea T=$R/speedlm_home/traces/traces.jsonl E=$R/speedlm_home/runs/events.jsonl G=/data/ryan.kim/speedlm-runs/regate-big-run1/decision.json",
+      "command": "export R=$SPEEDLM_TRAINING_RUN D=$SPEEDLM_DECISION_DIR; C=$(logs=($R/speedlm_home/runs/*/training-logs/stdout.log); [[ ${#logs[@]} -eq 1 && -f ${logs[0]} ]] || { echo 'ERROR: expected exactly one run dir' >&2; exit 1; }; dirname $(dirname ${logs[0]})); export C T=$R/speedlm_home/traces/traces.jsonl E=$R/speedlm_home/runs/events.jsonl G=$SPEEDLM_GATE_CORROBORATING",
       "pause_before": 0.3,
       "pause_after": 1.2
     },

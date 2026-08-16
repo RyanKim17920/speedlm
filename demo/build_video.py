@@ -50,7 +50,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 DEMO_DIR = REPO_ROOT / "demo"
 REMOTION_DIR = DEMO_DIR / "remotion"
 ROOT_TSX = REMOTION_DIR / "src" / "Root.tsx"
-SESSION_SCRIPT = DEMO_DIR / "session_fast.json"
+DEFAULT_SESSION_SCRIPT = DEMO_DIR / "session_fast.json"
 
 FPS = 30
 # Trim applied to the race clip in the final assembly — must match README.
@@ -77,11 +77,16 @@ def hr(label: str) -> None:
     print(f"\n── {label} {bar}", flush=True)
 
 
-def run(cmd: list, *, cwd: Path | None = None) -> None:
+def run(cmd: list, *, cwd: Path | None = None, extra_env: dict[str, str] | None = None) -> None:
     """Print the exact subprocess command line, then run it; abort on failure."""
+    import os as _os
+
     str_cmd = [str(c) for c in cmd]
     print(f"  $ {' '.join(str_cmd)}", flush=True)
-    result = subprocess.run(str_cmd, cwd=str(cwd) if cwd else None)
+    env = dict(_os.environ)
+    if extra_env:
+        env.update(extra_env)
+    result = subprocess.run(str_cmd, cwd=str(cwd) if cwd else None, env=env)
     if result.returncode != 0:
         raise BuildError(f"command exited {result.returncode}: {str_cmd[0]}")
 
@@ -211,7 +216,10 @@ def validate_inputs(args: argparse.Namespace, skip: set[str]) -> None:
 
     # terminal
     if "terminal" not in skip:
-        need(SESSION_SCRIPT, "session script (demo/session_fast.json)")
+        session_script = (
+            Path(args.session_script) if args.session_script else DEFAULT_SESSION_SCRIPT
+        )
+        need(session_script, "session script")
 
     # remotion
     if "remotion" not in skip:
@@ -228,8 +236,9 @@ def validate_inputs(args: argparse.Namespace, skip: set[str]) -> None:
         need(cap / "timeline-candidate.jsonl", "--capture-dir/timeline-candidate.jsonl")
         need(cap / "capture_manifest.json", "--capture-dir/capture_manifest.json")
         need(args.decision, "--decision")
-        for c in args.corroborating:
-            need(c, "--corroborating")
+        for spec in args.corroborating:
+            path_part = spec.partition("=")[2] if "=" in spec else spec
+            need(path_part, "--corroborating")
 
     if errors:
         raise BuildError("Input validation failed — missing paths:\n" + "\n".join(errors))
@@ -300,13 +309,34 @@ def stage_terminal(
                     )
         return cast, terminal_mp4, timing_json
 
+    session_script = Path(args.session_script) if args.session_script else DEFAULT_SESSION_SCRIPT
+
+    # Build the env vars that session_fast.json reads at record time.
+    # These replace the old hardcoded literals so that pointing the recorder
+    # at a new run produces a terminal segment that matches that run.
+    training_run = Path(args.training_run)
+    # SPEEDLM_DECISION_DIR: directory containing the primary decision.json
+    decision_dir = Path(args.decision).parent
+    # SPEEDLM_GATE_CORROBORATING: the first --corroborating path (for $G in the
+    # "three independent gates" step); uses the first entry if multiple are given.
+    # Extract first corroborating path (NAME=PATH or plain path)
+    first_corr_raw = args.corroborating[0] if args.corroborating else ""
+    first_corroborating = (
+        first_corr_raw.partition("=")[2] if "=" in first_corr_raw else first_corr_raw
+    )
+    session_env = {
+        "SPEEDLM_TRAINING_RUN": str(training_run),
+        "SPEEDLM_DECISION_DIR": str(decision_dir),
+        "SPEEDLM_GATE_CORROBORATING": first_corroborating,
+    }
+
     print("  step 1/2: record PTY session", flush=True)
     run(
         [
             PYTHON,
             DEMO_DIR / "session_record.py",
             "--script",
-            SESSION_SCRIPT,
+            session_script,
             "--out",
             cast,
             "--cwd",
@@ -317,6 +347,7 @@ def stage_terminal(
             "30",
         ],
         cwd=REPO_ROOT,
+        extra_env=session_env,
     )
 
     print("\n  step 2/2: render cast to video", flush=True)
@@ -413,21 +444,23 @@ def stage_remotion(
 
     # --- extract_series.py: build src/data.json -------------------------
     print("\n  step 1/2: extract_series.py", flush=True)
-    run(
-        [
-            PYTHON,
-            REMOTION_DIR / "extract_series.py",
-            "--run-root",
-            args.training_run,
-            "--decision",
-            args.decision,
-            "--cast",
-            cast,
-            "--timing",
-            timing_json,
-        ],
-        cwd=REPO_ROOT,
-    )
+    extract_cmd: list = [
+        PYTHON,
+        REMOTION_DIR / "extract_series.py",
+        "--run-root",
+        args.training_run,
+        "--decision",
+        args.decision,
+        "--cast",
+        cast,
+        "--timing",
+        timing_json,
+    ]
+    # Pass --corroborating entries through so the Remotion chart and the race
+    # outro card cite the same set of gates rather than each picking their own.
+    for c in args.corroborating:
+        extract_cmd += ["--corroborating", str(c)]
+    run(extract_cmd, cwd=REPO_ROOT)
 
     # --- npx remotion render -------------------------------------------
     print("\n  step 2/2: npx remotion render", flush=True)
@@ -473,8 +506,10 @@ def stage_race(args: argparse.Namespace, work_dir: Path, skip: set[str]) -> Path
         "--speed",
         "8",
     ]
-    for c in args.corroborating:
-        cmd += ["--corroborating", str(c)]
+    for spec in args.corroborating:
+        # build_video --corroborating accepts NAME=PATH; render.py takes plain paths.
+        path_part = spec.partition("=")[2] if "=" in spec else spec
+        cmd += ["--corroborating", path_part]
 
     run(cmd, cwd=REPO_ROOT)
     dur = video_duration(out)
@@ -650,13 +685,23 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     ap.add_argument(
         "--corroborating",
-        metavar="PATH",
+        metavar="NAME=PATH",
         action="append",
         default=[],
-        type=Path,
         help=(
-            "additional gate decision.json files for the 'reproduced N times' line "
-            "on the race outro card; repeatable; the line is suppressed if none are given"
+            "additional gate decision.json for the 'reproduced N times' panel; "
+            "repeatable; format: name=path/to/decision.json; "
+            "passed through identically to both extract_series.py (chart) and render.py "
+            "(race outro) so both panels always cite the same set of gates"
+        ),
+    )
+    ap.add_argument(
+        "--session-script",
+        metavar="PATH",
+        default=None,
+        help=(
+            "session JSON script to record for the terminal segment; "
+            "defaults to demo/session_fast.json"
         ),
     )
     ap.add_argument(

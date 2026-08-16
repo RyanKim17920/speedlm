@@ -86,10 +86,11 @@ DEFAULT_DECISION = Path("/data/ryan.kim/speedlm-runs/regate-big-run2/decision.js
 # Note what is deliberately NOT carried across from these earlier records: their
 # throughput deltas (+14.76%, +19.91%) are superseded and appear nowhere.
 _RUNS = Path("/data/ryan.kim/speedlm-runs")
-CORROBORATING_DECISIONS: list[tuple[str, Path]] = [
+DEFAULT_CORROBORATING_DECISIONS: list[tuple[str, Path]] = [
     (
         "bigcycle-run1",
-        _RUNS / "bigcycle-run1/speedlm_home/runs"
+        _RUNS
+        / "bigcycle-run1/speedlm_home/runs"
         / "e7004c4c0c7548fba65b05a924aa57ea/decision.json",
     ),
     ("regate-big-run1", _RUNS / "regate-big-run1/decision.json"),
@@ -120,7 +121,7 @@ def _logical_records(text: str) -> list[str]:
         if match:
             if current is not None:
                 records.append(" ".join(current))
-            current = [line[match.end():].strip()]
+            current = [line[match.end() :].strip()]
         elif current is not None:
             # A progress-bar repaint is not a continuation of the previous record.
             if "━" in line or line.lstrip().startswith("Epoch "):
@@ -437,9 +438,7 @@ def anchor_series(training: dict, gate: dict, cast: Path, timing: dict) -> dict:
     # `gate verdict   reject` row inside the result block rather than as a
     # shouted `VERDICT REJECT` banner, because the verdict is no longer the
     # headline. The anchor still keys off the same field either way.
-    patterns["gate"] = re.compile(
-        rf"verdict\s+{re.escape(gate['verdict'])}", re.IGNORECASE
-    )
+    patterns["gate"] = re.compile(rf"verdict\s+{re.escape(gate['verdict'])}", re.IGNORECASE)
 
     found = scan_cast(cast, patterns)
 
@@ -527,8 +526,7 @@ def find_training_log(run_roots: list[Path]) -> tuple[Path, Path]:
             if log.is_file():
                 return root, log
     raise SystemExit(
-        "no run with training-logs/stdout.log under: "
-        + ", ".join(str(p) for p in run_roots)
+        "no run with training-logs/stdout.log under: " + ", ".join(str(p) for p in run_roots)
     )
 
 
@@ -552,6 +550,18 @@ def main() -> None:
     ap.add_argument("--out", type=Path, default=Path(__file__).parent / "src" / "data.json")
     ap.add_argument("--cast", type=Path, help="recording to read event times from")
     ap.add_argument("--timing", type=Path, help="sidecar from session_render.py --timing-out")
+    ap.add_argument(
+        "--corroborating",
+        metavar="NAME=PATH",
+        action="append",
+        dest="corroborating",
+        default=[],
+        help=(
+            "additional gate decision.json for the 'reproduced N times' panel; "
+            "repeatable; format: name=path/to/decision.json; "
+            "when absent the built-in three-run default list is used"
+        ),
+    )
     args = ap.parse_args()
 
     root, log_path = find_training_log(args.run_root or DEFAULT_RUN_ROOTS)
@@ -560,7 +570,20 @@ def main() -> None:
         raise SystemExit(f"gate decision not found: {decision_path}")
     training = parse_training_log(log_path)
     gate = parse_decision(decision_path)
-    gate["reproductions"] = parse_reproductions(CORROBORATING_DECISIONS)
+
+    # Parse --corroborating NAME=PATH entries if supplied; fall back to the
+    # built-in default list only when the flag is entirely absent so existing
+    # behaviour is preserved for callers that do not pass the flag.
+    if args.corroborating:
+        corroborating_entries: list[tuple[str, Path]] = []
+        for spec in args.corroborating:
+            if "=" not in spec:
+                raise SystemExit(f"--corroborating must be NAME=PATH, got: {spec!r}")
+            name, _, path_str = spec.partition("=")
+            corroborating_entries.append((name.strip(), Path(path_str.strip())))
+    else:
+        corroborating_entries = DEFAULT_CORROBORATING_DECISIONS
+    gate["reproductions"] = parse_reproductions(corroborating_entries)
 
     cast = args.cast or DEFAULT_CAST
     timing_path = args.timing or DEFAULT_TIMING
@@ -597,14 +620,12 @@ def main() -> None:
     losses = [p["loss"] for p in train]
     print(f"run root      : {root}", file=sys.stderr)
     print(
-        f"train steps   : {len(train)} "
-        f"(global_step {train[0]['step']}..{train[-1]['step']})",
+        f"train steps   : {len(train)} (global_step {train[0]['step']}..{train[-1]['step']})",
         file=sys.stderr,
     )
     print(f"train/loss    : {max(losses):.3f} -> {min(losses):.3f}", file=sys.stderr)
     print(
-        f"val epochs    : {len(val)} loss "
-        f"{val[0]['loss']:.3f} -> {val[-1]['loss']:.3f}",
+        f"val epochs    : {len(val)} loss {val[0]['loss']:.3f} -> {val[-1]['loss']:.3f}",
         file=sys.stderr,
     )
     for i in range(3):
