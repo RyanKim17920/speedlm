@@ -1,33 +1,19 @@
 #!/usr/bin/env python3
 """Flip through the captured agent corpus, fast, one real instance per card.
 
-This is the "here is the traffic we serve" beat of the demo.  The first version
-of it replayed a 49-context slice of the frozen gate suite and showed each
-context's opening user turn.  That was honest but it looked fake, and for a
-reason worth writing down:
+This is the "here is the traffic we serve" beat of the demo.  Each card is
+one real captured agent trajectory.  Cards are keyed on the opening task
+instruction, which is generated per-seed by ``phrasing.py`` from a typed
+``Brief`` — 200 seeds × 12 families gives 2,400 distinct prompts, so the
+montage shows genuine variety at the prompt level.
 
-  **the corpus has exactly six distinct prompts.**
+Each card carries:
 
-Every instance of a task family opens with a byte-identical system prompt and
-first user turn -- that is precisely why ``family_hash`` in ``demo/capture.py``
-works.  Measured over all 601 captured trajectories, the number of distinct
-(system, first-user) pairs is 6, one per family.  So a montage keyed on the
-prompt shows the same six screens over and over.
-
-The variation is real, it just lives one level down: in the *workspace* each
-instance was given and in what the agent *did* to it.  Two ``bugfix-localize``
-instances get the same sentence ("the test suite is failing, fix the source")
-and different planted bugs in different modules; two ``log-triage`` instances
-get the same sentence and different 1,400-line logs with different error lines
-and request ids.  That difference surfaces in the recorded tool calls and their
-results, and in the per-instance ``metadata``.
-
-So this montage shows *that*, and labels it for what it is.  Each card is one
-real instance and carries:
-
-  * its ``instance_id`` and the run it came from -- unique by construction;
+  * its ``instance_id`` and the run it came from — unique by construction;
+  * the opening task instruction, shown verbatim and prominently (the star
+    of the card);
   * its ``metadata`` (the planted bug module, the traced answer, the window
-    size, the log length, the host count) -- the generator's own per-instance
+    size, the log length, the host count) — the generator's own per-instance
     parameters, printed verbatim;
   * its real tool-call trace, name plus arguments plus the first line of the
     result the sandbox returned, taken from ``turns[*].tool_calls``;
@@ -36,26 +22,28 @@ real instance and carries:
     turn's own recorded ``latency_seconds``.
 
 Nothing is paraphrased and nothing is composed: every string on screen is read
-out of a trajectory JSON.  The six prompts are shown once each, on the intro
-card, so the viewer knows what the shared instruction was.
+out of a trajectory JSON.  A ``signature`` guard in ``main()`` asserts that no
+two selected cards render identical text, and a separate ``prompt`` guard
+asserts that each selected card carries a distinct opening instruction — the
+property that phrasing.py was fixed to provide.
 
 The tallies are the point of the segment.  They count what the cards represent
 (instances, request records, generated tokens, recorded generation seconds) and
 they sit next to the corpus totals so the sample is never mistaken for the
 whole.  The coverage strip at the bottom draws one cell per captured instance,
-all 601, and lights the ones the montage actually plays.
+all in the corpus, and lights the ones the montage actually plays.
 
 ``--speed`` scales only the replay clock, so the recorded seconds stay legible
 as recorded seconds while the video runs many times faster; the badge is on
 every frame for that reason.
 
-Usage:
+Usage::
 
-    python demo/montage.py \
-        --corpus /data/.../bigcorpus-run1/traffic/trajectories \
-        --corpus /data/.../agentenv-qwen8b-run5/traffic/trajectories \
-        --traces /data/.../bigcorpus-run1/speedlm_home/traces/traces.jsonl \
-        --out    /data/.../demo-versions/traffic-montage-v2.mp4
+    python demo/montage.py \\
+        --corpus /data/.../bigcorpus-run1/traffic/trajectories \\
+        --corpus /data/.../agentenv-qwen8b-run5/traffic/trajectories \\
+        --traces /data/.../bigcorpus-run1/speedlm_home/traces/traces.jsonl \\
+        --out    /data/.../demo-versions/traffic-montage-v3.mp4
 """
 
 from __future__ import annotations
@@ -91,7 +79,7 @@ from render import (  # noqa: E402  (needs the sys.path line above)
     wrap_tail,
 )
 
-# Cards per family.  Six families, so this is the montage's breadth knob.
+# Cards per family.  Twelve families, so this is the montage's breadth knob.
 CARDS_PER_FAMILY = 3
 # Where the replay should land, in seconds of video, before the held cards.
 REPLAY_SECONDS = 11.0
@@ -103,6 +91,8 @@ INTRO_SECONDS = 2.6
 SUMMARY_SECONDS = 2.8
 TAIL_SECONDS = 0.6
 
+# All twelve task families, original six + v2 six.  Order determines the
+# interleaving of cards in the replay and the row layout in the coverage strip.
 FAMILY_ORDER = [
     "bugfix-localize",
     "call-chain-trace",
@@ -110,6 +100,12 @@ FAMILY_ORDER = [
     "log-triage",
     "refactor-rename",
     "schema-migrate",
+    "api-contract-drift",
+    "config-precedence-bug",
+    "dep-version-conflict",
+    "error-swallow-audit",
+    "flaky-test-quarantine",
+    "perf-hotspot",
 ]
 
 # Family metadata keys that are the generator's per-instance parameters.  The
@@ -123,6 +119,9 @@ FACT_KEYS = {
     "hosts": "hosts",
 }
 
+# Rows reserved at the top of the body pane for the task instruction.
+PROMPT_ROWS = 5
+
 
 # -- reading the corpus ----------------------------------------------------
 
@@ -134,6 +133,7 @@ class Instance:
     run: str
     instance_id: str
     family: str
+    prompt: str
     facts: list[str]
     solved: bool
     stop_condition: str
@@ -157,7 +157,13 @@ class Instance:
     def signature(self) -> str:
         """What the card actually shows, hashed, so duplicates can be refused."""
         body = "\n".join(
-            [self.instance_id, *self.facts, self.summary, *(a + b for a, b in self.tool_lines)]
+            [
+                self.instance_id,
+                self.prompt,
+                *self.facts,
+                self.summary,
+                *(a + b for a, b in self.tool_lines),
+            ]
         )
         return hashlib.md5(body.encode()).hexdigest()
 
@@ -202,6 +208,13 @@ def read_instance(path: Path, run: str) -> Instance | None:
     if not turns:
         return None
 
+    # First user message — the task instruction the card shows as its star.
+    prompt = ""
+    for message in data.get("messages", []):
+        if message.get("role") == "user":
+            prompt = " ".join((message.get("content") or "").split())
+            break
+
     facts = []
     for key, label in FACT_KEYS.items():
         if key in (data.get("metadata") or {}):
@@ -225,6 +238,7 @@ def read_instance(path: Path, run: str) -> Instance | None:
         run=run,
         instance_id=data["instance_id"],
         family=data["family"],
+        prompt=prompt,
         facts=facts,
         solved=bool((data.get("grade") or {}).get("solved")),
         stop_condition=data.get("stop_condition", ""),
@@ -242,7 +256,6 @@ def read_instance(path: Path, run: str) -> Instance | None:
 @dataclass
 class Corpus:
     instances: list[Instance] = field(default_factory=list)
-    prompts: dict[str, str] = field(default_factory=dict)
     records: int = 0
 
     @property
@@ -269,28 +282,7 @@ def load_corpus(roots: Sequence[Path]) -> Corpus:
             if instance is not None:
                 corpus.instances.append(instance)
                 corpus.records += instance.turn_count
-            # The six shared prompts, taken verbatim from the first trajectory
-            # of each family that we see.
-            data = json.loads(path.read_text())
-            if data["family"] not in corpus.prompts:
-                for message in data.get("messages", []):
-                    if message.get("role") == "user":
-                        corpus.prompts[data["family"]] = message.get("content", "")
-                        break
     return corpus
-
-
-def distinct_prompt_count(corpus: Corpus, roots: Sequence[Path]) -> int:
-    """How many distinct (system, first user) openings the corpus really has."""
-    seen: set[str] = set()
-    for root in roots:
-        for path in sorted(root.glob("*.json")):
-            data = json.loads(path.read_text())
-            messages = data.get("messages", [])
-            system = next((m["content"] for m in messages if m.get("role") == "system"), "")
-            user = next((m["content"] for m in messages if m.get("role") == "user"), "")
-            seen.add(hashlib.md5((system + user).encode()).hexdigest())
-    return len(seen)
 
 
 def select(corpus: Corpus, per_family: int) -> list[Instance]:
@@ -299,13 +291,20 @@ def select(corpus: Corpus, per_family: int) -> list[Instance]:
     Instances are ordered by how close their streamed turn is to the corpus
     median generation length, so no single card eats a third of the replay,
     then filtered so that no two selected cards render the same text.
+
+    Interleaving spreads across all families present (up to 12) and across
+    capture runs before taking a second card from any one run.
     """
     latencies = sorted(i.latency for i in corpus.instances)
     target = latencies[len(latencies) // 2] if latencies else 0.0
 
+    # Use the canonical order, restricted to families that actually appear.
+    present = set(corpus.by_family().keys())
+    families = [f for f in FAMILY_ORDER if f in present]
+
     chosen: list[Instance] = []
     seen: set[str] = set()
-    for family in FAMILY_ORDER:
+    for family in families:
         pool = sorted(
             corpus.by_family().get(family, []),
             key=lambda i: (abs(i.latency - target), i.instance_id),
@@ -332,10 +331,10 @@ def select(corpus: Corpus, per_family: int) -> list[Instance]:
             taken += 1
 
     # Interleave families so consecutive cards never repeat a family.
-    buckets = {f: [i for i in chosen if i.family == f] for f in FAMILY_ORDER}
+    buckets = {f: [i for i in chosen if i.family == f] for f in families}
     ordered: list[Instance] = []
     for rank in range(per_family):
-        for family in FAMILY_ORDER:
+        for family in families:
             if rank < len(buckets[family]):
                 ordered.append(buckets[family][rank])
 
@@ -350,14 +349,19 @@ def select(corpus: Corpus, per_family: int) -> list[Instance]:
 
 
 class Montage:
-    def __init__(self, corpus: Corpus, cards: list[Instance], speed: float,
-                 model: str, traces: int, prompt_count: int) -> None:
+    def __init__(
+        self,
+        corpus: Corpus,
+        cards: list[Instance],
+        speed: float,
+        model: str,
+        traces: int,
+    ) -> None:
         self.corpus = corpus
         self.cards = cards
         self.speed = speed
         self.model = model
         self.traces = traces
-        self.prompt_count = prompt_count
         self.duration = sum(c.latency for c in cards)
 
         self.f_title = font(38, bold=True)
@@ -387,9 +391,7 @@ class Montage:
         self.right_cols = int((self.right_w - 44) / (17 * 0.602))
 
         self.grid_top = 878
-        self.grid_index = {
-            (i.run, i.instance_id): n for n, i in enumerate(corpus.instances)
-        }
+        self.grid_index = {(i.run, i.instance_id): n for n, i in enumerate(corpus.instances)}
 
     # -- chrome ------------------------------------------------------------
 
@@ -398,8 +400,7 @@ class Montage:
         return image, ImageDraw.Draw(image)
 
     def header(self, draw: ImageDraw.ImageDraw, subtitle: str) -> None:
-        draw.text((40, 36), "SpeedLM  ·  the traffic we serve",
-                  font=self.f_title, fill=TEXT)
+        draw.text((40, 36), "SpeedLM  ·  the traffic we serve", font=self.f_title, fill=TEXT)
         draw.text((42, 90), subtitle, font=self.f_sub, fill=MUTED)
         draw.line((40, 128, WIDTH - 40, 128), fill=RULE, width=1)
 
@@ -429,8 +430,15 @@ class Montage:
 
     # -- the running tally -------------------------------------------------
 
-    def tally(self, draw: ImageDraw.ImageDraw, shown: int, records: int,
-              tokens: int, elapsed: float, fraction: float) -> None:
+    def tally(
+        self,
+        draw: ImageDraw.ImageDraw,
+        shown: int,
+        records: int,
+        tokens: int,
+        elapsed: float,
+        fraction: float,
+    ) -> None:
         top = self.tally_top
         draw.rectangle((40, top, WIDTH - 40, top + 116), fill=PANEL)
         cells = [
@@ -465,72 +473,116 @@ class Montage:
         draw.rectangle((x, self.pane_top, x + w, self.pane_bottom), fill=PANEL)
         draw.rectangle((x, self.pane_top, x + w, self.pane_top + 4), fill=STOCK_ACCENT)
 
-        draw.text((x + 22, self.pane_top + 20), card.instance_id.upper(),
-                  font=self.f_head, fill=STOCK_ACCENT)
-        draw.text((x + 22, self.pane_top + 48),
-                  f"{card.family} · {card.run} · "
-                  f"{card.turn_count} requests · {card.tokens:,} tok · "
-                  f"{card.wall_clock:.0f}s wall",
-                  font=self.f_meta, fill=DIM)
+        draw.text(
+            (x + 22, self.pane_top + 20),
+            card.instance_id.upper(),
+            font=self.f_head,
+            fill=STOCK_ACCENT,
+        )
+        draw.text(
+            (x + 22, self.pane_top + 48),
+            f"{card.family} · {card.run} · "
+            f"{card.turn_count} requests · {card.tokens:,} tok · "
+            f"{card.wall_clock:.0f}s wall",
+            font=self.f_meta,
+            fill=DIM,
+        )
         facts = "   ·   ".join(card.facts) if card.facts else "no generator parameters recorded"
         verdict = "graded solved" if card.solved else f"graded unsolved ({card.stop_condition})"
-        draw.text((x + 22, self.pane_top + 74), f"{facts}   ·   {verdict}",
-                  font=self.f_meta, fill=MUTED if card.solved else STOCK_ACCENT)
+        draw.text(
+            (x + 22, self.pane_top + 74),
+            f"{facts}   ·   {verdict}",
+            font=self.f_meta,
+            fill=MUTED if card.solved else STOCK_ACCENT,
+        )
 
-        draw.text((x + 22, self.body_top - 26),
-                  "WHAT THIS INSTANCE ACTUALLY WAS  ·  recorded tool calls and sandbox replies",
-                  font=self.f_meta, fill=MUTED)
+        # ── Prompt section — the star ──────────────────────────────────────
+        draw.text(
+            (x + 22, self.body_top - 26),
+            "TASK INSTRUCTION  ·  verbatim first user message",
+            font=self.f_meta,
+            fill=MUTED,
+        )
+        prompt_lines = textwrap.wrap(card.prompt, width=self.left_cols)
+        shown_prompt = prompt_lines[:PROMPT_ROWS]
+        y = self.body_top
+        for line in shown_prompt:
+            draw.text((x + 22, y), clip(line, self.left_cols), font=self.f_body, fill=TEXT)
+            y += self.line_h
+        # Pad to a fixed block so tool-call section starts at a stable y.
+        y += (PROMPT_ROWS - len(shown_prompt)) * self.line_h
 
-        rows = self.rows
+        # ── Tool call trace — supporting detail ───────────────────────────
+        y += 4  # small breathing room between the two sections
+        draw.text(
+            (x + 22, y),
+            "TOOL CALLS  ·  recorded trace and sandbox replies",
+            font=self.f_meta,
+            fill=MUTED,
+        )
+        y += self.line_h + 2
+
         summary_rows = 0
         summary_lines: list[str] = []
         if card.summary:
-            summary_lines = textwrap.wrap(
-                "submitted: " + card.summary, width=self.left_cols
-            )[:3]
+            summary_lines = textwrap.wrap("submitted: " + card.summary, width=self.left_cols)[:3]
             summary_rows = len(summary_lines) + 1
 
-        y = self.body_top
-        budget = rows - summary_rows
+        # Pixel budget remaining for tool calls.
+        tool_budget_px = self.pane_bottom - 20 - y - summary_rows * self.line_h
+        tool_budget = max(0, tool_budget_px // self.line_h)
+
+        tool_y = y
         drawn = 0
         for head, result in card.tool_lines:
-            # -2 not -1: the elision marker itself needs a row, and it would
-            # otherwise land past pane_bottom and collide with the corpus strip.
-            if drawn >= budget - 2:
+            if drawn >= tool_budget - 2:
                 left = len(card.tool_lines) - (drawn // 2)
-                draw.text((x + 22, y), f"... {left} more recorded tool calls",
-                          font=self.f_mono, fill=DIM)
+                draw.text(
+                    (x + 22, tool_y),
+                    f"... {left} more recorded tool calls",
+                    font=self.f_mono,
+                    fill=DIM,
+                )
                 drawn += 1
                 break
-            draw.text((x + 22, y), clip(head, self.left_cols),
-                      font=self.f_mono, fill=TEXT)
-            y += self.line_h
-            draw.text((x + 40, y), clip(result, self.left_cols - 2),
-                      font=self.f_mono,
-                      fill=TUNED_ACCENT if result.startswith("->") else STOCK_ACCENT)
-            y += self.line_h
+            draw.text((x + 22, tool_y), clip(head, self.left_cols), font=self.f_mono, fill=TEXT)
+            tool_y += self.line_h
+            draw.text(
+                (x + 40, tool_y),
+                clip(result, self.left_cols - 2),
+                font=self.f_mono,
+                fill=TUNED_ACCENT if result.startswith("->") else STOCK_ACCENT,
+            )
+            tool_y += self.line_h
             drawn += 2
 
         if summary_lines:
-            y = self.body_top + (rows - summary_rows + 1) * self.line_h
+            sum_y = self.pane_bottom - 20 - summary_rows * self.line_h
             for line in summary_lines:
-                draw.text((x + 22, y), line, font=self.f_mono, fill=MUTED)
-                y += self.line_h
+                draw.text((x + 22, sum_y), line, font=self.f_mono, fill=MUTED)
+                sum_y += self.line_h
 
-    def response_pane(self, draw: ImageDraw.ImageDraw, card: Instance,
-                      revealed: str) -> None:
+    def response_pane(self, draw: ImageDraw.ImageDraw, card: Instance, revealed: str) -> None:
         x, w = self.right_x, self.right_w
         draw.rectangle((x, self.pane_top, x + w, self.pane_bottom), fill=PANEL)
         draw.rectangle((x, self.pane_top, x + w, self.pane_top + 4), fill=TUNED_ACCENT)
 
-        draw.text((x + 22, self.pane_top + 20), "MODEL RESPONSE",
-                  font=self.f_head, fill=TUNED_ACCENT)
-        draw.text((x + 22, self.pane_top + 48),
-                  f"longest recorded turn  ·  {card.prompt_tokens:,} tok in  ·  "
-                  f"{card.latency:.2f}s on the wall",
-                  font=self.f_meta, fill=DIM)
-        draw.text((x + 22, self.body_top - 26),
-                  "STREAMING AT ITS RECORDED LATENCY", font=self.f_meta, fill=MUTED)
+        draw.text(
+            (x + 22, self.pane_top + 20), "MODEL RESPONSE", font=self.f_head, fill=TUNED_ACCENT
+        )
+        draw.text(
+            (x + 22, self.pane_top + 48),
+            f"longest recorded turn  ·  {card.prompt_tokens:,} tok in  ·  "
+            f"{card.latency:.2f}s on the wall",
+            font=self.f_meta,
+            fill=DIM,
+        )
+        draw.text(
+            (x + 22, self.body_top - 26),
+            "STREAMING AT ITS RECORDED LATENCY",
+            font=self.f_meta,
+            fill=MUTED,
+        )
 
         y = self.body_top
         for line in wrap_tail(revealed, self.right_cols, self.rows):
@@ -541,13 +593,16 @@ class Montage:
 
     def coverage(self, draw: ImageDraw.ImageDraw, lit: set[int]) -> None:
         top = self.grid_top
-        draw.text((40, top - 22),
-                  f"CAPTURED CORPUS  ·  one cell per trajectory  ·  "
-                  f"{len(self.corpus.instances)} instances, "
-                  f"{len(self.cards)} replayed here",
-                  font=self.f_meta, fill=MUTED)
         by_family = self.corpus.by_family()
-        widest = max(len(v) for v in by_family.values())
+        draw.text(
+            (40, top - 22),
+            f"CAPTURED CORPUS  ·  one cell per trajectory  ·  "
+            f"{len(self.corpus.instances)} instances, "
+            f"{len(self.cards)} replayed here",
+            font=self.f_meta,
+            fill=MUTED,
+        )
+        widest = max((len(v) for v in by_family.values()), default=1)
         label_w = 172
         cell = max(4, min(14, (WIDTH - 80 - label_w) // widest - 2))
         gap = 2
@@ -555,42 +610,63 @@ class Montage:
         y = top
         for family in FAMILY_ORDER:
             members = by_family.get(family, [])
+            if not members:
+                continue
             draw.text((40, y - 1), family, font=self.f_tally_label, fill=DIM)
             x = 40 + label_w
             for instance in members:
                 index = self.grid_index[(instance.run, instance.instance_id)]
                 on = index in lit
-                draw.rectangle((x, y, x + cell, y + row_h - 5),
-                               fill=TUNED_ACCENT if on else RULE)
+                draw.rectangle((x, y, x + cell, y + row_h - 5), fill=TUNED_ACCENT if on else RULE)
                 x += cell + gap
             y += row_h
 
     # -- cards -------------------------------------------------------------
 
     def intro(self) -> Image.Image:
+        """Intro card: corpus scale and family breakdown."""
         image, draw = self.frame()
-        self.header(draw, "the corpus has six prompts and hundreds of workspaces")
+        by_family = self.corpus.by_family()
+        families_present = [f for f in FAMILY_ORDER if f in by_family]
+        subtitle = (
+            f"{len(self.corpus.instances)} instances  ·  "
+            f"{len(families_present)} task families  ·  "
+            "each instance carries a distinct instruction"
+        )
+        self.header(draw, subtitle)
+
         y = 172
-        draw.text((40, y),
-                  f"{len(self.corpus.instances)} captured agent trajectories share exactly "
-                  f"{self.prompt_count} distinct opening prompts -- one per task family.",
-                  font=self.f_card, fill=TEXT)
-        draw.text((40, y + 40),
-                  "Here they are, verbatim. What differs between instances is the workspace "
-                  "behind them, so that is what the montage shows.",
-                  font=self.f_card, fill=MUTED)
-        y += 108
-        for family in FAMILY_ORDER:
-            prompt = " ".join(self.corpus.prompts.get(family, "").split())
+        draw.text(
+            (40, y),
+            f"{len(self.corpus.instances)} captured agent trajectories across "
+            f"{len(families_present)} task families.",
+            font=self.f_card,
+            fill=TEXT,
+        )
+        draw.text(
+            (40, y + 40),
+            "Instructions are generated per-seed by phrasing.py — every instance "
+            "opens with a different prompt.",
+            font=self.f_card,
+            fill=MUTED,
+        )
+        y += 100
+        draw.line((40, y, WIDTH - 40, y), fill=RULE, width=1)
+        y += 16
+
+        row_h = 38
+        for family in families_present:
+            count = len(by_family[family])
             draw.text((40, y), family, font=self.f_head, fill=STOCK_ACCENT)
-            wrapped = textwrap.wrap(prompt, width=132)
-            lines = wrapped[:3]
-            if len(wrapped) > 3:
-                lines[-1] = lines[-1][:118] + f"  ... +{len(wrapped) - 3} lines"
-            for line in lines:
-                draw.text((300, y), line, font=self.f_body, fill=TEXT)
-                y += 24
-            y += max(0, 3 - len(lines)) * 24 + 22
+            draw.text((340, y), f"{count} instances", font=self.f_body, fill=TEXT)
+            # Show a fragment of the first prompt in this family to hint at variety.
+            sample = by_family[family][0].prompt
+            sample_short = clip(" ".join(sample.split()), self.right_cols + 20)
+            draw.text((540, y), sample_short, font=self.f_mono, fill=DIM)
+            y += row_h
+            if y > self.pane_bottom:
+                break
+
         self.footer(draw)
         self.speed_badge(draw)
         return image
@@ -600,6 +676,8 @@ class Montage:
         self.header(draw, "what that traffic adds up to")
 
         shown = len(self.cards)
+        by_family = self.corpus.by_family()
+        families_present = [f for f in FAMILY_ORDER if f in by_family]
         cells = [
             (120, f"{len(self.corpus.instances)}", "agent trajectories", TEXT),
             (560, f"{self.traces:,}", "request records", TEXT),
@@ -612,16 +690,19 @@ class Montage:
 
         y = 410
         draw.line((120, y - 24, WIDTH - 120, y - 24), fill=RULE, width=1)
-        counts = {f: len(v) for f, v in self.corpus.by_family().items()}
-        family_line = "   ·   ".join(f"{f} {counts.get(f, 0)}" for f in FAMILY_ORDER)
+        counts = {f: len(v) for f, v in by_family.items()}
+        family_line = "   ·   ".join(f"{f} {counts.get(f, 0)}" for f in families_present)
         for line in textwrap.wrap(family_line, width=98) or [""]:
             draw.text((120, y), line, font=self.f_card, fill=MUTED)
             y += 44
         y += 16
         for text, colour in (
             (f"{shown} of those instances played above, one card each, none repeated.", TEXT),
-            ("Six prompts, six hundred workspaces: the prompt is the template, the", TEXT),
-            ("workspace and the tool calls are the data.", TEXT),
+            (
+                "Every instance opened with a distinct instruction generated from phrasing.py.",
+                TEXT,
+            ),
+            ("Variety comes from the prompt and the workspace, not just the tool calls.", MUTED),
             ("", TEXT),
             ("All of it is recorded as traces. The idle cycle trains the draft head", MUTED),
             ("on this traffic, and the gate replays a session-disjoint slice of it.", TUNED_ACCENT),
@@ -676,48 +757,77 @@ class Montage:
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--corpus", type=Path, action="append", required=True,
-                        help="a traffic/trajectories directory; repeatable")
-    parser.add_argument("--traces", type=Path, default=None,
-                        help="traces.jsonl, counted for the record tally")
+    parser.add_argument(
+        "--corpus",
+        type=Path,
+        action="append",
+        required=True,
+        help="a traffic/trajectories directory; repeatable",
+    )
+    parser.add_argument(
+        "--traces", type=Path, default=None, help="traces.jsonl, counted for the record tally"
+    )
     parser.add_argument("--model", default="Qwen/Qwen3-8B")
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--crf", type=int, default=20)
     parser.add_argument("--per-family", type=int, default=CARDS_PER_FAMILY)
     parser.add_argument("--replay-seconds", type=float, default=REPLAY_SECONDS)
-    parser.add_argument("--speed", type=float, default=0.0,
-                        help="replay clock scale; 0 derives it from --replay-seconds")
-    parser.add_argument("--frames-only", type=int, default=0,
-                        help="render every Nth replay frame as a PNG instead of a video")
+    parser.add_argument(
+        "--speed",
+        type=float,
+        default=0.0,
+        help="replay clock scale; 0 derives it from --replay-seconds",
+    )
+    parser.add_argument(
+        "--frames-only",
+        type=int,
+        default=0,
+        help="render every Nth replay frame as a PNG instead of a video",
+    )
     args = parser.parse_args(argv)
 
     corpus = load_corpus(args.corpus)
     if not corpus.instances:
         raise SystemExit(f"no trajectories under {args.corpus}")
-    prompt_count = distinct_prompt_count(corpus, args.corpus)
 
     records = corpus.records
     if args.traces:
         records = sum(1 for line in args.traces.read_text().splitlines() if line.strip())
 
     cards = select(corpus, args.per_family)
-    if len(cards) < args.per_family * len(FAMILY_ORDER):
+
+    families_present = sorted(set(corpus.by_family().keys()))
+    wanted = args.per_family * len(families_present)
+    if len(cards) < wanted:
         raise SystemExit(
             f"only {len(cards)} distinct cards available, wanted "
-            f"{args.per_family * len(FAMILY_ORDER)}"
+            f"{wanted} ({args.per_family} × {len(families_present)} families)"
         )
+
+    # Safety net 1: no two cards may render identical overall content.
     signatures = {c.signature for c in cards}
     if len(signatures) != len(cards):
-        # The whole point of the rebuild: two identical-looking cards would put
-        # the old repetition straight back on screen.
-        raise SystemExit("selected cards are not all distinct")
+        raise SystemExit("selected cards are not all distinct (signature collision)")
+
+    # Safety net 2: every card must carry a distinct opening prompt.  This is
+    # the property that phrasing.py was fixed to provide; it should pass
+    # trivially against a v2 corpus and FAIL against a v1 corpus (where all
+    # instances of a family share a byte-identical first user message).
+    selected_prompts = [c.prompt for c in cards]
+    if len(set(selected_prompts)) != len(cards):
+        duplicates = len(cards) - len(set(selected_prompts))
+        raise SystemExit(
+            f"{duplicates} selected card(s) share a prompt with another selected card — "
+            f"corpus may predate phrasing.py variant instructions "
+            f"({len(set(selected_prompts))} unique prompts out of {len(cards)} cards)"
+        )
 
     duration = sum(c.latency for c in cards)
     speed = args.speed or duration / args.replay_seconds
     speed = min(SPEED_MAX, max(SPEED_MIN, round(speed, 1)))
 
-    montage = Montage(corpus, cards, speed, args.model, records, prompt_count)
-    video = (INTRO_SECONDS + duration / speed + TAIL_SECONDS + SUMMARY_SECONDS)
+    montage = Montage(corpus, cards, speed, args.model, records)
+    video = INTRO_SECONDS + duration / speed + TAIL_SECONDS + SUMMARY_SECONDS
     print(
         f"{len(corpus.instances)} trajectories  {records} records  "
         f"{corpus.tokens:,} tokens  {corpus.wall_clock / 3600:.2f}h wall clock\n"
@@ -725,8 +835,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"at {speed:g}x  ->  {video:.1f}s of video"
     )
     for card in cards:
-        print(f"  {card.run:24s} {card.instance_id:26s} {card.latency:5.1f}s "
-              f"{len(card.tool_lines):2d} tool calls")
+        print(
+            f"  {card.run:24s} {card.instance_id:26s} {card.latency:5.1f}s "
+            f"{len(card.tool_lines):2d} tool calls"
+        )
 
     if args.frames_only:
         out_dir = args.out.parent / "montage-frames"

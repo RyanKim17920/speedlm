@@ -1,35 +1,182 @@
 # demo/
 
-Everything used to produce the SpeedLM demo video. This directory is a leaf:
-nothing under `src/`, `tests/`, or `scripts/` imports or references anything here,
-and `demo/demo-qwen8b.json` is the only config it needs.
+Everything used to produce the SpeedLM demo video. The finished video
+(`speedlm-final.mp4`, 87s, three source clips concatenated) can be rebuilt
+end-to-end from a new set of run artifacts with a single command:
 
-The finished video is two segments concatenated, in this order:
+```bash
+.venv/bin/python demo/build_video.py \
+    --corpus /data/ryan.kim/speedlm-runs/bigcorpus-run1/traffic/trajectories \
+    --capture-dir /data/ryan.kim/speedlm-runs/demo-video-run2 \
+    --decision /data/ryan.kim/speedlm-runs/regate-big-run2/decision.json \
+    --corroborating /data/ryan.kim/speedlm-runs/regate-big-run1/decision.json \
+    --training-run /data/ryan.kim/speedlm-runs/bigcycle-run1 \
+    --out /data/ryan.kim/speedlm-runs/demo-versions/speedlm-rebuilt.mp4 \
+    --work-dir /data/ryan.kim/speedlm-runs/demo-build
+```
 
-1. **the live tuning cycle** — a real terminal watching a real SpeedLM gateway
-   arm itself, train an Eagle3 head, benchmark it, and gate it (`cycle.sbatch` +
-   `session_record.py` + `session_render.py`)
-2. **stock vs tuned drafting, side by side** — the two heads replayed against
-   each other on one shared clock (`capture.sbatch` / `capture.py` + `render.py`)
+Use `--skip <stage>` (repeatable) to reuse an existing intermediate when only
+some stages have changed.  Stages: `montage`, `terminal`, `remotion`, `race`,
+`assemble`.
+
+
+## Pipeline overview
+
+The three source clips are assembled in one `filter_complex` re-encode pass
+(which also converts Remotion's `yuvj420p` output to `yuv420p`):
+
+```
+[0] traffic-montage.mp4   whole clip, no trim     16.97 s   demo/montage.py
+[1] versionA-split.mp4    whole clip, no trim     44.83 s   session_record.py
+                                                             session_render.py
+                                                             extract_series.py
+                                                             npx remotion render
+[2] race-8x.mp4           trim 1.5 s – 26.9 s    25.40 s   demo/render.py
+                          ─────────────────────   ───────
+                                                  87.20 s   speedlm-final.mp4
+```
+
+`libx264 -preset medium -crf 20 -pix_fmt yuv420p -movflags +faststart`, no
+audio.  `versionA-split.mp4` is `yuvj420p` (Remotion output) and carries a
+silent AAC track; the `filter_complex` pass normalises both.
 
 
 ## What each file does
 
 | file | what it is | GPU? |
 | --- | --- | --- |
-| `cycle.sbatch` | SLURM job: runs a real `speedlm vllm serve` gateway with `--enable-idle-tuning`, seeded with run5's captured traffic, and waits for one full idle-tuning cycle to complete | **yes** — 1 GPU, 2h |
+| `build_video.py` | **one-command rebuild** — drives all five stages in order, validates inputs up-front, verifies Root.tsx frame count, checks final duration | no |
+| `montage.py` | flip through real captured agent trajectories, one card per instance; renders the traffic intro clip | no |
+| `corpus_card.py` | standalone corpus summary card (totals, per-family, suite info) | no |
+| `merge_traces.py` | merge multiple `traces.jsonl` files from different traffic runs | no |
+| `render.py` | replay two captured drafting timelines side-by-side at `--speed 8`; derives every on-screen number from `--decision` at render time | no |
 | `session_record.py` | drives a real `bash` on a real PTY from a JSON step script, records asciicast v2 | no |
-| `session_render.py` | rasterises a `.cast` to 1920x1080 30fps H.264 via `pyte` + PIL + ffmpeg | no |
-| `session_cycle.json` | the step script for the cycle segment — watches `events.jsonl`, the trainer's `stdout.log`, and finally `decision.json` on the *live* run | n/a |
-| `session_speedlm.json` | an alternative step script narrating an already-finished run (post-hoc; not used for the shipped cycle segment) | n/a |
-| `capture.sbatch` | SLURM job: runs `capture.py` over the held-out suite, both arms sequentially in one allocation on one GPU | **yes** — 1 GPU, 2h |
-| `capture.py` | starts a real vLLM engine per arm and records a token-by-token JSONL timeline for each request | **yes** (`--dry-run` is GPU-free) |
-| `render.py` | replays the two timelines side by side and encodes the mp4 | no |
-| `demo-qwen8b.json` | the demo-sized SpeedLM config used by `cycle.sbatch` | n/a |
+| `session_render.py` | rasterises a `.cast` to 1920×1080 30fps H.264 via `pyte` + PIL + ffmpeg | no |
+| `session_fast.json` | step script for the fast terminal segment (typing_delay 0.0025 s/char, 44.83 s rendered) | n/a |
+| `session_cycle.json` | step script that tails a *live* run's `events.jsonl` and trainer `stdout.log` | n/a |
+| `session_cycle1e.json` | variant for the 1-epoch config | n/a |
+| `session_live.json` | alternative step script for narrating a running gateway | n/a |
+| `session_live_verdict.json` | short verdict-only step script | n/a |
+| `session_speedlm.json` | alternative step script for a finished run (post-hoc) | n/a |
+| `remotion/extract_series.py` | reads training logs + gate decision.json, writes `remotion/src/data.json`; anchors every chart datum to the frame where the terminal printed it | no |
+| `remotion/src/Root.tsx` | Remotion composition; `DURATION_IN_FRAMES` (line 14) **must match** the newly recorded terminal clip's frame count — `build_video.py` enforces this and aborts with the correct value if it does not | n/a |
+| `bigcycle.sbatch` | SLURM job: runs a real `speedlm vllm serve ... --enable-idle-tuning` gateway and waits for one full idle-tuning cycle | **yes** — 1 GPU |
+| `bigcycle-qwen8b.json` | SpeedLM config used by `bigcycle.sbatch` | n/a |
+| `cycle.sbatch` | earlier demo-sized cycle job (96-record corpus, 1 epoch) | **yes** — 1 GPU |
+| `cycle1e.sbatch` | 1-epoch variant cycle job | **yes** — 1 GPU |
+| `cycle1e-qwen8b.json` | SpeedLM config for `cycle1e.sbatch` | n/a |
+| `traffic.sbatch` | SLURM job: runs agentic traffic through the gateway via `scripts/run_agentic_traffic.py` (which imports `tests/e2e/agentenv/`) | **yes** — 1 GPU |
+| `traffic-v2.sbatch` | revised traffic job (updated routing / concurrency) | **yes** — 1 GPU |
+| `traffic-qwen8b.json` | SpeedLM config for traffic jobs | n/a |
+| `capture.sbatch` | SLURM job: runs `capture.py` over the held-out suite, both arms sequentially in one GPU allocation | **yes** — 1 GPU |
+| `capture.py` | starts a real vLLM engine per arm and records a token-by-token JSONL timeline; `--dry-run` is GPU-free | **yes** |
+| `demo-qwen8b.json` | demo-sized SpeedLM config (96-record corpus, 1 epoch) | n/a |
 
-Rendering is pure CPU: `imageio_ffmpeg` + PIL, and `session_render.py` additionally
-needs `pyte` and DejaVu Sans Mono (`fonts-dejavu-core`). Only `cycle.sbatch`,
-`capture.sbatch`, and `capture.py` touch a GPU.
+
+## Stage details
+
+### montage
+
+`demo/montage.py` reads one or more `traffic/trajectories` directories and
+renders one card per genuinely distinct agent instance.  Asserts that each
+selected card carries a distinct opening prompt (the property that
+`phrasing.py` provides); the corpus must have been captured with the variant
+instructions for this assertion to pass.
+
+```bash
+.venv/bin/python demo/montage.py \
+    --corpus /data/ryan.kim/speedlm-runs/bigcorpus-run1/traffic/trajectories \
+    --traces /data/ryan.kim/speedlm-runs/bigcycle-run1/speedlm_home/traces/traces.jsonl \
+    --out /data/ryan.kim/speedlm-runs/demo-versions/traffic-montage-v3.mp4
+```
+
+### terminal
+
+Two sub-steps: record a PTY session, then render it.
+
+```bash
+.venv/bin/python demo/session_record.py \
+    --script demo/session_fast.json \
+    --out    /data/ryan.kim/speedlm-runs/demo-fast/session_fast_v5.cast \
+    --cwd    /admin/home/ryan.kim/speedlm-fr \
+    --cols 100 --rows 30
+
+.venv/bin/python demo/session_render.py \
+    /data/ryan.kim/speedlm-runs/demo-fast/session_fast_v5.cast \
+    /data/ryan.kim/speedlm-runs/demo-fast/session_fast_v5.mp4 \
+    --timing-out /data/ryan.kim/speedlm-runs/demo-fast/timing_v5.json
+```
+
+`--timing-out` writes the piecewise-linear cast→video clock mapping that
+`extract_series.py` needs to anchor chart reveals to the exact frame where the
+terminal printed each value.
+
+### remotion
+
+Three sub-steps.
+
+**1. extract_series.py** reads the training log and gate decision, writes
+`demo/remotion/src/data.json`.  Must be re-run whenever the cast or timing
+sidecar changes, or the chart reveals will be anchored to the wrong frames.
+
+```bash
+.venv/bin/python demo/remotion/extract_series.py \
+    --run-root /data/ryan.kim/speedlm-runs/bigcycle-run1 \
+    --decision /data/ryan.kim/speedlm-runs/regate-big-run2/decision.json \
+    --cast   /data/ryan.kim/speedlm-runs/demo-fast/session_fast_v5.cast \
+    --timing /data/ryan.kim/speedlm-runs/demo-fast/timing_v5.json
+```
+
+**2.** Copy `terminal.mp4` to `demo/remotion/public/terminal.mp4`.
+
+**3. npx remotion render** (`build_video.py` runs this automatically):
+
+```bash
+cd demo/remotion
+npx remotion render SpeedLMDemo /data/ryan.kim/speedlm-runs/demo-versions/versionA-split-v3.mp4 \
+    --codec=h264 --crf=20
+```
+
+**Root.tsx frame count.**  `demo/remotion/src/Root.tsx` hardcodes
+`DURATION_IN_FRAMES` (currently 1344).  **This must match the newly recorded
+terminal clip's frame count** or the Remotion render will be truncated or
+padded.  `build_video.py` checks this automatically and aborts with the
+correct value.  Update it by hand if running Remotion directly:
+
+```
+# terminal duration in seconds × 30 fps, rounded to nearest integer
+# Example: 44.83 s × 30 = 1344.9 → 1345 frames
+```
+
+### race
+
+```bash
+.venv/bin/python demo/render.py \
+    --capture-dir /data/ryan.kim/speedlm-runs/demo-video-run2 \
+    --decision    /data/ryan.kim/speedlm-runs/regate-big-run2/decision.json \
+    --corroborating /data/ryan.kim/speedlm-runs/regate-big-run1/decision.json \
+    --out  /data/ryan.kim/speedlm-runs/demo-versions/race-8x.mp4 \
+    --speed 8
+```
+
+`--decision` is required; every displayed gate figure is derived from it at
+render time — nothing is hardcoded.  `--corroborating` (repeatable) supplies
+the "reproduced N times" line.
+
+### assemble
+
+`build_video.py` runs a single `ffmpeg filter_complex` pass:
+
+- clip [0] (montage): whole clip, `format=yuv420p`
+- clip [1] (remotion): whole clip, `format=yuv420p` (converts from `yuvj420p`)
+- clip [2] (race): `trim=start=1.5:end=26.9`, `setpts=PTS-STARTPTS`,
+  `format=yuv420p`
+
+then `concat=n=3`, `libx264 -preset medium -crf 20 -pix_fmt yuv420p
+-movflags +faststart`, audio dropped.
+
+After encoding, `build_video.py` ffprobes the output and reports the duration
+vs the arithmetic sum; a discrepancy > 0.5 s is flagged.
 
 
 ## Artifacts
@@ -37,165 +184,72 @@ needs `pyte` and DejaVu Sans Mono (`fonts-dejavu-core`). Only `cycle.sbatch`,
 Under `/data/ryan.kim/speedlm-runs/`:
 
 ```
-demo-cycle-run10/          # the live tuning cycle
-  provenance.txt           # host, SLURM_JOB_ID 380018, commit, seed traces
-  gateway-and-vllm.log     # full gateway + vLLM log
-  gateway-tail.log         # last 400 lines
-  results/                 # every JSON under SPEEDLM_HOME, incl. decision.json
-  speedlm_home/            # the run's SPEEDLM_HOME
-  speedlm-cycle.cast       # the raw PTY recording (1215.2s real)
-  speedlm-cycle.mp4        # 149.97s, 1920x1080 30fps
+demo-versions/
+  speedlm-final.mp4        # 87.17 s, the shipped final cut
+  traffic-montage-v2.mp4   # montage clip (16.97 s)
+  versionA-split-v2.mp4    # remotion terminal+chart clip (44.83 s)
+  race-8x.mp4              # race clip (30.9 s, trimmed to 25.4 s in assembly)
 
-demo-video-run2/           # the stock-vs-tuned capture
-  provenance.txt           # host, SLURM_JOB_ID 378951, commit
-  capture.log
+demo-fast/
+  session_fast_v4.cast     # PTY recording (asciicast v2)
+  session_fast_v4.mp4      # rendered terminal (44.83 s)
+  timing_v4.json           # cast→video clock mapping
+
+bigcorpus-run1/
+  traffic/trajectories/    # 601 agent trajectories (bigcorpus corpus)
+  speedlm_home/
+    traces/traces.jsonl
+    runs/e7004c4c.../
+      training-logs/stdout.log
+      decision.json
+
+demo-video-run2/           # stock-vs-tuned capture
   capture_manifest.json
-  comparison.json          # the totals of this recording
-  engine-stock.log / engine-candidate.log
-  timeline-stock.jsonl / timeline-candidate.jsonl
-  speedlm-drafting.mp4     # 1x
-  speedlm-drafting-4x.mp4  # 46.33s, the shipped 4x cut
+  timeline-stock.jsonl
+  timeline-candidate.jsonl
 
-speedlm-demo.mp4           # the two segments concatenated, 196.30s
-```
+regate-big-run2/
+  decision.json            # definitive gate decision (287-context suite, 8 repeats)
 
-
-## Regenerating
-
-### Segment 1 — the live tuning cycle
-
-`cycle.sbatch` is the thing being filmed; the recorder attaches to it while it runs.
-
-```bash
-# 1. submit the real cycle (1 GPU, ~30 min of cycle inside a 2h wall limit)
-sbatch demo/cycle.sbatch
-# writes /data/ryan.kim/speedlm-runs/demo-cycle-run10/ and
-#        /data/ryan.kim/speedlm-runs/slurm-demo-cycle-<jobid>.out
-
-# 2. once the job is RUNNING, record the terminal that watches it.
-#    session_cycle.json tails the live events.jsonl and the live trainer log,
-#    so this must be started while the cycle is still in flight.
-.venv/bin/python demo/session_record.py \
-    --script demo/session_cycle.json \
-    --out    /data/ryan.kim/speedlm-runs/demo-cycle-run10/speedlm-cycle.cast \
-    --cwd    /admin/home/ryan.kim/speedlm-fr \
-    --cols 100 --rows 30
-
-# 3. render (CPU only, no GPU, no SLURM)
-.venv/bin/python demo/session_render.py \
-    /data/ryan.kim/speedlm-runs/demo-cycle-run10/speedlm-cycle.cast \
-    /data/ryan.kim/speedlm-runs/demo-cycle-run10/speedlm-cycle.mp4 \
-    --max-gap 3.0 \
-    --timing-out /data/ryan.kim/speedlm-runs/demo-cycle-run10/speedlm-cycle.timing.json
-```
-
-`--max-gap 3.0` is what produced the shipped 149.97s cut from a 1215.2s recording
-(16 gaps compressed). `--max-gap 0` disables compression and plays the recording
-at its real pace.
-
-`--timing-out` writes a JSON sidecar stating how the clock was bent: piecewise-linear
-`[cast_t, video_t]` breakpoints plus the compressed gaps and their real durations.
-Only the renderer knows that mapping, and without it nothing can put an overlay on the
-frame where a line appeared. `demo/remotion/extract_series.py` reads it (together with
-the `.cast`) to stamp every chart datum with that frame; the flag is additive, and
-omitting it changes nothing about the video.
-
-### Segment 2 — stock vs tuned, side by side
-
-```bash
-# 1. capture both arms (1 GPU, both arms sequentially in one allocation)
-DEMO_OUT_DIR=/data/ryan.kim/speedlm-runs/demo-video-run2 sbatch demo/capture.sbatch
-
-# 2. render at 4x (CPU only)
-.venv/bin/python demo/render.py \
-    --capture-dir /data/ryan.kim/speedlm-runs/demo-video-run2 \
-    --out         /data/ryan.kim/speedlm-runs/demo-video-run2/speedlm-drafting-4x.mp4 \
-    --speed 4
-```
-
-`capture.py --dry-run` resolves the suite, selection, and engine argv without
-allocating a GPU, which is the cheap way to check the wiring before submitting.
-
-### Assembling the final video
-
-Both segments are already 1920x1080, 30 fps, H.264 High, yuv420p, tbn 15360, no
-audio — so they concatenate losslessly with a stream copy, no re-encode:
-
-```bash
-FF=$(.venv/bin/python -c "import imageio_ffmpeg;print(imageio_ffmpeg.get_ffmpeg_exe())")
-printf "file '%s'\nfile '%s'\n" \
-    /data/ryan.kim/speedlm-runs/demo-cycle-run10/speedlm-cycle.mp4 \
-    /data/ryan.kim/speedlm-runs/demo-video-run2/speedlm-drafting-4x.mp4 > /tmp/concat.txt
-"$FF" -y -f concat -safe 0 -i /tmp/concat.txt -c copy -movflags +faststart \
-    /data/ryan.kim/speedlm-runs/speedlm-demo.mp4
+regate-big-run1/
+  decision.json            # corroborating gate (same head, earlier run)
 ```
 
 
 ## Honesty properties
 
-These are the properties that make the video defensible, and where they live.
-
-**The terminal is a real PTY running real commands.** `session_record.py`
+**The terminal is a real PTY running real commands.**  `session_record.py`
 calls `pty.fork()` to hand a genuine `bash` a real terminal, then only writes
-keystrokes in and reads bytes out. Nothing fabricates output, replays a canned
-transcript, or re-flows text a program did not emit — if a command fails, the
-failure is what gets recorded. Narration is typed as real `# ...` shell input
-(the shell echoes and discards it), so there is no post-hoc caption layer.
+keystrokes in and reads bytes out.  Nothing fabricates output or replays a
+canned transcript — if a command fails, the failure is what gets recorded.
+Narration is typed as real `# ...` shell input.
 
-**Dead-air compression is marked on screen with the real elapsed time.**
-`session_render.py --max-gap` shrinks any stretch with no output longer than
-N seconds down to N seconds, and every compressed gap draws a marker pill in the
-bottom-right reading `⏩ <real time> elapsed` (e.g. `⏩ 8m12s elapsed`), using the
-*real* wall time that was removed. The renderer also prints a summary line to
-stderr stating the gap count, the total time removed, and the marker text.
-`--max-gap 0` turns compression off entirely.
+**Dead-air compression is marked on screen.**  `session_render.py --max-gap`
+(default 2.0 s) shrinks any stretch with no output down to that limit and
+draws a `⏩ <real time> elapsed` pill for every compressed gap.
 
-**`--speed` draws a persistent speed badge.** `render.py --speed` scales the
-shared replay clock only: no chunk is dropped, neither arm is re-timed, and every
-number on screen — elapsed, tokens, tok/s, accepted length — stays in the
-recording's own real seconds. Because a real 123.4s timer running out in 31s of
-video would otherwise read as a bug, every replay frame carries a badge reading
-`{speed}x SPEED` (`4x SPEED` in the shipped cut). At `--speed 1.0` no badge is
-drawn.
+**`--speed` draws a persistent badge.**  `render.py --speed 8` scales only
+the shared replay clock; no chunk is dropped and every displayed number (elapsed,
+tokens, tok/s, accepted length) stays in the recording's own real seconds.  At
+`--speed 1.0` no badge is drawn.
 
-**The demo does not invent its own headline number.** `cycle.sbatch` runs a real
-cycle at demo size (see `demo-qwen8b.json`: 96-record corpus, 1 epoch, 3 benchmark
-repeats — the validator's hard floor — 0 warmup, 128/64-token benchmark and
-correctness caps). `capture.sbatch` runs *one* sequential pass over the watchable
-contexts, which is far too little to promote on and exactly enough to watch; its
-captions quote the gated numbers alongside its own and say which is which.
+**Gate figures are derived at render time.**  `render.py` requires `--decision`
+and reads every displayed measurement — accepted-length delta, SE, percentage
+headline, throughput range, acceptance-rate pp — from the gate's own
+`decision.json`.  Nothing is hardcoded.
+
+**Chart anchors are real terminal timestamps.**  `extract_series.py` matches
+each training/validation datum against the exact cast event where the terminal
+printed it, then maps that to a video frame via the timing sidecar.  Points
+the terminal never printed inherit the next printed point's frame.
 
 
-## The numbers, from the artifacts
+## traffic.sbatch / traffic-v2.sbatch
 
-From `demo-cycle-run10/.../decision.json` — the gate the video shows, 36 contexts
-x 3 repeats, `max_tokens=128`, stock draft `RedHatAI/Qwen3-8B-speculator.eagle3`:
+These SLURM jobs run `scripts/run_agentic_traffic.py`, which imports
+`tests/e2e/agentenv/` to drive real agentic tasks through the gateway.
+`traffic-v2.sbatch` is the current version (updated routing and concurrency).
+They produce `traffic/trajectories/` directories consumed by `montage.py`.
 
-| | candidate | stock | delta | threshold |
-| --- | --- | --- | --- | --- |
-| accepted length | 2.4637 | 2.3143 | +0.1494 | >= 0.05 |
-| acceptance rate | 0.4879 | 0.4381 | +4.98 pp | >= 1.0 pp |
-| tok/s (replay) | 129.34 | 123.25 | +4.94% | >= -2.0% |
-| tok/s (prometheus) | 141.97 | 134.72 | +5.38% | — |
-
-`verdict: promote`, `reason: both_thresholds_met`,
-`acceptance_criterion: mean_accepted_length_delta`,
-output divergences 7/36 (p = 0.0057).
-
-From `demo-video-run2/comparison.json` — this recording's own totals, 49 contexts,
-16625 completion tokens per arm:
-
-| | stock | candidate |
-| --- | --- | --- |
-| wall seconds | 124.045 | 110.505 |
-| wall tok/s | 134.02 | 150.45 |
-| mean accepted length | 2.3890 | 2.7387 |
-| mean engine tok/s | 142.36 | 163.49 |
-
-`wall_speedup_pct: 10.92`, `accepted_length_delta: 0.3497`,
-`engine_tok_per_sec_delta_pct: 14.84`.
-
-The same file carries `gated_result_reference`, which is the number to cite:
-**+0.2989 accepted length, +9.94% tok/s**, from `docs/agentic-selfplay-result.md`
-(job 378546, unseen session-disjoint suite, 5 repeats x 100 contexts x 2 blocks
-per arm).
+`traffic.sbatch` is not a leaf — it has a dependency on `agentenv/` (the
+per-task sandbox drivers) and `scripts/run_agentic_traffic.py` (the harness).

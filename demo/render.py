@@ -31,10 +31,22 @@ video would read as a bug.
 
 Usage:
 
-    python demo/render.py \
-        --capture-dir /data/.../demo-video-run1 \
-        --out         /data/.../demo-video-run1/speedlm-drafting.mp4 \
-        --speed       4
+    python demo/render.py \\
+        --capture-dir /data/.../demo-video-run1 \\
+        --decision    /data/.../regate-big-run2/decision.json \\
+        --corroborating /data/.../bigcycle-run1/decision.json \\
+        --corroborating /data/.../regate-big-run1/decision.json \\
+        --out         /data/.../race-8x.mp4 \\
+        --speed       8
+
+``--decision`` is required and must point to the definitive gate decision.json
+that the video will cite.  Every displayed measurement -- accepted-length delta,
+SE, percentage headline, throughput range, acceptance-rate pp -- is derived from
+it at render time.  Never hardcoded.
+
+``--corroborating`` (repeatable, zero or more) names additional gate decision.json
+files for independent measurements of the same head.  They supply the "reproduced
+N times" line on the outro card.  If none are supplied that line is suppressed.
 """
 
 from __future__ import annotations
@@ -47,7 +59,7 @@ import sys
 import textwrap
 from bisect import bisect_left, bisect_right
 from collections.abc import Iterator, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -82,13 +94,201 @@ def font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont:
 
 
 # ---------------------------------------------------------------------------
+# Gate-number parsing
+# ---------------------------------------------------------------------------
+
+#: ``final_reason`` a vetoed record carries.  Mirrors
+#: ``speedlm.gate.decide.VETO_REASON_NON_STATIONARY``.
+_NON_STATIONARY_REASON = "throughput_not_stationary"
+
+# Fields that render.py requires from decision.json.  Any missing key causes a
+# loud failure rather than a silent fallback -- a wrong number on screen is the
+# single worst outcome this script can produce.
+_REQUIRED_DECISION_FIELDS = [
+    "stock_avg_accepted_length",
+    "candidate_avg_accepted_length",
+    "accepted_length_delta",
+    "accepted_length_delta_standard_error",
+    "acceptance_delta_pp",
+    "num_contexts",
+    "num_repeats",
+]
+
+
+def _vetoed(d: dict) -> bool:
+    """Whether a post-decision veto overrode this record's promotion.
+
+    Prefers the persisted answer.  Falls back to re-deriving it from the
+    stationarity block, so records written before ``final_verdict`` existed --
+    bigcycle-run1 among them -- still read as the rollbacks they were.
+
+    Intentionally mirrors ``demo/remotion/extract_series.py::_vetoed`` so both
+    scripts agree on which runs were rolled back.
+    """
+    if "vetoed" in d:
+        return bool(d["vetoed"])
+    stationarity = d.get("throughput_stationarity")
+    if not isinstance(stationarity, dict):
+        return False
+    return (
+        d.get("verdict") == "promote"
+        and bool(stationarity.get("required_for_promotion"))
+        and stationarity.get("status") == "non_stationary"
+    )
+
+
+def _final_verdict(d: dict) -> str:
+    """The actual outcome, accounting for post-hoc vetoes.
+
+    Intentionally mirrors ``demo/remotion/extract_series.py::_final_verdict``.
+    """
+    return d.get("final_verdict") or ("reject" if _vetoed(d) else d["verdict"])
+
+
+@dataclass
+class GateNumbers:
+    """Every measured value the video displays, derived from gate artifacts at render time."""
+
+    # Provenance strings for footers
+    gate_run_name: str  # e.g. "regate-big-run2" (parent.name of --decision path)
+    capture_job_id: str  # SLURM job that produced the capture (from capture_manifest)
+
+    # Accepted-length channel
+    stock_al: float  # stock_avg_accepted_length
+    tuned_al: float  # candidate_avg_accepted_length
+    al_delta: float  # accepted_length_delta
+    al_se: float  # accepted_length_delta_standard_error
+    al_pct: float  # al_delta / stock_al * 100
+
+    # Acceptance-rate channel
+    acceptance_delta_pp: float  # acceptance_delta_pp
+
+    # Suite metadata
+    num_contexts: int
+    num_repeats: int
+
+    # Throughput channel
+    throughput_vetoed: bool
+    tput_min_pct: float | None  # minimum per-repeat delta pct (from per_repeat)
+    tput_max_pct: float | None  # maximum per-repeat delta pct
+    tuned_tok_min: int | None  # floor of tuned tok/s across repeats
+    tuned_tok_max: int | None  # ceiling of tuned tok/s across repeats
+    stock_tok_first: int | None  # stock tok/s on the first scored repeat
+    stock_tok_last: int | None  # stock tok/s on the last scored repeat
+
+    # Corroborating measurements (from --corroborating files, excluding main)
+    corroborating_deltas: list[float] = field(default_factory=list)
+
+
+def _require_field(d: dict, key: str, path: Path) -> Any:
+    """Return ``d[key]`` or raise with a message naming the field and file."""
+    if key not in d:
+        raise SystemExit(
+            f"decision.json is missing required field '{key}': {path}\n"
+            "Refusing to render -- a missing field means a wrong number on screen."
+        )
+    return d[key]
+
+
+def parse_gate_numbers(
+    decision_path: Path,
+    manifest: dict,
+    corroborating_paths: Sequence[Path],
+) -> GateNumbers:
+    """Derive every displayed figure from gate artifacts on disk.
+
+    Fails loudly if a required field is absent -- never falls back to a default.
+    """
+    if not decision_path.is_file():
+        raise SystemExit(f"--decision file not found: {decision_path}")
+
+    d = json.loads(decision_path.read_text())
+
+    for key in _REQUIRED_DECISION_FIELDS:
+        _require_field(d, key, decision_path)
+
+    stock_al = float(d["stock_avg_accepted_length"])
+    tuned_al = float(d["candidate_avg_accepted_length"])
+    al_delta = float(d["accepted_length_delta"])
+    al_se = float(d["accepted_length_delta_standard_error"])
+    al_pct = al_delta / stock_al * 100.0
+    acceptance_delta_pp = float(d["acceptance_delta_pp"])
+    num_contexts = int(d["num_contexts"])
+    num_repeats = int(d["num_repeats"])
+    throughput_vetoed = _vetoed(d)
+
+    # Per-repeat throughput range (optional; absent on older records).
+    per_repeat = d.get("per_repeat") or []
+    tput_min_pct: float | None = None
+    tput_max_pct: float | None = None
+    tuned_tok_min: int | None = None
+    tuned_tok_max: int | None = None
+    stock_tok_first: int | None = None
+    stock_tok_last: int | None = None
+    if per_repeat:
+        stock_toks = [float(r["stock_tok_per_sec"]) for r in per_repeat]
+        tuned_toks = [float(r["candidate_tok_per_sec"]) for r in per_repeat]
+        deltas_pct = [(t - s) / s * 100.0 for s, t in zip(stock_toks, tuned_toks, strict=True)]
+        tput_min_pct = min(deltas_pct)
+        tput_max_pct = max(deltas_pct)
+        tuned_tok_min = int(round(min(tuned_toks)))
+        tuned_tok_max = int(round(max(tuned_toks)))
+        stock_tok_first = int(round(stock_toks[0]))
+        stock_tok_last = int(round(stock_toks[-1]))
+
+    # Provenance.
+    gate_run_name = decision_path.parent.name
+    # The capture job ID is the SLURM job that ran capture.py.  It lives in the
+    # manifest rather than being typed here so a re-run against a new capture dir
+    # automatically produces the right job number on screen.
+    capture_job_id = str(manifest.get("slurm_job_id", "unknown"))
+
+    # Corroborating runs.
+    corroborating_deltas: list[float] = []
+    for path in corroborating_paths:
+        if not path.is_file():
+            print(f"warning: corroborating gate not found (skipped): {path}", file=sys.stderr)
+            continue
+        cd = json.loads(path.read_text())
+        delta = cd.get("accepted_length_delta")
+        if delta is None:
+            print(
+                f"warning: corroborating gate has no accepted_length_delta (skipped): {path}",
+                file=sys.stderr,
+            )
+            continue
+        corroborating_deltas.append(float(delta))
+
+    return GateNumbers(
+        gate_run_name=gate_run_name,
+        capture_job_id=capture_job_id,
+        stock_al=stock_al,
+        tuned_al=tuned_al,
+        al_delta=al_delta,
+        al_se=al_se,
+        al_pct=al_pct,
+        acceptance_delta_pp=acceptance_delta_pp,
+        num_contexts=num_contexts,
+        num_repeats=num_repeats,
+        throughput_vetoed=throughput_vetoed,
+        tput_min_pct=tput_min_pct,
+        tput_max_pct=tput_max_pct,
+        tuned_tok_min=tuned_tok_min,
+        tuned_tok_max=tuned_tok_max,
+        stock_tok_first=stock_tok_first,
+        stock_tok_last=stock_tok_last,
+        corroborating_deltas=corroborating_deltas,
+    )
+
+
+# ---------------------------------------------------------------------------
 # Timeline model
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class Chunk:
-    t: float          # absolute seconds on the arm's own clock
+    t: float  # absolute seconds on the arm's own clock
     text: str
 
 
@@ -97,7 +297,7 @@ class Request:
     family: str
     context_hash: str
     turn_depth: int
-    start: float      # absolute seconds on the arm's own clock
+    start: float  # absolute seconds on the arm's own clock
     end: float
     tokens: int
     accepted_length: float
@@ -158,9 +358,7 @@ class Arm:
         return sum(measured) / len(measured) if measured else None
 
 
-def load_arm(
-    path: Path, label: str, draft: str, accent: tuple[int, int, int]
-) -> Arm:
+def load_arm(path: Path, label: str, draft: str, accent: tuple[int, int, int]) -> Arm:
     """Lay one arm's requests back to back on a single clock."""
     requests: list[Request] = []
     cursor = 0.0
@@ -168,10 +366,7 @@ def load_arm(
         for line in handle:
             row = json.loads(line)
             start = cursor
-            chunks = [
-                Chunk(t=start + float(c["t"]), text=c["text"])
-                for c in row["tokens"]
-            ]
+            chunks = [Chunk(t=start + float(c["t"]), text=c["text"]) for c in row["tokens"]]
             end = start + float(row["wall_s"])
             requests.append(
                 Request(
@@ -197,11 +392,11 @@ def load_arm(
 class ArmFrameState:
     """Everything one pane needs to draw itself at one instant."""
 
-    index: int              # 0-based request currently on screen
+    index: int  # 0-based request currently on screen
     done: bool
     elapsed: float
-    tokens_done: int        # tokens completed across all requests so far
-    chars_done: int         # characters of output emitted so far, across all requests
+    tokens_done: int  # tokens completed across all requests so far
+    chars_done: int  # characters of output emitted so far, across all requests
     text: str
     request: Request
 
@@ -272,9 +467,10 @@ def wrap_tail(text: str, columns: int, rows: int) -> list[str]:
         if not raw:
             lines.append("")
             continue
-        lines.extend(textwrap.wrap(
-            raw, width=columns, replace_whitespace=False, drop_whitespace=False
-        ) or [""])
+        lines.extend(
+            textwrap.wrap(raw, width=columns, replace_whitespace=False, drop_whitespace=False)
+            or [""]
+        )
     return lines[-rows:]
 
 
@@ -284,11 +480,13 @@ class Renderer:
         stock: Arm,
         tuned: Arm,
         manifest: dict[str, Any],
+        gate: GateNumbers,
         speed: float = 1.0,
     ) -> None:
         self.stock = stock
         self.tuned = tuned
         self.manifest = manifest
+        self.gate = gate
         # How many seconds of recorded time the replay clock advances per second
         # of video.  This scales the clock only: no recorded chunk is dropped and
         # no arm's timeline is re-timed, so the two arms keep their exact relative
@@ -301,9 +499,7 @@ class Renderer:
         # what lead() checks before claiming the stock arm is behind "the same
         # output": arms that had quietly drifted apart would show up here first.
         self.identical = sum(
-            1
-            for a, b in zip(stock.requests, tuned.requests, strict=True)
-            if a.text == b.text
+            1 for a, b in zip(stock.requests, tuned.requests, strict=True) if a.text == b.text
         )
         self.f_title = font(38, bold=True)
         self.f_sub = font(19)
@@ -333,6 +529,12 @@ class Renderer:
         # DejaVu Sans Mono advance is 0.602 em.
         self.columns = int((self.pane_w - 44) / (15 * 0.602))
 
+        # Sub-font column width used for outro paragraph wrapping.
+        # DejaVu Sans Mono advance is 0.602 em; sub font is size 19.
+        _sub_advance = 19 * 0.602
+        _sub_width = WIDTH - 2 * 120
+        self._sub_columns = int(_sub_width / _sub_advance) - 2
+
     # -- chrome ------------------------------------------------------------
 
     def frame(self) -> tuple[Image.Image, ImageDraw.ImageDraw]:
@@ -340,8 +542,12 @@ class Renderer:
         return image, ImageDraw.Draw(image)
 
     def header(self, draw: ImageDraw.ImageDraw, subtitle: str) -> None:
-        draw.text((40, 38), "SpeedLM  ·  idle-tuned Eagle3 draft head vs stock",
-                  font=self.f_title, fill=TEXT)
+        draw.text(
+            (40, 38),
+            "SpeedLM  ·  idle-tuned Eagle3 draft head vs stock",
+            font=self.f_title,
+            fill=TEXT,
+        )
         draw.text((42, 92), subtitle, font=self.f_sub, fill=MUTED)
         draw.line((40, 130, WIDTH - 40, 130), fill=RULE, width=1)
 
@@ -496,6 +702,126 @@ class Renderer:
         draw.rectangle((x - 12, y - 7, x + w + 12, y + h + 9), fill=TUNED_ACCENT)
         draw.text((x, y), text, font=self.f_stat, fill=BG)
 
+    # -- derived text helpers ----------------------------------------------
+
+    def _headline(self) -> str:
+        """Headline percentage string, e.g. "+15.0%"."""
+        return f"+{self.gate.al_pct:.1f}%"
+
+    def _delta_se_str(self) -> str:
+        """Short accepted-length delta + SE string."""
+        g = self.gate
+        return (
+            f"{g.stock_al:.4f} -> {g.tuned_al:.4f} tokens/step"
+            f"  ·  +{g.al_delta:.4f}, SE {g.al_se:.4f}"
+        )
+
+    def _delta_se_acceptance_str(self) -> str:
+        """Accepted-length delta + SE + acceptance pp string (outro)."""
+        g = self.gate
+        return (
+            f"{g.stock_al:.4f} -> {g.tuned_al:.4f} tokens/step"
+            f"  ·  +{g.al_delta:.4f}, SE {g.al_se:.4f}"
+            f"  ·  +{g.acceptance_delta_pp:.2f}pp acceptance"
+        )
+
+    def _footer_text(self) -> str:
+        """Shared footer for intro, outro, and replay frames."""
+        g = self.gate
+        return (
+            f"replay: capture job {g.capture_job_id}, an earlier idle-tuned head"
+            f"  ·  gate figures: {g.gate_run_name},"
+            f" {g.num_contexts}-context session-disjoint suite"
+        )
+
+    def _race_footer_text(self) -> str:
+        """Per-frame race footer with the gated accepted-length result."""
+        g = self.gate
+        return (
+            f"+{g.al_pct:.1f}% more tokens accepted per verifier step"
+            f" (+{g.al_delta:.4f}, SE {g.al_se:.4f})"
+            f" on the {g.num_contexts}-context session-disjoint suite"
+            "  ·  instrumentation gaps removed from both arms"
+        )
+
+    def _throughput_veto_line(self) -> str:
+        """One-sentence summary of the throughput channel's veto status."""
+        if self.gate.throughput_vetoed:
+            return (
+                "That run's gate vetoed its throughput channel as non-stationary;"
+                " the accepted-length channel passed."
+            )
+        return "That run's gate promoted the throughput channel."
+
+    def _outro_paragraph_lines(self) -> list[str]:
+        """Build the outro's detail paragraph as wrapped text lines."""
+        g = self.gate
+        parts: list[str] = []
+
+        # Reproduction line.
+        if g.corroborating_deltas:
+            total_n = len(g.corroborating_deltas) + 1  # corroborating + main
+            all_deltas = g.corroborating_deltas + [g.al_delta]
+            delta_list = " / ".join(f"+{d:.4f}" for d in all_deltas)
+            parts.append(
+                f"Reproduced {total_n} times on this head: {delta_list},"
+                f" each on a {g.num_contexts}-context"
+            )
+            parts.append(
+                f"session-disjoint suite."
+                f" The number to cite is {g.gate_run_name}:"
+                f" {g.num_repeats} repeats x {g.num_contexts} contexts."
+            )
+        else:
+            parts.append(
+                f"The number to cite is {g.gate_run_name}:"
+                f" {g.num_repeats} repeats x {g.num_contexts} contexts."
+            )
+
+        # Throughput paragraph.
+        if (
+            g.tput_min_pct is not None
+            and g.tput_max_pct is not None
+            and g.tuned_tok_min is not None
+            and g.tuned_tok_max is not None
+            and g.stock_tok_first is not None
+            and g.stock_tok_last is not None
+        ):
+            if g.throughput_vetoed:
+                parts.append(
+                    f"Wall-clock throughput there ran"
+                    f" +{g.tput_min_pct:.1f}% to +{g.tput_max_pct:.1f}%"
+                    f" across repeats -- the tuned arm held"
+                    f" {g.tuned_tok_min}-{g.tuned_tok_max}"
+                )
+                parts.append(
+                    f"tok/s while the shared-node baseline drifted"
+                    f" {g.stock_tok_first}->{g.stock_tok_last},"
+                    f" so we quote the drafting metric."
+                )
+                parts.append(
+                    "That gate vetoed the throughput channel as non-stationary"
+                    " (final verdict: reject); the"
+                )
+            else:
+                parts.append(
+                    f"Wall-clock throughput there ran"
+                    f" +{g.tput_min_pct:.1f}% to +{g.tput_max_pct:.1f}%"
+                    f" across repeats (throughput channel: promoted)."
+                )
+        elif g.throughput_vetoed:
+            parts.append(
+                "That gate vetoed the throughput channel as non-stationary"
+                " (final verdict: reject); the"
+            )
+
+        parts.append(
+            f"accepted-length channel passed at +{g.al_delta:.4f}."
+            " This replay is one sequential pass of an earlier"
+        )
+        parts.append("head, shown because it is watchable.")
+        return parts
+
     # -- cards -------------------------------------------------------------
 
     def intro(self) -> Image.Image:
@@ -507,13 +833,17 @@ class Renderer:
             ("Accept more of each draft and the same answer arrives sooner.", TEXT),
             ("", TEXT),
             ("LEFT   stock speculator, straight off the shelf", STOCK_ACCENT),
-            ("RIGHT  the same speculator after idle tuning on captured agent traffic",
-             TUNED_ACCENT),
+            (
+                "RIGHT  the same speculator after idle tuning on captured agent traffic",
+                TUNED_ACCENT,
+            ),
             ("", TEXT),
-            (f"{len(self.stock.requests)} held-out agent contexts, replayed one at a time "
-             "through both.", MUTED),
-            ("Every context comes from an agent session the tuned head never trained on.",
-             MUTED),
+            (
+                f"{len(self.stock.requests)} held-out agent contexts, replayed one at a time "
+                "through both.",
+                MUTED,
+            ),
+            ("Every context comes from an agent session the tuned head never trained on.", MUTED),
             ("", TEXT),
             ("The mechanism's definitive gated result, on a later and larger corpus:", MUTED),
         ]
@@ -525,20 +855,16 @@ class Renderer:
         # The headline gets the card's largest type. Everything qualifying it is
         # true and stays on the card, one size down: the point of the card is
         # that a viewer leaves with the drafting number, not with a verdict.
-        draw.text((120, y + 4), "+15.0%", font=self.f_big, fill=TUNED_ACCENT)
-        draw.text((384, y + 14), "more tokens accepted per verifier step",
-                  font=self.f_card_bold, fill=TEXT)
-        draw.text((384, y + 52), "2.3051 -> 2.6507 tokens/step  ·  +0.3457, SE 0.0029",
-                  font=self.f_card, fill=MUTED)
-        draw.text((120, y + 108),
-                  "That run's gate vetoed its throughput channel as non-stationary; the "
-                  "accepted-length channel passed.",
-                  font=self.f_sub, fill=MUTED)
-        self.footer(
-            draw,
-            "replay: capture job 378546, an earlier idle-tuned head  ·  "
-            "gate figures: regate-big-run2, 287-context session-disjoint suite",
+        draw.text((120, y + 4), self._headline(), font=self.f_big, fill=TUNED_ACCENT)
+        draw.text(
+            (384, y + 14),
+            "more tokens accepted per verifier step",
+            font=self.f_card_bold,
+            fill=TEXT,
         )
+        draw.text((384, y + 52), self._delta_se_str(), font=self.f_card, fill=MUTED)
+        draw.text((120, y + 108), self._throughput_veto_line(), font=self.f_sub, fill=MUTED)
+        self.footer(draw, self._footer_text())
         return image
 
     def outro(self) -> Image.Image:
@@ -549,27 +875,40 @@ class Renderer:
         saved = stock_s - tuned_s
         pct = (saved / stock_s * 100.0) if stock_s > 0 else 0.0
 
-        draw.text((120, 210), f"time to finish the same {len(self.stock.requests)} contexts",
-                  font=self.f_card, fill=MUTED)
+        draw.text(
+            (120, 210),
+            f"time to finish the same {len(self.stock.requests)} contexts",
+            font=self.f_card,
+            fill=MUTED,
+        )
         draw.text((120, 260), f"{stock_s:.1f}s", font=self.f_big, fill=STOCK_ACCENT)
         draw.text((360, 288), "stock", font=self.f_card, fill=MUTED)
         draw.text((640, 260), f"{tuned_s:.1f}s", font=self.f_big, fill=TUNED_ACCENT)
         draw.text((880, 288), "idle-tuned", font=self.f_card, fill=MUTED)
-        draw.text((1220, 268), f"{saved:.1f}s faster  ({pct:.1f}%)",
-                  font=self.f_card_bold, fill=TUNED_ACCENT)
+        draw.text(
+            (1220, 268),
+            f"{saved:.1f}s faster  ({pct:.1f}%)",
+            font=self.f_card_bold,
+            fill=TUNED_ACCENT,
+        )
 
         rows = [
-            ("output tokens",
-             f"{self.stock.total_tokens}", f"{self.tuned.total_tokens}"),
-            ("tokens / second (wall clock)",
-             f"{self.stock.total_tokens / stock_s:.1f}" if stock_s else "-",
-             f"{self.tuned.total_tokens / tuned_s:.1f}" if tuned_s else "-"),
-            ("mean accepted length (engine)",
-             accepted_text(self.stock.mean_accepted_length),
-             accepted_text(self.tuned.mean_accepted_length)),
-            ("identical output text",
-             f"{self.identical}/{len(self.stock.requests)}",
-             f"{self.identical}/{len(self.tuned.requests)}"),
+            ("output tokens", f"{self.stock.total_tokens}", f"{self.tuned.total_tokens}"),
+            (
+                "tokens / second (wall clock)",
+                f"{self.stock.total_tokens / stock_s:.1f}" if stock_s else "-",
+                f"{self.tuned.total_tokens / tuned_s:.1f}" if tuned_s else "-",
+            ),
+            (
+                "mean accepted length (engine)",
+                accepted_text(self.stock.mean_accepted_length),
+                accepted_text(self.tuned.mean_accepted_length),
+            ),
+            (
+                "identical output text",
+                f"{self.identical}/{len(self.stock.requests)}",
+                f"{self.identical}/{len(self.tuned.requests)}",
+            ),
         ]
         y = 420
         draw.line((120, y - 14, WIDTH - 120, y - 14), fill=RULE, width=1)
@@ -585,37 +924,21 @@ class Renderer:
         # The closing beat lands on the drafting result, so it gets the largest
         # type on the card and the last word. The replay totals above it are this
         # clip's own arithmetic; this is the measured, reproduced number.
-        draw.text((120, y + 2), "+15.0%", font=self.f_big, fill=TUNED_ACCENT)
-        draw.text((384, y + 10), "more tokens accepted per verifier step",
-                  font=self.f_card_bold, fill=TEXT)
-        draw.text((384, y + 48),
-                  "2.3051 -> 2.6507 tokens/step  ·  +0.3457, SE 0.0029  ·  +11.52pp acceptance",
-                  font=self.f_card, fill=MUTED)
+        draw.text((120, y + 2), self._headline(), font=self.f_big, fill=TUNED_ACCENT)
+        draw.text(
+            (384, y + 10),
+            "more tokens accepted per verifier step",
+            font=self.f_card_bold,
+            fill=TEXT,
+        )
+        draw.text((384, y + 48), self._delta_se_acceptance_str(), font=self.f_card, fill=MUTED)
         y += 96
 
-        for text, colour in (
-            ("Reproduced three times on this head: +0.3416 / +0.3402 / +0.3457, each on a"
-             " 287-context", MUTED),
-            ("session-disjoint suite. The number to cite is regate-big-run2: 8 repeats x 287"
-             " contexts.", MUTED),
-            ("Wall-clock throughput there ran +12.9% to +20.7% across repeats -- the tuned arm held"
-             " 143-147", MUTED),
-            ("tok/s while the shared-node baseline drifted 127->121, so we quote the drafting"
-             " metric.", MUTED),
-            ("That gate vetoed the throughput channel as non-stationary (final verdict: reject);"
-             " the", MUTED),
-            ("accepted-length channel passed at +0.3457. This replay is one sequential pass of an"
-             " earlier", MUTED),
-            ("head, shown because it is watchable.", MUTED),
-        ):
-            draw.text((120, y), text, font=self.f_sub, fill=colour)
+        for text in self._outro_paragraph_lines():
+            draw.text((120, y), text, font=self.f_sub, fill=MUTED)
             y += 30
 
-        self.footer(
-            draw,
-            "replay: capture job 378546, an earlier idle-tuned head  ·  "
-            "gate figures: regate-big-run2, 287-context session-disjoint suite",
-        )
+        self.footer(draw, self._footer_text())
         return image
 
     # -- the replay --------------------------------------------------------
@@ -634,6 +957,7 @@ class Renderer:
         # hold keeps its real duration -- it is a static frame like the cards, and
         # a 1.5s beat before the summary is already the shortest it can usefully be.
         frames = int(replay_seconds / self.speed * FPS)
+        race_footer = self._race_footer_text()
         for i in range(frames + int(TAIL_SECONDS * FPS)):
             # Clamped so the hold sits on the true end of the replay rather than
             # running the clock past it; state_at saturates there in any case.
@@ -645,12 +969,7 @@ class Renderer:
             self.pane(draw, self.stock, stock_state, self.pane_x[0], n_contexts)
             self.pane(draw, self.tuned, tuned_state, self.pane_x[1], n_contexts)
             self.lead(draw, stock_state, tuned_state)
-            self.footer(
-                draw,
-                "+15.0% more tokens accepted per verifier step "
-                "(+0.3457, SE 0.0029) on the 287-context session-disjoint suite"
-                "  ·  instrumentation gaps removed from both arms",
-            )
+            self.footer(draw, race_footer)
             # Only when the clock is actually scaled: a "1x SPEED" pill on an
             # unscaled render would be chrome that tells the viewer nothing.
             if self.speed != 1.0:
@@ -666,20 +985,36 @@ class Renderer:
 def encode(frames: Iterator[Image.Image], out: Path, crf: int) -> None:
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     argv = [
-        ffmpeg, "-y",
-        "-f", "rawvideo", "-pix_fmt", "rgb24",
-        "-s", f"{WIDTH}x{HEIGHT}", "-r", str(FPS),
-        "-i", "-",
+        ffmpeg,
+        "-y",
+        "-f",
+        "rawvideo",
+        "-pix_fmt",
+        "rgb24",
+        "-s",
+        f"{WIDTH}x{HEIGHT}",
+        "-r",
+        str(FPS),
+        "-i",
+        "-",
         "-an",
-        "-c:v", "libx264", "-preset", "medium", "-crf", str(crf),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-crf",
+        str(crf),
         # yuv420p is what makes the file play in browsers and QuickTime rather
         # than only in ffplay.
-        "-pix_fmt", "yuv420p",
-        "-movflags", "+faststart",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
         str(out),
     ]
-    process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                               stderr=subprocess.PIPE)
+    process = subprocess.Popen(
+        argv, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+    )
     assert process.stdin is not None
     written = 0
     try:
@@ -702,24 +1037,53 @@ def encode(frames: Iterator[Image.Image], out: Path, crf: int) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--capture-dir", type=Path, required=True)
+    parser.add_argument(
+        "--decision",
+        type=Path,
+        required=True,
+        help="gate decision.json to cite; every number the video displays is "
+        "derived from this file at render time",
+    )
+    parser.add_argument(
+        "--corroborating",
+        type=Path,
+        action="append",
+        default=[],
+        metavar="PATH",
+        help="additional gate decision.json files for the 'reproduced N times' "
+        "line; may be repeated; if none are supplied the line is suppressed",
+    )
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--crf", type=int, default=20)
-    parser.add_argument("--speed", type=float, default=1.0,
-                        help="replay the drafting segment this many times faster; the "
-                             "intro and outro cards keep their real duration, and the "
-                             "numbers on screen stay real measured seconds")
-    parser.add_argument("--frames-only", type=int, default=0,
-                        help="render only the first N replay frames as PNGs, for a quick look")
+    parser.add_argument(
+        "--speed",
+        type=float,
+        default=1.0,
+        help="replay the drafting segment this many times faster; the "
+        "intro and outro cards keep their real duration, and the "
+        "numbers on screen stay real measured seconds",
+    )
+    parser.add_argument(
+        "--frames-only",
+        type=int,
+        default=0,
+        help="render only the first N replay frames as PNGs, for a quick look",
+    )
     args = parser.parse_args(argv)
     if args.speed <= 0:
         raise SystemExit("--speed must be positive")
 
     capture: Path = args.capture_dir
     manifest = json.loads((capture / "capture_manifest.json").read_text())
-    stock = load_arm(capture / "timeline-stock.jsonl", "STOCK",
-                     manifest["stock_draft"], STOCK_ACCENT)
-    tuned = load_arm(capture / "timeline-candidate.jsonl", "IDLE-TUNED",
-                     Path(manifest["candidate_draft"]).parent.name + "/draft-model", TUNED_ACCENT)
+    stock = load_arm(
+        capture / "timeline-stock.jsonl", "STOCK", manifest["stock_draft"], STOCK_ACCENT
+    )
+    tuned = load_arm(
+        capture / "timeline-candidate.jsonl",
+        "IDLE-TUNED",
+        Path(manifest["candidate_draft"]).parent.name + "/draft-model",
+        TUNED_ACCENT,
+    )
 
     if len(stock.requests) != len(tuned.requests):
         raise SystemExit(
@@ -733,11 +1097,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     if mismatched:
         raise SystemExit(f"arms replayed different contexts, first: {mismatched[0]}")
 
-    renderer = Renderer(stock, tuned, manifest, speed=args.speed)
-    print(f"stock  {stock.duration:.1f}s  {stock.total_tokens} tok  "
-          f"accepted {accepted_text(stock.mean_accepted_length)}")
-    print(f"tuned  {tuned.duration:.1f}s  {tuned.total_tokens} tok  "
-          f"accepted {accepted_text(tuned.mean_accepted_length)}")
+    gate = parse_gate_numbers(args.decision, manifest, args.corroborating)
+
+    renderer = Renderer(stock, tuned, manifest, gate, speed=args.speed)
+    print(
+        f"stock  {stock.duration:.1f}s  {stock.total_tokens} tok  "
+        f"accepted {accepted_text(stock.mean_accepted_length)}"
+    )
+    print(
+        f"tuned  {tuned.duration:.1f}s  {tuned.total_tokens} tok  "
+        f"accepted {accepted_text(tuned.mean_accepted_length)}"
+    )
+    print(
+        f"gate   {gate.gate_run_name}  +{gate.al_pct:.1f}%"
+        f"  al={gate.al_delta:.4f} SE {gate.al_se:.4f}"
+        f"  vetoed={gate.throughput_vetoed}"
+    )
 
     if args.frames_only:
         out_dir = args.out.parent / "frames"

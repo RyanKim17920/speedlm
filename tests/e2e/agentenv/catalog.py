@@ -50,6 +50,8 @@ import random
 from collections.abc import Mapping
 from typing import Any, Final
 
+from tests.e2e.agentenv.families_v2 import CATALOG_V2, TASKS_V2
+from tests.e2e.agentenv.phrasing import Brief, Fact, FactKind, render_instruction
 from tests.e2e.agentenv.tasks import Grade, Task, TaskInstance, Workspace
 from tests.e2e.agentenv.workspace import WorkspaceSandbox
 
@@ -279,6 +281,28 @@ def _tests_pass_grader(target: str | None = None) -> Any:
 # bugfix-localize
 # ---------------------------------------------------------------------------
 _BUG_SITES: Final[tuple[str, ...]] = ("validate", "aggregate", "report")
+_BUGFIX_SALT: Final = 0xC0DE
+
+
+def _bugfix_brief(seed: int) -> Brief:
+    rng = random.Random(seed)
+    threshold = rng.choice([50, 75, 100, 125])
+    currency = rng.choice(["USD", "EUR", "GBP"])
+    return Brief(
+        goal="find the source bug and fix the pipeline code so the test suite passes",
+        required_facts=(
+            Fact(text="pytest", kind=FactKind.COMMAND),
+            Fact(text="pipeline/", kind=FactKind.PATH),
+            Fact(text=str(threshold), kind=FactKind.NUMBER),
+            Fact(text=currency, kind=FactKind.TOKEN),
+        ),
+        context="the ledger pipeline test suite is currently failing",
+        constraints=(
+            "do not change anything under tests/ — the tests are correct",
+            "change the smallest amount of pipeline code possible",
+        ),
+        blame_path="",
+    )
 
 
 def _bugfix_instance(seed: int) -> TaskInstance:
@@ -287,14 +311,7 @@ def _bugfix_instance(seed: int) -> TaskInstance:
     return TaskInstance(
         id=f"bugfix-localize-{seed:04d}",
         family="bugfix-localize",
-        instruction=(
-            "The ledger pipeline's test suite is failing. Find out why and fix "
-            "the source so the whole suite passes.\n\n"
-            "Do not change anything under tests/ -- the tests describe the "
-            "behaviour we want, and editing them would hide the defect rather "
-            "than fix it. Change the smallest amount of pipeline code that makes "
-            "the suite pass."
-        ),
+        instruction=render_instruction(_bugfix_brief(seed), seed=seed, salt=_BUGFIX_SALT),
         workspace=Workspace(files=files),
         grader=_bugfix_grader(files),
         metadata={"planted_bug_module": site, "seed": seed},
@@ -352,11 +369,30 @@ def _bugfix_solution(seed: int) -> Any:
 # ---------------------------------------------------------------------------
 # feature-implement
 # ---------------------------------------------------------------------------
+_FEATURE_SALT: Final = 0xCAFE
+
+
+def _feature_brief(seed: int) -> Brief:
+    rng = random.Random(seed ^ 0x5EED)
+    window = rng.choice([3, 4, 5])
+    return Brief(
+        goal="implement rolling_max in pipeline/rolling.py so the test suite passes",
+        required_facts=(
+            Fact(text="tests/test_rolling.py", kind=FactKind.PATH),
+            Fact(text="docs/rolling.md", kind=FactKind.PATH),
+            Fact(text="pipeline/rolling.py", kind=FactKind.PATH),
+            Fact(text=str(window), kind=FactKind.NUMBER),
+        ),
+        constraints=("do not change the tests or the docs",),
+        creates=("pipeline/rolling.py",),
+    )
+
+
 def _feature_instance(seed: int) -> TaskInstance:
     rng = random.Random(seed ^ 0x5EED)
     window = rng.choice([3, 4, 5])
     files = dict(_pipeline_files(bug=None, seed=seed))
-    files["tests/test_rolling.py"] = f'''from pipeline.rolling import rolling_max
+    files["tests/test_rolling.py"] = f"""from pipeline.rolling import rolling_max
 
 WINDOW = {window}
 
@@ -395,7 +431,7 @@ def test_non_positive_window_is_rejected():
     except ValueError:
         return
     raise AssertionError("rolling_max accepted a window of 0")
-'''
+"""
     files["docs/rolling.md"] = (
         "# rolling_max\n\n"
         "`pipeline.rolling.rolling_max(series, window)` returns a list the same\n"
@@ -406,12 +442,7 @@ def test_non_positive_window_is_rejected():
     return TaskInstance(
         id=f"feature-implement-{seed:04d}",
         family="feature-implement",
-        instruction=(
-            "tests/test_rolling.py describes a rolling-maximum helper that has "
-            "not been written yet, and docs/rolling.md specifies it. Implement "
-            "it so the whole test suite passes.\n\n"
-            "Do not change the tests or the docs."
-        ),
+        instruction=render_instruction(_feature_brief(seed), seed=seed, salt=_FEATURE_SALT),
         workspace=Workspace(files=files),
         grader=_feature_grader(files),
         metadata={"window": window, "seed": seed},
@@ -475,6 +506,34 @@ def _feature_solution(seed: int) -> Any:
 # ---------------------------------------------------------------------------
 # log-triage
 # ---------------------------------------------------------------------------
+_LOG_SALT: Final = 0xB0B0
+
+
+def _log_brief(seed: int) -> Brief:
+    rng = random.Random(seed ^ 0xB0B)
+    services = ["auth", "ledger", "billing", "search", "notify"]
+    culprit = rng.choice(services)
+    request_id = f"req-{rng.randrange(16**8):08x}"
+    error_code = rng.choice(["E_TIMEOUT", "E_CONFLICT", "E_QUOTA", "E_UPSTREAM"])
+    return Brief(
+        goal="find the ERROR line and write findings.json with the three fields",
+        required_facts=(
+            Fact(text="service.log", kind=FactKind.PATH),
+            Fact(text="findings.json", kind=FactKind.PATH),
+            Fact(text=culprit, kind=FactKind.TOKEN),
+            Fact(text=request_id, kind=FactKind.TOKEN),
+            Fact(text=error_code, kind=FactKind.TOKEN),
+        ),
+        context="exactly one line is at ERROR level",
+        constraints=(
+            'use exactly the keys "service", "request_id" and "error_code"',
+            "the error code is the uppercase token that begins the error message",
+        ),
+        has_test_suite=False,
+        creates=("findings.json",),
+    )
+
+
 def _log_instance(seed: int) -> TaskInstance:
     rng = random.Random(seed ^ 0xB0B)
     services = ["auth", "ledger", "billing", "search", "notify"]
@@ -500,14 +559,7 @@ def _log_instance(seed: int) -> TaskInstance:
     return TaskInstance(
         id=f"log-triage-{seed:04d}",
         family="log-triage",
-        instruction=(
-            "service.log holds one shift of production traffic. Exactly one line "
-            "is at ERROR level.\n\n"
-            "Find it and write findings.json at the workspace root, a JSON "
-            'object with exactly the keys "service", "request_id" and '
-            '"error_code", taken verbatim from that line. The error code is the '
-            "uppercase token that begins the error message."
-        ),
+        instruction=render_instruction(_log_brief(seed), seed=seed, salt=_LOG_SALT),
         workspace=Workspace(
             files={
                 "service.log": log,
@@ -545,9 +597,7 @@ def _log_grader(expected: Mapping[str, str]) -> Any:
         return Grade(
             solved=solved,
             detail=(
-                "all three fields match"
-                if solved
-                else f"got {found!r}, wanted {dict(expected)!r}"
+                "all three fields match" if solved else f"got {found!r}, wanted {dict(expected)!r}"
             ),
             checks=checks,
         )
@@ -583,6 +633,31 @@ def _log_solution(seed: int) -> Any:
 # ---------------------------------------------------------------------------
 # refactor-rename
 # ---------------------------------------------------------------------------
+_REFACTOR_SALT: Final = 0xBEEF
+
+
+def _refactor_brief(seed: int) -> Brief:
+    rng = random.Random(seed)
+    threshold = rng.choice([50, 75, 100, 125])
+    currency = rng.choice(["USD", "EUR", "GBP"])
+    return Brief(
+        goal="rename the function and keep the whole test suite green",
+        required_facts=(
+            Fact(text="needs_review", kind=FactKind.SYMBOL),
+            Fact(text="requires_second_approval", kind=FactKind.SYMBOL),
+            Fact(text=str(threshold), kind=FactKind.NUMBER),
+            Fact(text=currency, kind=FactKind.TOKEN),
+        ),
+        context="needs_review reads like a noun phrase and callers expect it to return a list",
+        constraints=(
+            "rename everywhere it is defined or used, including in tests",
+            "the old name must not survive anywhere in the workspace",
+            "no behaviour may change",
+        ),
+        creates=("requires_second_approval",),
+    )
+
+
 def _refactor_instance(seed: int) -> TaskInstance:
     files = dict(_pipeline_files(bug=None, seed=seed))
     files["pipeline/cli.py"] = '''"""Command line entry point."""
@@ -608,7 +683,7 @@ def main(argv: list[str]) -> int:
     print(f"{len(flagged)} entries need review")
     return 0
 '''
-    files["tests/test_cli.py"] = '''import pipeline.cli as cli
+    files["tests/test_cli.py"] = """import pipeline.cli as cli
 
 
 def test_main_rejects_wrong_argument_count():
@@ -620,18 +695,11 @@ def test_main_reads_a_ledger(tmp_path, capsys):
     ledger.write_text("alpha, 10, USD\\n", encoding="utf-8")
     assert cli.main(["cli.py", str(ledger)]) == 0
     assert "alpha: 10" in capsys.readouterr().out
-'''
+"""
     return TaskInstance(
         id=f"refactor-rename-{seed:04d}",
         family="refactor-rename",
-        instruction=(
-            "`needs_review` is a confusing name: it reads like a noun phrase and "
-            "callers keep expecting it to return a list. Rename it to "
-            "`requires_second_approval` everywhere it is defined or used, "
-            "including in tests, and keep the whole suite green.\n\n"
-            "The old name must not survive anywhere in the workspace, and no "
-            "behaviour may change."
-        ),
+        instruction=render_instruction(_refactor_brief(seed), seed=seed, salt=_REFACTOR_SALT),
         workspace=Workspace(files=files),
         grader=_refactor_grader(),
         metadata={"seed": seed},
@@ -657,9 +725,7 @@ def _refactor_grader() -> Any:
         bodies = {path: path.read_text(encoding="utf-8") for path in sources}
         old_present = any("needs_review" in text for text in bodies.values())
         new_defined = any("def requires_second_approval" in text for text in bodies.values())
-        new_called = sum(
-            1 for text in bodies.values() if "requires_second_approval" in text
-        )
+        new_called = sum(1 for text in bodies.values() if "requires_second_approval" in text)
         passed, output = sandbox.tests_pass()
         checks = {
             "pytest": passed,
@@ -698,6 +764,34 @@ def _refactor_solution(seed: int) -> Any:
 # ---------------------------------------------------------------------------
 # schema-migrate
 # ---------------------------------------------------------------------------
+_SCHEMA_SALT: Final = 0xF00D
+
+
+def _schema_brief(seed: int) -> Brief:
+    rng = random.Random(seed ^ 0xC0FFEE)
+    hosts = [f"{name}-{rng.randrange(10, 99)}" for name in ("edge", "core", "cache")]
+    port = 8000 + rng.randrange(0, 900)
+    replicas = rng.randrange(1, 6)
+    enabled_bool = (0 + seed) % 2 == 0
+    return Brief(
+        goal="produce settings.json in the new format and run the test suite",
+        required_facts=(
+            Fact(text="settings.ini", kind=FactKind.PATH),
+            Fact(text="settings.json", kind=FactKind.PATH),
+            Fact(text=hosts[0], kind=FactKind.TOKEN),
+            Fact(text=str(port), kind=FactKind.NUMBER),
+            Fact(text=str(replicas), kind=FactKind.NUMBER),
+            Fact(text=str(enabled_bool).lower(), kind=FactKind.TOKEN),
+        ),
+        context="settings.ini is the old deployment config",
+        constraints=(
+            "ports and replica counts are JSON numbers, not strings",
+            "enabled is a JSON boolean, not the string the ini file uses",
+        ),
+        creates=("settings.json",),
+    )
+
+
 def _schema_instance(seed: int) -> TaskInstance:
     rng = random.Random(seed ^ 0xC0FFEE)
     hosts = [f"{name}-{rng.randrange(10, 99)}" for name in ("edge", "core", "cache")]
@@ -765,7 +859,7 @@ def main() -> int:
 if __name__ == "__main__":
     raise SystemExit(main())
 '''
-    tests = '''import subprocess
+    tests = """import subprocess
 import sys
 
 
@@ -774,18 +868,11 @@ def test_settings_json_passes_the_validator():
         [sys.executable, "validate_settings.py"], capture_output=True, text=True
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
-'''
+"""
     return TaskInstance(
         id=f"schema-migrate-{seed:04d}",
         family="schema-migrate",
-        instruction=(
-            "settings.ini is the old deployment config. Produce settings.json "
-            "carrying the same content in the new format, then run the test "
-            "suite to confirm the validator accepts it.\n\n"
-            "README.md states the rules. Types matter: ports and replica counts "
-            "are JSON numbers and `enabled` is a JSON boolean, not the strings "
-            "the ini file uses."
-        ),
+        instruction=render_instruction(_schema_brief(seed), seed=seed, salt=_SCHEMA_SALT),
         workspace=Workspace(
             files={
                 "settings.ini": "\n".join(ini_lines),
@@ -863,6 +950,31 @@ def _schema_solution(seed: int) -> Any:
 # ---------------------------------------------------------------------------
 # call-chain-trace
 # ---------------------------------------------------------------------------
+_TRACE_SALT: Final = 0xA11C
+
+
+def _trace_brief(seed: int) -> Brief:
+    rng = random.Random(seed ^ 0xA11CE)
+    base = rng.randrange(3, 40)
+    steps = [rng.randrange(2, 9) for _ in range(5)]
+    return Brief(
+        goal="work out the return value by reading the code and compose the arithmetic",
+        required_facts=(
+            Fact(text="chain.stage5.apply5", kind=FactKind.SYMBOL),
+            Fact(text="answer.txt", kind=FactKind.PATH),
+            Fact(text=str(base), kind=FactKind.NUMBER),
+            Fact(text=str(steps[0]), kind=FactKind.NUMBER),
+        ),
+        context="chain.stage5.apply5() returns a single integer computed by a chain of stages",
+        constraints=(
+            "write that integer and nothing else to answer.txt",
+            "there is no test suite and you must not add one",
+        ),
+        has_test_suite=False,
+        creates=("answer.txt",),
+    )
+
+
 def _trace_instance(seed: int) -> TaskInstance:
     rng = random.Random(seed ^ 0xA11CE)
     base = rng.randrange(3, 40)
@@ -898,13 +1010,7 @@ def _trace_instance(seed: int) -> TaskInstance:
     return TaskInstance(
         id=f"call-chain-trace-{seed:04d}",
         family="call-chain-trace",
-        instruction=(
-            f"Work out what `chain.stage{len(steps)}.apply{len(steps)}()` returns "
-            "by reading the code, then write that integer, and nothing else, to "
-            "answer.txt at the workspace root.\n\n"
-            "There is no test suite here and you must not add one: read the "
-            "modules and compose the arithmetic yourself."
-        ),
+        instruction=render_instruction(_trace_brief(seed), seed=seed, salt=_TRACE_SALT),
         workspace=Workspace(files=files),
         grader=_trace_grader(answer),
         metadata={"seed": seed, "answer": answer, "stages": len(steps)},
@@ -979,6 +1085,7 @@ TASKS: Final[tuple[Task, ...]] = (
         summary="Compose six constants across six modules into one value.",
         build=_trace_instance,
     ),
+    *TASKS_V2,
 )
 
 #: Reference solutions, used only by the solvability pre-flight in
@@ -991,6 +1098,7 @@ CATALOG: Final[Mapping[str, Any]] = {
     "refactor-rename": _refactor_solution,
     "schema-migrate": _schema_solution,
     "call-chain-trace": _trace_solution,
+    **CATALOG_V2,
 }
 
 
@@ -1024,7 +1132,5 @@ def all_instances(
     if not chosen:
         raise ValueError(f"no task matched families={families!r}")
     return [
-        task.instance(seed)
-        for seed in range(seed_start, seed_start + seeds)
-        for task in chosen
+        task.instance(seed) for seed in range(seed_start, seed_start + seeds) for task in chosen
     ]
