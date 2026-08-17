@@ -390,7 +390,7 @@ class Montage:
         self.left_cols = int((self.left_w - 44) / (15 * 0.602))
         self.right_cols = int((self.right_w - 44) / (17 * 0.602))
 
-        self.grid_top = 878
+        self.grid_top = 874
         self.grid_index = {(i.run, i.instance_id): n for n, i in enumerate(corpus.instances)}
 
     # -- chrome ------------------------------------------------------------
@@ -594,31 +594,83 @@ class Montage:
     def coverage(self, draw: ImageDraw.ImageDraw, lit: set[int]) -> None:
         top = self.grid_top
         by_family = self.corpus.by_family()
+        families_present = [f for f in FAMILY_ORDER if f in by_family]
+        n_families = len(families_present)
+        if n_families == 0:
+            return
+
+        # ── geometry ──────────────────────────────────────────────────────
+        # Row height: divide the available strip area evenly across however
+        # many families are present.  This keeps the last row's bottom edge
+        # above the footer rule at HEIGHT-74, regardless of family count.
+        footer_rule_y = HEIGHT - 74  # mirrors self.footer()
+        row_h = max(8, (footer_rule_y - top) // n_families)
+
+        # Label font: scale with row_h so text always fits within its row.
+        # Cap at 16 (readable), floor at 6 (still distinguishable).
+        # ink_h(font(N)) ≤ N - 1 for the sizes we use, so row_h - 1 gives a
+        # safe upper bound; we clamp to the allowed range.
+        label_font_size = max(6, min(16, row_h - 1))
+        f_label = font(label_font_size)
+
+        # Label column: wide enough for the longest name actually present so
+        # long names like "flaky-test-quarantine" are never clipped.
+        label_w = max(int(draw.textlength(f, font=f_label)) + 10 for f in families_present)
+
+        # Cell width: fill the remaining horizontal space.
+        widest = max((len(by_family[f]) for f in families_present), default=1)
+        cell_area_w = WIDTH - 80 - label_w
+        gap = 2
+        raw_cell = cell_area_w // widest - gap
+        if raw_cell >= 1:
+            cell = max(1, min(14, raw_cell))
+            bucket = 1
+            agg_label = ""
+        else:
+            # Sub-pixel situation: aggregate instances into display buckets and
+            # say so, rather than silently misrepresenting the count.
+            n_cells_fit = max(1, cell_area_w // (1 + gap))
+            bucket = -(-widest // n_cells_fit)  # ceiling division
+            cell = 1
+            agg_label = f"  ·  cells aggregated {bucket}∶ 1"
+
+        # ── header ────────────────────────────────────────────────────────
         draw.text(
             (40, top - 22),
-            f"CAPTURED CORPUS  ·  one cell per trajectory  ·  "
+            f"CAPTURED CORPUS  ·  one cell per trajectory{agg_label}  ·  "
             f"{len(self.corpus.instances)} instances, "
             f"{len(self.cards)} replayed here",
             font=self.f_meta,
             fill=MUTED,
         )
-        widest = max((len(v) for v in by_family.values()), default=1)
-        label_w = 172
-        cell = max(4, min(14, (WIDTH - 80 - label_w) // widest - 2))
-        gap = 2
-        row_h = 15
+
+        # ── rows ──────────────────────────────────────────────────────────
+        cell_h = max(1, row_h - 5)
         y = top
         for family in FAMILY_ORDER:
             members = by_family.get(family, [])
             if not members:
                 continue
-            draw.text((40, y - 1), family, font=self.f_tally_label, fill=DIM)
+            draw.text((40, y - 1), family, font=f_label, fill=DIM)
             x = 40 + label_w
-            for instance in members:
-                index = self.grid_index[(instance.run, instance.instance_id)]
-                on = index in lit
-                draw.rectangle((x, y, x + cell, y + row_h - 5), fill=TUNED_ACCENT if on else RULE)
-                x += cell + gap
+            if bucket == 1:
+                for instance in members:
+                    index = self.grid_index[(instance.run, instance.instance_id)]
+                    on = index in lit
+                    draw.rectangle(
+                        (x, y, x + cell, y + cell_h),
+                        fill=TUNED_ACCENT if on else RULE,
+                    )
+                    x += cell + gap
+            else:
+                for b_start in range(0, len(members), bucket):
+                    chunk = members[b_start : b_start + bucket]
+                    on = any(self.grid_index[(inst.run, inst.instance_id)] in lit for inst in chunk)
+                    draw.rectangle(
+                        (x, y, x + cell, y + cell_h),
+                        fill=TUNED_ACCENT if on else RULE,
+                    )
+                    x += cell + gap
             y += row_h
 
     # -- cards -------------------------------------------------------------

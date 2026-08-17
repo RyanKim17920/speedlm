@@ -10,7 +10,7 @@ export const FPS = 30;
  * reports it, and it agrees with demo-fast/timing_v4.json's total_frames).
  * Swap in a different capture and update this to match its real frame count.
  */
-export const DURATION_IN_FRAMES = 1344;
+export const DURATION_IN_FRAMES = 1349;
 
 export const RemotionRoot: React.FC = () => (
   <Composition
