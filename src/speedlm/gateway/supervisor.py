@@ -7,8 +7,8 @@ import contextlib
 from collections.abc import Callable
 from pathlib import Path
 
+from speedlm.gateway.control import DraftReference
 from speedlm.gateway.process import VLLMProcess
-from speedlm.tuner.orchestrator import DraftReference
 
 ArgvFactory = Callable[[DraftReference], list[str]]
 ProcessFactory = Callable[..., VLLMProcess]
