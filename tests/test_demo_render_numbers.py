@@ -6,11 +6,11 @@ TDD discipline: each test was run and confirmed to FAIL before the implementatio
 was added.  The observed failure output is recorded in the module docstring of
 each test class.
 """
+
 from __future__ import annotations
 
 import json
 import sys
-import tempfile
 from pathlib import Path
 
 import pytest
@@ -19,10 +19,9 @@ import pytest
 # Helpers
 # ---------------------------------------------------------------------------
 
-REAL_DECISION = Path("/data/ryan.kim/speedlm-runs/regate-big-run2/decision.json")
-REAL_CAPTURE_MANIFEST = Path(
-    "/data/ryan.kim/speedlm-runs/demo-video-run2/capture_manifest.json"
-)
+FIXTURE_DIR = Path(__file__).parent / "fixtures"
+FIXTURE_DECISION = FIXTURE_DIR / "regate-big-run2" / "decision.json"
+FIXTURE_CAPTURE_MANIFEST = FIXTURE_DIR / "demo-video-run2" / "capture_manifest.json"
 
 # A minimal capture manifest for tests that do not need the real one.
 _MINIMAL_MANIFEST = {
@@ -59,8 +58,12 @@ def _base_decision(**overrides) -> dict:
 # a) Real decision -> headline matches the hardcoded text
 # ---------------------------------------------------------------------------
 
+
 class TestRealDecisionReproducesHardcodedStrings:
     """Verify the refactor is faithful: derived numbers match the old literals.
+
+    Uses vendored fixtures from tests/fixtures/ (transcribed from docs/speedup-ceiling.md
+    after the original artifact was deleted on 2026-08-21).
 
     Pre-fix observed failure (strings are compared below):
         AssertionError: assert '+15.0%' == '+15.0%'
@@ -68,107 +71,88 @@ class TestRealDecisionReproducesHardcodedStrings:
     attribute 'parse_gate_numbers' when parse_gate_numbers did not exist.)
     """
 
-    @pytest.mark.skipif(
-        not REAL_DECISION.is_file(),
-        reason="real gate artifact not present on this machine",
-    )
     def test_headline_pct(self):
         """Derived headline must round to +15.0% on regate-big-run2."""
         sys.path.insert(0, str(Path(__file__).parent.parent / "demo"))
         import render as R
 
-        manifest = json.loads(REAL_CAPTURE_MANIFEST.read_text())
-        gate = R.parse_gate_numbers(REAL_DECISION, manifest, [])
+        manifest = json.loads(FIXTURE_CAPTURE_MANIFEST.read_text())
+        gate = R.parse_gate_numbers(FIXTURE_DECISION, manifest, [])
         assert f"+{gate.al_pct:.1f}%" == "+15.0%"
 
-    @pytest.mark.skipif(
-        not REAL_DECISION.is_file(),
-        reason="real gate artifact not present on this machine",
-    )
     def test_delta_se_string(self):
         """Derived delta/SE string must match the old hardcoded caption."""
         sys.path.insert(0, str(Path(__file__).parent.parent / "demo"))
         import render as R
 
-        manifest = json.loads(REAL_CAPTURE_MANIFEST.read_text())
-        gate = R.parse_gate_numbers(REAL_DECISION, manifest, [])
+        manifest = json.loads(FIXTURE_CAPTURE_MANIFEST.read_text())
+        gate = R.parse_gate_numbers(FIXTURE_DECISION, manifest, [])
         # Old hardcoded text (intro card line 531 / outro card line 592):
         # "2.3051 -> 2.6507 tokens/step  ·  +0.3457, SE 0.0029"
         expected_prefix = "2.3051 -> 2.6507 tokens/step  ·  +0.3457, SE 0.0029"
-        derived = f"{gate.stock_al:.4f} -> {gate.tuned_al:.4f} tokens/step  ·  +{gate.al_delta:.4f}, SE {gate.al_se:.4f}"
+        derived = (
+            f"{gate.stock_al:.4f} -> {gate.tuned_al:.4f} tokens/step"
+            f"  ·  +{gate.al_delta:.4f}, SE {gate.al_se:.4f}"
+        )
         assert derived == expected_prefix
 
-    @pytest.mark.skipif(
-        not REAL_DECISION.is_file(),
-        reason="real gate artifact not present on this machine",
-    )
     def test_acceptance_pp(self):
         """Derived acceptance-rate pp must match +11.52pp."""
         sys.path.insert(0, str(Path(__file__).parent.parent / "demo"))
         import render as R
 
-        manifest = json.loads(REAL_CAPTURE_MANIFEST.read_text())
-        gate = R.parse_gate_numbers(REAL_DECISION, manifest, [])
+        manifest = json.loads(FIXTURE_CAPTURE_MANIFEST.read_text())
+        gate = R.parse_gate_numbers(FIXTURE_DECISION, manifest, [])
         assert f"+{gate.acceptance_delta_pp:.2f}pp" == "+11.52pp"
 
-    @pytest.mark.skipif(
-        not REAL_DECISION.is_file(),
-        reason="real gate artifact not present on this machine",
-    )
     def test_num_contexts(self):
         """Derived context count must be 287."""
         sys.path.insert(0, str(Path(__file__).parent.parent / "demo"))
         import render as R
 
-        manifest = json.loads(REAL_CAPTURE_MANIFEST.read_text())
-        gate = R.parse_gate_numbers(REAL_DECISION, manifest, [])
+        manifest = json.loads(FIXTURE_CAPTURE_MANIFEST.read_text())
+        gate = R.parse_gate_numbers(FIXTURE_DECISION, manifest, [])
         assert gate.num_contexts == 287
 
-    @pytest.mark.skipif(
-        not REAL_DECISION.is_file(),
-        reason="real gate artifact not present on this machine",
-    )
     def test_throughput_vetoed(self):
         """regate-big-run2 must report its throughput channel as vetoed."""
         sys.path.insert(0, str(Path(__file__).parent.parent / "demo"))
         import render as R
 
-        manifest = json.loads(REAL_CAPTURE_MANIFEST.read_text())
-        gate = R.parse_gate_numbers(REAL_DECISION, manifest, [])
+        manifest = json.loads(FIXTURE_CAPTURE_MANIFEST.read_text())
+        gate = R.parse_gate_numbers(FIXTURE_DECISION, manifest, [])
         assert gate.throughput_vetoed is True
 
-    @pytest.mark.skipif(
-        not REAL_DECISION.is_file(),
-        reason="real gate artifact not present on this machine",
-    )
     def test_capture_job_id(self):
         """Capture job ID must be read from manifest, not hardcoded."""
         sys.path.insert(0, str(Path(__file__).parent.parent / "demo"))
         import render as R
 
-        manifest = json.loads(REAL_CAPTURE_MANIFEST.read_text())
-        gate = R.parse_gate_numbers(REAL_DECISION, manifest, [])
-        # The real manifest has slurm_job_id 378951 (NOT the old hardcoded 378546).
+        manifest = json.loads(FIXTURE_CAPTURE_MANIFEST.read_text())
+        gate = R.parse_gate_numbers(FIXTURE_DECISION, manifest, [])
+        # The fixture manifest has slurm_job_id 378951 (NOT the old hardcoded 378546).
         # Confirm it matches what is in the manifest, not a baked literal.
-        assert gate.capture_job_id == str(manifest["slurm_job_id"])
+        # Assert the literal, not str(manifest["slurm_job_id"]) -- comparing the
+        # parsed value against the same dict it was parsed from is a tautology
+        # that passes for any manifest content.
+        assert gate.capture_job_id == "378951"
+        assert gate.capture_job_id != "378546"  # the old baked-in literal
 
-    @pytest.mark.skipif(
-        not REAL_DECISION.is_file(),
-        reason="real gate artifact not present on this machine",
-    )
     def test_gate_run_name(self):
         """Gate run name must be derived from the --decision path."""
         sys.path.insert(0, str(Path(__file__).parent.parent / "demo"))
         import render as R
 
-        manifest = json.loads(REAL_CAPTURE_MANIFEST.read_text())
-        gate = R.parse_gate_numbers(REAL_DECISION, manifest, [])
+        manifest = json.loads(FIXTURE_CAPTURE_MANIFEST.read_text())
+        gate = R.parse_gate_numbers(FIXTURE_DECISION, manifest, [])
+        # gate_run_name is derived from decision_path.parent.name
         assert gate.gate_run_name == "regate-big-run2"
 
 
 # ---------------------------------------------------------------------------
 # b) Synthetic decision -> different numbers -> values are genuinely derived
 # ---------------------------------------------------------------------------
+
 
 class TestSyntheticDecisionProducesCorrectDerivation:
     """Confirm values are derived, not coincidentally correct.
@@ -244,6 +228,7 @@ class TestSyntheticDecisionProducesCorrectDerivation:
 # c) Missing required field -> loud error, no silent fallback
 # ---------------------------------------------------------------------------
 
+
 class TestMissingFieldRaisesLoudly:
     """A decision.json missing any required field must raise SystemExit naming the field.
 
@@ -253,15 +238,18 @@ class TestMissingFieldRaisesLoudly:
     have failed because no SystemExit was raised.)
     """
 
-    @pytest.mark.parametrize("missing_field", [
-        "stock_avg_accepted_length",
-        "candidate_avg_accepted_length",
-        "accepted_length_delta",
-        "accepted_length_delta_standard_error",
-        "acceptance_delta_pp",
-        "num_contexts",
-        "num_repeats",
-    ])
+    @pytest.mark.parametrize(
+        "missing_field",
+        [
+            "stock_avg_accepted_length",
+            "candidate_avg_accepted_length",
+            "accepted_length_delta",
+            "accepted_length_delta_standard_error",
+            "acceptance_delta_pp",
+            "num_contexts",
+            "num_repeats",
+        ],
+    )
     def test_missing_field_raises_system_exit(self, tmp_path, missing_field):
         sys.path.insert(0, str(Path(__file__).parent.parent / "demo"))
         import render as R
@@ -273,8 +261,7 @@ class TestMissingFieldRaisesLoudly:
             R.parse_gate_numbers(path, _MINIMAL_MANIFEST, [])
         # The error message must name the missing field.
         assert missing_field in str(exc_info.value), (
-            f"SystemExit message did not name missing field '{missing_field}': "
-            f"{exc_info.value}"
+            f"SystemExit message did not name missing field '{missing_field}': {exc_info.value}"
         )
 
     def test_missing_field_does_not_render_placeholder(self, tmp_path):
@@ -294,6 +281,7 @@ class TestMissingFieldRaisesLoudly:
 # d) Throughput veto -> output states the veto, not a win
 # ---------------------------------------------------------------------------
 
+
 class TestThroughputVetoRendering:
     """With vetoed=true the video must state the veto, never quote a win.
 
@@ -304,8 +292,9 @@ class TestThroughputVetoRendering:
     def _make_renderer_with_gate(self, gate, tmp_path):
         """Build a minimal Renderer without loading real timelines."""
         sys.path.insert(0, str(Path(__file__).parent.parent / "demo"))
-        import render as R
         from unittest.mock import MagicMock, patch
+
+        import render as R
 
         # We only test the text-derivation helpers, not frame rendering.
         # Build a Renderer with mocked stock/tuned arms so we don't need PIL/ffmpeg.
@@ -402,28 +391,38 @@ class TestThroughputVetoRendering:
 # e) Corroborating files -> "reproduced N times" count is computed, not typed
 # ---------------------------------------------------------------------------
 
+
 class TestCorroboratingCount:
     """Zero corroborating files -> no 'Reproduced' claim; N files -> N+1 total."""
 
     def test_zero_corroborating_no_reproduced_claim(self, tmp_path):
         sys.path.insert(0, str(Path(__file__).parent.parent / "demo"))
+        from unittest.mock import MagicMock, patch
+
         import render as R
-        from unittest.mock import MagicMock
 
         path = _write_decision(tmp_path, _base_decision())
         gate = R.parse_gate_numbers(path, _MINIMAL_MANIFEST, [])
         assert gate.corroborating_deltas == []
 
-        stock = MagicMock(); stock.requests = []; stock.duration = 1.0
-        stock.total_tokens = 100; stock.mean_accepted_length = None
-        tuned = MagicMock(); tuned.requests = []; tuned.duration = 0.9
-        tuned.total_tokens = 100; tuned.mean_accepted_length = None
-        with __import__("unittest.mock", fromlist=["patch"]).patch.object(
-            R.Renderer, "__init__", lambda self, *a, **kw: None
-        ):
+        stock = MagicMock()
+        stock.requests = []
+        stock.duration = 1.0
+        stock.total_tokens = 100
+        stock.mean_accepted_length = None
+        tuned = MagicMock()
+        tuned.requests = []
+        tuned.duration = 0.9
+        tuned.total_tokens = 100
+        tuned.mean_accepted_length = None
+        with patch.object(R.Renderer, "__init__", lambda self, *a, **kw: None):
             r = R.Renderer.__new__(R.Renderer)
-        r.stock = stock; r.tuned = tuned; r.manifest = {}
-        r.gate = gate; r.speed = 1.0; r.identical = 0
+        r.stock = stock
+        r.tuned = tuned
+        r.manifest = {}
+        r.gate = gate
+        r.speed = 1.0
+        r.identical = 0
         lines = r._outro_paragraph_lines()
         text = " ".join(lines)
         assert "Reproduced" not in text, (
@@ -432,8 +431,9 @@ class TestCorroboratingCount:
 
     def test_two_corroborating_files_shows_three_total(self, tmp_path):
         sys.path.insert(0, str(Path(__file__).parent.parent / "demo"))
+        from unittest.mock import MagicMock, patch
+
         import render as R
-        from unittest.mock import MagicMock
 
         # Write two corroborating files.
         c1 = tmp_path / "c1.json"
@@ -445,16 +445,24 @@ class TestCorroboratingCount:
         gate = R.parse_gate_numbers(path, _MINIMAL_MANIFEST, [c1, c2])
         assert len(gate.corroborating_deltas) == 2
 
-        stock = MagicMock(); stock.requests = []; stock.duration = 1.0
-        stock.total_tokens = 100; stock.mean_accepted_length = None
-        tuned = MagicMock(); tuned.requests = []; tuned.duration = 0.9
-        tuned.total_tokens = 100; tuned.mean_accepted_length = None
-        with __import__("unittest.mock", fromlist=["patch"]).patch.object(
-            R.Renderer, "__init__", lambda self, *a, **kw: None
-        ):
+        stock = MagicMock()
+        stock.requests = []
+        stock.duration = 1.0
+        stock.total_tokens = 100
+        stock.mean_accepted_length = None
+        tuned = MagicMock()
+        tuned.requests = []
+        tuned.duration = 0.9
+        tuned.total_tokens = 100
+        tuned.mean_accepted_length = None
+        with patch.object(R.Renderer, "__init__", lambda self, *a, **kw: None):
             r = R.Renderer.__new__(R.Renderer)
-        r.stock = stock; r.tuned = tuned; r.manifest = {}
-        r.gate = gate; r.speed = 1.0; r.identical = 0
+        r.stock = stock
+        r.tuned = tuned
+        r.manifest = {}
+        r.gate = gate
+        r.speed = 1.0
+        r.identical = 0
         lines = r._outro_paragraph_lines()
         text = " ".join(lines)
         assert "Reproduced 3 times" in text, (

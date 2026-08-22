@@ -87,15 +87,6 @@ QUANTITATIVE_WORDS: tuple[str, ...] = (
     "we need to hit",
 )
 
-LOCATIVE_WORDS: tuple[str, ...] = (
-    "the failure's in",
-    "is where the bug lives",
-    "the issue traces back to",
-    "start at",
-    "is the hot spot",
-    "traces back to",
-)
-
 TEST_SUITE_WORDS: tuple[str, ...] = (
     "test failure",
     "failing suite",

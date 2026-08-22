@@ -61,10 +61,7 @@ def _scan_session_json(path: Path) -> list[str]:
         except json.JSONDecodeError as exc:
             return [f"{path}: invalid JSON — {exc}"]
 
-    if isinstance(doc, list):
-        steps = doc
-    else:
-        steps = doc.get("steps", [])
+    steps = doc if isinstance(doc, list) else doc.get("steps", [])
 
     violations: list[str] = []
     for i, step in enumerate(steps):
@@ -103,16 +100,19 @@ class _DirectConsumptionVisitor(ast.NodeVisitor):
 
     def visit_Call(self, node: ast.Call) -> None:  # noqa: N802
         func = node.func
-        if isinstance(func, ast.Name) and func.id == "parse_reproductions":
-            # Check if first argument is a bare CORROBORATING_DECISIONS name
-            if node.args and isinstance(node.args[0], ast.Name):
-                arg_name = node.args[0].id
-                if arg_name == "CORROBORATING_DECISIONS":
-                    self.violations.append(
-                        f"line {node.lineno}: parse_reproductions(CORROBORATING_DECISIONS)"
-                        " — not CLI-overridable; wrap as"
-                        " parse_reproductions(args.corroborating or CORROBORATING_DECISIONS)"
-                    )
+        if (
+            isinstance(func, ast.Name)
+            and func.id == "parse_reproductions"
+            and node.args
+            and isinstance(node.args[0], ast.Name)
+            and node.args[0].id == "CORROBORATING_DECISIONS"
+        ):
+            # Bare CORROBORATING_DECISIONS passed without CLI override
+            self.violations.append(
+                f"line {node.lineno}: parse_reproductions(CORROBORATING_DECISIONS)"
+                " — not CLI-overridable; wrap as"
+                " parse_reproductions(args.corroborating or CORROBORATING_DECISIONS)"
+            )
         self.generic_visit(node)
 
 
