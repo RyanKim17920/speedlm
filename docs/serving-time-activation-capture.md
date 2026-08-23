@@ -1316,8 +1316,8 @@ stage.
 **This repository documents no consumer-GPU or VRAM target anywhere.** A search
 across code, docs, and config returns zero hits for RTX / GeForce / 4090 / 3090 /
 5090 / "consumer" / "gaming" / 24GB. The documented targeting is the opposite:
-README **Project status** describes the live E2E test as an **H100** test, `DEMO.md:346`
-places runs on an H100 in a SLURM partition, and `DEMO.md:321` explicitly rules
+README **Project status** describes the live E2E test as an **H100** test, `docs/DEMO.md:346`
+places runs on an H100 in a SLURM partition, and `docs/DEMO.md:321` explicitly rules
 out laptop-local execution. README **GPU runtime stack** pins the GPU host stack
 but names no GPU model or VRAM size. Every one of the 25 GPU-identifying records in
 `log_artifacts/` is an NVIDIA H100 80GB HBM3.

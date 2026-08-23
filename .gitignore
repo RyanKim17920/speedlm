@@ -41,6 +41,9 @@ htmlcov/
 .idea/
 .vscode/
 
+# Hypothesis
+.hypothesis/
+
 # Agent tooling
 .serena/
 .claude/settings.local.json

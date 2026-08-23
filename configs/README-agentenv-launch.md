@@ -62,7 +62,7 @@ otherwise overwrite the previous run's artifacts.
 
 ## Where things land
 
-    $run_dir  = /data/ryan.kim/speedlm-runs/agentenv-qwen8b-run5
+    $run_dir  = /data/ryan.kim/speedlm-runs/agentenv-qwen8b-run5   # deleted 2026-08-21; override DEMO_RUN_DIR
       slurm-<jobid>.out        job stdout (the #SBATCH --output path)
       provenance.txt           host, job id, GPU, commit, config
       gateway-and-vllm.log     everything the server and tuner printed
@@ -78,10 +78,10 @@ nothing is written to a shared speedlm home.
 
 ## Monitoring
 
-    scripts/agentenv_monitor.sh <jobid> /data/ryan.kim/speedlm-runs/agentenv-qwen8b-run5
+    scripts/agentenv_monitor.sh <jobid> /data/ryan.kim/speedlm-runs/agentenv-qwen8b-run5   # deleted; override
 
 Optional third argument is the ledger path; it defaults to
-`/data/ryan.kim/speedlm-runs/agentenv-ledger.jsonl`. The monitor polls `squeue`
+`/data/ryan.kim/speedlm-runs/agentenv-ledger.jsonl` (deleted 2026-08-21; override via third argument). The monitor polls `squeue`
 every 40s (1200 polls, about 13.3h against the job's 12h limit), reports
 in-flight `idle tuning cycle failed` lines without exiting on them (the cycle
 retries after a cooldown), and exits as soon as a decision artifact appears at

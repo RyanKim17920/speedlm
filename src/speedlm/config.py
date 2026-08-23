@@ -456,7 +456,7 @@ class PromotionConfig:
     Both values remain fully configurable via ``promotion`` in ``config.json``;
     these are defaults, not policy.  Note that setting them to ``0.0``/``0.0``
     reduces the gate to "not measurably worse", which promotes on noise
-    indefinitely -- see DEMO.md on why lowering the gate is the failure mode
+    indefinitely -- see docs/DEMO.md on why lowering the gate is the failure mode
     this system exists to prevent.
     """
 
