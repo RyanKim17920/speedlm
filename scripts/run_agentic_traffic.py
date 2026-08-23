@@ -81,7 +81,16 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         ),
     )
     parser.add_argument("--max-turns", type=int, default=30)
-    parser.add_argument("--max-output-tokens", type=int, default=1024)
+    parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=3072,
+        help=(
+            "Cap on generated tokens per turn. 1024 truncates Qwen3's reasoning "
+            "block before it emits a tool call, which ends the trajectory after "
+            "~2 turns with zero tool calls -- feature-implement solved 0%% that way."
+        ),
+    )
     parser.add_argument("--temperature", type=float, default=0.7)
     parser.add_argument("--top-p", type=float, default=0.95)
     parser.add_argument(
@@ -117,9 +126,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
     families = tuple(name for name in args.families.split(",") if name) or None
-    instances = all_instances(
-        seeds=args.seeds, families=families, seed_start=args.seed_start
-    )
+    instances = all_instances(seeds=args.seeds, families=families, seed_start=args.seed_start)
     out = args.out
     (out / "trajectories").mkdir(parents=True, exist_ok=True)
     (out / "workspaces").mkdir(parents=True, exist_ok=True)
@@ -184,9 +191,7 @@ def main(argv: list[str] | None = None) -> int:
                 "tool_calls": result.tool_call_count,
                 "failed_tool_calls": result.failed_tool_call_count,
                 "stop_condition": result.stop_condition,
-                "final_prompt_tokens": (
-                    result.turns[-1].prompt_tokens if result.turns else None
-                ),
+                "final_prompt_tokens": (result.turns[-1].prompt_tokens if result.turns else None),
                 "wall_clock_seconds": round(result.wall_clock_seconds, 2),
                 "grade_detail": grade.detail,
             }
@@ -253,9 +258,7 @@ def _report(summaries: list[dict[str, Any]], args: argparse.Namespace) -> dict[s
         "dispatched_tool_calls": sum(int(item["tool_calls"]) for item in ran),
         "failed_tool_calls": sum(int(item["failed_tool_calls"]) for item in ran),
         "total_turns": sum(int(item["turns"]) for item in ran),
-        "mean_turns_per_trajectory": round(
-            sum(int(item["turns"]) for item in ran) / len(ran), 2
-        )
+        "mean_turns_per_trajectory": round(sum(int(item["turns"]) for item in ran) / len(ran), 2)
         if ran
         else None,
         "max_final_prompt_tokens": max(prompt_tokens) if prompt_tokens else None,

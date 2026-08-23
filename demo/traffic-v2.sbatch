@@ -222,7 +222,7 @@ echo "gateway ready at $base_url (log match, zero traffic generated)"
   --seeds "$seeds" \
   --seed-start "$seed_start" \
   --max-turns 24 \
-  --max-output-tokens 1024 \
+  --max-output-tokens 3072 \
   --request-timeout 600 \
   --trajectory-wall-clock 1500 \
   --stop-after-seconds 14400 \
