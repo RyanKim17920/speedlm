@@ -73,8 +73,9 @@ def _human(num_bytes: int) -> str:
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__,
-                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     parser.add_argument("--out", required=True, type=Path, help="Merged store path.")
     parser.add_argument(
         "--store",
@@ -147,11 +148,20 @@ def main(argv: list[str] | None = None) -> int:
     id_dupes = 0
     malformed = 0
 
-    for path in inputs:
+    # Ingestion ordinal per record: (source index, line number). Capture
+    # timestamps have one-second resolution, so ~20% of rows tie. Breaking a
+    # tie by record id -- a hash -- shuffles rows that share a second into
+    # arbitrary order, which can place a response BEFORE the request whose
+    # prefix cites it. Self-play attestation then reports the row's own
+    # generator as "generated later" and the cycle aborts. Measured on the
+    # 6,176-record capture: 1,209 rows shared a timestamp and 49 prefix turns
+    # were rejected purely from tie ordering.
+    order: dict[str, tuple[int, int]] = {}
+    for source_index, path in enumerate(inputs):
         read = 0
         added = 0
         with path.open() as handle:
-            for line in handle:
+            for line_number, line in enumerate(handle):
                 line = line.strip()
                 if not line:
                     continue
@@ -169,10 +179,14 @@ def main(argv: list[str] | None = None) -> int:
                     id_dupes += 1
                     continue
                 by_id[rid] = record
+                order[rid] = (source_index, line_number)
                 added += 1
         per_source.append((path, read, added))
 
-    records = sorted(by_id.values(), key=lambda r: (r.get("timestamp") or 0.0, r["id"]))
+    records = sorted(
+        by_id.values(),
+        key=lambda r: ((r.get("timestamp") or 0.0), *order[r["id"]]),
+    )
 
     # Content-duplicate census, always computed, dropped only on request.
     content_counts: Counter[str] = Counter(_content_key(r) for r in records)
@@ -211,13 +225,17 @@ def main(argv: list[str] | None = None) -> int:
     print(f"  records in            : {sum(r for _, r, _ in per_source)}")
     print(f"  dropped (duplicate id): {id_dupes}")
     print(f"  dropped (malformed)   : {malformed}")
-    print(f"  duplicate content sets: {content_dupes} "
-          f"({'dropped' if args.drop_duplicate_content else 'kept'})")
+    print(
+        f"  duplicate content sets: {content_dupes} "
+        f"({'dropped' if args.drop_duplicate_content else 'kept'})"
+    )
     print(f"  records out           : {len(records)}")
     print()
     print("=== corpus ===")
-    print(f"  total tokens : {total_prompt + total_completion} "
-          f"(prompt {total_prompt}, completion {total_completion})")
+    print(
+        f"  total tokens : {total_prompt + total_completion} "
+        f"(prompt {total_prompt}, completion {total_completion})"
+    )
     if records:
         print(f"  mean tokens  : {(total_prompt + total_completion) / len(records):.1f} per record")
         print(f"  mean bytes   : {size_bytes / len(records):.0f} per record")
