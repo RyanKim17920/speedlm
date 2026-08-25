@@ -39,11 +39,17 @@ set -euo pipefail
 #     tokens x (num_aux_layers + 1) x hidden_size x 2
 #   = tokens x (31 + 1) x 4096 x 2  [Qwen3-8B: 32 aux layers, hidden 4096]
 #   = tokens x 32,768 B
-# Measured mean tokens/row for this traffic: 2,277 => 74.6 MB/row.
-# Worst-case shard occupancy at window = 1024 rows:
-#     1,024 x 74,612,736 + 1 GiB headroom
-#   = 76,403,441,664 + 1,073,741,824
-#   = 77,477,183,488 B = 72.16 GiB  -- FITS under 96 GiB with 23.84 GiB margin
+# Measured mean tokens/row for this traffic: 4,714 => 154.5 MB/row.
+# (Was 2,277 => 74.6 MB/row before --max-output-tokens went 1024 -> 3072.
+#  Raising the cap to stop Qwen3's reasoning being truncated roughly
+#  doubled generation length, so every hidden-state tensor doubled too.
+#  At window=1024 that is 147 GiB, over the 96 GiB ceiling, and it
+#  OOM-killed extraction at 197 GB RSS on job 392254.)
+# Worst-case shard occupancy at window = 512 rows:
+#       512 x 154,468,352 + 1 GiB headroom
+#   = 79,087,796,224 + 1,073,741,824
+#   = 80,161,538,048 B = 74.66 GiB  -- FITS under 96 GiB with 21.34 GiB margin
+# (660 rows is the ceiling at this token length; 1,024 would need 147 GiB.)
 # (1,280 rows would be 89.95 GiB, only 6.05 GiB margin; 1,536 exceeds 96 GiB.)
 # The quota is set to the 96 GiB ceiling (= 103,079,215,104 B).  That is
 # fail-closed but not a reservation: actual occupancy is ~55 GB because the
