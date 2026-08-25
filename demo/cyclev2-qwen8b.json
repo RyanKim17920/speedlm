@@ -25,7 +25,7 @@
   },
   "tuning": {
     "min_trace_records": 32,
-    "min_corpus_records": 1024,
+    "min_corpus_records": 512,
     "training_window_records": 512,
     "poll_interval_seconds": 0.25,
     "idle_confirmations": 2,
