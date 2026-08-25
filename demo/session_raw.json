@@ -1,0 +1,31 @@
+{
+  "typing_delay": 0.0025,
+  "settle": 0.4,
+  "steps": [
+    {"command": "export R=$SPEEDLM_TRAINING_RUN; C=$(logs=($R/speedlm_home/runs/*/training-logs/stdout.log); [[ ${#logs[@]} -eq 1 && -f ${logs[0]} ]] || { echo 'ERROR: expected exactly one run dir' >&2; exit 1; }; dirname $(dirname ${logs[0]})); export C E=$R/speedlm_home/runs/events.jsonl T=$R/speedlm_home/traces/traces.jsonl",
+     "pause_after": 1.0},
+
+    {"command": "grep -m1 -n 'speedlm vllm serve' $R/gateway-and-vllm.log || head -3 $R/gateway-and-vllm.log",
+     "pause_after": 2.5},
+    {"command": "grep -E 'Loading|Model loading took|Starting vLLM|Uvicorn running' $R/gateway-and-vllm.log | head -12",
+     "pause_after": 4.0},
+
+    {"command": "grep -E 'POST /v1/chat/completions' $R/gateway-and-vllm.log | head -15",
+     "pause_after": 4.0},
+    {"command": "grep -E 'Avg prompt throughput' $R/gateway-and-vllm.log | head -8",
+     "pause_after": 3.5},
+
+    {"command": "wc -l $T", "pause_after": 2.0},
+    {"command": "cat $E", "pause_after": 5.0},
+
+    {"command": "grep -E 'leased|training record' $R/gateway-and-vllm.log | head -6",
+     "pause_after": 4.0},
+    {"command": "ls -la $C/ | head -20", "pause_after": 3.5},
+    {"command": "head -30 $C/training-logs/stdout.log", "pause_after": 5.0},
+    {"command": "grep -oE 'train\\.loss=[0-9.]+' $C/training-logs/stdout.log | head -20",
+     "pause_after": 5.0},
+    {"command": "tail -25 $C/training-logs/stdout.log", "pause_after": 5.0},
+
+    {"command": "cat $C/decision.json | head -40", "pause_after": 6.0}
+  ]
+}
