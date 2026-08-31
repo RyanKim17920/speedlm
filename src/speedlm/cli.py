@@ -77,7 +77,15 @@ def _build_parser() -> argparse.ArgumentParser:
     vllm_parser = subparsers.add_parser("vllm", help="vLLM proxy commands")
     vllm_sub = vllm_parser.add_subparsers(dest="vllm_command")
 
-    serve_parser = vllm_sub.add_parser("serve", help="Launch vLLM with SpeedLM proxy")
+    serve_parser = vllm_sub.add_parser(
+        "serve",
+        help="Launch vLLM with SpeedLM proxy",
+        usage="speedlm vllm serve MODEL [SPEEDLM_OPTIONS] [VLLM_ARGS...]",
+        description=(
+            "Launch a real vLLM server behind the SpeedLM streaming and capture gateway."
+        ),
+        epilog="Arguments SpeedLM does not recognize are forwarded unchanged to vLLM.",
+    )
     serve_parser.add_argument("model", help="Model name or path")
     serve_parser.add_argument("--host", default=None, help="Wrapper listen host")
     serve_parser.add_argument("--port", type=int, default=None, help="Wrapper listen port")

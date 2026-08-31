@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -11,6 +12,8 @@ from pathlib import Path
 from typing import Any
 
 from speedlm.storage import append_jsonl, atomic_write_json
+
+logger = logging.getLogger(__name__)
 
 
 class StateError(RuntimeError):
@@ -160,6 +163,12 @@ class TunerStateMachine:
             },
         )
         self._snapshot = next_snapshot
+        logger.info(
+            "idle tuner state %s -> %s: %s",
+            current.state.value,
+            target.value,
+            reason or "no reason recorded",
+        )
         return next_snapshot
 
     def resume(self) -> TunerState:
@@ -202,6 +211,7 @@ class TunerStateMachine:
                     "recovery": False,
                 },
             )
+            logger.info("idle tuner state initialized: %s", initial.state.value)
             return initial
         try:
             raw = json.loads(self._state_path.read_text(encoding="utf-8"))
@@ -236,3 +246,9 @@ class TunerStateMachine:
             },
         )
         self._snapshot = next_snapshot
+        logger.info(
+            "idle tuner recovery state %s -> %s: %s",
+            current.state.value,
+            target.value,
+            next_snapshot.reason,
+        )

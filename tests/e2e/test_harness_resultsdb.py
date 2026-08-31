@@ -30,6 +30,11 @@ REAL_ROOT = Path("/data/ryan.kim/speedlm-runs")
 requires_real_runs = pytest.mark.skipif(
     not REAL_ROOT.is_dir(), reason="historical run tree is not on this host"
 )
+requires_full_real_run_archive = pytest.mark.skipif(
+    not REAL_ROOT.is_dir()
+    or sum(1 for path in REAL_ROOT.iterdir() if path.is_dir()) < 60,
+    reason="the complete historical run archive is not on this host",
+)
 
 
 # ---------------------------------------------------------------------------
@@ -827,7 +832,7 @@ def test_real_sample_rows_use_the_fixture_field_names() -> None:
     assert set(_sample(0, 1.0, 1.0)) == set(real)
 
 
-@requires_real_runs
+@requires_full_real_run_archive
 def test_the_real_tree_indexes_without_raising() -> None:
     records = index_runs(REAL_ROOT)
     assert len(records) >= 60

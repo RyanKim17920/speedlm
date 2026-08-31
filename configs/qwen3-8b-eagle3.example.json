@@ -1,0 +1,19 @@
+{
+  "model": "Qwen/Qwen3-8B",
+  "profile": "qwen3-8b-eagle3",
+  "tuning_enabled": false,
+  "idle_threshold_seconds": 300.0,
+  "tuning": {
+    "speculators_repo": "/absolute/path/to/speculators",
+    "training_python": "/absolute/path/to/speculators/.venv/bin/python",
+    "vllm_python": "/absolute/path/to/vllm-environment/bin/python",
+    "sequence_length": 16384
+  },
+  "workload": {
+    "domain": "",
+    "expect_tools": null,
+    "expect_multi_turn": null,
+    "expect_system_prompts": null,
+    "expect_client_supplied_assistant_turns": null
+  }
+}

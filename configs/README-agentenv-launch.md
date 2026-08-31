@@ -1,5 +1,12 @@
 # Launching the agentic self-play idle-tuning run
 
+> **Historical cluster runbook.** This page preserves the exact paths, job IDs,
+> and pinned settings used for the original H100 experiment; they are
+> reproducibility provenance, not portable defaults. For a new machine, start
+> with [`README.md`](README.md) and
+> [`qwen3-8b-eagle3.example.json`](qwen3-8b-eagle3.example.json), then replace
+> every site-specific path before launching.
+
 This is the operator's page for `scripts/agentenv_run.sbatch`: what it does, in
 what order, where its output lands, and how to watch it. Every note here exists
 because a prior allocation died on it.

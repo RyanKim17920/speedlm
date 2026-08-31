@@ -98,6 +98,15 @@ def test_traces_help_uses_generic_import_description(capsys) -> None:
     assert "import traces from existing logs (auto-detects format)" in out.out
 
 
+def test_vllm_serve_help_documents_passthrough(capsys) -> None:
+    with pytest.raises(SystemExit) as exc:
+        main(["vllm", "serve", "--help"])
+    assert exc.value.code == 0
+    out = capsys.readouterr()
+    assert "[VLLM_ARGS...]" in out.out
+    assert "forwarded unchanged to vLLM" in out.out
+
+
 def test_traces_stats_empty(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys) -> None:
     monkeypatch.setenv("SPEEDLM_HOME", str(tmp_path))
     code = main(["traces", "stats"])

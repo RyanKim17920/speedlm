@@ -1,4 +1,4 @@
-#!/admin/home/ryan.kim/speedlm-fr/.venv/bin/python
+#!/usr/bin/env python3
 """One command for the benchmarking harness.
 
 Launching a benchmark used to mean hand-writing a config, remembering which
@@ -38,8 +38,9 @@ from pathlib import Path
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+for search_root in (REPO_ROOT, REPO_ROOT / "src"):
+    if str(search_root) not in sys.path:
+        sys.path.insert(0, str(search_root))
 
 from tests.e2e.harness import compare as C  # noqa: E402
 from tests.e2e.harness import preflight as P  # noqa: E402
@@ -48,7 +49,14 @@ from tests.e2e.harness import resultsdb as DB  # noqa: E402
 from tests.e2e.harness import workloads as W  # noqa: E402
 from tests.e2e.harness.model import MetricSeries, RunRecord  # noqa: E402
 
-DEFAULT_RUN_ROOT = Path("/data/ryan.kim/speedlm-runs")
+# These defaults preserve the original cluster benchmark layout. Public users
+# can override them without editing this script (or pass ``--root`` where that
+# option is available).
+DEFAULT_RUN_ROOT = Path(os.environ.get("SPEEDLM_RUN_ROOT", "/data/ryan.kim/speedlm-runs"))
+DEFAULT_CORPUS = os.environ.get(
+    "SPEEDLM_CORPUS",
+    "/data/ryan.kim/speedlm-corpora/ultrachat-prompts.jsonl",
+)
 LAUNCHER = REPO_ROOT / "scripts" / "make_snapshot_run.sh"
 
 #: The name is deliberately long and unpleasant to type.  It is the only way
@@ -378,7 +386,7 @@ def build_preflight_config(args: argparse.Namespace) -> P.PreflightConfig:
     # --no-corpus, so model the same thing rather than reporting a missing
     # option the operator never had to supply.
     if "--corpus" not in options and not args.no_corpus:
-        options["--corpus"] = "/data/ryan.kim/speedlm-corpora/ultrachat-prompts.jsonl"
+        options["--corpus"] = DEFAULT_CORPUS
     if args.no_corpus:
         options.pop("--corpus", None)
 

@@ -20,7 +20,18 @@ build-backend = "hatchling.build"
 name = "speedlm"
 version = "0.1.0"
 description = "near-drop-in replacement for `vllm serve` that captures traffic as traces and fine-tunes a speculative draft head during idle GPU time"
+readme = "README.md"
+license = { file = "LICENSE" }
+authors = [{ name = "Ryan Kim" }]
 requires-python = ">=3.12,<3.13"
+keywords = ["vllm", "speculative-decoding", "llm-inference", "idle-tuning"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 dependencies = [
     "fastapi>=0.115",
     "httpx>=0.27",
@@ -38,8 +49,31 @@ dev = [
 [project.scripts]
 speedlm = "speedlm.cli:main"
 
+[project.urls]
+Homepage = "https://github.com/RyanKim17920/speedlm"
+Repository = "https://github.com/RyanKim17920/speedlm.git"
+Documentation = "https://github.com/RyanKim17920/speedlm#readme"
+Issues = "https://github.com/RyanKim17920/speedlm/issues"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/speedlm"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src",
+    "/tests",
+    "/configs",
+    "/docs",
+    "/README.md",
+    "/CONTRIBUTING.md",
+    "/LICENSE",
+    "/pyproject.toml",
+    "/uv.lock",
+]
+exclude = [
+    "/docs/assets",
+    "/tests/**/__pycache__",
+]
 
 [tool.ruff]
 line-length = 100
@@ -47,6 +81,9 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["simulation", "speedlm", "tests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -63,7 +100,7 @@ testpaths = ["tests"]
 # -ra they now announce themselves by name and reason on every run, and they stay
 # runnable by simply setting those variables.
 addopts = "-q -ra"
-pythonpath = ["src"]
+pythonpath = ["src", "tests"]
 markers = [
     "e2e: real end-to-end tests that require a live GPU and vLLM server",
     "no_torch: runs in the project venv too (uses torch-free fakes)",
@@ -76,8 +113,8 @@ disallow_untyped_defs = true
 files = ["src/speedlm"]
 
 # Activation-capture modules import torch/safetensors/vllm lazily at runtime.
-# They execute inside the separate vLLM venv (/admin/home/ryan.kim/speedlm/.preflight/venvs/vllm/)
-# where these packages are installed. The project venv only has fastapi/httpx/uvicorn
+# They execute inside the separately configured vLLM environment where these
+# packages are installed. The project venv only has fastapi/httpx/uvicorn
 # (see project.dependencies above) — adding torch here would break that minimal env.
 [[tool.mypy.overrides]]
 module = ["torch.*", "torch"]

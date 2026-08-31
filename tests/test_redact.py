@@ -495,14 +495,14 @@ def test_real_jwts_are_still_redacted(jwt: str) -> None:
     ("text", "address", "expected"),
     [
         (
-            "So the contact email is kelsei.etchison@mga.edu. The address is",
-            "kelsei.etchison@mga.edu",
+            "So the contact email is alex.smith@example.com. The address is",
+            "alex.smith@example.com",
             "So the contact email is <REDACTED:email>. The address is",
         ),
         (
-            "Reach him at kenthomas@envisorco.com.",
-            "kenthomas@envisorco.com",
-            "Reach him at <REDACTED:email>.",
+            "Reach them at casey.jones@example.org.",
+            "casey.jones@example.org",
+            "Reach them at <REDACTED:email>.",
         ),
         (
             "Write to bob.smith@example.co.uk. Then call.",

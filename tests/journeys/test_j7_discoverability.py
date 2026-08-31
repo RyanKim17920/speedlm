@@ -78,13 +78,6 @@ def test_help_contract_rejects_unknown_or_misspelled_options(
     assert "unrecognized arguments" in result.stderr
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "src/speedlm/cli.py:129-138 omits forwarded vLLM arguments from serve help even "
-        "though src/speedlm/cli.py:515-525 accepts and forwards them"
-    ),
-)
 def test_serve_help_discloses_forwarded_vllm_arguments(speedlm_home: Path) -> None:
     result = run_cli(speedlm_home, "vllm", "serve", "--help")
     assert_clean_cli_result(result)

@@ -206,7 +206,15 @@ def evaluate_workload(
 
     # ── Shape the training and gate paths must handle ───────────────────────
 
-    if shape.is_material(shape.tool_schema_records):
+    # A tool-bearing corpus is only a mismatch when the operator did not say
+    # this deployment serves tool traffic.  The remedy below has always told
+    # operators to set ``expect_tools=true``; continuing to emit the warning
+    # after they do so makes that declaration cosmetic and trains people to
+    # ignore a warning they cannot resolve.
+    if (
+        shape.is_material(shape.tool_schema_records)
+        and workload.expect_tools is not True
+    ):
         findings.append(
             WorkloadFinding(
                 code="tool_schemas_present",
@@ -231,7 +239,10 @@ def evaluate_workload(
             )
         )
 
-    if shape.is_material(shape.client_supplied_assistant_records):
+    if (
+        shape.is_material(shape.client_supplied_assistant_records)
+        and workload.expect_client_supplied_assistant_turns is not True
+    ):
         findings.append(
             WorkloadFinding(
                 code="client_supplied_assistant_turns_dropped",

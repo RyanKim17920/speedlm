@@ -55,12 +55,16 @@
 
 set -euo pipefail
 
-REPO=/admin/home/ryan.kim/speedlm-fr
-SNAPSHOT_ROOT=/data/ryan.kim/speedlm-snapshots
-RUN_ROOT=/data/ryan.kim/speedlm-runs
-VLLM_ENV=/admin/home/ryan.kim/speedlm/.preflight/venvs/vllm
-PYLIBS_PYTEST=/data/ryan.kim/pylibs/pytest
-CORPUS=/data/ryan.kim/speedlm-corpora/ultrachat-prompts.jsonl
+# The defaults below preserve the cluster layout used by the archived runs.
+# Resolve the repository from this script for portable checkouts, and expose
+# environment overrides for every other site-specific dependency.
+script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+REPO=${SPEEDLM_REPO_ROOT:-$(cd -- "$script_dir/.." && pwd)}
+SNAPSHOT_ROOT=${SPEEDLM_SNAPSHOT_ROOT:-/data/ryan.kim/speedlm-snapshots}
+RUN_ROOT=${SPEEDLM_RUN_ROOT:-/data/ryan.kim/speedlm-runs}
+VLLM_ENV=${SPEEDLM_VLLM_ENV:-/admin/home/ryan.kim/speedlm/.preflight/venvs/vllm}
+PYLIBS_PYTEST=${SPEEDLM_PYTEST_PATH:-/data/ryan.kim/pylibs/pytest}
+CORPUS=${SPEEDLM_CORPUS:-/data/ryan.kim/speedlm-corpora/ultrachat-prompts.jsonl}
 
 # The gateway flavors default SPEEDLM_*_VLLM_ARGS to "[]", i.e. no bounds at
 # all, which on a shared GPU lets vLLM size its KV cache for the whole card.
@@ -147,9 +151,14 @@ Optional:
                         authoritative and must agree.
   -h | --help           this message
 
-The snapshot lands in /data/ryan.kim/speedlm-snapshots/<full-sha>/ and is made
+The snapshot lands in SPEEDLM_SNAPSHOT_ROOT/<full-sha>/ (default:
+/data/ryan.kim/speedlm-snapshots) and is made
 read-only.  Re-running for the same commit reuses it (content is identical by
 construction), so snapshots are cheap: the tree is ~2.5 MB.
+
+The literal /admin/home and /data defaults reproduce the original cluster.
+Portable installations can set SPEEDLM_REPO_ROOT, SPEEDLM_SNAPSHOT_ROOT,
+SPEEDLM_RUN_ROOT, SPEEDLM_VLLM_ENV, SPEEDLM_PYTEST_PATH, and SPEEDLM_CORPUS.
 
 STAGE 0 RUNNER x MODEL MATRIX
 ----------------------------

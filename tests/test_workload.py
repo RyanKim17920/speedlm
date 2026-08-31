@@ -214,6 +214,29 @@ def test_declared_tools_that_never_arrive_are_reported() -> None:
     assert "workload.expect_tools=true" in findings["declared_shape_absent"]
 
 
+def test_declared_tool_workload_resolves_the_defaults_mismatch() -> None:
+    findings = _evaluate(
+        _shape(tool_schema_records=95, tool_call_records=60),
+        workload=WorkloadConfig(domain="agentic-coding", expect_tools=True),
+    )
+    assert "tool_schemas_present" not in findings
+
+
+def test_declared_client_assistant_history_resolves_the_expected_loss_warning() -> None:
+    findings = _evaluate(
+        _shape(
+            multi_turn_records=90,
+            client_supplied_assistant_records=70,
+            training_dropped_records=70,
+        ),
+        workload=WorkloadConfig(
+            domain="agentic-coding",
+            expect_client_supplied_assistant_turns=True,
+        ),
+    )
+    assert "client_supplied_assistant_turns_dropped" not in findings
+
+
 def test_an_undeclared_expectation_makes_no_claim() -> None:
     """None must never be read as False."""
     findings = _evaluate(

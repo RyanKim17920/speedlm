@@ -1,5 +1,10 @@
 # demo/
 
+> **Legacy long-form pipeline.** The public README now uses the current
+> 63-second Remotion cut at <code>docs/assets/speedlm-demo.mp4</code>. This page
+> documents the older staged renderer and remains for reproducibility; its
+> timings and clip inventory do not describe the current public video.
+
 Everything used to produce the SpeedLM demo video.
 
 ## Current state

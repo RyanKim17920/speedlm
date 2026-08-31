@@ -23,6 +23,7 @@ import hashlib
 import importlib.machinery
 import importlib.util
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -684,6 +685,13 @@ def test_workloads_verify_of_a_missing_spec_dir_exits_non_zero(
 # ---------------------------------------------------------------------------
 
 
+def _launcher_env(tmp_path: Path) -> dict[str, str]:
+    return {
+        **os.environ,
+        "SPEEDLM_SNAPSHOT_ROOT": str(tmp_path / "snapshots"),
+    }
+
+
 def _generate_sbatch(tmp_path: Path, *args: str) -> str:
     """Run the real launcher for one flavor and return the job.sbatch text."""
     import subprocess
@@ -713,6 +721,7 @@ def _generate_sbatch(tmp_path: Path, *args: str) -> str:
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
+        env=_launcher_env(tmp_path),
     )
     sbatch = run_root / "probe" / "job.sbatch"
     assert sbatch.is_file(), (
@@ -845,6 +854,7 @@ def test_launcher_refuses_a_workload_for_a_flavor_that_ignores_it(
         cwd=REPO_ROOT,
         capture_output=True,
         text=True,
+        env=_launcher_env(tmp_path),
         check=True,
     ).stdout.strip()
     run_root = tmp_path / "runs"
@@ -901,6 +911,7 @@ def test_launcher_preflight_gate_refuses_and_writes_nothing(tmp_path: Path) -> N
             cwd=REPO_ROOT,
             capture_output=True,
             text=True,
+            env=_launcher_env(tmp_path),
         )
 
     refused = launch("bad", "--vllm-args", '["--max-model-len","4096"]')

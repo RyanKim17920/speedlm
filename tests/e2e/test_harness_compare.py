@@ -576,9 +576,15 @@ def test_render_reports_a_provenance_less_run_as_such() -> None:
 # ---------------------------------------------------------------------------
 
 _REAL_RUN_ROOT = Path("/data/ryan.kim/speedlm-runs")
+_HAS_CONFIG_MATRIX_RUNS = _REAL_RUN_ROOT.is_dir() and any(
+    _REAL_RUN_ROOT.glob("config-matrix-*/results")
+)
 
 
-@pytest.mark.skipif(not _REAL_RUN_ROOT.is_dir(), reason="no run root on this host")
+@pytest.mark.skipif(
+    not _HAS_CONFIG_MATRIX_RUNS,
+    reason="no historical config-matrix runs on this host",
+)
 def test_every_comparability_key_is_a_name_the_index_actually_emits() -> None:
     """Pin each dimension's spelling against what resultsdb really produces.
 

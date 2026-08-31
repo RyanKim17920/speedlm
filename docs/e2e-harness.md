@@ -8,7 +8,7 @@ harness **is**, not what it should be.
 read the artifacts one left behind.
 
 **Citation convention.** Technical claims carry a source or artifact reference
-relative to `/admin/home/ryan.kim/speedlm-fr` unless the path is absolute.
+relative to the repository root unless the path is absolute.
 Symbol references are preferred because line anchors drift. Untouched historical
 line anchors remain pinned to commit `1c8f5c0`, as stated above. Anything not
 confirmed against a source or a measurement is labelled **[unverified]**.
@@ -542,9 +542,11 @@ scripts/make_snapshot_run.sh --flavor idle-tuning \
 ```
 
 It `git archive`s the commit into
-`/data/ryan.kim/speedlm-snapshots/<full-sha>/`, makes it read-only, creates a run
-directory under `/data/ryan.kim/speedlm-runs/`, and writes a `job.sbatch` that
-runs from the snapshot. It **never submits**; it prints the `sbatch` command.
+`$SPEEDLM_SNAPSHOT_ROOT/<full-sha>/` (default:
+`/data/ryan.kim/speedlm-snapshots/<full-sha>/`), makes it read-only, creates a
+run directory under `/data/ryan.kim/speedlm-runs/`, and writes a
+`job.sbatch` that runs from the snapshot. It **never submits**; it prints the
+`sbatch` command.
 
 ### Why `PYTHONPATH`, and why a git worktree is not enough
 
@@ -673,11 +675,12 @@ is what the code does", not "this is what a run showed".
 
 `scripts/speedbench` is a single CLI over the whole cycle: pick a workload,
 validate the launch, submit it, index what came back, compare two runs, and
-track a metric across commits. It adds the repo root to `sys.path`
-(`scripts/speedbench:40-42`) and imports the harness modules directly
-(`:44-49`), so it runs under the project `.venv` and needs no torch.
-`DEFAULT_RUN_ROOT` is `/data/ryan.kim/speedlm-runs` (`:51`) and `LAUNCHER` is
-`scripts/make_snapshot_run.sh` (`:52`).
+track a metric across commits. It adds the repository and its `src/` tree to
+`sys.path` and imports the harness modules directly, so it runs under the
+project environment and needs no torch.
+`DEFAULT_RUN_ROOT` reads `SPEEDLM_RUN_ROOT` when set and otherwise preserves the
+historical `/data/ryan.kim/speedlm-runs` cluster default. `LAUNCHER` resolves to
+`scripts/make_snapshot_run.sh`.
 
 ### 10.1 The seven subcommands
 
