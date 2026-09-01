@@ -2,23 +2,32 @@
 
 ## What SpeedLM is, in three sentences
 
-SpeedLM is a near-drop-in wrapper around `vllm serve`: it launches vLLM behind a streaming
-gateway, proxies OpenAI-compatible traffic, and captures completed requests inline as it
-forwards the bytes to the client. During idle GPU periods it takes an **existing public
-speculative draft head** (e.g. `RedHatAI/gpt-oss-20b-speculator.eagle3`) and fine-tunes it on
-that deployment's own captured traffic — it never trains a draft from scratch, and it refuses
-a missing `from_pretrained` base.
+SpeedLM automatically speeds up local LLM serving with GPU time that would
+otherwise sit idle. You keep the same OpenAI-compatible vLLM workflow and local
+serving boundary; SpeedLM learns from the traffic your deployment already sees
+and improves the speculative helper behind it.
 
-A frozen held-out gate then replays stock vs. candidate and promotes the candidate **only** if
-both acceptance and throughput improve; otherwise it rolls back.
+Under the hood, SpeedLM launches `vllm serve` behind a streaming gateway,
+captures completed requests as it forwards bytes to the client, and fine-tunes
+an **existing public speculative draft head** (for example,
+`RedHatAI/gpt-oss-20b-speculator.eagle3`) during confirmed idle periods. It
+never trains a draft from scratch and refuses a missing `from_pretrained` base.
 
-The whole user-facing flow is three commands:
+A frozen held-out gate then replays stock versus candidate and promotes the
+candidate **only** if the configured acceptance and throughput safeguards
+pass; otherwise it rolls back. The full model still verifies every proposed
+token.
+
+After the one-time Speculators and profile configuration described below, the
+recurring user-facing flow is two commands:
 
 ```bash
-speedlm traces import corpus.jsonl
 speedlm vllm serve MODEL --enable-idle-tuning
 speedlm gain
 ```
+
+`speedlm traces import corpus.jsonl` is an optional bootstrap when you already
+have compatible traces; live serving captures completed traffic automatically.
 
 There is no separate harness. No manual prepare / extract-hidden-states / train / stitch
 scripts. That is the point of the demo.
@@ -103,9 +112,9 @@ Exit code: **1** (doctor exits 1 on overall FAIL).
 
 **What to say:** "Seven read-only checks, an overall verdict, and an *execution mode*. The
 execution mode is what the tuner consults before it will do anything — `idle`, `colocated`,
-or `unavailable`. On this box it is `unavailable`, so if I started the gateway with
-`--enable-idle-tuning` right now, the tuner would refuse to construct itself and log why,
-and serving would continue unaffected. It fails closed and it says so."
+or `unavailable`. On this box it is `unavailable`, so launching with
+`--enable-idle-tuning` would fail closed before tuned serving is exposed and say why. Run
+without the flag when you only want normal proxy serving on a host that cannot tune."
 
 ### 3. `speedlm status` — before any traffic
 
@@ -233,7 +242,7 @@ streaming to the caller — capture is on the request path, not a sidecar."
 ### 7. The idle cycle — ILLUSTRATIVE, do not run live
 
 With `--enable-idle-tuning`, once the gateway has been quiet for `idle_threshold_seconds`
-(default **300 s**) and the store holds at least **32** records, the tuner walks this state
+(default **300 s**) and the store holds at least **256** records, the tuner walks this state
 machine:
 
 ```
@@ -241,9 +250,10 @@ READY -> QUIESCING -> SLEEPING -> EXTRACTING -> TRAINING
       -> CANDIDATE_STARTING -> BENCHMARKING -> PROMOTING -> WAKING -> READY
 ```
 
-Any failure diverts to `ROLLING_BACK -> WAKING -> READY`, and **new traffic preempts the
-cycle** — serving wins. Default stage timeouts: quiesce 30 s, sleep 120 s, candidate start
-600 s, benchmark 1800 s, restore 600 s.
+Any failure diverts to `ROLLING_BACK -> WAKING -> READY`. New traffic preempts
+stages that are safe to cancel; at non-interruptible boundaries it waits until
+a verified serving state is restored. Default stage timeouts: quiesce 30 s,
+sleep 120 s, candidate start 600 s, benchmark 1800 s, restore 600 s.
 
 Watch it with `speedlm status`, which reads `$SPEEDLM_HOME/runs/state.json`.
 
@@ -264,55 +274,27 @@ measurement       : no_gate_run
 No gate has ever run: there is no completed benchmark in /tmp/speedlm-demo/home1/runs, so there is no measured gain to report.
 ```
 
-**Real output of the renderer, against a `decision.json` carrying the measured 61-row
-numbers.** The renderer, thresholds and verdict text below are real; the numbers come from the
-prior measurement, not from a GPU run performed during this runbook's authoring:
+Older revisions of this runbook contained a 61-row acceptance-rate example
+from a retired decision schema. Do not present that output as the current gate.
+Run `speedlm gain` against the actual `decision.json` you intend to show and
+retain that artifact with the demo.
 
-```
-SpeedLM gain
-source            : /tmp/speedlm-demo/home2/runs/run-20260725-041500/decision.json
-source mtime      : 2026-07-25T05:19:00.193966+00:00
-verdict           : reject
-reason            : throughput_below_threshold (the throughput gain missed its threshold)
-repeats           : 3
-acceptance stock  : 64.12%
-acceptance cand   : 64.17%
-acceptance delta  : +0.05 pp (threshold >= 1.00 pp)
-throughput stock  : 118.40 tok/s
-throughput cand   : 102.18 tok/s
-throughput delta  : -13.70% (threshold >= 2.00%)
-per-repeat:
-  [0] stock 119.10 tok/s, candidate 102.90 tok/s, acceptance 64.28% -> 64.33%, invalid 0.00%, mismatches 0
-  [1] stock 118.20 tok/s, candidate 101.70 tok/s, acceptance 64.01% -> 64.06%, invalid 0.00%, mismatches 0
-  [2] stock 117.90 tok/s, candidate 101.94 tok/s, acceptance 64.07% -> 64.11%, invalid 0.00%, mismatches 0
-Verdict: the candidate draft was rejected because the throughput gain missed its threshold.
-```
+The current default gate uses accepted length as the draft-efficiency
+criterion and throughput as a regression guard:
 
-`speedlm gain --json` emits the same content machine-readably, including a `thresholds` block
-and `status: "measured"`.
+- `min_accepted_length_delta = 0.05`
+- `min_throughput_delta_pct = -2.0`
 
-**This is the most important slide, and it is a rejection.** Say it plainly:
+Those thresholds are deliberately asymmetric: the candidate must improve
+accepted length, while the noisier wall-clock channel must remain inside the
+configured regression budget. Validity, repeat-count, output-integrity, and
+stationarity checks still fail closed.
 
-> "On our existing 61-row corpus the measured adaptation was **+0.047 percentage points of
-> acceptance and −13.7% throughput**. That is a regression. The gate rejected it. The prototype
-> we replaced passed the *same* checkpoint with `all_compatibility_gates_passed: true`, because
-> its gate was checking compatibility, not benefit. Our gate refuses to ship a regression. It
-> said no, and it was right."
-
-Then the design point: the gate is **fail-closed**. It rejects on unavailable acceptance
-counters, on a vLLM counter reset mid-window, on invalid responses (>10%), on any output
-mismatch between arms, on fewer than 3 repeats, and on either threshold being missed. Only
-`both_thresholds_met` promotes. Defaults: `min_acceptance_delta_pp = 1.0`,
-`min_throughput_delta_pct = -2.0`.
-
-Those two are not symmetric and that is deliberate. Acceptance is the promotion
-criterion — it is measured off deterministic counters with no timing component,
-so its noise floor is one accepted token in ~1155 (0.087 pp) and a 1.0 pp bar is
-a real, resolvable lift. Throughput is a regression guard, negative on purpose:
-the arm-to-arm standard error is ~1.1% at five repeats, so demanding a *positive*
-throughput delta smaller than the ~2.1% detection limit would mean promoting
-whenever the noise happened to fall the right way. See README's *Promotion
-thresholds* for the full derivation.
+For the current video, keep the two real results distinct. The archived 287×8
+gate measured **+15.0% accepted length** but did not promote because its timing
+channel was non-stationary. A separate retained 125×8 gate measured **+13.4%**
+and did promote. That distinction demonstrates the user benefit of gating:
+SpeedLM does not deploy every promising training run.
 
 ---
 
@@ -608,13 +590,9 @@ There is deliberately **no** `speedlm tune`, `speedlm prepare`, `speedlm extract
 command is, that is the demo landing: there isn't one, because you don't run it — the gateway
 does, when the GPU is idle.
 
-### README drift to be aware of
+### Keep this inventory aligned with the CLI
 
-`README.md` is stale in two places. Neither is a missing command, but do not read from it live:
-
-- It says `speedlm doctor` "prints a 'not yet implemented' message and returns exit code 2" and
-  is "currently stubbed". **That is no longer true** — `doctor` is fully wired (`_cmd_doctor` in
-  `src/speedlm/cli.py`), runs all seven checks, and returns 1 on FAIL / 0 otherwise.
-- Its CLI listing omits `--enable-idle-tuning`, and it states that "the current `vllm serve`
-  handler does not schedule an idle adaptation cycle." The flag exists and `_run_vllm_gateway`
-  does start the tuner service when it is passed and `doctor` reports a usable execution mode.
+The README and this demo guide now describe the implemented `doctor` command
+and `--enable-idle-tuning` path. Before a live demo, compare both documents with
+`speedlm --help` and `speedlm vllm serve --help` so future CLI changes do not
+turn documentation into a promise the executable no longer keeps.

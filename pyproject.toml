@@ -19,7 +19,7 @@ build-backend = "hatchling.build"
 [project]
 name = "speedlm"
 version = "0.1.0"
-description = "near-drop-in replacement for `vllm serve` that captures traffic as traces and fine-tunes a speculative draft head during idle GPU time"
+description = "Uses idle GPU time to automatically tune supported local LLM serving profiles without changing the OpenAI-compatible workflow"
 readme = "README.md"
 license = { file = "LICENSE" }
 authors = [{ name = "Ryan Kim" }]

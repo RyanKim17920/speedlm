@@ -1,40 +1,60 @@
 # SpeedLM
 
+**Automatically speeds up local LLMs with idle GPU time.**
+
 <p align="center">
   <a href="docs/assets/speedlm-devpost-59s.mp4?raw=1">
     <img
       src="docs/assets/devpost/06-local-inference-gap.png"
-      alt="Hosted API versus local vLLM versus SpeedLM: local idle time becomes draft tuning"
+      alt="SpeedLM automatically uses idle local GPU time to improve speculative decoding"
       width="100%"
     />
   </a>
 </p>
 
 <p align="center">
-  <a href="docs/assets/speedlm-devpost-59s.mp4?raw=1"><strong>▶ Watch the 59-second problem-to-proof demo</strong></a>
+  <a href="docs/assets/speedlm-devpost-59s.mp4?raw=1"><strong>▶ See SpeedLM improve a local LLM in 59 seconds</strong></a>
   <br />
   <sub>
-    The local-inference gap, followed by authentic vLLM, curl, idle-tuning,
-    training, and promotion evidence. The recording uses a five-second demo
-    idle threshold; the software default is five minutes.
+    Real vLLM serving, matching recorded replies, automatic idle tuning, and a
+    measured promotion. The recording uses a five-second demo idle threshold;
+    the software default is five minutes.
   </sub>
 </p>
 
-SpeedLM wraps <code>vllm serve</code>, captures the traffic your deployment
-already receives, and uses idle GPU time to tune an existing speculative draft.
-The OpenAI-compatible API stays the same.
+SpeedLM helps a local vLLM deployment get faster at the work it actually sees.
+It learns from completed requests on your infrastructure, trains only during
+confirmed idle windows, and keeps the same OpenAI-compatible API for clients.
 
-- **Serve normally.** Requests stream through a small gateway to a real vLLM
-  process.
-- **Learn from real traffic.** Completed inputs and outputs become bounded,
-  redacted training traces.
-- **Tune only while idle.** A candidate draft must beat the current draft on a
-  held-out gate before SpeedLM promotes it.
+## Why use SpeedLM?
+
+- **Speed up the workload you actually serve.** SpeedLM adapts an existing
+  speculative draft to your deployment's real request patterns instead of
+  leaving it generic and static.
+- **Keep serving data on your infrastructure.** Capture, training traces, and
+  model artifacts are stored locally; SpeedLM does not require sending your
+  request history to a hosted training service.
+- **Keep your serving workflow.** Launch the real vLLM server through
+  <code>speedlm vllm serve</code>. Common vLLM serving options continue to
+  work, and clients keep using the OpenAI-compatible serving endpoints.
+- **Use GPU time that would otherwise sit idle.** SpeedLM waits for a verified
+  quiet window, drains accepted requests, and then trains a candidate draft.
+- **Deploy only a gated draft-efficiency improvement.** The current draft
+  remains untouched while a candidate trains. SpeedLM promotes it only after
+  accepted length improves and the configured throughput guard passes;
+  otherwise it restores the current draft.
+
+In the strongest archived Qwen3-8B agentic-workload gate, the tuned draft
+produced **15.0% more accepted tokens per verifier step**. SpeedLM did not
+promote that candidate because its timing channel was non-stationary. A
+separate retained gate promoted a **13.4% accepted-length gain**. Observed
+wall-clock throughput varied by run, so neither result promises that every
+deployment becomes exactly that much faster.
 
 > **Research preview:** the complete live path has been exercised on H100s.
 > Other GPU/runtime combinations are not yet claimed as supported.
 
-## Quick start
+## Use it with your existing vLLM server
 
 ### 1. Prerequisites
 
@@ -49,7 +69,7 @@ The live-tested stack is vLLM 0.25.1+cu129, PyTorch 2.11.0, CUDA 12.9, and
 CUDA, PyTorch, vLLM, model weights, and Speculators are intentionally installed
 out of band because their packages depend on the GPU host.
 
-### 2. Install the wrapper
+### 2. Install SpeedLM beside vLLM
 
 Run this inside the Python 3.12 environment where vLLM already works:
 
@@ -67,9 +87,9 @@ the lightweight wrapper while leaving the CUDA and training runtimes unresolved
 would report success too early. A tagged package or CUDA container is the right
 next distribution step.
 
-### 3. Serve and capture
+### 3. Keep the OpenAI-compatible serving API and capture completed traffic
 
-Replace <code>vllm serve</code> with <code>speedlm vllm serve</code>:
+Add the <code>speedlm</code> prefix to the command you already use:
 
 ~~~bash
 speedlm vllm serve Qwen/Qwen3-8B \
@@ -94,13 +114,14 @@ curl http://localhost:8100/v1/chat/completions \
   }'
 ~~~
 
-At this point SpeedLM is serving and capturing traffic, but it is **not
-tuning**.
+Your clients keep calling the OpenAI-compatible serving API. At this point
+SpeedLM is serving and capturing traffic locally, but it is **not tuning yet**.
 
-## Turn on idle tuning
+## Make idle time improve future requests
 
-Idle tuning warm-starts from an existing public draft head; it does not train a
-speculator from scratch. First install
+After one-time setup, add <code>--enable-idle-tuning</code> and SpeedLM will use
+confirmed quiet windows automatically. Idle tuning warm-starts from an existing
+public draft head; it does not train a speculator from scratch. First install
 [Speculators](https://github.com/vllm-project/speculators/blob/main/docs/user_guide/getting_started.md),
 then copy the portable Qwen configuration:
 
@@ -125,24 +146,24 @@ speedlm vllm serve Qwen/Qwen3-8B \
   --max-model-len 16384
 ~~~
 
-After setup, <code>--enable-idle-tuning</code> is the only serving change. The
-explicit <code>--max-model-len 16384</code> keeps the serving and training
-context windows aligned with the example.
+After setup, <code>--enable-idle-tuning</code> is the only additional serving
+change. The explicit <code>--max-model-len 16384</code> keeps the serving and
+training context windows aligned with the example.
 
 If your traffic includes tools, multi-turn history, or client-supplied assistant
 turns, declare that in the config's <code>workload</code> section before
 tuning. SpeedLM measures the captured corpus and warns when the declaration
 does not match it.
 
-### What happens when traffic stops
+### What SpeedLM does with an idle window
 
-1. The gateway waits for five quiet minutes by default, plus two confirmation
-   polls.
-2. It closes admission, drains accepted requests, and puts vLLM to sleep.
-3. SpeedLM snapshots traces, extracts training signals, trains a candidate, and
-   benchmarks it on a session-disjoint held-out suite.
-4. It promotes only a candidate that clears the accepted-length and throughput
-   safeguards; otherwise it restores the incumbent.
+1. It waits for five quiet minutes by default, plus two confirmation polls, so
+   a short traffic gap does not start training.
+2. It closes admission, finishes accepted requests, and puts vLLM to sleep.
+3. It snapshots local traces, extracts training signals, trains a candidate,
+   and benchmarks it on a session-disjoint held-out suite.
+4. It promotes the candidate only if it clears the accepted-length and
+   throughput safeguards; otherwise the current draft stays in place.
 
 A request arriving during this cycle waits at the gateway, preempts work where
 safe, and runs only after a verified draft is awake. It is never sent to a
@@ -158,7 +179,7 @@ speedlm traces stats
 speedlm gain
 ~~~
 
-## Measured result
+## What improvement has been measured?
 
 On Qwen3-8B agentic coding traffic, the session-disjoint gate measured:
 
@@ -168,10 +189,11 @@ On Qwen3-8B agentic coding traffic, the session-disjoint gate measured:
 | Relative change | — | **+15.0%** |
 | Contexts × repeats | 287 × 8 | 287 × 8 |
 
-That acceptance-side result is reproducible. Wall-clock throughput for the same
-two heads ranged from +9.9% to +19.9% across shared-node gates, so SpeedLM does
-not present a universal “15% faster” claim. The most repeated gate measured
-+16.15% throughput but correctly vetoed that timing channel as non-stationary.
+That acceptance-side result is reproducible, but the archived gate did not
+promote because its timing channel was non-stationary. A separate retained
+125-context × 8-repeat gate measured **+13.4% accepted length** and did promote.
+Wall-clock throughput for the same two heads ranged from +9.9% to +19.9% across
+shared-node gates, so SpeedLM does not present a universal “15% faster” claim.
 See [the current result](docs/agentic-selfplay-result.md) and
 [the speedup ceiling analysis](docs/speedup-ceiling.md).
 
@@ -180,7 +202,7 @@ much work the verifier can accept per step, not the target model's intended
 distribution. Exact bytes are not guaranteed across independently batched vLLM
 runs, even at temperature zero.
 
-## Built-in profiles
+## Which models can use automatic tuning today?
 
 | Profile | Verifier | Idle tuning |
 | --- | --- | --- |
@@ -192,10 +214,11 @@ runs, even at temperature zero.
 Plain proxy serving can launch other models. Idle tuning requires a compatible,
 trainable profile and warm-start draft.
 
-## Data and safety
+## Where your data stays
 
-State defaults to <code>~/.speedlm</code> and can be moved with
-<code>SPEEDLM_HOME</code> or <code>--home</code>:
+SpeedLM stores captured exchanges, derived traces, and tuning artifacts on the
+local host by default. State defaults to <code>~/.speedlm</code> and can be moved
+with <code>SPEEDLM_HOME</code> or <code>--home</code>:
 
 ~~~text
 ~/.speedlm/

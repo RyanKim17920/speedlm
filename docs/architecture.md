@@ -29,7 +29,7 @@ exchange only after the request and response are paired.
 | --- | --- | --- |
 | Serving | vLLM handles traffic normally | Admitted immediately |
 | Quiescing | Admission closes and already admitted work drains | Waits; the cycle is preempted |
-| Sleeping | vLLM releases GPU memory | Waits; serving recovery begins |
+| Sleeping | vLLM releases serving GPU memory | Waits; serving recovery begins |
 | Extracting / training | Separate processes prepare signals and train a candidate | Waits; workers are terminated and the incumbent is restored |
 | Benchmarking | Stock and candidate drafts replay a frozen held-out suite | Waits; replay is cancelled and the incumbent is restored |
 | Promoting | The passed candidate becomes the durable active pointer | Waits briefly, then uses the verified candidate |

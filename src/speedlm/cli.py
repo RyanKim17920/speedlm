@@ -66,7 +66,10 @@ _COMMANDS = frozenset({"vllm", "traces", "status", "gain", "doctor"})
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="speedlm",
-        description="SpeedLM — speculative decoding for vLLM",
+        description=(
+            "Automatically speeds up supported local LLM profiles with idle GPU time "
+            "(research preview)."
+        ),
     )
     parser.add_argument("--version", action="store_true", default=False, help="Show version")
     parser.add_argument("--home", type=str, default=None, help="Override SPEEDLM_HOME")
@@ -74,15 +77,19 @@ def _build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command")
 
     # ---- vllm serve (nested) ----
-    vllm_parser = subparsers.add_parser("vllm", help="vLLM proxy commands")
+    vllm_parser = subparsers.add_parser(
+        "vllm", help="Run your existing vLLM server through SpeedLM"
+    )
     vllm_sub = vllm_parser.add_subparsers(dest="vllm_command")
 
     serve_parser = vllm_sub.add_parser(
         "serve",
-        help="Launch vLLM with SpeedLM proxy",
+        help="Serve through SpeedLM and capture completed traffic",
         usage="speedlm vllm serve MODEL [SPEEDLM_OPTIONS] [VLLM_ARGS...]",
         description=(
-            "Launch a real vLLM server behind the SpeedLM streaming and capture gateway."
+            "Keep the same OpenAI-compatible serving workflow while SpeedLM "
+            "captures completed traffic locally; opt in to idle tuning with "
+            "--enable-idle-tuning."
         ),
         epilog="Arguments SpeedLM does not recognize are forwarded unchanged to vLLM.",
     )
@@ -95,7 +102,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--enable-idle-tuning",
         action=argparse.BooleanOptionalAction,
         default=None,
-        help="Start the idle auto-tuner in the background",
+        help="Use confirmed idle GPU time to train and gate a candidate draft automatically",
     )
 
     # ---- traces import ----
