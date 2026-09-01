@@ -1,21 +1,22 @@
 # SpeedLM
 
 <p align="center">
-  <a href="docs/assets/speedlm-demo.mp4?raw=1">
+  <a href="docs/assets/speedlm-devpost-59s.mp4?raw=1">
     <img
-      src="docs/assets/speedlm-demo-poster.jpg"
-      alt="Normal vLLM and SpeedLM serving identical output side by side"
+      src="docs/assets/devpost/06-local-inference-gap.png"
+      alt="Hosted API versus local vLLM versus SpeedLM: local idle time becomes draft tuning"
       width="100%"
     />
   </a>
 </p>
 
 <p align="center">
-  <a href="docs/assets/speedlm-demo.mp4?raw=1"><strong>▶ Watch the 63-second demo</strong></a>
+  <a href="docs/assets/speedlm-devpost-59s.mp4?raw=1"><strong>▶ Watch the 59-second problem-to-proof demo</strong></a>
   <br />
   <sub>
-    Authentic vLLM, curl, capture, idle, and training output. The recording uses a
-    five-second demo idle threshold; the default is five minutes.
+    The local-inference gap, followed by authentic vLLM, curl, idle-tuning,
+    training, and promotion evidence. The recording uses a five-second demo
+    idle threshold; the software default is five minutes.
   </sub>
 </p>
 
