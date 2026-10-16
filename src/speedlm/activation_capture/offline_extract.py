@@ -34,6 +34,14 @@ _DEFAULT_SPECULATORS_REPO = Path(
     )
 )
 
+#: Default GPU memory utilization fraction for the offline extraction engine.
+#: This fraction is applied to each device's *total* memory so the engine
+#: allocates at most ``total * gpu_memory_utilization`` bytes.  A value of
+#: 0.5 ensures the offline engine can run alongside a recently-teardown
+#: capture engine without hitting CUDA OOM, while surviving both smaller
+#: cards and larger verifier models.
+DEFAULT_GPU_MEMORY_UTILIZATION: float = 0.5
+
 
 def _environ(speculators_repo: Path) -> dict[str, str]:
     """Build the environment for Speculators subprocesses."""
@@ -44,14 +52,45 @@ def _environ(speculators_repo: Path) -> dict[str, str]:
     return env
 
 
-def _wait_for_health(url: str, timeout: float, poll: float = 0.5) -> None:
-    """Block until the vLLM engine reports healthy."""
+def _read_log_tail(log_path: Path, lines: int = 100) -> str:
+    """Return the last *lines* of a log file, or a short fallback."""
+    try:
+        raw = log_path.read_text(encoding="utf-8", errors="replace")
+        all_lines = raw.splitlines()
+        tail = all_lines[-lines:]
+        return "\n".join(tail)
+    except FileNotFoundError:
+        return "(log file not found)"
+
+
+def _wait_for_health(
+    url: str,
+    process: subprocess.Popen[bytes],
+    timeout: float,
+    *,
+    poll: float = 0.5,
+    log_path: Path | None = None,
+) -> None:
+    """Block until the vLLM engine reports healthy.
+
+    Polls the subprocess each iteration so an already-dead engine
+    short-circuits immediately rather than burning the full timeout.
+    If *log_path* is given, its tail is appended to the timeout message.
+    """
     import urllib.error  # lazy stdlib
     import urllib.request
 
     deadline = time.monotonic() + timeout
     last_err: str = "not attempted"
     while time.monotonic() < deadline:
+        rc = process.poll()
+        if rc is not None:
+            detail = f"vLLM exited with code {rc}"
+            if log_path is not None:
+                detail += "\n--- vLLM log (last 100 lines) ---\n"
+                detail += _read_log_tail(log_path)
+                detail += "\n--- end of vLLM log ---"
+            raise RuntimeError(detail)
         try:
             with urllib.request.urlopen(url, timeout=2.0) as resp:  # noqa: S310
                 if 200 <= resp.status < 300:
@@ -60,7 +99,12 @@ def _wait_for_health(url: str, timeout: float, poll: float = 0.5) -> None:
         except (OSError, urllib.error.URLError) as exc:
             last_err = repr(exc)
         time.sleep(poll)
-    raise TimeoutError(f"vLLM did not become ready within {timeout}s; {last_err}")
+    detail = f"vLLM did not become ready within {timeout}s; {last_err}"
+    if log_path is not None:
+        detail += "\n--- vLLM log (last 100 lines) ---\n"
+        detail += _read_log_tail(log_path)
+        detail += "\n--- end of vLLM log ---"
+    raise TimeoutError(detail)
 
 
 def _write_conversation_jsonl(
@@ -93,6 +137,7 @@ def extract(
     port: int = 8131,
     ready_timeout: float = 300.0,
     extraction_timeout: float = 600.0,
+    gpu_memory_utilization: float = DEFAULT_GPU_MEMORY_UTILIZATION,
 ) -> Path:
     """Run the full offline extraction pipeline on a single prompt.
 
@@ -101,6 +146,11 @@ def extract(
     2. Launch a vLLM hidden-state server (via ``launch_vllm.py``).
     3. Run ``data_generation_offline.py`` against the server.
     4. Tear down the server.
+
+    Args:
+        gpu_memory_utilization: Fraction of each GPU device's total memory
+            that the offline engine may use.  Defaults to
+            ``DEFAULT_GPU_MEMORY_UTILIZATION`` (0.5).
 
     Returns the path to the directory containing the ``hs_*.safetensors``
     shards.
@@ -160,7 +210,9 @@ def extract(
             f"Rendered input row: {rendered}"
         )
 
-    # Step 3: launch hidden-state server
+    # Step 3: launch hidden-state server with output captured to a log file
+    server_log = output_dir / "offline_vllm.log"
+    log_handle = server_log.open("wb")
     server = subprocess.Popen(
         [
             str(vpython),
@@ -179,16 +231,21 @@ def extract(
             "8",
             "--enforce-eager",
             "--gpu-memory-utilization",
-            "0.5",
+            str(gpu_memory_utilization),
         ],
         cwd=str(repo),
         env=env,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stdout=log_handle,
+        stderr=subprocess.STDOUT,
     )
 
     try:
-        _wait_for_health(f"http://127.0.0.1:{port}/health", ready_timeout)
+        _wait_for_health(
+            f"http://127.0.0.1:{port}/health",
+            server,
+            ready_timeout,
+            log_path=server_log,
+        )
 
         # Step 4: run data_generation_offline.py
         gen_result = subprocess.run(
@@ -228,6 +285,7 @@ def extract(
         except subprocess.TimeoutExpired:
             server.kill()
             server.wait()
+        log_handle.close()
 
 
 def load_hidden_states(
