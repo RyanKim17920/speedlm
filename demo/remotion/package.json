@@ -6,11 +6,17 @@
   "scripts": {
     "start": "remotion studio",
     "build": "remotion render SpeedLMDemo out/speedlm-demo.mp4",
+    "build:short": "remotion render SpeedLMShort out/speedlm-short.mp4",
+    "build:submission": "remotion render SpeedLMSubmission out/speedlm-submission.mp4",
+    "build:campaign:120": "remotion render SpeedLMCampaign120 out/speedlm-campaign-119s.mp4",
+    "build:campaign:60": "remotion render SpeedLMCampaign60 out/speedlm-campaign-59s.mp4",
     "preview": "remotion render SpeedLMDemo out/preview.mp4 --frames=0-120",
     "data": "python3 extract_series.py"
   },
   "dependencies": {
     "@remotion/cli": "4.0.509",
+    "@remotion/media": "4.0.509",
+    "@remotion/transitions": "4.0.509",
     "react": "19.0.0",
     "react-dom": "19.0.0",
     "remotion": "4.0.509"

@@ -1,0 +1,11 @@
+{
+  "typing_delay": 0.003,
+  "settle": 1.0,
+  "prompt": "\\[\\033[1;32m\\]speedlm-events\\[\\033[0m\\]$ ",
+  "steps": [
+    {
+      "command": "tail -n +1 -F \"$SPEEDLM_HOME/runs/events.jsonl\"",
+      "pause_after": 420
+    }
+  ]
+}
